@@ -5,10 +5,13 @@
  * against the node on this computer and stays in the room, printing what
  * the page sees, while the node's own log tells the chain's part.
  *
- *   host:  opens its home room, makes it PRIVATE (every door "owner", the
- *          keypad's own setting), waits for the node's contact card and
- *          writes an invite that carries it.
- *   guest: opens that invite and stays in the host's room.
+ *   host:  opens its OWN home room (never a room a reused profile was last
+ *          in), makes it PRIVATE (every door "owner", the keypad's own
+ *          setting), waits for the node's contact card and writes an invite
+ *          that carries it.
+ *   guest: opens that invite and stays. It counts as in the host's room only
+ *          once a verified frame from the host has applied ("linked"); a copy
+ *          of the room kept from an earlier run does not count.
  *
  * A room is private space only when no door lets anyone walk in, and only a
  * private room's invite carries contact cards (roomCap.ts `cardsForPass`):
@@ -143,6 +146,9 @@ await ctx.addInitScript({
       localStorage.setItem('ssf-player-name', ${JSON.stringify(name)});
     }
   } catch { /* storage refused */ }
+  // A host opens its own home room: without this a reused profile resumes
+  // the room it was last in (ssf-last-room), which need not be its own.
+  if (${JSON.stringify(role === 'host')}) { try { localStorage.removeItem('ssf-last-room'); } catch { /* storage refused */ } }
   performance.setResourceTimingBufferSize(10000);
   window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 200);
   window.cancelAnimationFrame = (id) => clearTimeout(id);
@@ -185,16 +191,26 @@ const status = () => page.evaluate(() => {
   try { card = !!localStorage.getItem('ssf-node-card'); } catch { /* storage refused */ }
   return {
     room: window.__ssfRoomId ?? null,
-    // The room's owner record is there: for a guest, the host's state arrived.
+    // The room's owner record is there. It can come from a copy kept from an
+    // earlier run, so it says nothing about a live link.
     ownerKnown: info ? !!info.get('owner') : false,
+    // A verified frame from the room's host has applied (never true for the
+    // host's own page, which holds the room itself).
+    linked: window.__ssfSync ? !!window.__ssfSync.linked() : null,
     mode: np && typeof np.mode === 'function' ? np.mode() : null,
     players,
     nodeCard: card,
   };
 }).catch((e) => ({ error: String(e).slice(0, 120) }));
 
-const inRoom = (room) => !!(window.__ssfDoc && window.__ssfDoc.getMap('roomInfo').get('owner')
-  && window.networkProvider && window.networkProvider.mode() !== 'offline' && (!room || window.__ssfRoomId === room));
+/** The host's page holds a room with its node (the room is its own, so the
+ *  owner record is its own writing). */
+const inRoom = () => !!(window.__ssfDoc && window.__ssfDoc.getMap('roomInfo').get('owner')
+  && window.networkProvider && window.networkProvider.mode() !== 'offline');
+/** The guest's page is in `room` with the host's live state: the page's own
+ *  signal that a verified frame from the host has applied. The owner record
+ *  alone would also be true of a copy kept from an earlier run. */
+const linkedTo = (room) => !!(window.__ssfRoomId === room && window.__ssfSync && window.__ssfSync.linked());
 
 let room = null;
 if (role === 'host') {
@@ -206,8 +222,18 @@ if (role === 'host') {
     await fail('the page never got into a room with its node: is the node running on this computer, and is this the right --node-port?');
   }
   if (!failed) {
-    room = await page.evaluate(() => window.__ssfRoomId);
-    log(`host: in room ${room}`);
+    const here = await page.evaluate(async () => ({
+      room: window.__ssfRoomId,
+      home: (await window.__mod('identity')).getDefaultRoomId(),
+    }));
+    room = here.room;
+    if (here.room !== here.home) {
+      await fail(`the page is in room ${here.room}, not this player's own home room ${here.home}: its doors are not this script's to change`);
+    } else {
+      log(`host: in its own home room ${room}`);
+    }
+  }
+  if (!failed) {
     // Private space: no door lets anyone walk in. The keypad's own writer,
     // for the four berths and every door the room has.
     const doors = await page.evaluate(async () => {
@@ -254,14 +280,15 @@ if (role === 'host') {
     room = facts.roomId;
     log(`guest: invite read: ${JSON.stringify(facts)}`);
     await page.goto(`${base}/?seed=${encodeURIComponent(seed)}`);
-    log(`guest: page open with the invite, waiting to be in room ${room} with the host's state`);
+    log(`guest: page open with the invite, waiting for the host's live state of room ${room}`);
     try {
-      await page.waitForFunction(inRoom, room, { timeout: 180_000 });
-      log(`guest: IN THE ROOM ${room}: the host's state arrived`);
+      await page.waitForFunction(linkedTo, room, { timeout: 180_000 });
+      log(`guest: LINKED to the host in room ${room}: a verified frame from the host applied`);
     } catch {
       // Not a failure of the drill: with no live route this is where the
-      // Phone Book's part begins. The page stays and keeps trying.
-      log(`guest: not in the room after 180 s (no live route to the host yet); staying, the node keeps dialling`);
+      // Phone Book's part begins. The page stays and keeps trying, and the
+      // status lines say "linked":true when the link comes.
+      log(`guest: not linked to the host after 180 s (no live route yet); staying, the node keeps dialling`);
     }
   }
 }

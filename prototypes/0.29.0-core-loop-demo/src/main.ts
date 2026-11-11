@@ -2756,6 +2756,10 @@ async function joinRoomAtEpoch(
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;
+  // And whether this room's state is live: `linked` is true once a VERIFIED
+  // frame from the room's host has applied, which a cached copy of the room
+  // never is (scripts/drill-link.mjs waits on it).
+  (window as any).__ssfSync = { linked: () => sync.linkedSynced, server: () => sync.serverSynced };
 
   // 🤝 Co-present settlement requests ride THIS room's doc — observe per-join
   // (the doc changes each room), tearing down the prior room's observer. When

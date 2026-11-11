@@ -1156,8 +1156,9 @@ const DEFAULT_WT_PORT: u16 = 4443;
 /// computer (a developer's, or a drill beside an installed game) cannot share
 /// the default and names another here. It is the standalone node's setting:
 /// the desktop app looks at the default port to tell whether a node already
-/// runs (`acquire_p2p_node` in src-tauri). A value that is no port leaves
-/// the default and comes back with a warning to print.
+/// runs (`acquire_p2p_node` in src-tauri) and removes the variable for the
+/// node it starts. A value that is no port leaves the default and comes
+/// back with a warning to print.
 fn wt_port_of(raw: Option<&str>) -> (u16, Option<String>) {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return (DEFAULT_WT_PORT, None);
