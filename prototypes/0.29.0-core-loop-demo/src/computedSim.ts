@@ -85,7 +85,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
 import { CrapsHarness, crapsChangeKind, crapsShownOf } from './computedCrapsSim';
 import type { CrapsBotSpec, Place } from './computedCrapsSim';
-import { FAIR_ONLY_RV, isFairOnlyInc, parseFairOnlyKey, readCk } from './computedFairOnly';
+import { FAIR_ONLY_RV, isFairOnlyInc, nextSid3, parseFairOnlyKey, readCk } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
 import { canon, gameOfInc, houseCommitOf, MAX_HELD_ROUNDS, parseKey, seedTable, signBytes, slipCommit } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
@@ -764,6 +764,11 @@ export class Sim {
   private readonly houseCks = new Set<string>();
   /** The opening roots their openers wrote (the keys). */
   private readonly openedRoots = new Set<string>();
+  /** Every checkpoint a page's doc held that reads whole, by the session it
+   *  opens (`<t>:<inc>:<nextSid3>`): what a sweep says it repeats. */
+  private readonly ckBySession = new Map<string, { key: string; ck: CkRec }>();
+  /** The last base the oracle's own rule gave each load of a page, by `<t>|<inc>` (foBase). */
+  private readonly foHeld = new WeakMap<Page, Map<string, FoBase>>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
@@ -1045,7 +1050,13 @@ export class Sim {
       // 🔒 A FAIR ONLY game's checkpoints are its house's (design §8.4 P1): a
       // page writes its own opening root, and puts back one the house wrote.
       for (const k of top ?? []) {
-        if (!k?.startsWith('ck:') || !computed.has(k)) continue;
+        if (!k?.startsWith('ck:')) continue;
+        // (The oracle's own base for this page, kept as its doc's checkpoints
+        // change: the base it holds when the doc loses it is the last it had.)
+        const at = parseFairOnlyKey(k);
+        if (at?.kind === 'ck') this.foBase(sp, computed, { room: PAGE_ROOM, t: at.t, inc: at.inc });
+        if (!computed.has(k)) continue;
+        this.noteCk(k, computed.get(k));
         if (tr.origin === HOUSE_ORIGIN) this.houseCks.add(k);
         else if (tr.origin !== NET && !sp.cheats) {
           // Its own root at the opening. Any page may put back that root or
@@ -1743,7 +1754,7 @@ export class Sim {
   private observeGame(sp: SimPage, t: string, inc: string, res: FoldResult): void {
     if (sp.cheats) return;
     const base = sp.p.casino.computedResolutionOf(t, inc)?.base;
-    if (base && base.ck.u > 0 && !this.foBases.has(base.key)) this.foBases.set(base.key, { t, inc, ck: base.ck, by: `${sp.name} at ${this.elapsed} ms` });
+    if (base && base.ck.b !== 'g' && !this.foBases.has(base.key)) this.foBases.set(base.key, { t, inc, ck: base.ck, by: `${sp.name} at ${this.elapsed} ms` });
     if (res.pending) return;
     const n = new Map(res.base.n);
     const decided = res.rounds.filter((v) => v.decided);
@@ -1768,6 +1779,16 @@ export class Sim {
   /** 🔒 How many checkpoints of FAIR ONLY games the house node wrote, and how
    *  many bases past a root the honest pages counted (gameProblems holds each
    *  to the oracle). */
+  /** A checkpoint a doc holds, kept by the session it opens if it reads whole. */
+  private noteCk(key: string, value: unknown): void {
+    if (readCk(PAGE_ROOM, key, value).kind !== 'ok') return;
+    const parts = key.split(':');
+    const inc = parts[parts.length - 2];
+    const t = parts.slice(1, -2).join(':');
+    const ck = value as CkRec;
+    this.ckBySession.set(`${t}:${inc}:${nextSid3({ room: PAGE_ROOM, t, inc }, ck)}`, { key, ck });
+  }
+
   get houseCheckpoints(): number {
     return this.houseCks.size;
   }
@@ -1794,7 +1815,28 @@ export class Sim {
         && verify(dl.k, roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g)
         && verify(ck.k, signBytes('ck', ctx, body), g);
       if (!signed) out.push(`${by} counted ${key}, which the game's house did not sign`);
-      const id = `${t}:${inc}:${ck.b}:${ck.u}:${ck.l}`;
+      // A sweep (design §8.5 N3s) repeats the checkpoint whose session it
+      // closes, one sweep on: back along those to the trim or the root they
+      // began from, each holding what the one before held. The trim is held to
+      // the folds, as any; a root, to its opener's.
+      // (Field for field, but the session closed, the sweep count and who signed. A record canon cannot read holds nothing.)
+      const content = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, s: c.s, h: c.h, x: c.x, e: c.e });
+      let ground: { key: string; ck: CkRec } | null = { key, ck };
+      while (ground && ground.ck.w !== undefined) {
+        const swept: CkRec = ground.ck;
+        const prev = this.ckBySession.get(`${t}:${inc}:${swept.b}`);
+        const held = content(swept);
+        ground = prev && held !== null && (prev.ck.w ?? 0) === swept.w! - 1 && content(prev.ck) === held ? prev : null;
+      }
+      if (!ground) {
+        out.push(`${by} counted ${key} (round ${ck.u}, sweep ${ck.w}), which repeats no checkpoint the room held`);
+        continue;
+      }
+      if (ground.ck.b === 'g') {
+        if (!this.openedRoots.has(ground.key)) out.push(`${by} counted ${key} (round ${ck.u}, sweep ${ck.w}), of a root no honest page opened`);
+        continue;
+      }
+      const id = `${t}:${inc}:${ground.ck.b}:${ck.u}:${ck.l}`;
       const nets = JSON.stringify(Object.keys(ck.n).sort().map((pid) => [pid, ck.n[pid]]));
       const want = JSON.stringify([nets, ck.d ?? '', ck.o ?? null]);
       const got = this.reached.get(id);
@@ -2201,6 +2243,10 @@ export class Sim {
    *  the best by round, then an end, then sweeps, then the lowest id. And the
    *  houses those delegations name. */
   private foBase(sp: SimPage, map: Y.Map<unknown>, ctx: FoldCtx): FoBase | null {
+    // (S3: by round, then an end, then sweeps, then the lowest id.)
+    const outranks = (a: CkRec, aId: string, b: CkRec, bId: string): boolean => a.u > b.u
+      || (a.u === b.u && ((a.e ?? 0) > (b.e ?? 0)
+        || ((a.e ?? 0) === (b.e ?? 0) && ((a.w ?? 0) > (b.w ?? 0) || ((a.w ?? 0) === (b.w ?? 0) && aId < bId)))));
     const verify = sp.p.keypair.verifyIdentityStrict;
     const ok = (id: string, pub: string, bytes: () => Uint8Array, sig: string): boolean => {
       const key = `fo|${ctx.t}|${ctx.inc}|${id}`;
@@ -2228,12 +2274,23 @@ export class Sim {
       if (!(root ? ck.k === ck.ok && dlOk : dlOk && dl!.h === ck.k)) continue;
       if (!ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g)) continue;
       houses.add(dl!.h);
-      const better = best === null || ck.u > best.ck.u
-        || (ck.u === best.ck.u && ((ck.e ?? 0) > (best.ck.e ?? 0)
-          || ((ck.e ?? 0) === (best.ck.e ?? 0) && ((ck.w ?? 0) > (best.ck.w ?? 0) || ((ck.w ?? 0) === (best.ck.w ?? 0) && id < best.id)))));
-      if (better) best = { key, id, ck };
+      if (best === null || outranks(ck, id, best.ck, best.id)) best = { key, id, ck };
     }
-    return best ? { key: best.key, ck: best.ck, houses } : null;
+    // A page holds the base it counts from (casinoDoc's held records, design
+    // §8.4 P2): while the doc has lost it (a peer's delete or junk over its
+    // key, until a page or the house puts it back) the page counts from it
+    // still, whatever lesser checkpoint the doc holds meanwhile (an old one
+    // laid back in). So does the oracle's count, for that load of the page:
+    // the last base this rule gave it stands until the doc holds a better.
+    const held = this.foHeld.get(sp.p) ?? new Map<string, FoBase>();
+    this.foHeld.set(sp.p, held);
+    const name = `${ctx.t}|${ctx.inc}`;
+    const was = held.get(name);
+    if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) return was;
+    if (!best) return null;
+    const base = { key: best.key, ck: best.ck, houses };
+    held.set(name, base);
+    return base;
   }
 
   /** Each player's chips as casinoDoc reads them against what a cold fold of

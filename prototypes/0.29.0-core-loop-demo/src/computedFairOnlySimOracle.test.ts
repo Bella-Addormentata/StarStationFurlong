@@ -16,6 +16,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sealCk } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
+import { houseSign } from './computedHouse';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
@@ -127,6 +128,9 @@ describe('a page that writes a checkpoint', () => {
     await sim.run(20_000);
     const T = 'roulette-1';
     const C = sim.pages.find((sp) => sp.name === 'C')!;
+    // (On until a round has moved chips: the pages' counts rest on the root then.)
+    while (sim.elapsed < RUN_MS && (C.p.casino.computedFoldOf(T)?.nets.size ?? 0) === 0) await sim.run(1_000);
+    expect(C.p.casino.computedFoldOf(T)?.nets.size ?? 0, sim.label).toBeGreaterThan(0);
     const inc = C.p.casino.computedIncOf(T)!;
     const top = C.p.doc.getMap<unknown>('casinoComputed');
     const roots = [...top.keys()].filter((k) => k.startsWith(`ck:${T}:${inc}:`));
@@ -136,11 +140,52 @@ describe('a page that writes a checkpoint', () => {
     await sim.run(1_000);
     C.cheats = true;
     C.p.doc.transact(() => top.delete(roots[0]));
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    // While the doc holds no root, a page counts from the one it held, and the oracle's cold count with it.
+    await sim.run(500);
+    sim.enter(B);
+    expect(B.p.doc.getMap('casinoComputed').has(roots[0]), sim.label).toBe(false);
+    expect(B.p.casino.computedFoldOf(T)?.nets.size ?? 0, sim.label).toBeGreaterThan(0);
+    expect(sim.ledgerProblems(B), sim.label).toEqual([]);
+    expect(sim.cageProblems(B), sim.label).toEqual([]);
     await sim.run(10_000);
     await sim.syncAll();
-    const B = sim.pages.find((sp) => sp.name === 'B')!;
     expect(B.p.doc.getMap('casinoComputed').has(roots[0]), sim.label).toBe(true);
     expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
+});
+
+describe('the checkpoint oracle and a sweep', () => {
+  it("a sweep the house's key signed that does not hold what the checkpoint it sweeps held (a thousand chips more to one player) is counted from by the pages, and named", async () => {
+    const sim = await Sim.open({ name: 'fair-only-wrong-sweep', seed: seed(1218), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const T = 'roulette-1';
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    while (sim.elapsed < RUN_MS && sim.node!.trims < 1) await sim.run(2_000);
+    sim.heal();
+    await sim.quiet(120_000);
+    sim.nodeUp = false;
+    await sim.syncAll();
+    expect(sim.gameProblems(), sim.label).toEqual([]);
+    sim.enter(B);
+    const inc = B.p.casino.computedIncOf(T)!;
+    const real = B.p.casino.computedResolutionOf(T, inc)!.base!.ck;
+    expect(real.u, sim.label).toBeGreaterThan(0);
+    const ctx = sim.ctxOf(T, inc);
+    const { g: _g, ...body } = real;
+    const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
+    const swept = sealCk(
+      ctx, { ...body, b: B.p.fold.nextSid3(ctx, real), w: (real.w ?? 0) + 1, n: { ...real.n, [B.pid]: (BigInt(real.n[B.pid] ?? '0') + 1000n).toString() } },
+      (bytes) => houseSign(secret, bytes),
+    );
+    B.cheats = true;
+    B.p.doc.transact(() => B.p.doc.getMap<unknown>('casinoComputed').set(swept.key, swept.value));
+    await sim.run(2_000);
+    await sim.syncAll();
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(swept.key);
+    const problems = sim.gameProblems();
+    expect(problems.some((p) => p.includes(swept.key) && /repeats no checkpoint the room held/.test(p)), problems.join('\n')).toBe(true);
   }, TIMEOUT);
 });
 

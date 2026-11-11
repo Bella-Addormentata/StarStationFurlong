@@ -20,7 +20,7 @@ import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, NAME, OPENING_
 import { foldGameOf, MAX_HELD_ROUNDS, nextSid3, recHash, TableFold } from './computedFold';
 import type { CloseRec, FoldCtx, FoldResult, SlipRec } from './computedFold';
 import { beatKey, delegationKey, HEARTBEAT_MS } from './computedHouse';
-import { HOUSE_IDLE_MS, HOUSE_SWEEP_BYTES, HOUSE_TRIM_AFTER_MS, HOUSE_TRIM_ROUNDS, REVEAL_CUTOFF_MS, SETTLE_MS, SimHouse } from './computedSimHouse';
+import { HOUSE_IDLE_MS, HOUSE_SWEEP_BYTES, HOUSE_SWEEP_KEYS, HOUSE_SWEEP_MIN_MS, HOUSE_TRIM_AFTER_MS, HOUSE_TRIM_ROUNDS, REVEAL_CUTOFF_MS, SETTLE_MS, SimHouse } from './computedSimHouse';
 import { ComputedKit, red, testIdentity, trustAll } from './computedTestKit';
 import type { Built } from './computedTestKit';
 
@@ -568,6 +568,188 @@ describe("the simulations' house at a FAIR ONLY game: the trim", () => {
     room.run(HOUSE_TRIM_AFTER_MS + HOUSE_IDLE_MS, 1_000);
     expect(room.fold().rounds[0]).toMatchObject({ decided: 'house' });
     expect(room.house.trims).toBe(0);
+  });
+});
+
+describe("the simulations' house at a FAIR ONLY game: the sweep (N3s)", () => {
+  /** A game with nothing decided: the house's join of round 1 in, and alice's open felt (an old version beside it). */
+  function fresh() {
+    const room = new GameRoom().start();
+    const old = kit.slip(alice, 1, [red(1)], { v: 1 });
+    const felt = kit.slip(alice, 1, [red(7)], { v: 2 });
+    room.put(old, felt);
+    const [join] = room.keys('o:1:');
+    expect(join).toBeDefined();
+    return { room, old, felt, join };
+  }
+  /** Round 1 played and trimmed to, nothing decided since. */
+  function trimmed() {
+    const room = new GameRoom().start();
+    const r1 = room.played(1, SID);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 1_200);
+    expect(room.house.trims).toBe(1);
+    const { key, ck } = room.cks()[0];
+    return { room, r1, key, ck };
+  }
+
+  it("the sweep's numbers are the ones the node's half is told", () => {
+    expect({ HOUSE_SWEEP_BYTES, HOUSE_SWEEP_KEYS, HOUSE_SWEEP_MIN_MS }).toEqual({ HOUSE_SWEEP_BYTES: 48 * 1024, HOUSE_SWEEP_KEYS: 2_048, HOUSE_SWEEP_MIN_MS: 10_000 });
+  });
+
+  it("junk in a session with nothing decided: it signs the root's content again, one sweep on, and the session it opens holds the open felt and its join and no junk", () => {
+    const { room, old, felt, join } = fresh();
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(1_200);
+    expect(room.house).toMatchObject({ sweeps: 1, trims: 0, crossCheckMismatches: 0 });
+    const cks = room.cks();
+    expect(cks).toHaveLength(1);
+    const { key, ck } = cks[0];
+    expect(readCk(ROOM, key, ck)).toMatchObject({ kind: 'ok' });
+    const { g: _g, b: _b, k: _k, dl: _dl, ...rootContent } = ROOT.value;
+    expect(ck).toMatchObject({ ...rootContent, b: SID, w: 1, u: 0, n: {}, dl: DL_HOUSE, k: H.pub });
+    expect(Object.keys(ck).sort()).toEqual(['b', 'dl', 'g', 'j', 'k', 'l', 'n', 'ok', 'rv', 'ts', 'u', 'v', 'w']);
+    const res = resolved(room);
+    expect(res).toMatchObject({ live: true, base: { key }, pending: false });
+    expect(res.houseAt(H.pub, 1)).toBe(true);
+    expect(room.sesKeys()).toEqual([`ses:${T}:${P.inc}:${nextSid3(P, ck)}`]);
+    expect(nextSid3(P, ck)).not.toBe(SID);
+    expect([...room.ses().keys()].sort()).toEqual([felt.key, join].sort());
+    expect(room.ses().has(old.key)).toBe(false);
+    expect(room.house.rows.get(`${ROOM}|${T}|${P.inc}`)).toEqual({ key, value: ck });
+    // Round 1 plays on from it, on the join it carried: no second join.
+    room.run(2_000);
+    expect(room.keys('o:1:')).toEqual([join]);
+    const b1 = kit.slip(bob, 1, [red(5)]);
+    const c1 = kit.close(alice, 1, room.sid(), [felt, b1], kit.houseCommit(H, 1));
+    room.put(b1, c1, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:1:').map((v) => v.x)).toEqual([[c1.hash]]);
+  });
+
+  it('after a trim: the checkpoint again, one sweep on, with its nets, its outcome and the commitment it carried; round u\'s decider and seeds go with it, and the next round plays', () => {
+    const { room, r1, key, ck } = trimmed();
+    const carried = [...room.ses().keys()].sort();
+    expect(carried).toEqual([`h:1:${recHash(r1.h)}`, kit.reveal(1, 'alice').key, kit.reveal(1, 'bob').key].sort());
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(1_200);
+    expect(room.house).toMatchObject({ sweeps: 1, trims: 1, crossCheckMismatches: 0 });
+    const [swept] = room.cks();
+    expect(room.cks()).toHaveLength(1);
+    expect(swept.key).not.toBe(key);
+    const { g: _g, ...content } = ck;
+    expect(swept.ck).toMatchObject({ ...content, b: nextSid3(P, ck), w: 1 });
+    expect(Object.keys(swept.ck).sort()).toEqual([...Object.keys(ck), 'w'].sort());
+    expect(resolved(room)).toMatchObject({ live: true, base: { key: swept.key } });
+    expect([...room.ses().keys()].sort()).toEqual(carried);
+    expect(room.fold()).toMatchObject({ open: 2, required: kit.houseCommit(H, 2) });
+    // …and a second sweep carries them on again.
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_SWEEP_MIN_MS + 1_200, 1_000);
+    expect(room.house.sweeps).toBe(2);
+    expect(room.base()).toMatchObject({ u: 1, w: 2, h: kit.houseCommit(H, 2) });
+    expect([...room.ses().keys()].sort()).toEqual(carried);
+    const { c } = room.closed(2, room.sid());
+    room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:2:').map((v) => v.x)).toEqual([[c.hash]]);
+  });
+
+  it('a house that restarted since the trim carries the decider on, and not what else lies under round u', () => {
+    const { room, r1 } = trimmed();
+    room.house.restart();
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(SETTLE_MS + 1_200);
+    expect(room.house.sweeps).toBe(1);
+    expect([...room.ses().keys()].filter((k) => !k.startsWith('o:'))).toEqual([`h:1:${recHash(r1.h)}`]);
+  });
+
+  it('at most one per HOUSE_SWEEP_MIN_MS: junk again at once waits, and the second is two sweeps on', () => {
+    const { room } = fresh();
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+    const at = room.now;
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_SWEEP_MIN_MS - 2_400);
+    expect(room.house.sweeps).toBe(1);
+    room.run(2_400);
+    expect(room.house.sweeps).toBe(2);
+    expect(room.now - at).toBeGreaterThanOrEqual(HOUSE_SWEEP_MIN_MS - 1_200);
+    expect(room.base()).toMatchObject({ u: 0, w: 2 });
+    expect(room.cks()).toHaveLength(1);
+    expect(resolved(room)).toMatchObject({ live: true, base: { key: room.cks()[0].key } });
+  });
+
+  it('junk just short of SWEEP_BYTES is left, however long; and a session idle with nothing decided is not swept', () => {
+    const { room } = fresh();
+    const raw = (): number => room.fold().rawBytes - room.fold().keptBytes;
+    room.junk(HOUSE_SWEEP_BYTES - raw() - 3_000);
+    expect(raw()).toBeLessThan(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_IDLE_MS + 5_000, 1_000);
+    expect(room.house).toMatchObject({ sweeps: 0, trims: 0 });
+    room.doc.transact(() => {
+      for (let i = 0; i < 4; i++) room.ses().set(`more-${i}`, 'x'.repeat(1_000));
+    });
+    expect(raw()).toBeGreaterThanOrEqual(HOUSE_SWEEP_BYTES);
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+  });
+
+  it('keys of nothing: HOUSE_SWEEP_KEYS of them are swept though they weigh little, one fewer are not', () => {
+    const { room } = fresh();
+    const keys = (n: number, tag: string): void => room.doc.transact(() => {
+      for (let i = 0; i < n; i++) room.ses().set(`${tag}${i}`, 0);
+    });
+    // (The old felt is junk too: one key.)
+    keys(HOUSE_SWEEP_KEYS - 2, 'a');
+    expect(room.fold().rawBytes - room.fold().keptBytes).toBeLessThan(HOUSE_SWEEP_BYTES);
+    room.run(2_400);
+    expect(room.house.sweeps).toBe(0);
+    keys(1, 'b');
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+  });
+
+  it('not while a close of the open round is in: then the round is decided, and the trim sweeps', () => {
+    const { room } = fresh();
+    const b1 = kit.slip(bob, 1, [red(5)]);
+    const a1 = kit.slip(alice, 1, [red(7)], { v: 2 });
+    const c1 = kit.close(alice, 1, SID, [a1, b1], kit.houseCommit(H, 1));
+    room.put(b1, c1);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(3_000);
+    expect(room.house).toMatchObject({ sweeps: 0, trims: 0 });
+    room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.run(HOUSE_TRIM_AFTER_MS + 1_400);
+    expect(room.house).toMatchObject({ sweeps: 0, trims: 1 });
+    expect(room.base()).toMatchObject({ u: 1, l: c1.hash });
+    expect(room.base().w).toBeUndefined();
+  });
+
+  it('the cross-check: a sweep that does not hold what the base holds is not signed', () => {
+    const faults: ((body: Record<string, unknown>) => Record<string, unknown>)[] = [
+      (body) => ({ ...body, b: 'f'.repeat(24) }),
+      (body) => ({ ...body, w: 2 }),
+      (body) => ({ ...body, w: undefined }),
+      (body) => ({ ...body, n: { alice: '1000' } }),
+      (body) => ({ ...body, o: 5 }),
+      (body) => ({ ...body, h: 'e'.repeat(64) }),
+      (body) => ({ ...body, u: 2 }),
+      (body) => ({ ...body, k: H2.pub }),
+    ];
+    for (const [i, fault] of faults.entries()) {
+      const { room, key } = trimmed();
+      room.house.faultTrim = fault;
+      room.junk(HOUSE_SWEEP_BYTES);
+      room.run(2_400);
+      expect(room.house.sweeps, `fault ${i}`).toBe(0);
+      expect(room.house.crossCheckMismatches, `fault ${i}`).toBeGreaterThanOrEqual(1);
+      expect(room.cks().map((x) => x.key), `fault ${i}`).toEqual([key]);
+      room.house.faultTrim = null;
+      room.run(1_200);
+      expect(room.house.sweeps, `fault ${i}`).toBe(1);
+    }
   });
 });
 
