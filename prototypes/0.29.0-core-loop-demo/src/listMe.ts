@@ -109,8 +109,8 @@ const where = (net: ChiaNetwork | null): string => net?.name ?? 'the Chia networ
  *  names no payer, since there the SSF wallet may be the one. */
 const whatIsWritten = (net: ChiaNetwork | null): string =>
   net && !net.test
-    ? 'its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach, each from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card can read your addresses.'
-    : 'its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Only holders of your contact card can read your addresses.';
+    ? 'its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach, each from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card, and a host your node knocks on, can read your addresses.'
+    : 'its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Only holders of your contact card, and a host your node knocks on, can read your addresses.';
 
 export const listMeOnNote = (net: ChiaNetwork | null): string => `LIST ME is on for ${where(net)}: your station writes ${whatIsWritten(net)}`;
 
@@ -151,7 +151,7 @@ export function listMeWarning(net: ChiaNetwork | null, held = false): string {
     : '';
   const wallet = !net || net.test ? ' (on a test network your SSF wallet may pay for a write, which shows its address)' : '';
   const heldOff = held ? " While SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, only the knocks are written." : '';
-  return `List this station in the Phone Book on ${where(net)}? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach.${pays} Only holders of your contact card can read your addresses. Anyone can see that some Star Station node wrote, and when${wallet}; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain.${heldOff} Tap CONFIRM.`;
+  return `List this station in the Phone Book on ${where(net)}? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach.${pays} Only holders of your contact card, and a host your node knocks on, can read your addresses. Anyone can see that some Star Station node wrote, and when${wallet}; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain.${heldOff} Tap CONFIRM.`;
 }
 
 /** The turn an act sends: `true` for on, `false` for off, or none (`arm`

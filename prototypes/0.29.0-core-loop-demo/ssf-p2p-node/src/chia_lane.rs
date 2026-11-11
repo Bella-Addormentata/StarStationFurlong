@@ -443,6 +443,42 @@ pub fn sort_addr_entries(entries: &mut Vec<AddrEntry>) {
     entries.dedup_by_key(|e| e.addr);
 }
 
+/// Write one address into its 20-byte slot: family, address, port, flags.
+/// The slot is zero before the call, so an IPv4 address leaves the rest of
+/// the address field zero (the canonical form [`read_addr_slot`] asks for).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+fn write_addr_slot(slot: &mut [u8], addr: &std::net::SocketAddr, flags: u8) {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            slot[0] = 4;
+            slot[1..5].copy_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            slot[0] = 6;
+            slot[1..17].copy_from_slice(&v6.octets());
+        }
+    }
+    slot[17..19].copy_from_slice(&addr.port().to_le_bytes());
+    slot[19] = flags;
+}
+
+/// Read address slot `i` back: an unknown family and an IPv4 slot with bytes
+/// set past its four octets are refused.
+fn read_addr_slot(slot: &[u8], i: usize) -> Result<AddrEntry> {
+    let port = u16::from_le_bytes([slot[17], slot[18]]);
+    let ip: std::net::IpAddr = match slot[0] {
+        4 => {
+            if slot[5..17].iter().any(|&b| b != 0) {
+                return Err(anyhow!("record IPv4 slot {i} is not canonical"));
+            }
+            std::net::Ipv4Addr::new(slot[1], slot[2], slot[3], slot[4]).into()
+        }
+        6 => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&slot[1..17]).unwrap()).into(),
+        other => return Err(anyhow!("record address slot {i} has family {other}")),
+    };
+    Ok(AddrEntry { addr: std::net::SocketAddr::new(ip, port), flags: slot[19] })
+}
+
 /// The per-node presence record (kind 1): who, which era, the per-era key a
 /// knock is sealed to, when, and up to eight public addresses with flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,19 +529,7 @@ pub fn encode_presence_v2(record: &PresenceV2, secret: &iroh::SecretKey) -> Resu
     buf[OFF_EXPIRES_AT..OFF_EXPIRES_AT + 8].copy_from_slice(&record.expires_at.to_le_bytes());
     buf[OFF_ADDR_COUNT] = record.addrs.len() as u8;
     for (i, entry) in record.addrs.iter().enumerate() {
-        let slot = &mut buf[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
-        match entry.addr.ip() {
-            std::net::IpAddr::V4(v4) => {
-                slot[0] = 4;
-                slot[1..5].copy_from_slice(&v4.octets());
-            }
-            std::net::IpAddr::V6(v6) => {
-                slot[0] = 6;
-                slot[1..17].copy_from_slice(&v6.octets());
-            }
-        }
-        slot[17..19].copy_from_slice(&entry.addr.port().to_le_bytes());
-        slot[19] = entry.flags;
+        write_addr_slot(&mut buf[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN], &entry.addr, entry.flags);
     }
     let sig = secret.sign(&buf[..OFF_SIG]);
     buf[OFF_SIG..].copy_from_slice(&sig.to_bytes());
@@ -549,19 +573,7 @@ pub fn decode_presence_v2(bytes: &[u8], expected_era: u64) -> Result<PresenceV2>
     }
     let mut addrs = Vec::with_capacity(count);
     for i in 0..count {
-        let slot = &bytes[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
-        let port = u16::from_le_bytes([slot[17], slot[18]]);
-        let ip: std::net::IpAddr = match slot[0] {
-            4 => {
-                if slot[5..17].iter().any(|&b| b != 0) {
-                    return Err(anyhow!("record IPv4 slot {i} is not canonical"));
-                }
-                std::net::Ipv4Addr::new(slot[1], slot[2], slot[3], slot[4]).into()
-            }
-            6 => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&slot[1..17]).unwrap()).into(),
-            other => return Err(anyhow!("record address slot {i} has family {other}")),
-        };
-        addrs.push(AddrEntry { addr: std::net::SocketAddr::new(ip, port), flags: slot[19] });
+        addrs.push(read_addr_slot(&bytes[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN], i)?);
     }
     Ok(PresenceV2 {
         era,
@@ -588,8 +600,13 @@ pub fn decode_presence_v2(bytes: &[u8], expected_era: u64) -> Result<PresenceV2>
 // the hint, only H can read who knocked and for which rooms. Room ids ride
 // inside the ciphertext as 16-byte lane ids ([`room_lane_id`]), never in the
 // hint — nothing on chain is keyed by a room. J's own contact key rides along
-// (the slot presence uses for `kx_pk`) when J is findable, so H can dial J by
-// its presence; zeros otherwise, and H dials by node id alone.
+// (the slot presence uses for `kx_pk`) where J's card may be handed out, so H
+// can read J's presence; zeros otherwise. J's public addresses as the knock
+// is written ride along too, in the address slots the rooms leave free (the
+// REPLY addresses): a J on its first visit hands out no contact key (it
+// cannot yet know the room is private), and without them H had only J's node
+// id and the DHT to dial back by. They are inside the seal, so only H reads
+// them, and they tell H what J's own dial to H shows it anyway.
 //
 // Both sides then rendezvous on the knock's CONFIRMATION HEIGHT, the one
 // clock they share without talking (`chia_knock::rendezvous_due`).
@@ -612,6 +629,14 @@ const CTX_KNOCK_ROOM: &str = "ssf-chia-knock-room-v1";
 const CTX_KNOCK_SEAL: &str = "ssf-chia-knock-seal-v1";
 /// Rooms one knock may name (the address slots of the shared layout).
 pub const MAX_KNOCK_ROOMS: usize = MAX_V2_ADDRS;
+/// Reply addresses a knock for one room may carry: the slots that room
+/// leaves free. A knock's rooms and reply addresses share the eight slots.
+pub const MAX_KNOCK_REPLY_ADDRS: usize = MAX_V2_ADDRS - 1;
+/// A knock's count byte: the number of rooms in its low four bits, the number
+/// of reply addresses above them. A knock with no reply address is byte for
+/// byte what it was before the reply addresses existed.
+const KNOCK_ROOMS_MASK: usize = 0x0F;
+const KNOCK_REPLY_SHIFT: u32 = 4;
 /// A room's lane id inside a knock: the first bytes of a keyed hash of its id.
 pub const ROOM_LANE_ID_LEN: usize = 16;
 
@@ -663,6 +688,12 @@ pub struct KnockV2 {
     pub expires_at: u64,
     /// Lane ids of the rooms the knocker wants in, at most [`MAX_KNOCK_ROOMS`].
     pub rooms: Vec<[u8; ROOM_LANE_ID_LEN]>,
+    /// Where the knocker can be dialed as the knock is written: its public
+    /// addresses, so the host can dial back at the rendezvous with neither
+    /// the knocker's contact key (a first visit carries none) nor the DHT.
+    /// They take the address slots the rooms leave free; empty in a knock
+    /// written before they existed.
+    pub reply: Vec<std::net::SocketAddr>,
 }
 
 /// The beacon (kind 3): a node id in the clear, nothing else.
@@ -735,8 +766,9 @@ fn read_v2_header(bytes: &[u8], expected_kind: u8, expected_era: u64) -> Result<
 }
 
 /// Encode + sign a knock into its fixed 320-byte plaintext (sealed to the host
-/// by [`seal_to_kx`] afterwards). The room lane ids take the address slots,
-/// the knocker's contact key the key slot (zeros when withheld).
+/// by [`seal_to_kx`] afterwards). The room lane ids take the first address
+/// slots and the reply addresses the next ones, the knocker's contact key the
+/// key slot (zeros when withheld).
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub fn encode_knock_v2(knock: &KnockV2, secret: &iroh::SecretKey) -> Result<[u8; RECORD_V2_LEN]> {
     if knock.from != secret.public() {
@@ -745,12 +777,23 @@ pub fn encode_knock_v2(knock: &KnockV2, secret: &iroh::SecretKey) -> Result<[u8;
     if knock.rooms.is_empty() || knock.rooms.len() > MAX_KNOCK_ROOMS {
         return Err(anyhow!("a knock names 1 to {MAX_KNOCK_ROOMS} rooms, not {}", knock.rooms.len()));
     }
+    if knock.rooms.len() + knock.reply.len() > MAX_V2_ADDRS {
+        return Err(anyhow!(
+            "a knock's {} room(s) and {} reply address(es) do not fit its {MAX_V2_ADDRS} slots",
+            knock.rooms.len(),
+            knock.reply.len()
+        ));
+    }
     let mut buf = [0u8; RECORD_V2_LEN];
     write_v2_header(&mut buf, KIND_KNOCK, knock.era, &knock.from, &knock.ck_from.unwrap_or([0u8; 32]), knock.issued_at, knock.expires_at);
-    buf[OFF_ADDR_COUNT] = knock.rooms.len() as u8;
+    buf[OFF_ADDR_COUNT] = (knock.rooms.len() | (knock.reply.len() << KNOCK_REPLY_SHIFT)) as u8;
     for (i, lane) in knock.rooms.iter().enumerate() {
         let slot = &mut buf[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
         slot[..ROOM_LANE_ID_LEN].copy_from_slice(lane);
+    }
+    for (j, addr) in knock.reply.iter().enumerate() {
+        let i = knock.rooms.len() + j;
+        write_addr_slot(&mut buf[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN], addr, 0);
     }
     sign_v2(&mut buf, secret);
     Ok(buf)
@@ -759,25 +802,39 @@ pub fn encode_knock_v2(knock: &KnockV2, secret: &iroh::SecretKey) -> Result<[u8;
 /// Decode + verify a knock plaintext read under an inbox hint of `expected_era`.
 /// Rejects the wrong length, version, kind or era, a bad signature and a
 /// non-canonical body. The knock's room list is the host's to match against
-/// the rooms it holds; freshness is the reader's job.
+/// the rooms it holds; freshness is the reader's job, and so is which of the
+/// reply addresses it will dial (they are the knocker's own word).
 pub fn decode_knock_v2(bytes: &[u8], expected_era: u64) -> Result<KnockV2> {
     let h = read_v2_header(bytes, KIND_KNOCK, expected_era)?;
-    if h.count == 0 || h.count > MAX_KNOCK_ROOMS {
-        return Err(anyhow!("knock names {} rooms, expected 1 to {MAX_KNOCK_ROOMS}", h.count));
+    let (room_count, reply_count) = (h.count & KNOCK_ROOMS_MASK, h.count >> KNOCK_REPLY_SHIFT);
+    if room_count == 0 || room_count > MAX_KNOCK_ROOMS {
+        return Err(anyhow!("knock names {room_count} rooms, expected 1 to {MAX_KNOCK_ROOMS}"));
     }
-    if bytes[OFF_ADDRS + h.count * ADDR_SLOT_LEN..OFF_RESERVED].iter().any(|&b| b != 0) {
-        return Err(anyhow!("knock body is not canonical (unused room slots set)"));
+    let used = room_count + reply_count;
+    if used > MAX_V2_ADDRS {
+        return Err(anyhow!("knock's {room_count} room(s) and {reply_count} reply address(es) overrun its {MAX_V2_ADDRS} slots"));
     }
-    let mut rooms = Vec::with_capacity(h.count);
-    for i in 0..h.count {
+    if bytes[OFF_ADDRS + used * ADDR_SLOT_LEN..OFF_RESERVED].iter().any(|&b| b != 0) {
+        return Err(anyhow!("knock body is not canonical (unused slots set)"));
+    }
+    let mut rooms = Vec::with_capacity(room_count);
+    for i in 0..room_count {
         let slot = &bytes[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN];
         if slot[ROOM_LANE_ID_LEN..].iter().any(|&b| b != 0) {
             return Err(anyhow!("knock room slot {i} is not canonical"));
         }
         rooms.push(slot[..ROOM_LANE_ID_LEN].try_into().unwrap());
     }
+    let mut reply = Vec::with_capacity(reply_count);
+    for i in room_count..used {
+        let entry = read_addr_slot(&bytes[OFF_ADDRS + i * ADDR_SLOT_LEN..OFF_ADDRS + (i + 1) * ADDR_SLOT_LEN], i)?;
+        if entry.flags != 0 {
+            return Err(anyhow!("knock reply slot {i} is not canonical (flags set)"));
+        }
+        reply.push(entry.addr);
+    }
     let ck_from = if h.key_slot == [0u8; 32] { None } else { Some(h.key_slot) };
-    Ok(KnockV2 { era: expected_era, from: h.node_id, ck_from, issued_at: h.issued_at, expires_at: h.expires_at, rooms })
+    Ok(KnockV2 { era: expected_era, from: h.node_id, ck_from, issued_at: h.issued_at, expires_at: h.expires_at, rooms, reply })
 }
 
 /// Encode + sign a beacon: the header alone, every slot zero.
@@ -911,6 +968,7 @@ mod p6b_tests {
             issued_at: 1_791_700_000,
             expires_at: 1_791_700_000 + 2 * ERA_SECS,
             rooms: rooms.iter().map(|r| room_lane_id(r)).collect(),
+            reply: vec![],
         }
     }
 
@@ -960,6 +1018,53 @@ mod p6b_tests {
         tail[OFF_ADDRS + ROOM_LANE_ID_LEN] = 1;
         sign_v2(&mut tail, &sk);
         assert!(decode_knock_v2(&tail, 7).is_err(), "the bytes after a lane id must be zero");
+    }
+
+    /// The reply addresses: a knock tells its host where to dial back, in the
+    /// slots its rooms leave free, and a knock written without them is byte
+    /// for byte the knock of before.
+    #[test]
+    fn knock_carries_reply_addresses_in_the_slots_its_rooms_leave_free() {
+        let sk = iroh::SecretKey::generate();
+        let v6: std::net::SocketAddr = "[2001:4860:4860::8888]:44442".parse().unwrap();
+        let v4: std::net::SocketAddr = "8.8.8.8:44442".parse().unwrap();
+        let mut k = knock(&sk, None, &["lobby"]);
+        let bare = encode_knock_v2(&k, &sk).unwrap();
+        assert_eq!(bare[OFF_ADDR_COUNT], 1, "no reply address: the count byte of before");
+        assert!(bare[OFF_ADDRS + ADDR_SLOT_LEN..OFF_RESERVED].iter().all(|&b| b == 0), "and every other slot zero, as before");
+        k.reply = vec![v6, v4];
+        let bytes = encode_knock_v2(&k, &sk).unwrap();
+        assert_eq!(bytes.len(), RECORD_V2_LEN, "the same fixed size, so the sealed knock is no longer on chain");
+        assert_eq!(bytes[OFF_ADDR_COUNT], 1 | (2 << 4), "one room in the low bits, two reply addresses above");
+        let back = decode_knock_v2(&bytes, 7).unwrap();
+        assert_eq!(back, k);
+        assert_eq!(back.reply, vec![v6, v4], "in the order written");
+        // With a contact key too, and beside two rooms.
+        let mut both = knock(&sk, Some([5u8; 32]), &["lobby", "workshop"]);
+        both.reply = vec![v4];
+        assert_eq!(decode_knock_v2(&encode_knock_v2(&both, &sk).unwrap(), 7).unwrap(), both);
+        // The slots are shared: one room leaves seven.
+        let mut full = knock(&sk, None, &["lobby"]);
+        full.reply = vec![v4; MAX_KNOCK_REPLY_ADDRS];
+        assert_eq!(decode_knock_v2(&encode_knock_v2(&full, &sk).unwrap(), 7).unwrap().reply.len(), MAX_KNOCK_REPLY_ADDRS);
+        full.reply.push(v4);
+        assert!(encode_knock_v2(&full, &sk).is_err(), "eight reply addresses beside a room do not fit");
+        // Non-canonical bodies, signed again by the knocker: none decodes.
+        let dirty = |change: &dyn Fn(&mut [u8; RECORD_V2_LEN])| {
+            let mut b = [0u8; RECORD_V2_LEN];
+            b.copy_from_slice(&bytes);
+            change(&mut b);
+            sign_v2(&mut b, &sk);
+            decode_knock_v2(&b, 7)
+        };
+        let slot = |i: usize| OFF_ADDRS + i * ADDR_SLOT_LEN;
+        assert!(dirty(&|_| {}).is_ok(), "signed again unchanged, it decodes");
+        assert!(dirty(&|b| b[slot(1) + 19] = 1).is_err(), "a reply slot carries no flags");
+        assert!(dirty(&|b| b[slot(1)] = 5).is_err(), "an unknown address family");
+        assert!(dirty(&|b| b[slot(2) + 9] = 1).is_err(), "an IPv4 slot with bytes past its four octets");
+        assert!(dirty(&|b| b[OFF_ADDR_COUNT] = 1 | (8 << 4)).is_err(), "more reply addresses than the slots left");
+        assert!(dirty(&|b| b[OFF_ADDR_COUNT] = 1 | (1 << 4)).is_err(), "a slot past the count must be zero");
+        assert!(dirty(&|b| b[OFF_ADDR_COUNT] = 2 << 4).is_err(), "a knock names at least one room");
     }
 
     #[test]

@@ -136,7 +136,7 @@ describe.each([TESTNET11, MAINNET])('listMeRow on $name', (net) => {
     // Off a test network each write has a key of its own that the lobby dish pays for.
     for (const text of [listMeOnNote(net), listMeWarning(net)]) {
       expect(text.includes('a key of its own that the lobby dish pays for, never from your SSF wallet')).toBe(!net.test);
-      expect(text).toContain('Only holders of your contact card can read your addresses.');
+      expect(text).toContain('Only holders of your contact card, and a host your node knocks on, can read your addresses.');
       expect(text).toContain('once an edition (about a week)');
       expect(text).toContain('a knock on a host it holds a card for and cannot reach');
     }
@@ -155,16 +155,16 @@ describe('the LIST ME texts, whole', () => {
   it('reads so on mainnet, where LIST ME starts off', () => {
     expect(listMeDefaultOffNote(MAINNET)).toBe('LIST ME is off for Chia mainnet, where it starts off: your station writes no Phone Book listing and no knock there until you turn it on here.');
     expect(listMeWarning(MAINNET)).toBe(
-      'List this station in the Phone Book on Chia mainnet? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Each is written from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card can read your addresses. Anyone can see that some Star Station node wrote, and when; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain. Tap CONFIRM.',
+      'List this station in the Phone Book on Chia mainnet? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Each is written from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card, and a host your node knocks on, can read your addresses. Anyone can see that some Star Station node wrote, and when; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain. Tap CONFIRM.',
     );
     expect(listMeOnNote(MAINNET)).toBe(
-      'LIST ME is on for Chia mainnet: your station writes its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach, each from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card can read your addresses.',
+      'LIST ME is on for Chia mainnet: your station writes its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach, each from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card, and a host your node knocks on, can read your addresses.',
     );
   });
 
   it('reads so on testnet11, where it starts on', () => {
     expect(listMeOnNote(TESTNET11)).toBe(
-      'LIST ME is on for testnet11: your station writes its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Only holders of your contact card can read your addresses.',
+      'LIST ME is on for testnet11: your station writes its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Only holders of your contact card, and a host your node knocks on, can read your addresses.',
     );
     expect(listMeOffNote(TESTNET11)).toBe(
       'LIST ME is off for testnet11: your station writes no Phone Book listing and no knock there. What it wrote before stays on the chain; readers stop finding a listing once its edition and the next have passed.',

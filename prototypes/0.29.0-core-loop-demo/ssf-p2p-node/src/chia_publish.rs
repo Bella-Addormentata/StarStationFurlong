@@ -5957,6 +5957,42 @@ pub fn knock_leave(
     Ok(cap.hands_out_own_card(key_durable, share_enabled).then_some(*contact_key))
 }
 
+/// What a knock carries of its writer beside the node id, as the room's word
+/// stands at spend time: the contact key where the card may be handed out
+/// ([`knock_leave`]), and the addresses the host can dial back
+/// ([`knock_reply_addrs`]). A knock written from a bare contact key's word
+/// (`From`) carries no address, which is the knock of before the reply
+/// addresses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KnockCarry {
+    pub ck: Option<[u8; 32]>,
+    pub reply: Vec<std::net::SocketAddr>,
+}
+
+impl From<Option<[u8; 32]>> for KnockCarry {
+    fn from(ck: Option<[u8; 32]>) -> Self {
+        Self { ck, reply: Vec::new() }
+    }
+}
+
+/// The reply addresses a knock carries: the node's live addresses filtered to
+/// PUBLIC, internet-routable ones by the judge the listing uses
+/// ([`public_addr_entries`]: a LAN or CGNAT address never leaves the
+/// machine), in the listing's canonical order (IPv6 first), each once, and
+/// as many as a knock for one room has slots for
+/// ([`chia_lane::MAX_KNOCK_REPLY_ADDRS`]). A host this node knocks on at its
+/// first visit has nothing else to dial back by: the contact key stays home
+/// until the room is known private ([`knock_leave`]), and the node id alone
+/// finds an address only through the DHT. They ride inside the knock's seal,
+/// so only the host reads them, and they tell it what this node's own dial
+/// to the host shows it anyway.
+pub fn knock_reply_addrs(live_addrs: &[String]) -> Vec<std::net::SocketAddr> {
+    let mut entries: Vec<AddrEntry> = crate::chia_public_addrs(live_addrs).into_iter().map(|addr| AddrEntry { addr, flags: 0 }).collect();
+    chia_lane::sort_addr_entries(&mut entries);
+    entries.truncate(chia_lane::MAX_KNOCK_REPLY_ADDRS);
+    entries.into_iter().map(|e| e.addr).collect()
+}
+
 /// Write one knock for `req`: the knocker's node id, its contact key when
 /// `leave` hands one out (so the host can read its presence and dial it there)
 /// and the room's lane id, signed (iroh key), sealed to the host's card key
@@ -5993,7 +6029,7 @@ pub async fn publish_knock(
     burners: bool,
     iroh_sk: &iroh::SecretKey,
     gate: &tokio::sync::Mutex<()>,
-    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    leave: impl FnOnce() -> Result<KnockCarry, Withdrawn>,
     req: &KnockRequest,
     room_key: &[u8; 32],
     era: u64,
@@ -6064,7 +6100,7 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
     burners: bool,
     iroh_sk: &iroh::SecretKey,
     gate: &tokio::sync::Mutex<()>,
-    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    leave: impl FnOnce() -> Result<KnockCarry, Withdrawn>,
     req: &KnockRequest,
     room_key: &[u8; 32],
     era: u64,
@@ -6110,7 +6146,7 @@ async fn publish_knock_on(
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
     gate: &tokio::sync::Mutex<()>,
-    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    leave: impl FnOnce() -> Result<KnockCarry, Withdrawn>,
     req: &KnockRequest,
     room_key: &[u8; 32],
     era: u64,
@@ -6131,8 +6167,8 @@ async fn publish_knock_on(
         hint,
         Some(gate),
         move |input| {
-            let ck_from = leave()?;
-            knock_memo(net, iroh_sk, req, room_key, era, input, ck_from, now_unix)
+            let carry = leave()?;
+            knock_memo_with(net, iroh_sk, req, room_key, era, input, &carry, now_unix)
         },
         "knock",
         Resend::WhileListed,
@@ -6192,7 +6228,7 @@ async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
     money: Payer,
     iroh_sk: &iroh::SecretKey,
     gate: &tokio::sync::Mutex<()>,
-    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    leave: impl FnOnce() -> Result<KnockCarry, Withdrawn>,
     req: &KnockRequest,
     room_key: &[u8; 32],
     era: u64,
@@ -6218,8 +6254,8 @@ async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
         hint,
         Some(gate),
         move |parent| {
-            let ck_from = leave()?;
-            knock_memo(net, iroh_sk, req, room_key, era, parent, ck_from, now_unix)
+            let carry = leave()?;
+            knock_memo_with(net, iroh_sk, req, room_key, era, parent, &carry, now_unix)
         },
         rng,
         money,
@@ -6488,11 +6524,35 @@ fn lost_knock_line(req: &KnockRequest, era: u64) -> String {
 }
 
 /// The memo a knock for `req` carries on `net` once its input coin `input`
-/// is known: the knock naming the room's lane id and `ck_from`, signed (iroh
-/// key), and sealed to the host's card key on `net` with `input` as the
-/// carrier's parent and the room's lane token (stage 4 design §3.5). It
-/// touches no chain, so chia_resolve's tests file what it gives under
-/// [`knock_hint`] in a mock chain and read it back on each network.
+/// is known: the knock naming the room's lane id and what the writer hands
+/// out of itself (`carry`: its contact key where its card may go, and the
+/// addresses to dial it back at), signed (iroh key), and sealed to the
+/// host's card key on `net` with `input` as the carrier's parent and the
+/// room's lane token (stage 4 design §3.5). It touches no chain, so
+/// chia_resolve's tests file what it gives under [`knock_hint`] in a mock
+/// chain and read it back on each network.
+#[allow(clippy::too_many_arguments)]
+pub fn knock_memo_with(
+    net: crate::chia_network::ChiaNet,
+    iroh_sk: &iroh::SecretKey,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    input: Bytes32,
+    carry: &KnockCarry,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let lane = chia_lane::derive_lane_token(room_key);
+    let rooms = vec![chia_lane::room_lane_id(&req.room)];
+    let knock = KnockV2 { era, from: iroh_sk.public(), ck_from: carry.ck, issued_at: now, expires_at: now + 2 * ERA_SECS, rooms, reply: carry.reply.clone() };
+    let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
+    chia_lane::seal_to_kx(net, &req.kx_host, KIND_KNOCK, era, &input.to_bytes(), &lane, &plain)
+}
+
+/// [`knock_memo_with`] for a knock that carries no reply address: the knock
+/// of before them, which the tests of the seal, the hint and the readers
+/// were written on.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn knock_memo(
     net: crate::chia_network::ChiaNet,
@@ -6504,11 +6564,7 @@ pub fn knock_memo(
     ck_from: Option<[u8; 32]>,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let lane = chia_lane::derive_lane_token(room_key);
-    let rooms = vec![chia_lane::room_lane_id(&req.room)];
-    let knock = KnockV2 { era, from: iroh_sk.public(), ck_from, issued_at: now, expires_at: now + 2 * ERA_SECS, rooms };
-    let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
-    chia_lane::seal_to_kx(net, &req.kx_host, KIND_KNOCK, era, &input.to_bytes(), &lane, &plain)
+    knock_memo_with(net, iroh_sk, req, room_key, era, input, &KnockCarry::from(ck_from), now)
 }
 
 /// What the beacon arm made of a due try ([`beacon_on_path`]).
@@ -7427,13 +7483,18 @@ pub async fn heartbeat_loop(
                 // private — a private pass's word admits its cards, not ours).
                 // A bare knock still names our node id, which the host dials
                 // back through the DHT.
+                // Our public addresses of this tick ride in it wherever the
+                // knock itself may go ([`knock_reply_addrs`]): a first visit's
+                // knock has no contact key to give, and the host dials back
+                // at these with no DHT.
                 let leave = {
                     let hub = hub.clone();
                     let (room, host) = (req.room.clone(), req.host.clone());
+                    let reply = knock_reply_addrs(&addrs);
                     move || {
                         let cap = hub.chia_rooms.lock().unwrap().get(&room).cloned();
                         let linked = host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &room, &pk));
-                        knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key)
+                        knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key).map(|ck| KnockCarry { ck, reply })
                     }
                 };
                 // The arm's whole step from here to the write is one seam
@@ -7814,6 +7875,35 @@ mod tests {
         assert_eq!(knock_leave(Some(&private), true, true, true, &ck), Err(Withdrawn("the two are linked meanwhile")));
         let err: anyhow::Error = Withdrawn("x").into();
         assert!(err.downcast_ref::<Withdrawn>().is_some(), "the publisher tells a withdrawn knock from a failed one");
+    }
+
+    /// A first visit's knock has no contact key to give (the test above:
+    /// "a private pass admits its cards, not ours"), so what its host dials
+    /// back by is the addresses the knock carries: the node's public ones as
+    /// the listing would name them, IPv6 first, each once, as many as a
+    /// knock for one room has slots for, and never a LAN, link-local or
+    /// documentation address.
+    #[test]
+    fn a_knocks_reply_addresses_are_the_nodes_public_ones_in_the_listings_order() {
+        let live: Vec<String> = vec![
+            "192.168.1.5:44442".into(),
+            "8.8.8.8:44442".into(),
+            "[fe80::1]:44442".into(),
+            "[2001:4860:4860::8888]:44442".into(),
+            "8.8.8.8:44442".into(),
+            "203.0.113.9:44442".into(),
+            "[2001:4860:4860::8844]:44442".into(),
+        ];
+        let reply = knock_reply_addrs(&live);
+        let want: Vec<std::net::SocketAddr> =
+            ["[2001:4860:4860::8844]:44442", "[2001:4860:4860::8888]:44442", "8.8.8.8:44442"].iter().map(|a| a.parse().unwrap()).collect();
+        assert_eq!(reply, want, "public only, IPv6 first, the duplicate once");
+        let listed: Vec<std::net::SocketAddr> = public_addr_entries(&live, &InboundVerified::default(), 0, 0).into_iter().map(|e| e.addr).collect();
+        assert_eq!(reply, listed, "the addresses the listing names, in its order");
+        let many: Vec<String> = (1..=12u8).map(|i| format!("8.8.{i}.8:44442")).collect();
+        assert_eq!(knock_reply_addrs(&many).len(), chia_lane::MAX_KNOCK_REPLY_ADDRS, "no more than a one-room knock has slots for");
+        assert!(knock_reply_addrs(&[]).is_empty(), "a node with no address says none");
+        assert_eq!(KnockCarry::from(Some([7u8; 32])), KnockCarry { ck: Some([7u8; 32]), reply: vec![] }, "a contact key's word alone carries no address");
     }
 
     #[test]

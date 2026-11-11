@@ -1238,6 +1238,7 @@ mod tests {
             issued_at: now,
             expires_at: now + 2 * chia_lane::ERA_SECS,
             rooms: vec![lane],
+            reply: vec![],
         };
         let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
         let input = [5u8; 32];
@@ -1277,6 +1278,7 @@ mod tests {
             issued_at: now,
             expires_at: now + 2 * chia_lane::ERA_SECS,
             rooms: vec![lane_id],
+            reply: vec![],
         };
         let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
         let input = [5u8; 32];
@@ -1841,7 +1843,7 @@ mod tests {
             let listing = PresenceV2 { era, node_id: sk.public(), kx_pk: [1u8; 32], issued_at: now - 60, expires_at: now + 3600, addrs };
             let sealed = chia_lane::seal_v2(net, &ck, KIND_PRESENCE, era, &chia_lane::encode_presence_v2(&listing, sk).unwrap()).unwrap();
             chain.file(Bytes32::new(chia_lane::derive_ck_hint(net, &ck, era)), sealed, [0x30 + i; 32], height);
-            let knock = KnockV2 { era, from: sk.public(), ck_from: None, issued_at: now - 60, expires_at: now + 3600, rooms: vec![chia_lane::room_lane_id("r")] };
+            let knock = KnockV2 { era, from: sk.public(), ck_from: None, issued_at: now - 60, expires_at: now + 3600, rooms: vec![chia_lane::room_lane_id("r")], reply: vec![] };
             let input = [0x40 + i; 32];
             let sealed = chia_lane::seal_to_kx(net, &kx_public, KIND_KNOCK, era, &input, &lane, &chia_lane::encode_knock_v2(&knock, sk).unwrap()).unwrap();
             chain.file(Bytes32::new(chia_lane::derive_inbox_hint(net, &ck, &lane, era)), sealed, input, height);
@@ -1897,6 +1899,41 @@ mod tests {
                 let beacons = read_beacons(on, &chain, peak, now).await.unwrap();
                 assert_eq!(beacons.iter().map(|f| f.item.node_id).collect::<Vec<_>>(), want, "written on {net:?}, read on {on:?}: the beacon");
             }
+        }
+    }
+
+    /// The reply addresses from writer to reader: a knock written with them
+    /// (`chia_publish::knock_memo_with`, the knock arm's own step) is read
+    /// from the host's inbox with the same addresses in the same order, on
+    /// each network, and a knock written without any reads back with none.
+    /// The first is a first visit's knock: no contact key, so the addresses
+    /// are all the host has to dial back by.
+    #[cfg(feature = "chia-publish")]
+    #[tokio::test]
+    async fn a_knocks_reply_addresses_reach_the_host_that_reads_its_inbox() {
+        use crate::chia_lane::ERA_BLOCKS;
+        use crate::chia_publish::KnockCarry;
+        let (ck, kx_secret, room_key) = ([21u8; 32], [22u8; 32], [23u8; 32]);
+        let kx_host = curve25519_dalek::MontgomeryPoint::mul_base_clamped(kx_secret).to_bytes();
+        let req = crate::chia_knock::KnockRequest { room: "r".into(), host: "host".into(), ck_host: ck, kx_host, attempts: 0 };
+        let (now, era) = (1_791_700_000u64, 12u64);
+        let (height, peak) = (12 * ERA_BLOCKS + 10, 12 * ERA_BLOCKS + 50);
+        let reply: Vec<std::net::SocketAddr> = vec!["[2001:4860:4860::8888]:44442".parse().unwrap(), "8.8.8.8:44442".parse().unwrap()];
+        for net in ChiaNet::ALL {
+            let (first_visit, bare) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+            let mut chain = MemoChain::default();
+            let hint = crate::chia_publish::knock_hint(net, &req, &room_key, era);
+            let input = Bytes32::new([0x40; 32]);
+            let carry = KnockCarry { ck: None, reply: reply.clone() };
+            let memo = crate::chia_publish::knock_memo_with(net, &first_visit, &req, &room_key, era, input, &carry, now).unwrap();
+            chain.file(hint, memo, input.to_bytes(), height);
+            let input = Bytes32::new([0x41; 32]);
+            let memo = crate::chia_publish::knock_memo(net, &bare, &req, &room_key, era, input, None, now).unwrap();
+            chain.file(hint, memo, input.to_bytes(), height);
+            let knocks = read_inbox(net, &chain, &kx_secret, &ck, &room_key, "r", peak, now, &mut std::collections::HashMap::new()).await.unwrap();
+            let of = |sk: &iroh::SecretKey| knocks.iter().find(|f| f.item.from == sk.public()).map(|f| (f.item.ck_from, f.item.reply.clone()));
+            assert_eq!(of(&first_visit), Some((None, reply.clone())), "{net:?}: no contact key, and the addresses to dial back");
+            assert_eq!(of(&bare), Some((None, vec![])), "{net:?}: a knock written without them names its node id alone");
         }
     }
 
