@@ -159,11 +159,15 @@ export function send(T: number, x: Page, y: Page): void {
   Y.applyUpdate(y.doc, diff);
 }
 
-/** One frame of page p at T: it runs its tables (croupier noteTablesRunning,
- *  as World does every frame) and ticks the computed one. */
+/** One frame of page p at T, as World draws one (updateCroupier): it marks
+ *  the frame as one that runs tables (croupier noteTablesRunning) when the
+ *  room has a table or work waits that no table carries (computedTable
+ *  tableFrame, World's own condition: with `tables` empty and none of that, the
+ *  page reads as asleep a lapse on, as it does in the app), and ticks the
+ *  computed ones. */
 export function frame(T: number, p: Page, tables: ComputedTableRef[] = [PAGE_TABLE]): void {
   const now = clockOf(p, T);
-  p.croupier.noteTablesRunning(now);
+  if (p.table.tableFrame(tables.length)) p.croupier.noteTablesRunning(now);
   p.table.tickComputedTables(tables, now);
 }
 

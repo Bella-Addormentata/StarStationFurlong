@@ -354,20 +354,24 @@ export class NetworkProvider implements NetworkProviderPort {
    *  disconnect() (its read is still pending), and a reconnect that lands the
    *  same room before it ends must not take that session's stale status or
    *  error as its own. */
-  requestFaucet(op: FaucetOp, amount?: number): FaucetRequestTicket {
+  requestFaucet(op: FaucetOp, amount?: number, wallet?: boolean): FaucetRequestTicket {
     const seq = ++this.#faucetSeq;
-    return { seq, sent: this.#sendFaucetRequest(op, amount, seq) };
+    return { seq, sent: this.#sendFaucetRequest(op, amount, seq, wallet === true) };
   }
 
-  async #sendFaucetRequest(op: FaucetOp, amount: number | undefined, seq: number): Promise<void> {
+  async #sendFaucetRequest(op: FaucetOp, amount: number | undefined, seq: number, wallet: boolean): Promise<void> {
     const boot = this.#boot;
     const wt = this.#wt;
     if (!wt || this.#mode === 'offline' || !boot) {
       throw new Error('no connection to your node');
     }
     try {
-      const body: { op: FaucetOp; amount?: number } = { op };
+      const body: { op: FaucetOp; amount?: number; wallet?: true } = { op };
       if (op === 'give') body.amount = Math.max(0, Math.floor(amount ?? 0));
+      // ⛓️ `wallet`: the asker shows the wallet's balance (the Bank's RECEIVE).
+      // Off a test network the node reads the wallet's coins only then, so
+      // the dish's own polls do not show full nodes the wallet's address.
+      if (wallet) body.wallet = true;
       const payloadBytes = new TextEncoder().encode(JSON.stringify(body));
       const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
       const wire = { v: 1, room: boot.roomId, kind: 'faucet', seq, author: '', payload: payloadB64 };

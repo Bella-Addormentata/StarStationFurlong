@@ -14,7 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetError, latestFaucetStatus, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
+import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetStatus, latestWalletError, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
 import { qrSvg } from "./qrCode";
 import {
   acceptNodeCard,
@@ -266,12 +266,12 @@ import {
   towHoldsDock,
 } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
-import { setRoomStateArrivedCheck, setSoleCroupierPredicate, setTableInRoomPredicate } from "./croupier";
+import { setRoomStateArrivedCheck, setSoleCroupierPredicate, setTableInRoomPredicate, tableOfGameAmong } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
-import { leaveComputedTables, setLocalHouse } from "./computedTable";
+import { leaveComputedTables, setLocalHouse, setLocalHouseFold } from "./computedTable";
 import { listenToRoom, noteRoomHeard } from "./roomHearing";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -301,6 +301,7 @@ import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
+import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
@@ -1110,6 +1111,67 @@ function renderChiaLaneRow(): void {
   }
 }
 
+/** 📖 LIST ME under the PHONE BOOK row (listMe.ts): armed and waiting for
+ *  CONFIRM (for the network and the node whose warning was read, and no
+ *  other: a fingerprint that names another disarms it), a turn in flight,
+ *  and the last turn's failure. Opening the Network view disarms it and
+ *  clears the failure; the node's own memory of the switch rides on its
+ *  fingerprint. */
+let listMeArmed: ListMeTarget | null = null;
+let listMeTurning: "on" | "off" | null = null;
+let listMeError: string | null = null;
+/** When the switch last changed what it does (the CHIA switch's rule: a tap
+ *  within BANK_SETTLE_MS of that is no decision). */
+let listMeChangedAt = 0;
+/** What the switch did at the last render. */
+let listMeShownAct: string | null = null;
+
+/** 📖 The note, switch, warning and error under the PHONE BOOK row, from the
+ *  node that answered the last probe (none while it does not). Written with
+ *  textContent, hidden and attributes only, never innerHTML, so focus stays
+ *  on the one button from LIST ME to CONFIRM to LISTING. */
+function renderListMeRow(): void {
+  const fp = localNodeLive ? localFingerprint : null;
+  const row = listMeRow(fp, { armed: listMeStands(listMeArmed, fp), turning: listMeTurning, error: listMeError });
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("list-me-note", row.note);
+  line("list-me-warning", row.warning);
+  line("list-me-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== listMeShownAct) {
+    listMeShownAct = b?.act ?? null;
+    listMeChangedAt = performance.now();
+  }
+  const btn = document.getElementById(LIST_ME_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went hands focus to its view, not to the page behind
+    // the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
 /** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
  *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
  *  the address override, the two room switches and the override's text box.
@@ -1193,6 +1255,26 @@ async function turnChiaLaneSwitch(turn: ChiaLaneTurn): Promise<void> {
   await refreshLocalFingerprint();
   chiaLaneChangedAt = performance.now();
   renderChiaLaneRow();
+}
+
+/** 📖 Ask the node to turn LIST ME on or off for its network, then read its
+ *  fingerprint again so the PHONE BOOK row, the switch and the Bank show
+ *  what the node now holds, not what the page hoped. */
+async function turnListMeSwitch(on: boolean): Promise<void> {
+  if (listMeTurning) return;
+  // An on goes out for what CONFIRM was armed for, not for whatever node
+  // answers when it arrives: the node refuses another's.
+  const armedFor = listMeArmed;
+  listMeTurning = on ? "on" : "off";
+  listMeArmed = null;
+  listMeError = null;
+  renderListMeRow();
+  const turned = await turnListMe(localNodeOrigin, on, on ? armedFor : null);
+  listMeTurning = null;
+  listMeError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  listMeChangedAt = performance.now();
+  renderListMeRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -5364,6 +5446,10 @@ async function openBankBackupWindow(): Promise<void> {
   renderBankApp();
 }
 
+/** ⛓️ A balance read that came due while the Bank was off screen, and waits
+ *  for it to be back (requestBankBalance). */
+let bankBalanceOwed = false;
+
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
  *  The reply lands in the dish's store, whose subscribers repaint the view;
  *  a request that cannot leave (no node, a failed stream) is filed there too,
@@ -5371,14 +5457,42 @@ async function openBankBackupWindow(): Promise<void> {
  *  reading "reading the chain…" for good. Rooms without a dish have no poll
  *  of their own, so this runs on open and on REFRESH. The balance travels
  *  over the room's link to the node, so there is nothing to ask before a room
- *  is joined, and nothing while no wallet is loaded. */
+ *  is joined, and nothing while no wallet is loaded.
+ *
+ *  ⛓️ It asks only with the Bank on screen (statusAsksForBalance). A read
+ *  that comes due while it is not (a wallet turned on whose answer landed
+ *  after Tab put the phone away, or the window was minimised: turnBankWallet
+ *  waits on the node twice before it gets here) is owed, and sent when the
+ *  Bank is back on screen (the screen watch in renderBankApp), so the full
+ *  nodes are never asked for a balance nobody can see. */
 function requestBankBalance(): void {
+  bankBalanceOwed = false;
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
   // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
   if (localFingerprint.chia_lane?.off) return;
-  const { seq, sent } = networkProvider.requestFaucet("status");
+  if (!statusAsksForBalance()) {
+    bankBalanceOwed = true;
+    return;
+  }
+  // ⛓️ The Bank asks for the wallet's coins by name: off a test network the
+  // node reads them for no other status.
+  const { seq, sent } = networkProvider.requestFaucet("status", undefined, true);
   sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
+}
+
+/** ⛓️ Does a faucet status sent now ask the node for the wallet's coins too?
+ *  Only while RECEIVE's balance is on screen: the Bank is the phone's view
+ *  AND the phone is out (bankViewOnScreen), AND the page itself is not
+ *  hidden. Tab puts the phone away without taking `active` off the Bank's
+ *  view, so the view's class alone would keep the dish's polls asking for a
+ *  balance nobody can see; and a minimised window or a background tab keeps
+ *  its timers, the dish's 60-second poll among them, so a phone left out on
+ *  the Bank would keep asking for as long as the player is away. With the
+ *  Bank off screen, and off a test network, those polls leave the wallet
+ *  unread. */
+function statusAsksForBalance(): boolean {
+  return bankViewOnScreen() && document.visibilityState !== "hidden";
 }
 
 function renderBankApp(): void {
@@ -5463,7 +5577,12 @@ function renderBankApp(): void {
       const networkHtml = wv.network
         ? `<div id="bank-network" style="font-size:9.5px; margin-top:5px; line-height:1.6; color:${wv.network.warn ? "#ffb300" : "rgba(212,168,75,0.6)"};${wv.network.warn ? " font-weight:800;" : ""}">${esc(wv.network.text)}</div>`
         : "";
-      const switchHtml = `${networkHtml}
+      // 📖 Off a test network: who pays for the Phone Book listing (never
+      // this wallet).
+      const listingHtml = wv.listing
+        ? `<div id="bank-listing-line" style="font-size:9px; margin-top:4px; line-height:1.6; color:rgba(212,168,75,0.6);">${esc(wv.listing)}</div>`
+        : "";
+      const switchHtml = `${networkHtml}${listingHtml}
         ${wv.text || b ? `<div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
           <span style="flex:1; min-width:0; font-size:10px; color:rgba(212,168,75,${wv.showsAddress ? "0.7" : "0.5"}); line-height:1.6;">${esc(wv.text)}</span>
           ${b ? `<button type="button" id="${BANK_WALLET_BUTTON_ID}" data-act="${b.act}"${b.busy ? ' aria-disabled="true" aria-busy="true"' : ""} style="${btnStyle(false)}${b.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${b.busy ? " cursor:progress; opacity:0.7;" : ""}">${esc(b.label)}</button>` : ""}
@@ -5531,14 +5650,16 @@ function renderBankApp(): void {
       // on another chain, not yet re-read) is no balance of this address.
       const roomSt = roomId ? latestFaucetStatus(roomId) : null;
       const st = roomSt && roomSt.net?.id === net.id ? roomSt : null;
-      const err = roomId ? latestFaucetError(roomId) : null;
+      const err = roomId ? latestWalletError(roomId) : null;
       const owned = st?.walletMojos ?? null;
       const spendable = st?.walletSpendableMojos ?? owned;
       const confirming = owned !== null && spendable !== null && spendable < owned ? owned - spendable : 0n;
       // The balance is read over the room's link to the node, so there is
       // none before a room is joined. A failed read is shown as such (the
-      // store keeps the node's last error until a later answer clears it) and
-      // a balance kept from before it is dated, not passed off as current.
+      // store keeps the last error until newer wallet figures are filed: a
+      // dish poll that left the wallet unread clears the dish's error, and
+      // says nothing about the balance) and a balance kept from before it is
+      // dated, not passed off as current.
       const balance = !roomId
         ? "shown once you are in a room (your node answers over the room's link)"
         : owned === null
@@ -5706,11 +5827,15 @@ function renderBankApp(): void {
     const phone = document.getElementById("spacephone-container");
     const watch = new MutationObserver(() => {
       if (!treasuryViewOnScreen(view)) bankBackupLeftScreen();
+      // ⛓️ Back on screen: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     watch.observe(view, { attributes: true, attributeFilter: ["class"] });
     if (phone) watch.observe(phone, { attributes: true, attributeFilter: ["class"] });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") bankBackupLeftScreen();
+      // ⛓️ Shown again: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
     // the phone's toggle and preventDefaults every press), and a COPY only a
@@ -8852,6 +8977,10 @@ function setupSpacePhoneOverlay() {
       chiaLaneArmed = false;
       if (!chiaLaneTurning) chiaLaneError = null;
       renderChiaLaneRow();
+      // 📖 The same for a LIST ME armed on an earlier visit.
+      listMeArmed = null;
+      if (!listMeTurning) listMeError = null;
+      renderListMeRow();
       // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
       // and every other control without a pointer (Tab is the app's phone
       // toggle, not a tab stop).
@@ -9602,6 +9731,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       localNodeOrigin = "";
       bankWalletArmed = false;
       chiaLaneArmed = false;
+      listMeArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -9613,16 +9743,21 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     renderPhoneBookIndicator(null);
     // ⛓️ Nor the Chia switch: there is no node to send it to.
     renderChiaLaneRow();
+    renderListMeRow();
     return localFingerprint;
   }
   // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
   // Chia is off from the fingerprint: repaint it while open when any changed
   // (a wallet turned on or off here, or by SSF_CHIA_LANE at the node's
-  // restart; Chia turned off in the Network rows).
-  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null]);
+  // restart; Chia turned off, or LIST ME turned, in the Network rows).
+  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null, localFingerprint?.chia_listing ?? null]);
   const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
+  // 📖 A LIST ME armed on another node, or on this one's other network (a
+  // node restarted between two probes), is armed no longer: CONFIRM is for
+  // the warning that was read.
+  if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
   // 🛑 The Chia Mesh switch follows the node's network (test networks only).
   if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();
   localNodeOrigin = nodeOrigin;
@@ -9632,7 +9767,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
   if (
     backupMoved ||
-    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null])) &&
+    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null, fingerprint.chia_listing ?? null])) &&
       document.getElementById("phone-app-bank")?.classList.contains("active"))
   ) {
     renderBankApp();
@@ -9641,10 +9776,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // holder, for the node to add a seed to its computed tables' rounds
   // (computedTable houseDuty). Kept while the node is away a round.
   setLocalHouse(fingerprint.house ?? null);
+  // 🔒 …and what its fold serves: a table moves to a FAIR ONLY game only where
+  // the owner's own node says it runs them (computedTable switchFairOnlyOn).
+  setLocalHouseFold(fingerprint.house_fold ?? null);
   setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
   renderChiaLaneRow();
+  renderListMeRow();
   refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
@@ -10141,6 +10280,29 @@ function setupNetworkDetailsPanel() {
     });
     // A held Enter or Space repeats its keydown, and each one taps the button.
     laneBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
+    });
+  }
+  // 📖 LIST ME (listMe.ts), the CHIA switch's rules: LIST ME arms CONFIRM,
+  // and CONFIRM and UNLIST ME each take a fresh tap.
+  const listBtn = document.getElementById(LIST_ME_BUTTON_ID) as HTMLButtonElement | null;
+  if (listBtn) {
+    listBtn.addEventListener("click", (e) => {
+      if (listBtn.getAttribute("aria-disabled") === "true") return;
+      const act = listBtn.dataset.act;
+      if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), listMeChangedAt)) return;
+      if (act === "arm") {
+        listMeArmed = listMeTarget(localNodeLive ? localFingerprint : null);
+        listMeError = null;
+        listMeChangedAt = performance.now();
+        renderListMeRow();
+        return;
+      }
+      const on = listMeTurnOf(act);
+      if (on !== null) void turnListMeSwitch(on);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    listBtn.addEventListener("keydown", (e) => {
       if (laneKeyRepeat(e)) e.preventDefault();
     });
   }
@@ -11529,7 +11691,7 @@ async function init() {
   subscribeFaucet(() => {
     if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
   });
-  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount, statusAsksForBalance());
   // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
   world.faucetChiaNet = () => localFingerprint?.chia_net;
   // ⛓️ And says Chia is off while the fingerprint does.
@@ -11546,7 +11708,7 @@ async function init() {
     if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
   });
   window.setInterval(() => {
-    if (world.hasFaucetDish()) networkProvider.requestFaucet("status").sent.catch(() => {});
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status", undefined, statusAsksForBalance()).sent.catch(() => {});
   }, 60_000);
 
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
@@ -11625,8 +11787,10 @@ async function init() {
     return currentRoomDeedIsMine();
   });
   // 📒 A table removal heard while the casino doc holds part of an update
-  // waits for the rest, unless the table is back in the room by then.
-  setTableInRoomPredicate((tableId) => FURNITURE.some((item) => item.id === tableId));
+  // waits for the rest, unless the table is back in the room by then: a
+  // table of the game taken down (other furniture the id came to hold, a
+  // sofa or a table of the other game, is not that table back).
+  setTableInRoomPredicate((tableId, game) => tableOfGameAmong(FURNITURE, tableId, game));
   // 🛰️ Nor are the tables run on a doc the room's state hasn't reached this
   // visit: it may be the room cache's copy from before this page left, its
   // own table lease in it (croupier tablesAwake).

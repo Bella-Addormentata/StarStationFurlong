@@ -166,27 +166,49 @@ describe('a game the table has left', () => {
     expect(a.casino.computedFoldOf(TABLE)!.rounds[0]).toMatchObject({ r: 1, decided: 'void' });
   });
 
-  it('is served only while the page looks at its table: a table out of the room\'s list has its left game waited on', async () => {
+  it('is served wherever its table is: at a table out of the room\'s list its round is closed at its deadline and its seed revealed', async () => {
     const [a] = await twoGames();
+    const window = a.table.BET_WINDOW_MS;
     const at = run([a], T0 + STEP, T0 + 3_000, { step: STEP });
     expect(a.table.writeComputedSlip(TABLE, [red(9)], at)).toBe('ok');
     nameGame(a, G2.inc);
-    const quiet = run([a], at + STEP, at + 40_000, { step: STEP, tables: [] });
-    expect(inSession(a, G.inc, 'c', 1)).toEqual([]);
-    const closedAt = run([a], quiet, quiet + 10_000, { step: STEP, until: () => inSession(a, G.inc, 'c', 1).length > 0 });
-    expect(closedAt).toBeLessThanOrEqual(quiet + STEP * 2);
+    // (the table is taken out of the room: no table is passed)
+    const closedAt = run([a], at + STEP, at + 40_000, { step: STEP, tables: [], until: () => inSession(a, G.inc, 'c', 1).length > 0 });
+    expect(closedAt).toBeGreaterThanOrEqual(at + window - STEP * 2);
+    expect(closedAt).toBeLessThanOrEqual(at + window + STEP * 4);
+    run([a], closedAt + STEP, closedAt + 2_000, { step: STEP, tables: [] });
+    const [x] = inSession(a, G.inc, 'x', 1);
+    expect(asReveal(recIn(a, G.inc, x))).toMatchObject({ r: 1, p: a.pid });
+    // back in the room, the round is not closed again
+    run([a], closedAt + 2_000 + STEP, closedAt + 5_000, { step: STEP });
+    expect(inSession(a, G.inc, 'c', 1)).toHaveLength(1);
   });
 
-  it('is served only as the game of the table it is at: a table the room lists as the other game has its left game waited on', async () => {
+  it('and the game the table played when it was taken out: its round is closed at its deadline, its seed revealed, and nothing new is started for the player while the table is out', async () => {
     const [a] = await twoGames();
+    const window = a.table.BET_WINDOW_MS;
+    const at = run([a], T0 + STEP, T0 + 3_000, { step: STEP });
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], at)).toBe('ok');
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    const closedAt = run([a], at + STEP, at + 40_000, { step: STEP, tables: [], until: () => inSession(a, G.inc, 'c', 1).length > 0 });
+    expect(closedAt).toBeGreaterThanOrEqual(at + window - STEP * 2);
+    expect(closedAt).toBeLessThanOrEqual(at + window + STEP * 4);
+    run([a], closedAt + STEP, closedAt + 2_000, { step: STEP, tables: [] });
+    const [x] = inSession(a, G.inc, 'x', 1);
+    expect(asReveal(recIn(a, G.inc, x))).toMatchObject({ r: 1, p: a.pid });
+  });
+
+  it('is served under a table the room lists as the other game, as under none: a roulette game is none of a craps table\'s, and its round is closed at its deadline all the same', async () => {
+    const [a] = await twoGames();
+    const window = a.table.BET_WINDOW_MS;
     const at = run([a], T0 + STEP, T0 + 3_000, { step: STEP });
     expect(a.table.writeComputedSlip(TABLE, [red(9)], at)).toBe('ok');
     nameGame(a, G2.inc);
-    // (the table is a craps one in the room's list for a while, as another table of the same name would be: a roulette game is none of its)
-    const quiet = run([a], at + STEP, at + 25_000, { step: STEP, tables: [{ id: TABLE, game: 'craps' }] });
-    expect(inSession(a, G.inc, 'c', 1)).toEqual([]);
-    const closedAt = run([a], quiet, quiet + 10_000, { step: STEP, until: () => inSession(a, G.inc, 'c', 1).length > 0 });
-    expect(closedAt).toBeLessThanOrEqual(quiet + STEP * 2);
+    // (the table is a craps one in the room's list, as another table of the same name would be)
+    const tables = [{ id: TABLE, game: 'craps' as const }];
+    const closedAt = run([a], at + STEP, at + 40_000, { step: STEP, tables, until: () => inSession(a, G.inc, 'c', 1).length > 0 });
+    expect(closedAt).toBeGreaterThanOrEqual(at + window - STEP * 2);
+    expect(closedAt).toBeLessThanOrEqual(at + window + STEP * 4);
   });
 
   it('has a record of the page\'s the doc lost put back', async () => {

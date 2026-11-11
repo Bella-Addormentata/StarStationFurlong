@@ -196,6 +196,19 @@ impl HintCursor {
     }
 }
 
+/// 🕳️ Whether room-keyed (v1) records are read on `net`: on a test network
+/// only. No station writes one off a test network: a room's Chia mesh
+/// switch is not offered there, and the SSF wallet, which pays for a v1
+/// record, pays for no write there (`chia_publish::money_memo_refusal`). A
+/// read could find nothing a station wrote, and would show the full node
+/// this station's private rooms as hints, in the very bytes it asks a test
+/// network's node for: a v1 hint is the room key's and the day's alone and
+/// carries no network tag (docs/TDD/ChiaLanePrivacy.md §3, and §6 (22)).
+/// The watcher's beat and the dial that ran out of routes both ask this.
+pub fn reads_v1(net: ChiaNet) -> bool {
+    net.is_test()
+}
+
 /// The epochs a reader scans at `now`: next, current and previous. The next
 /// one catches a publisher whose clock runs ahead of ours (invisible before
 /// P1); the previous one keeps records straddling midnight findable.
@@ -1322,6 +1335,28 @@ mod tests {
         assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS).fresh(now), Some(100), "at the bound: still the clock");
         assert_eq!(ChainPeak::new(100, now - PEAK_MAX_AGE_SECS - 1).fresh(now), None, "older: ask the chain");
         assert_eq!(ChainPeak::new(100, now + 5).fresh(now), None, "a read dated in the future (clock set back) is stale, not fresh forever");
+    }
+
+    /// Room-keyed (v1) records are read on a test network only: off one no
+    /// station writes them, and their hints carry no network tag.
+    #[test]
+    fn v1_room_records_are_read_on_a_test_network_only() {
+        assert!(reads_v1(ChiaNet::Testnet11));
+        assert!(!reads_v1(ChiaNet::Mainnet));
+        for net in ChiaNet::ALL {
+            assert_eq!(reads_v1(net), net.is_test(), "{net:?}");
+        }
+        // The dial that ran out of routes asks the rule before its one
+        // lookup of a room's v1 record (`main.rs`; the watcher's own test
+        // covers its beat). Read from the source, and joined here so that
+        // these lines are not counted.
+        let main = include_str!("main.rs");
+        let gate = ["if cap.may_read() && chia_resolve::reads_v1", "chia_network::net()) {"].join("(");
+        let lookup = ["chia_resolve::resolve_target", "&cap.room_key, &target_str)"].join("(");
+        assert_eq!(main.matches(&["resolve_target", ""].join("(")).count(), 1, "one v1 lookup at a dial's end");
+        assert_eq!((main.matches(&gate).count(), main.matches(&lookup).count()), (1, 1));
+        let (g, l) = (main.find(&gate).unwrap(), main.find(&lookup).unwrap());
+        assert!(g < l && !main[g..l].contains('}'), "the lookup is inside the rule's block");
     }
 
     #[test]

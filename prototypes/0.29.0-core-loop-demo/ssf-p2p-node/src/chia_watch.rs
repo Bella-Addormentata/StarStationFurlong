@@ -423,8 +423,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // seals they open (stage 4 design §3.5). The v1 room reads take none: a
     // v1 hint is the room key's and the day's alone, the same bytes on every
     // chain, since §3.5 tags only the v2 hints, the AADs and the dish, and no
-    // node writes a v1 record off a test network (§4.5 (2)).
+    // node writes a v1 record off a test network (§4.5 (2)). So off a test
+    // network none is read either (`chia_resolve::reads_v1`): the reads could
+    // find nothing, and would show a full node this station's private rooms.
     let net = crate::chia_network::net();
+    let reads_v1 = chia_resolve::reads_v1(net);
+    if !reads_v1 {
+        println!("⛓️ ChiaHub watcher: no room-keyed (v1) record is read on {}, where none is written", net.name());
+    }
     let knocks_file = net.path(crate::chia_knock::KNOCKS_FILE);
     let knocks_path = knocks_file.as_path();
     println!(
@@ -511,7 +517,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             let book = hub.knocks.lock().unwrap();
             !book.sent.is_empty() || !book.inbox.is_empty()
         };
-        if readable.is_empty() && peers.is_empty() && !self_publishing && inbox_rooms.is_empty() && !knocks_live {
+        // A readable room is something to read for only where its v1
+        // records are read (`reads_v1`): off a test network a station with
+        // rooms and nothing else asks no full node at all.
+        let v1_rooms = reads_v1 && !readable.is_empty();
+        if !v1_rooms && peers.is_empty() && !self_publishing && inbox_rooms.is_empty() && !knocks_live {
             continue;
         }
 
@@ -534,8 +544,9 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             let (connected, dialing) = snapshot_peers(&hub, &room);
             let rc = cache.entry(room.clone()).or_default();
 
-            // Beat-aligned chain read (skipped when the peak is unknown).
-            if peak > 0 && sched.due(&room_sched_key(&room), peak, !connected.is_empty()) {
+            // Beat-aligned chain read (skipped when the peak is unknown, and
+            // off a test network: `reads_v1`).
+            if reads_v1 && peak > 0 && sched.due(&room_sched_key(&room), peak, !connected.is_empty()) {
                 let mut found = Vec::new();
                 for e in chia_resolve::scan_epochs(now_unix) {
                     let hint = chia_lane::derive_hint(&room_key, e);
@@ -597,11 +608,17 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // get their own records, neither can shadow the other. Our own record
         // goes first: seeing it confirm tells the publisher the write landed
         // and clears every cooldown, since the peers see us at their next beat.
+        // 🕳️ It is read only while the publisher may write it
+        // (`self_publishing`: LIST ME on, a listing to keep up, its writer
+        // not refused). A station that does not list has no write to
+        // confirm, and the read would only show a full node which listing
+        // hint goes with this address (docs/TDD/ChiaLanePrivacy.md §3). A
+        // build with no publisher never reads it.
         // Only the chain reads need the peak; the holds planned from the cached
         // records (further below) run without one, as the room records' do.
         if peak > 0 {
             let own_ck = hub.contact_key;
-            if sched.due(SELF_SCHED_KEY, peak, false) {
+            if self_publishing && sched.due(SELF_SCHED_KEY, peak, false) {
                 match chia_resolve::read_ck(net, &client, &own_ck, peak, now_unix, &mut self_cursors).await {
                     Ok(found) => {
                         if let Some(newest) = found
@@ -1305,6 +1322,52 @@ mod tests {
         let s = BeatSchedule::new(0);
         assert_eq!(s.beat_blocks, 1, "zero is clamped, never a division by zero");
         assert_eq!(BeatSchedule::new(DEFAULT_BEAT_BLOCKS).beat_blocks, 32);
+    }
+
+    /// The watcher asks a full node for the station's own listing hints
+    /// only while the publisher may write the listing (LIST ME on): the
+    /// one read of our own contact key in this file sits behind the
+    /// publisher's word, and a beat is spent on it only then. Read from
+    /// the source, since the read is in the watcher's loop itself.
+    #[test]
+    fn the_own_listing_is_read_only_while_the_publisher_may_write_it() {
+        let source = include_str!("chia_watch.rs");
+        // Joined here so that this test's own lines are not counted.
+        let due = ["sched.due(SELF_SCHED_KEY", " peak, false)"].join(",");
+        let read = ["read_ck(net, &client, &own_ck", " peak, now_unix, &mut self_cursors)"].join(",");
+        assert_eq!(source.matches(&due).count(), 1, "one place spends the own key's beat");
+        assert_eq!(source.matches(&format!("if self_publishing && {due} {{")).count(), 1, "and it asks the publisher's word first");
+        assert_eq!(source.matches(&read).count(), 1, "one read of our own key");
+        let gate = source.find(&due).unwrap();
+        let own_read = source.find(&read).unwrap();
+        assert!(gate < own_read && !source[gate..own_read].contains('}'), "the read is the gate's first statement");
+        // The flag is the publisher's: on only while it may write the listing.
+        let flag = ["hub.presence_publishing", "load("].join(".");
+        assert_eq!(source.matches(&flag).count(), 1);
+    }
+
+    /// Off a test network the watcher asks a full node for no room-keyed
+    /// (v1) hint: this file's one read of a room hint sits behind
+    /// `chia_resolve::reads_v1`, and a station with rooms and nothing else
+    /// to read for stays idle there. Read from the source, since the read
+    /// is in the watcher's loop itself.
+    #[test]
+    fn room_hints_are_read_only_where_v1_records_are() {
+        let source = include_str!("chia_watch.rs");
+        // Joined here so that this test's own lines are not counted.
+        let read = ["chia_resolve::read_hint", "&client, Bytes32::new(hint), &room_key, now_unix, cursor)"].join("(");
+        let gate = ["if reads_v1 && peak > 0 && sched.due(&room_sched_key(&room)", " peak, !connected.is_empty()) {"].join(",");
+        assert_eq!(source.matches(&read).count(), 1, "one read of a room hint");
+        assert_eq!(source.matches(&["read_hint", "&client"].join("(")).count(), 1, "and no other read through the watcher's carrier");
+        assert_eq!(source.matches(&gate).count(), 1, "behind the rule");
+        let (g, r) = (source.find(&gate).unwrap(), source.find(&read).unwrap());
+        assert!(g < r && !source[g..r].contains('}'), "the read is inside the gate's block");
+        // The rule is the resolver's, asked once for the node's own network.
+        let rule = ["let reads_v1 = chia_resolve::reads_v1", "net);"].join("(");
+        assert_eq!(source.matches(&rule).count(), 1);
+        // Rooms alone are nothing to read for where v1 is not read.
+        let idle = ["let v1_rooms = reads_v1 && !readable.is_empty()", "\n        if !v1_rooms && peers.is_empty()"].join(";");
+        assert_eq!(source.matches(&idle).count(), 1, "the idle rule counts rooms only where v1 is read");
     }
 
     #[test]

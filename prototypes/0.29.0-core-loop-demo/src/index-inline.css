@@ -143,8 +143,9 @@
       }
 
       /* ⛓️ The CHIA row's note, switch, warning and error (chiaLane.ts), under
-         the row. The button's look follows its data-danger and aria-busy, which
-         main.ts sets: its markup is never rebuilt, so focus stays on it. */
+         the row, and 📖 LIST ME's under the PHONE BOOK row (listMe.ts), which
+         look the same. A button's look follows its data-danger and aria-busy,
+         which main.ts sets: its markup is never rebuilt, so focus stays on it. */
       .chia-lane-detail {
         margin: 0 0 6px;
         font-size: 9.5px;
@@ -152,7 +153,8 @@
         color: rgba(212, 168, 75, 0.6);
       }
 
-      #chia-lane-switch {
+      #chia-lane-switch,
+      #list-me-switch {
         margin-top: 4px;
         padding: 5px 9px;
         background: rgba(212, 168, 75, 0.10);
@@ -165,27 +167,32 @@
       }
 
       #chia-lane-switch[hidden],
+      #list-me-switch[hidden],
       .chia-lane-detail [hidden] {
         display: none;
       }
 
-      #chia-lane-switch[data-danger="true"] {
+      #chia-lane-switch[data-danger="true"],
+      #list-me-switch[data-danger="true"] {
         background: rgba(255, 23, 68, 0.10);
         border-color: rgba(255, 23, 68, 0.35);
         color: #ff8a80;
       }
 
-      #chia-lane-switch[aria-busy="true"] {
+      #chia-lane-switch[aria-busy="true"],
+      #list-me-switch[aria-busy="true"] {
         cursor: progress;
         opacity: 0.7;
       }
 
-      #chia-lane-warning {
+      #chia-lane-warning,
+      #list-me-warning {
         color: #ffb300;
         margin-top: 4px;
       }
 
-      #chia-lane-error {
+      #chia-lane-error,
+      #list-me-error {
         color: #f0a060;
         margin-top: 4px;
       }

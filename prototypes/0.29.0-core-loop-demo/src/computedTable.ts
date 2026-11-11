@@ -154,16 +154,19 @@ import {
   computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
+  computedFairOnlyChecking,
   computedFairOnlyRecoveries,
   computedFairOnlyReturns,
   computedFoldOf,
   computedGameMovesOf,
+  computedGamesHeldBy,
   computedRedecide,
   computedIncEnded,
   computedIncFor,
   computedIncOf,
   computedLiveTables,
   computedRecoveries,
+  computedRecoveryPending,
   computedResolutionOf,
   computedRestorePending,
   computedRecoveryOn,
@@ -178,11 +181,13 @@ import {
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
   delegationHeld,
+  delegationOf,
   fairSettingSeq,
   finalizeComputed,
   giveUpComputed,
   giveWayComputed,
   holdsDeed,
+  HOUSE_ONLY_MIN_BUILD,
   houseHeardFrom,
   houseOnline,
   houseSetUp,
@@ -193,6 +198,7 @@ import {
   ownerRunChosen,
   putBackHouseRecords,
   putBackFairOnlyRecords,
+  putBackFairOnlyTable,
   putComputedSwitchBack,
   readAllBets,
   readAllCrapsBets,
@@ -214,6 +220,7 @@ import {
   writeComputedOff,
   writeComputedOn,
   writeDelegation,
+  writeFairOnlyOn,
   writeFairSetting,
   writeHouseSum,
   writeOwnerRunChosen,
@@ -232,8 +239,9 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
-import { isFairOnlyInc } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, sealCk } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
+import type { DelegationRec } from './computedHouse';
 import {
   BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
@@ -248,6 +256,7 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 import { getIdentityPub, signIdentity } from './keypair';
 import { localStandOf } from './localStands';
+import type { HouseFold } from './nodeFingerprint';
 import { heardThrough, noteClockRead } from './roomHearing';
 
 // ── ⏱ Timing ─────────────────────────────────────────────────────────────────
@@ -2824,7 +2833,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
     tickTable(st, now);
     tellPhase(st, now);
   }
-  serveLeftGames(inRoom, now);
+  serveLeftGames(now);
   // A live table out of the room ends; ended incarnations, whatever tables
   // were passed (a removed one isn't), are compacted.
   awayDuty(inRoom, now);
@@ -2835,36 +2844,38 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
 }
 
 /**
- * 🔒 Serve the FAIR ONLY games the tables passed have left (S9 moved the table
- * to another game of the deed holder's, or of the switch's hint): each live
- * game this page keeps a state of, of the table's game, beside the one played.
- * What the page put into such a game while it was played reaches a decision
- * all the same: its seeds are revealed, its close written while its house is
- * heard (closePaused) and its abandon (houseAway), its put-backs go, its notes
- * are kept.
- * Not what would start something for the player where the table no longer plays
- * the game (tickTable side): the held felt, the riders' bets, the phase the
- * table's listeners are told of, which is the game played's. Only a state that
- * exists is served: a page serves a game it has played at the table, and one
- * it has not, or that it was bound after the table left, it does not (a state
- * made at a look at the table is the game played's: tableOf). A game that has
- * ended is let go of by compaction, as before. Nor a game the page has nothing
- * in (nothingAtStake): a table's hint can name many games in turn, and the
- * page would pay for the gates of each at every frame for no duty. What a pass
- * costs a state that is not due is a lookup and a comparison.
+ * 🔒 Serve the live FAIR ONLY games this page keeps a state of that the pass
+ * over the tables did not: a game its table has left (S9 moved the table to
+ * another game of the deed holder's, or of the switch's hint), and a game whose
+ * table is not among those passed as a table of its game: taken out of the
+ * room's layout (a removal has no part in a game, S7, and the pages put the
+ * table of the game played back: fairKeepDuty), or standing there as a table
+ * of the other game.
+ * What the page put into such a game reaches a decision all the same: its
+ * seeds are revealed, its close written while its house is heard (closePaused)
+ * and its abandon (houseAway), its put-backs go, its notes are kept. A round
+ * in flight does not wait for a record of the room's layout that any peer can
+ * delete: with the game unserved while its table is out, no page would reveal,
+ * and the first page served again would forfeit the others on graces that ran
+ * out meanwhile.
+ * Not what would start something for the player where no table plays the game
+ * (tickTable side): the held felt, the riders' bets, the phase the table's
+ * listeners are told of, which is the game played's at a table in the room.
+ * Only a state that exists is served: a page serves a game it has played at
+ * the table, and one it has not, or that it was bound after the table left, it
+ * does not (a state is made at a look at a table that plays the game:
+ * tableOf). A game that has ended is let go of by compaction, as before. Nor a
+ * game the page has nothing in (nothingAtStake): a table's hint can name many
+ * games in turn, and the page would pay for the gates of each at every frame
+ * for no duty. The state the pass over the tables served is not due here (its
+ * tick is TICK_MS old at the most), so no game is asked of S9: what a pass
+ * costs a state that is not due is a comparison.
  */
-function serveLeftGames(inRoom: ReadonlyMap<string, GameName>, now: number): void {
+function serveLeftGames(now: number): void {
   if (fairTables.size === 0) return;
   const me = getPlayerId();
-  // (The game each table plays, asked of S9 once for a table in this pass, and only for a state that is due: S9 reads
-  // all the table's games, which a hint can multiply, and the pass looks at every state the page keeps.)
-  const played = new Map<string, string | null>();
   for (const st of [...fairTables.values()]) {
-    if (inRoom.get(st.t) !== st.game) continue;
     if (st.tickedAt !== null && now >= st.tickedAt && now - st.tickedAt < TICK_MS) continue;
-    let inc = played.get(st.t);
-    if (inc === undefined) played.set(st.t, (inc = computedIncOf(st.t)));
-    if (st.inc === inc) continue;
     if (computedResolutionOf(st.t, st.inc)?.live !== true) continue;
     if (nothingAtStake(st, me)) continue;
     st.tickedAt = now;
@@ -4534,6 +4545,14 @@ interface Keeping {
    *  open, is a wait of its own. */
   sid: string | null;
   sesMoves: number;
+  /** Since when this page sees the game's table out of the room's layout
+   *  (null: it is not), and casinoDoc's counts of the changes of the layout's
+   *  key of it and of the times it went out, as this page last read them
+   *  (FairOnlyRecovery tableMoves, tableOuts): a table that came back and went
+   *  since, or was another game's meanwhile, is a wait of its own. */
+  tableAt: number | null;
+  tableMoves: number;
+  tableOuts: number;
   /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
    *  and when it read each put-back since (its own and other pages'), within
    *  CONTESTED_CALM_MS. Whether it read one while it did not stand down, since
@@ -4560,7 +4579,9 @@ let keptAt: number | null = null;
  * computedFairOnlyRecoveries has which, and when one is missing). The page
  * counts from what it holds meanwhile, so nothing waits on this: it is for the
  * pages that come later, which can count nothing of a game whose base the doc
- * lacks.
+ * lacks. And of the game its table plays, what makes the table play it for a
+ * page that comes later: the table's switch (P4) and the table in the room's
+ * layout (P5).
  * - **The records**: at once, in turn (dutyRank('restore') among the signers of
  *   the game's staked felts, STAGGER_MS a place; a page with no felt there
  *   OUTSIDER_WAIT_MS later; the turns start again each time the records come
@@ -4577,6 +4598,25 @@ let keptAt: number | null = null;
  *   turn it is if by no one else, whatever a peer wrote and deleted meanwhile.
  *   A stand-down that is over is forgotten at the page's first look past its
  *   end, whatever the page does at that look (standOver).
+ * - **The table's switch**, naming another incarnation or none while the table
+ *   plays the game (S9's choice among the table's live games, to which the
+ *   switch is a hint: casinoDoc computedIncOf): one more record, written with
+ *   the others in the same write and by the same turns. Not while the table is
+ *   out of the layout.
+ * - **The table**, out of the room's layout while the game it plays is live
+ *   and no end order stands (the game's authority takes a table out by ending
+ *   the game): as this page last saw it placed, the switch with it in one
+ *   write, OPEN_WAIT_MS on, in the turns of the records after that, with the
+ *   room heard all the while, JUNK_GAP_MS after this page's last put-back of
+ *   the game at the earliest. The wait is one disappearance's: a table that
+ *   came back and went, an end order that stood meanwhile, or the table
+ *   playing another game meanwhile starts it again, between two looks of the
+ *   page as well (casinoDoc counts the times the table went out: tableOuts).
+ *   One stand-down for all a page puts back of a game: a table or a switch
+ *   that comes back is a put-back counted as a record's is, the records' and
+ *   the table's each by itself (a table that stays out hides no put-back of
+ *   the records), so CONTESTED_COUNT is of put-backs of the game, and a page
+ *   that finds something of it lacking after the last of them stands down.
  * - **The live session's map**, gone with the game live: an empty one
  *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
  *   while, as at a page-signed table (recoverDuty: two pages that made one at
@@ -4588,7 +4628,7 @@ let keptAt: number | null = null;
  * clock, so the page writes that much later and in its turn still (a wait
  * started again would end somewhere among the turns after it), and one gone
  * back by TABLE_CLOCK_SLACK_MS or more is a wake (croupier tablesAwake), whose
- * lapse starts both waits again. Not on a frame whose doc was bound afresh
+ * lapse starts the waits again. Not on a frame whose doc was bound afresh
  * since this page looked at its clock. Nothing is signed, and nothing is given
  * up: a page holds what it counted for as long as it is bound.
  */
@@ -4607,16 +4647,18 @@ function fairKeepDuty(pub: string, now: number): void {
     listed.add(key);
     let w = keeping.get(key);
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
-    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, tableAt: null, tableMoves: r.tableMoves, tableOuts: r.tableOuts, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
     const over = standOver(w, now);
     if (!ready) {
       w.at = null;
       w.missingAt = null;
+      w.tableAt = null;
       continue;
     }
     if (came) w.at = null;
     keepStep(w, r, pub, now, over);
+    tableStep(w, r, pub, now, over);
     openStep(w, r, pub, now);
   }
   // (A game with nothing missing is not listed: its waits are over, and what
@@ -4629,6 +4671,7 @@ function fairKeepDuty(pub: string, now: number): void {
     standOver(w, now);
     w.at = null;
     w.missingAt = null;
+    w.tableAt = null;
     if (w.back.length === 0 && w.until === 0) keeping.delete(key);
   }
 }
@@ -4679,9 +4722,22 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, ove
     return;
   }
   if (w.at === null || w.at > now) w.at = now;
-  if (now < w.until) return;
   // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
   if (over !== null && w.at < over) w.at = over;
+  if (standsDown(w, r, now)) return;
+  if (now < w.at + turnOf('restore', r, r.u, pub)) return;
+  if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
+  if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
+}
+
+/** Whether this page puts nothing of the game back now: it stands down
+ *  (KEEP_BACKOFF_MS), from now on when CONTESTED_COUNT put-backs of the game
+ *  within CONTESTED_CALM_MS did not last, one of them at the least read while
+ *  it did not stand down (the look that finds the game lacking again), or from
+ *  before. One stand-down for all the page puts back of a game: its records,
+ *  the table's switch and the table. */
+function standsDown(w: Keeping, r: FairOnlyRecovery, now: number): boolean {
+  if (now < w.until) return true;
   // (What was counted is let go of where a stand-down begins. None of it would
   // be counted past one as it is: a stand-down is longer than
   // CONTESTED_CALM_MS, and noteReturns lets go at every look.)
@@ -4690,11 +4746,38 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, ove
     w.back = [];
     w.fresh = false;
     notifyCasinoView(r.t);
+    return true;
+  }
+  return false;
+}
+
+/** The game's table, out of the room's layout (design §8.4 P5): put back, and
+ *  the switch with it, OPEN_WAIT_MS on, in the turns of the records after
+ *  that, with the room heard all the while (the game's end may be on its way:
+ *  its authority takes a table out by ending the game), JUNK_GAP_MS after this
+ *  page's last put-back of the game, and not while the room stands down. The
+ *  wait is one disappearance's: the layout's key of the table changed
+ *  (tableMoves), or the table was not out for the game at some count since this
+ *  page last looked (tableOuts: it stood there, it played another game, an end
+ *  order stood), between two looks of this page as well, and the wait starts
+ *  again. */
+function tableStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, over: number | null): void {
+  if (w.tableMoves !== r.tableMoves || w.tableOuts !== r.tableOuts) {
+    w.tableMoves = r.tableMoves;
+    w.tableOuts = r.tableOuts;
+    w.tableAt = null;
+  }
+  if (!r.tableMissing) {
+    w.tableAt = null;
     return;
   }
-  if (now < w.at + turnOf('restore', r, r.u, pub)) return;
+  if (w.tableAt === null || w.tableAt > now) w.tableAt = now;
+  // (After a stand-down the turns start when it is over, as the records' do.)
+  if (over !== null && w.tableAt + OPEN_WAIT_MS < over) w.tableAt = over - OPEN_WAIT_MS;
+  if (standsDown(w, r, now)) return;
+  if (now < w.tableAt + OPEN_WAIT_MS + turnOf('restore', r, r.u, pub) || !heardThrough(now - OPEN_WAIT_MS, now)) return;
   if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
-  if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
+  if (putBackFairOnlyTable(r.t, r.inc)) w.wroteAt = now;
 }
 
 function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
@@ -4793,6 +4876,29 @@ export function setLocalHouse(pub: string | null): void {
   localHouse = typeof pub === 'string' && isPub(pub) ? pub : null;
 }
 
+/** 🔒 What this page's own node says its fold serves (its fingerprint's
+ *  `house_fold`: main.ts setLocalHouseFold), or null for a node that says
+ *  nothing of one, or no node. */
+let localFold: HouseFold | null = null;
+
+/** 🔒 What the fold of this page's own node serves (nodeFingerprint
+ *  parseHouseFold), or null: main.ts, on every fingerprint read, beside the
+ *  house key. A table moves to a FAIR ONLY game only where the node that will
+ *  be its house says it runs them (nodeRunsFairOnly). */
+export function setLocalHouseFold(fold: HouseFold | null): void {
+  localFold = fold;
+}
+
+/** Whether this page's node says it runs FAIR ONLY games of this build's
+ *  rules (design §8.1): its fold names both letters, `p` and `q`, and this
+ *  build's rules version, and is not off. No node of today's says so (they fold
+ *  `r` and `d`, in shadow), so nothing is offered until the node's half of PR
+ *  6c is out. */
+function nodeRunsFairOnly(): boolean {
+  const f = localFold;
+  return f !== null && f.off !== true && f.letters.includes('p') && f.letters.includes('q') && f.rv.includes(FAIR_ONLY_RV);
+}
+
 /**
  * 10. The house's room records: every REPUT_MS, on an awake page with its
  * doc whole, each page puts back what it counted of them that the doc lost
@@ -4868,6 +4974,21 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
   return { setUp: houseSetUp(), online, fairness: readFairSetting(t), canSet: holdsDeed(), openFair, waiting };
 }
 
+/** The final checkpoint of the page-signed incarnation `at` runs, as this page
+ *  signs one to end it (the house's switch-off, a migration, the opening of a
+ *  FAIR ONLY game over it): at the last round its fold decided, or its base's,
+ *  with the fold's nets, which count on. Noted as an end this page wrote
+ *  (endedByMe). */
+function finalOf(at: { st: TableState; res: FoldResult }): Checkpoint {
+  const { st, res } = at;
+  const D = lastDecided(res);
+  const u = D ? D.r : Math.max(1, res.base.u);
+  const l = D ? D.close : res.base.l ?? NO_CLOSE;
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  endedByMe.add(nextSid(st.ctx, cp));
+  return cp;
+}
+
 /**
  * 🏠 Move a table PR 2–4 opened (a `c` or `k` name: no house plays it) onto
  * a house table, once the room has a house (casinoDoc houseSetUp) and the
@@ -4892,11 +5013,7 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   if (res.tip || res.held.size > 0 || res.openCloses.some((c) => c.state !== 'invalid')) return false;
   const e = viewOf(st, res, now);
   if (e.view.phase !== 'betting' || e.holding !== null) return false;
-  const D = lastDecided(res);
-  const u = D ? D.r : Math.max(1, res.base.u);
-  const l = D ? D.close : res.base.l ?? NO_CLOSE;
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
-  endedByMe.add(nextSid(st.ctx, cp));
+  const cp = finalOf(at);
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
@@ -4922,6 +5039,47 @@ export function computedCompactionPending(): boolean {
   } catch {
     return false;
   }
+}
+
+/** 🔒 Whether a FAIR ONLY game has work owed that no table of the room
+ *  carries: something of it for the put-back duty to look at (casinoDoc
+ *  computedFairOnlyChecking: a game the doc lacks a record, the switch, the
+ *  table or the session's map of stays there until it is whole, through a
+ *  stand-down too, whose end the page must be awake at), or a live game this
+ *  page has something at stake in (serveLeftGames: its seed to reveal, its
+ *  close, its abandon, what it puts back). Both are an awake page's, and with
+ *  the room's last table out World would mark no frame: the page would read as
+ *  asleep a lapse on, and for good. (Without this term the table went back by
+ *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
+ *  lapse: no later turn came, no page without a felt wrote, nothing ran after
+ *  a stand-down, and no round in flight was served past the lapse.) Only asked
+ *  in a room with no table (tableFrame), and never throws out of World's
+ *  frame. What it costs with no game tracked is a set's size, twice. */
+export function computedFairOnlyPending(): boolean {
+  try {
+    if (computedFairOnlyChecking() > 0) return true;
+    if (fairTables.size === 0) return false;
+    const me = getPlayerId();
+    for (const st of fairTables.values()) {
+      if (computedResolutionOf(st.t, st.inc)?.live === true && !nothingAtStake(st, me)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a frame of this page is one that runs tables, which World marks
+ *  (croupier noteTablesRunning: a page that stops marking reads as asleep a
+ *  lapse later, tablesAwake, and every duty here is an awake page's): the room
+ *  has a table (`tables` of them), or work waits that no table carries: an
+ *  ended incarnation to compact or one to end (computedCompactionPending), a
+ *  recovery owed (casinoDoc computedRecoveryPending), a FAIR ONLY game's
+ *  put-backs or its round in flight (computedFairOnlyPending). One place for
+ *  World's frame and the specs' (computedPageKit frame, computedSim), so a
+ *  spec's page sleeps where the app's does. */
+export function tableFrame(tables: number): boolean {
+  return tables > 0 || computedCompactionPending() || computedRecoveryPending() || computedFairOnlyPending();
 }
 
 // ── 🔀 The switch ────────────────────────────────────────────────────────────
@@ -5223,17 +5381,120 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
     return 'ok';
   }
   const { st, res } = at;
-  const D = lastDecided(res);
-  const u = D ? D.r : Math.max(1, res.base.u);
-  const l = D ? D.close : res.base.l ?? NO_CLOSE;
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
-  endedByMe.add(nextSid(st.ctx, cp));
+  const cp = finalOf(at);
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
     attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now, playedTo(st, res));
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
+    return true;
+  });
+  return done ? 'ok' : 'reconnecting';
+}
+
+// ── 🔒 Opening a FAIR ONLY game ──────────────────────────────────────────────
+
+/** Why this page is offered no FAIR ONLY table at all (design §8.1): it does
+ *  not hold the room's deed ('owner'), computed tables are turned off on it
+ *  ('off': the dev flag), the room does not hold its own node's house key as
+ *  this page delegated it ('no-house': no node, as on a Mac, or the delegation
+ *  not written or not checked yet; the design's houseSetUp, asked of the house
+ *  the game's root will name), or that node does not say it runs FAIR ONLY
+ *  games ('no-engine': nodeRunsFairOnly). */
+export type FairOnlyOfferRefusal = 'owner' | 'off' | 'no-house' | 'no-engine';
+
+/** Why FAIR ONLY is not offered on this page, or, where it is, the delegation
+ *  of this page's node's house that the offer stands on: the one the root of a
+ *  game opened on it names (switchFairOnlyOn). */
+function fairOnlyOffer(): FairOnlyOfferRefusal | DelegationRec {
+  if (!holdsDeed()) return 'owner';
+  if (!computedTablesEnabled()) return 'off';
+  const dl = localHouse === null ? null : delegationOf(localHouse);
+  if (dl === null) return 'no-house';
+  return nodeRunsFairOnly() ? dl : 'no-engine';
+}
+
+/** Why FAIR ONLY is not offered on this page, or null where it is: the ⚙
+ *  card's to ask before it shows the choice, and the opening's first check. */
+export function fairOnlyOfferRefusal(): FairOnlyOfferRefusal | null {
+  const offer = fairOnlyOffer();
+  return typeof offer === 'string' ? offer : null;
+}
+
+/** Why a table can't move to a FAIR ONLY game now: what the house's switch
+ *  refuses for (ComputedSwitchRefusal: 'craps' here is a computed name of the
+ *  other game under the table), no offer on this page (FairOnlyOfferRefusal),
+ *  the table playing no house table ('not-house': owner-run, or a name PR 2–4
+ *  opened, which the driving page moves onto a house table first), the table
+ *  playing a FAIR ONLY game another key holds ('theirs': that game is its
+ *  holder's to end), or no house of the room heard ('house-away': round 1 needs
+ *  its join). */
+export type FairOnlyOnRefusal = ComputedSwitchRefusal | FairOnlyOfferRefusal | 'not-house' | 'theirs' | 'house-away';
+export type FairOnlyOnResult = 'ok' | FairOnlyOnRefusal;
+
+/**
+ * 🔒 The room's owner moves house table `t` to a FAIR ONLY game (design §8.7;
+ * the ⚙ card's FAIR ONLY · THE TABLE WAITS FOR THE HOUSE, once it has the
+ * line): in ONE transaction the house table's incarnation ends as a switch-off
+ * ends it (its final checkpoint with the fold's nets, which count on; its
+ * sessions gone; its `gone:` mark; the deed holder's attestation of the end),
+ * and the game opens: a name no other game has (its inputs this page's key,
+ * 16 random hex, this build's rules version and this page's clock:
+ * faironlyInc), its root checkpoint signed by this page's key and naming its
+ * node's house by the delegation the room holds, the empty session the root
+ * opens, and the switch. Every page then plays the game (S9: the deed
+ * holder's); round 1 waits for the house's join, the root carrying no
+ * commitment.
+ *
+ * Refused (nothing written) where FAIR ONLY is not offered on this page
+ * (fairOnlyOfferRefusal), on a page asleep or not whole, at a table that plays
+ * no house table of `game`, while an earlier build than HOUSE_ONLY_MIN_BUILD
+ * drives the room's tables (it reads the switch as none, and would run
+ * owner-run rounds there), while no house of the room is heard, and while the
+ * house table has a round under way as its switch-off would be refused
+ * (offRefusal: a close in or a result's hold; at craps the wait for the throw,
+ * and contract bets riding until the second press, `again`, which hands them
+ * back with the rest), or its last result still shows. Bets on an open round
+ * go back to their players, as at a switch-off. 'ok' with nothing written at a
+ * table where this page's key holds a live game of `game` already. Nothing
+ * calls this yet but the specs: the ⚙ card's line is PR 6c-4c's.
+ */
+export function switchFairOnlyOn(t: string, game: GameName = 'roulette', now = Date.now(), again = false): FairOnlyOnResult {
+  lookAtClock(now);
+  const dl = fairOnlyOffer();
+  if (typeof dl === 'string') return dl;
+  const gate = switchGate(t, now);
+  if (gate) return gate;
+  const me = getIdentityPub();
+  if (computedGamesHeldBy(t, me).some((held) => gameOfInc(held) === game)) return 'ok';
+  const inc = computedIncOf(t);
+  if (inc === null || !isComputedTable(t)) return 'not-house';
+  if (gameOfInc(inc) !== game) return 'craps';
+  if (isFairOnlyInc(inc)) return 'theirs';
+  if (!houseRules(inc)) return 'not-house';
+  if (leaseIsOldBuild(now, HOUSE_ONLY_MIN_BUILD)) return 'old-build';
+  if (!houseOnline(now)) return 'house-away';
+  const refused = offRefusal(t, now, again);
+  if (refused) return refused;
+  // (The incarnation the switch names, when the doc holds anything of it: one
+  // it holds nothing of, a peer's forgery, is only marked ended.)
+  const at = ordinaryTableOf(t);
+  // Nor while its last result shows: the ball lands and the dice stop on
+  // every page first, as the automatic switch and a migration wait for them.
+  if (at && viewOf(at.st, at.res, now).view.phase === 'settled') return 'busy';
+  const letter = game === 'craps' ? 'q' : 'p';
+  const room = casinoRoomId();
+  const name = { rv: FAIR_ONLY_RV, ok: me, j: randomSeedHex().slice(0, 16), ts: Math.floor(now) };
+  const ctx: FoldCtx = { room, t, inc: faironlyInc(letter, room, t, name) };
+  const root = sealCk(ctx, {
+    v: 1, ...name, b: 'g', u: 0, l: NO_CLOSE, n: {}, ...(letter === 'q' ? { s: { p: 0, w: {} } } : {}), dl, k: me,
+  }, signIdentity);
+  const end = at ? { ...at, cp: finalOf(at) } : null;
+  const done = transactCasino(() => {
+    if (!writeFairOnlyOn(t, root, end ? { inc: end.st.inc, cp: end.cp } : undefined)) return false;
+    // 🏛️ D2: vouch for the end, as a switch-off does (F4 put-back).
+    if (end) attestEnd(end.st.ctx, t, end.st.inc, end.res, end.cp, end.st.attested, now, playedTo(end.st, end.res));
     return true;
   });
   return done ? 'ok' : 'reconnecting';

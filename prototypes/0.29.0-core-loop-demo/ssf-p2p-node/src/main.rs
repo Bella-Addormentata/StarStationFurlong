@@ -51,6 +51,10 @@ mod chia_network;
 // the start, the lane is built closed and no Chia task or wallet starts;
 // turned off in the game, the lane is closed at once.
 mod chia_strict;
+// 📖 LIST ME (stage 4 of the mainnet transition, design §4.5 (6)): the
+// player's switch for this station's Phone Book writes on one Chia network,
+// off where the coins are real money until the player turns it on.
+mod chia_listing;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
@@ -419,6 +423,15 @@ pub struct Fingerprint {
     /// address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_lane: Option<chia_strict::LaneView>,
+    /// 📖 LIST ME on this node's network (chia_listing.rs): whether its
+    /// publisher may write the Phone Book listing and the knocks (`on`),
+    /// whether the player turned the switch or the network's default stands
+    /// (`chosen`), `held` when `SSF_CHIA_FINDABLE=0` holds the listing off
+    /// beside it, and `damaged` when its file cannot be read. Read live per
+    /// request; absent from a read-only build, which writes nothing, and
+    /// from an older node. Loopback only, like the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_listing: Option<chia_listing::ListingView>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -783,6 +796,12 @@ pub struct HubState {
     /// player turns the SSF wallet on in the Bank (rung 6 reads it per dial).
     #[cfg(feature = "chia-read")]
     pub knock_publishing: std::sync::atomic::AtomicBool,
+    /// 📖 LIST ME for the process's network (chia_listing.rs): whether the
+    /// publisher may write this station's listing and its knocks there. The
+    /// heartbeat asks it at every tick and rung 6 at every dial, so a turn
+    /// in the SpacePhone's Network settings holds within the run.
+    #[cfg(feature = "chia-publish")]
+    pub list_me: chia_listing::ListMe,
     /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
     /// per era) and knocks read from our inbox, each with the confirmation
     /// height both sides dial by.
@@ -1076,6 +1095,7 @@ pub fn compute_fingerprint(
         #[cfg(not(feature = "chia-read"))]
         chia_network: None,
         chia_lane: None,
+        chia_listing: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -1150,6 +1170,7 @@ mod fingerprint_json_tests {
             chia_wallet: None,
             chia_network: None,
             chia_lane: None,
+            chia_listing: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -1415,22 +1436,33 @@ fn load_configured_relays_from_env() -> Vec<String> {
 // rung: a room now survives not just a closed browser but a NODE RESTART —
 // the owner's machine reboots and visitors still get the room. Corrupt or
 // unreadable files fail OPEN (fresh doc, logged), never fatal.
+//
+// 🔒 A room's document holds the room key, so its file is owner-only on Unix
+// (private_file::write_private_in_place): made 0600, and one an older build
+// left to the umask is tightened when it is rewritten and when it is loaded.
+// The folder itself is left as it was made, so the file names (the room ids,
+// in hex) stay listable there.
 
 const ROOMS_DIR: &str = "rooms";
 
 /// Room ids are user-influenced strings — hex-encode for a filesystem-safe,
 /// reversible filename.
-fn room_doc_path(room_id: &str) -> std::path::PathBuf {
-    std::path::Path::new(ROOMS_DIR).join(format!("{}.bin", hex::encode(room_id.as_bytes())))
+fn room_doc_path(dir: &std::path::Path, room_id: &str) -> std::path::PathBuf {
+    dir.join(format!("{}.bin", hex::encode(room_id.as_bytes())))
 }
 
 /// Write one room's full-state snapshot. Best-effort: failures log and drop.
 fn persist_room_doc(room_id: &str, snapshot: &[u8]) {
-    if let Err(e) = std::fs::create_dir_all(ROOMS_DIR) {
-        eprintln!("💾 room persist: cannot create {ROOMS_DIR}/: {e}");
+    persist_room_doc_in(std::path::Path::new(ROOMS_DIR), room_id, snapshot)
+}
+
+/// [`persist_room_doc`] in `dir`, which the tests name.
+fn persist_room_doc_in(dir: &std::path::Path, room_id: &str, snapshot: &[u8]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("💾 room persist: cannot create {}/: {e}", dir.display());
         return;
     }
-    if let Err(e) = std::fs::write(room_doc_path(room_id), snapshot) {
+    if let Err(e) = private_file::write_private_in_place(&room_doc_path(dir, room_id), snapshot) {
         eprintln!("💾 room persist: write failed for {room_id}: {e}");
     }
 }
@@ -1438,8 +1470,13 @@ fn persist_room_doc(room_id: &str, snapshot: &[u8]) {
 /// Load every persisted room doc at startup → (room_id, snapshot) pairs.
 /// Malformed filenames / unreadable files are skipped with a log line.
 fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
+    load_persisted_rooms_in(std::path::Path::new(ROOMS_DIR))
+}
+
+/// [`load_persisted_rooms`] from `dir`, which the tests name.
+fn load_persisted_rooms_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir(ROOMS_DIR) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return out, // no dir yet — first run
     };
@@ -1454,12 +1491,79 @@ fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
             }
         };
         match std::fs::read(entry.path()) {
-            Ok(bytes) if !bytes.is_empty() => out.push((room_id, bytes)),
-            Ok(_) => {}
+            Ok(bytes) => {
+                // 🔒 A document an older build wrote was left to the umask,
+                // and a room nobody changes again is never rewritten:
+                // tightened as it is loaded. A failure is said, and the
+                // room still loads.
+                if let Err(e) = private_file::tighten_private(&entry.path()) {
+                    eprintln!("💾 room persist: could not make {name} readable by its owner only ({e})");
+                }
+                if !bytes.is_empty() {
+                    out.push((room_id, bytes));
+                }
+            }
             Err(e) => eprintln!("💾 room persist: unreadable {name}: {e}"),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod room_doc_tests {
+    use super::*;
+
+    /// A room's document holds the room key (docs/TDD/ChiaLanePrivacy.md
+    /// §9): its file is saved owner-only, one an older build left to the
+    /// umask is tightened when it is rewritten and when it is loaded, and
+    /// what loads back is what was saved, under the room's own id.
+    #[test]
+    fn a_room_document_is_saved_owner_only_and_loads_back() {
+        let dir = std::env::temp_dir().join(format!("ssf-rooms-{}", rand::random::<u64>()));
+        let rooms = dir.join("rooms");
+        #[cfg(unix)]
+        let mode = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        #[cfg(unix)]
+        let broaden = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        assert!(load_persisted_rooms_in(&rooms).is_empty(), "no folder yet: a first run");
+        persist_room_doc_in(&rooms, "home/one", b"snapshot one, the longer");
+        persist_room_doc_in(&rooms, "two", b"snapshot two");
+        let one = room_doc_path(&rooms, "home/one");
+        let two = room_doc_path(&rooms, "two");
+        assert_eq!(one, rooms.join(format!("{}.bin", hex::encode("home/one"))), "the id in hex, so no room id leaves the folder");
+        #[cfg(unix)]
+        assert_eq!((mode(&one), mode(&two)), (0o600, 0o600), "a new document is owner-only");
+        // A document an older build wrote: tightened by the next save,
+        // which replaces it whole...
+        #[cfg(unix)]
+        broaden(&one);
+        persist_room_doc_in(&rooms, "home/one", b"snapshot one");
+        assert_eq!(std::fs::read(&one).unwrap(), b"snapshot one");
+        #[cfg(unix)]
+        assert_eq!(mode(&one), 0o600, "a broader document is owner-only after a save");
+        // ...and one of a room nobody changes again, by the load.
+        #[cfg(unix)]
+        broaden(&two);
+        // An empty document and a file that is no room's are passed over.
+        std::fs::write(room_doc_path(&rooms, "empty"), b"").unwrap();
+        std::fs::write(rooms.join("not-hex.bin"), b"x").unwrap();
+        std::fs::write(rooms.join("notes.txt"), b"x").unwrap();
+        let mut loaded = load_persisted_rooms_in(&rooms);
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            vec![("home/one".to_string(), b"snapshot one".to_vec()), ("two".to_string(), b"snapshot two".to_vec())]
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&two), 0o600, "a broader document is owner-only after a load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 🔒 The node's iroh key, kept as `contact.key` is (stage 4 design §4.5):
@@ -2293,15 +2397,35 @@ async fn node_main() -> Result<()> {
     let wallet_loaded = chia_heartbeat_sk.is_some();
     #[cfg(not(feature = "chia-publish"))]
     let wallet_loaded = false;
-    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded, chia_off_source);
+    // 📖 LIST ME for this network (chia_listing.rs), read here for the line
+    // below and kept by the hub for the run: whether this station's
+    // publisher may write its listing and its knocks. Its own line follows
+    // the lane's, and is not said while Chia is off on this computer, where
+    // nothing is written whatever the switch says and the lane's line says
+    // so. A build that only reads the chain has no switch.
+    #[cfg(feature = "chia-publish")]
+    let list_me = chia_listing::ListMe::read(chia_net, chia_net.path(chia_listing::LISTING_FILE), chia_publish::findable_enabled());
+    #[cfg(feature = "chia-publish")]
+    let listed = list_me.on();
+    #[cfg(not(feature = "chia-publish"))]
+    let listed = false;
+    chia_lane::startup_status(&secret_key, &iroh_direct_addrs, wallet_loaded, listed, chia_off_source);
+    #[cfg(feature = "chia-publish")]
+    if !chia_off {
+        if let Some(line) = list_me.start_line() {
+            println!("{line}");
+        }
+    }
 
     // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
     // testnet11 under the same fixed test room key the publish hook uses, and log
     // the recovered node_id + addrs — the READ side of mesh introduction. Read-only
     // (no wallet needed); spawned so it never blocks startup. Never while
-    // Chia is off (`chia_plan`).
+    // Chia is off (`chia_plan`), and on a test network only (`test_hook_on`):
+    // the hint it asks a full node for is computed from a constant in the
+    // source, so the request marks the asking address as a Star Station node.
     #[cfg(feature = "chia-read")]
-    if chia_plan.resolve_hook {
+    if chia_plan.resolve_hook && test_hook_on(chia_net, "SSF_CHIA_RESOLVE_TEST") {
         let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
         tokio::spawn(async move {
             match chia_resolve::resolve_by_room_key(&test_room_key).await {
@@ -2464,6 +2588,8 @@ async fn node_main() -> Result<()> {
         knock_queue: Mutex::new(std::collections::VecDeque::new()),
         #[cfg(feature = "chia-read")]
         knock_publishing: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "chia-publish")]
+        list_me,
         #[cfg(feature = "chia-read")]
         knocks: Mutex::new(chia_knock::KnockBook::at_start(&chia_network::net().path(chia_knock::KNOCKS_FILE), chia_off)),
         #[cfg(feature = "chia-publish")]
@@ -2485,6 +2611,15 @@ async fn node_main() -> Result<()> {
             std::path::Path::new(board_bundles::BUNDLES_DIR),
             chia_resolve::unix_now(),
         )),
+    });
+    // 📖 The wallet lease asks the same switch before a saved bundle of a
+    // listing's or a knock's goes to the peers again (chia_publish.rs
+    // `Resend`): turned off, LIST ME stops those too, in this run and after
+    // a restart.
+    #[cfg(feature = "chia-publish")]
+    chia_publish::WALLET_LEASE.ask_list_me({
+        let hub = hub.clone();
+        move || hub.list_me.on()
     });
 
     // 🖥️ The desktop app's channel thread, once the hub exists: its ops
@@ -3430,24 +3565,43 @@ async fn report_dial_status(
     }
 }
 
-/// 🛑 Why rung 6 queues no knock on `net` while `knock_publishing` is off:
-/// the log line's reason and the page's dial detail. Off a test network the
-/// SSF wallet pays for no knock (stage 4 design §4.5 (1),
-/// `chia_publish::money_memo_refusal`), whatever the build, the wallet or
-/// the watcher say, so that is the reason there; on a test network a knock
-/// needs the publish build, the wallet on and the watcher on.
+/// 🛑 Why rung 6 queues no knock on `net`: the log line's reason and the
+/// page's dial detail. On every network a knock needs the publish build,
+/// the SSF wallet on and the watcher on (`publishing`: the hub's
+/// `knock_publishing`). With those, the one reason left is the player's
+/// switch: LIST ME is off for the network (chia_listing.rs, stage 4 design
+/// §4.5 (6)), which is where a station on a network of real coins starts.
+/// Who pays is no reason any more: off a test network a knock is written
+/// from a burner key of its own, which the lobby dish funds
+/// (`chia_publish::burner_paths`).
 #[cfg(feature = "chia-read")]
-fn no_knock_reason(net: chia_network::ChiaNet) -> (String, String) {
-    if net.is_test() {
+fn no_knock_reason(net: chia_network::ChiaNet, publishing: bool) -> (String, String) {
+    if !publishing {
         (
             "a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0)".to_string(),
             "no route; this node cannot knock (publishing or the watcher off)".to_string(),
         )
     } else {
         (
-            format!("on {} the SSF wallet pays for no knock yet", net.name()),
-            format!("no route; on {} this node writes no knock yet", net.name()),
+            format!("LIST ME is off for {}, and a knock is a Phone Book write (the SpacePhone's Network settings turn it on)", net.name()),
+            format!("no route; LIST ME is off for {}, so this node writes no knock", net.name()),
         )
+    }
+}
+
+/// 📖 Whether LIST ME is on for the process's network (chia_listing.rs),
+/// asked by rung 6 at each dial. A build that only reads the chain has no
+/// switch, and no publisher either, which rung 6 says first.
+#[cfg(feature = "chia-read")]
+fn list_me_on(hub: &SharedHub) -> bool {
+    #[cfg(feature = "chia-publish")]
+    {
+        hub.list_me.on()
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = hub;
+        false
     }
 }
 
@@ -3456,24 +3610,21 @@ mod no_knock_reason_tests {
     use super::no_knock_reason;
     use crate::chia_network::ChiaNet;
 
-    /// Stage 4 design §4.5 (1), on both networks: testnet11 keeps the build,
-    /// wallet and watcher reason; off a test network the reason is the
-    /// refusal to pay, the one switch-free cause there, and the publish
-    /// build refuses on the same networks (`money_memo_refusal`).
+    /// On both networks alike (stage 4 design §4.5 (6)): with no publisher
+    /// or no watcher, the build, wallet and watcher reason; with both, the
+    /// player's switch, by its name and with the network's. Neither says the
+    /// wallet does not pay: a knock is no longer the wallet's to pay for off
+    /// a test network.
     #[test]
     fn rung_6_names_the_real_reason_no_knock_is_queued() {
         for net in ChiaNet::ALL {
-            let (why, detail) = no_knock_reason(net);
-            if net.is_test() {
-                assert!(why.contains("SSF wallet on") && why.contains("SSF_CHIA_WATCH"), "{why}");
-                assert_eq!(detail, "no route; this node cannot knock (publishing or the watcher off)");
-            } else {
-                assert_eq!(why, "on Chia mainnet the SSF wallet pays for no knock yet");
-                assert_eq!(detail, "no route; on Chia mainnet this node writes no knock yet");
-                assert!(!why.contains("Bank") && !why.contains("SSF_CHIA_WATCH"), "{why}");
-            }
-            #[cfg(feature = "chia-publish")]
-            assert_eq!(net.is_test(), crate::chia_publish::money_memo_refusal(net).is_none(), "{net:?}");
+            let (why, detail) = no_knock_reason(net, false);
+            assert!(why.contains("SSF wallet on") && why.contains("SSF_CHIA_WATCH"), "{why}");
+            assert_eq!(detail, "no route; this node cannot knock (publishing or the watcher off)");
+            let (why, detail) = no_knock_reason(net, true);
+            assert_eq!(why, format!("LIST ME is off for {}, and a knock is a Phone Book write (the SpacePhone's Network settings turn it on)", net.name()));
+            assert_eq!(detail, format!("no route; LIST ME is off for {}, so this node writes no knock", net.name()));
+            assert!(!why.contains("pays") && !why.contains("yet") && !detail.contains("yet"), "{why} / {detail}");
         }
     }
 }
@@ -3655,9 +3806,13 @@ async fn dial_peer_inner(
                 Err(e) => eprintln!("⛓️ ChiaHub rung-6 contact-key resolve error: {e:#}"),
             }
         }
+        // 🕳️ The room's v1 record, on a test network only
+        // (`chia_resolve::reads_v1`): off one no station writes a v1 record,
+        // and the lookup would only show a full node which private room this
+        // station is dialing in.
         let chia_cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
         if let Some(cap) = chia_cap {
-            if cap.may_read() {
+            if cap.may_read() && chia_resolve::reads_v1(chia_network::net()) {
                 match chia_resolve::resolve_target(&cap.room_key, &target_str).await {
                     Ok(Some(rec)) => {
                         let addrs = chia_public_dial_addrs(&rec.addrs);
@@ -3731,15 +3886,19 @@ async fn dial_peer_inner(
             // build and the SSF wallet on the queue has no consumer,
             // and without the watcher a sent knock is never judged or dialed
             // on, so no knock is queued or promised and the log says what one
-            // needs (#272 review rounds 11 and 14); off a test network the
-            // wallet pays for none, and the log says that instead
-            // (`no_knock_reason`). An unfunded wallet is the publisher's to
-            // report.
+            // needs (#272 review rounds 11 and 14); nor while the player's
+            // LIST ME is off for this network, and the log says that
+            // instead (`no_knock_reason`). An unfunded wallet is the
+            // publisher's to report.
             Some(cap) if cap.may_use_cards() => {
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
-                    if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
-                        let (why, detail) = no_knock_reason(chia_network::net());
+                    // 📖 And only while LIST ME is on for this network
+                    // (chia_listing.rs): a knock is a Phone Book write, so
+                    // the player's switch covers it, asked at each dial.
+                    let publishing = hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed);
+                    if !publishing || !list_me_on(&hub) {
+                        let (why, detail) = no_knock_reason(chia_network::net(), publishing);
                         println!(
                             "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: {why} (not queued)"
                         );
@@ -6385,9 +6544,11 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
 /// test network only (stage 4 design §4.5 (3)): the publish hook writes this
 /// node's addresses under a room key anyone can compute from a constant in
 /// the source, the craps hook writes plaintext, and the claim-and-write hook
-/// spends a lobby dish coin under a hint computed the same way. Like the
-/// hooks, `1` alone sets one.
-#[cfg(feature = "chia-publish")]
+/// spends a lobby dish coin under a hint computed the same way. The resolve
+/// hook writes nothing, but asks a full node for the hint of that same room
+/// key, which no player's station asks for. Like the hooks, `1` alone sets
+/// one.
+#[cfg(feature = "chia-read")]
 fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool, Option<String>) {
     match raw {
         Some("1") if net.is_test() => (true, None),
@@ -6398,7 +6559,7 @@ fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool,
 
 /// [`test_hook`] for the environment's `var`: says the refusal, if any, and
 /// returns whether the hook runs.
-#[cfg(feature = "chia-publish")]
+#[cfg(feature = "chia-read")]
 fn test_hook_on(net: chia_network::ChiaNet, var: &str) -> bool {
     let (runs, refused) = test_hook(net, var, std::env::var(var).ok().as_deref());
     if let Some(line) = refused {
@@ -6407,7 +6568,7 @@ fn test_hook_on(net: chia_network::ChiaNet, var: &str) -> bool {
     runs
 }
 
-#[cfg(all(test, feature = "chia-publish"))]
+#[cfg(all(test, feature = "chia-read"))]
 mod test_hook_tests {
     use super::test_hook;
     use crate::chia_network::ChiaNet;
@@ -6417,7 +6578,7 @@ mod test_hook_tests {
     /// value runs nothing anywhere and says nothing. No environment is read.
     #[test]
     fn the_env_test_hooks_run_on_a_test_network_only() {
-        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST"] {
+        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST", "SSF_CHIA_RESOLVE_TEST"] {
             for net in ChiaNet::ALL {
                 for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
                     assert_eq!(test_hook(net, var, raw), (false, None), "{var}={raw:?} on {net:?}");
@@ -6434,6 +6595,20 @@ mod test_hook_tests {
                 }
             }
         }
+    }
+
+    /// The read-only hook starts through the same rule as the three that
+    /// write (docs/TDD/ChiaLanePrivacy.md §7): this file's one place that
+    /// starts it asks `test_hook_on` first. Read from the source, since the
+    /// start is in `main` itself.
+    #[test]
+    fn the_resolve_hook_starts_through_the_rule() {
+        let source = include_str!("main.rs");
+        // Joined here so that this test's own lines are not counted.
+        let plan = ["chia_plan", "resolve_hook"].join(".");
+        let start = format!("if {plan} && test_hook_on(chia_net, \"SSF_CHIA_RESOLVE_TEST\") {{");
+        assert_eq!(source.matches(&start).count(), 1, "the hook's start asks the rule");
+        assert_eq!(source.matches(&plan).count(), 1, "and nothing else starts it");
     }
 }
 
@@ -6750,11 +6925,14 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
     // the host alone dials. `SSF_CHIA_WATCH=0` keeps knocks off.
     //
     // 🛑 Off a test network the SSF wallet pays for no knock (stage 4 design
-    // §4.5 (1)), so rung 6 queues none there; the heartbeat says why once.
+    // §4.5 (1)): a knock there is written from a burner key of its own,
+    // which the lobby dish funds (`chia_publish::burner_paths`), so the
+    // queue has its consumer on every network. Whether a knock may be
+    // written at all is the player's LIST ME (chia_listing.rs), which rung
+    // 6 asks at each dial and the heartbeat at each tick.
     let net = chia_network::net();
     if chia_knock::knocks_available(true, chia_watch::watch_enabled()) {
-        let pays = chia_publish::money_memo_refusal(net).is_none();
-        hub.knock_publishing.store(pays, std::sync::atomic::Ordering::Relaxed);
+        hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
     } else {
         println!("{}", watcher_off_knock_line(net));
     }
@@ -6773,11 +6951,12 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
 }
 
 /// The line said when the watcher is off, so no knock is written. Presence
-/// publishes as before on a test network only: off one the SSF wallet pays
-/// for no listing either (stage 4 design §4.5 (1)), and the heartbeat says so.
+/// publishes as before on a test network; off one it is written only while
+/// the player's LIST ME is on (chia_listing.rs), so the line promises none
+/// there and says what it follows.
 #[cfg(feature = "chia-publish")]
 fn watcher_off_knock_line(net: chia_network::ChiaNet) -> String {
-    let presence = if net.is_test() { "; presence publishes as before" } else { "" };
+    let presence = if net.is_test() { "; presence publishes as before" } else { "; its listing follows LIST ME" };
     format!(
         "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous{presence}"
     )
@@ -6789,7 +6968,8 @@ mod watcher_off_line_tests {
     use crate::chia_network::ChiaNet;
 
     /// testnet11 keeps its line whole; off a test network it promises no
-    /// presence, which the SSF wallet pays for no more there.
+    /// presence, which is written there only while LIST ME is on, and says
+    /// so.
     #[test]
     fn the_watcher_off_line_promises_presence_on_a_test_network_only() {
         assert_eq!(
@@ -6798,27 +6978,35 @@ mod watcher_off_line_tests {
         );
         assert_eq!(
             watcher_off_knock_line(ChiaNet::Mainnet),
-            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous"
+            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; its listing follows LIST ME"
         );
     }
 }
 
 /// 🏦 The line said once the Bank's TURN ON has loaded the wallet and
-/// remembered it. Publishing starts within a minute on a test network only:
-/// off one the SSF wallet pays for no chain write (stage 4 design §4.5 (1),
-/// `chia_publish::money_memo_refusal`), and the node writes no listing and
-/// no knock yet (LIST ME, §4.5 (6)). The line does not say that the node
-/// only reads the chain: its beacon, where the operator turned it on, is
-/// written from a key of its own.
+/// remembered it, with whether LIST ME is on for the network (`listed`,
+/// chia_listing.rs). Publishing starts within a minute where LIST ME is on.
+/// Off a test network the SSF wallet pays for no chain write (stage 4
+/// design §4.5 (1), `chia_publish::money_memo_refusal`), and the line says
+/// who does: the lobby dish, through keys of the station's own. With LIST
+/// ME off the line says the station writes no listing and no knock, and
+/// where that is changed. It never says that the node only reads the chain:
+/// its beacon, where the operator turned it on, is written from a key of
+/// its own.
 #[cfg(feature = "chia-publish")]
-fn bank_on_line(net: chia_network::ChiaNet) -> String {
-    if chia_publish::money_memo_refusal(net).is_none() {
-        "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start".to_string()
-    } else {
-        format!(
-            "🏦 SSF wallet: turned on in the Bank — on {} it pays for no chain write, and this node writes no listing and no knock there yet; it is back on at the next start",
-            net.name()
-        )
+fn bank_on_line(net: chia_network::ChiaNet, listed: bool) -> String {
+    let name = net.name();
+    match (chia_publish::money_memo_refusal(net).is_none(), listed) {
+        (true, true) => "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start".to_string(),
+        (true, false) => format!(
+            "🏦 SSF wallet: turned on in the Bank — LIST ME is off for {name}, so this station writes no listing and no knock there until it is turned on in the SpacePhone's Network settings; the wallet is back on at the next start"
+        ),
+        (false, true) => format!(
+            "🏦 SSF wallet: turned on in the Bank — on {name} it pays for no chain write: this station's listing and knocks are written from keys of its own that the lobby dish funds, starting within a minute; the wallet is back on at the next start"
+        ),
+        (false, false) => format!(
+            "🏦 SSF wallet: turned on in the Bank — on {name} it pays for no chain write, and this station writes no listing and no knock there until LIST ME is turned on in the SpacePhone's Network settings; the wallet is back on at the next start"
+        ),
     }
 }
 
@@ -6827,23 +7015,37 @@ mod bank_on_line_tests {
     use super::bank_on_line;
     use crate::chia_network::ChiaNet;
 
-    /// testnet11 keeps its line whole; off a test network the Bank's TURN ON
-    /// promises no publishing, which the SSF wallet pays for no more there,
-    /// and says what is not written yet: the listing and the knocks. It no
-    /// longer says the node only reads the chain, since a beacon the
-    /// operator turned on is written there from a key of its own.
+    /// testnet11 with LIST ME on keeps its line whole. With LIST ME off, on
+    /// either network, the Bank's TURN ON promises no listing and no knock
+    /// and says where LIST ME is turned on. Off a test network with LIST ME
+    /// on it says the wallet does not pay and who does. No line says the
+    /// node only reads the chain, since a beacon the operator turned on is
+    /// written from a key of its own.
     #[test]
-    fn the_bank_promises_publishing_on_a_test_network_only() {
+    fn the_bank_promises_publishing_only_where_list_me_is_on() {
         assert_eq!(
-            bank_on_line(ChiaNet::Testnet11),
+            bank_on_line(ChiaNet::Testnet11, true),
             "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start"
         );
-        let line = bank_on_line(ChiaNet::Mainnet);
         assert_eq!(
-            line,
-            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write, and this node writes no listing and no knock there yet; it is back on at the next start"
+            bank_on_line(ChiaNet::Testnet11, false),
+            "🏦 SSF wallet: turned on in the Bank — LIST ME is off for testnet11, so this station writes no listing and no knock there until it is turned on in the SpacePhone's Network settings; the wallet is back on at the next start"
         );
-        assert!(!line.contains("publishing") && !line.contains("only reads"), "{line}");
+        assert_eq!(
+            bank_on_line(ChiaNet::Mainnet, true),
+            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write: this station's listing and knocks are written from keys of its own that the lobby dish funds, starting within a minute; the wallet is back on at the next start"
+        );
+        assert_eq!(
+            bank_on_line(ChiaNet::Mainnet, false),
+            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write, and this station writes no listing and no knock there until LIST ME is turned on in the SpacePhone's Network settings; the wallet is back on at the next start"
+        );
+        for net in ChiaNet::ALL {
+            for listed in [true, false] {
+                let line = bank_on_line(net, listed);
+                assert!(!line.contains("only reads") && !line.contains(" yet"), "{line}");
+                assert_eq!(line.contains("writes no listing and no knock"), !listed, "{line}");
+            }
+        }
     }
 }
 
@@ -6950,7 +7152,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
         start_publisher(hub, iroh_endpoint, chia_sk);
         if saved {
-            println!("{}", bank_on_line(net));
+            println!("{}", bank_on_line(net, hub.list_me.on()));
         }
         return Ok(());
     }
@@ -6992,6 +7194,33 @@ async fn turn_lane(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Valu
     #[cfg(not(feature = "chia-publish"))]
     let _ = hub;
     (turned.status, turned.body)
+}
+
+/// 📖 One turn of LIST ME for the SpacePhone's Network settings
+/// (chia_listing.rs): the switch saves it and answers, and the node says its
+/// line. Turned off, the knocks rung 6 queued and the publisher has not yet
+/// written are dropped: the player's word covers them too, and a later dial
+/// decides anew (the queue is in memory only). A build that only reads the
+/// chain has no switch.
+fn turn_listing(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) {
+    #[cfg(feature = "chia-publish")]
+    {
+        let turned = hub.list_me.turn(on, chia_listing::unix_now(), chia_strict::strict());
+        match &turned.line {
+            Some(line) if turned.failed => eprintln!("{line}"),
+            Some(line) => println!("{line}"),
+            None => {}
+        }
+        if !hub.list_me.on() {
+            hub.knock_queue.lock().unwrap().clear();
+        }
+        (turned.status, turned.body)
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = (hub, on);
+        ("409 Conflict", serde_json::json!({ "ok": false, "error": chia_listing::UNBUILT_WORDS }))
+    }
 }
 
 /// 🏦 One words answer, for a page `app_page` passed (the HTTP route) or for
@@ -7319,6 +7548,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     fp.chia_lane = Some(chia_strict::view());
                     #[cfg(feature = "chia-publish")]
                     {
+                        // 📖 LIST ME on this network, live too: a turn in
+                        // the Network settings shows at the next read.
+                        fp.chia_listing = Some(hub_clone.list_me.view());
                         // 📖 And the Phone Book listing state the publisher
                         // mirrored on its last tick, for the top bar's icon.
                         fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
@@ -7473,6 +7705,35 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
                 let (status, body) = match chia_strict::lane_gate(local, target) {
                     Ok(on) => turn_lane(&hub_clone, on).await,
+                    Err(refused) => refused,
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/chia/listing?") || req.starts_with("POST /api/chia/listing ") {
+                // 📖 The SpacePhone's LIST ME switch (chia_listing.rs): `on=1`
+                // lets this station write its Phone Book listing and its
+                // knocks on the node's network from the publisher's next
+                // tick, `on=0` stops both at once (and the saved bundles of
+                // writes already sent stop going to the peers again,
+                // chia_publish.rs `Resend`), and either is remembered for
+                // that network alone. Behind the wallet switch's gate: only
+                // this machine's own game page may ask.
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
+                // An on names the network and the node it was confirmed
+                // for, and is taken only by that node on that network.
+                let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
+                let (status, body) = match chia_listing::listing_gate(local, target, chia_network::net(), &node_id) {
+                    Ok(on) => turn_listing(&hub_clone, on),
                     Err(refused) => refused,
                 };
                 let body = body.to_string();

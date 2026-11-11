@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
-import { parseChiaLane, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
+import { parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseHouseFold, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -160,6 +160,34 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ off: true, source: 'setting', setting: 'off', at: 1_700_000_000, path: '/home/x/chia_lane_off.json' })).toEqual({ off: true, source: 'setting', setting: 'off' });
   });
 
+  it('keeps what LIST ME says only in the node\'s own shape, and never reads a damaged switch as on (📖 LIST ME)', () => {
+    const fp = (chia_listing: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_listing })?.chia_listing;
+    // Every shape the node sends (chia_listing.rs ListingView).
+    expect(fp({ on: true, chosen: false })).toEqual({ on: true, chosen: false });
+    expect(fp({ on: false, chosen: false })).toEqual({ on: false, chosen: false });
+    expect(fp({ on: true, chosen: true })).toEqual({ on: true, chosen: true });
+    expect(fp({ on: false, chosen: true })).toEqual({ on: false, chosen: true });
+    expect(fp({ on: true, chosen: true, held: true })).toEqual({ on: true, chosen: true, held: true });
+    expect(fp({ on: false, chosen: false, held: true })).toEqual({ on: false, chosen: false, held: true });
+    expect(fp({ on: false, chosen: false, damaged: true })).toEqual({ on: false, chosen: false, damaged: true });
+    // A switch that cannot be read counts as off, whatever `on` says.
+    expect(fp({ on: true, chosen: true, damaged: true })).toEqual({ on: false, chosen: true, damaged: true });
+    // An older node sends no switch at all.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_listing).toBeUndefined();
+    // `held` and `damaged` only as true.
+    for (const junk of [false, 'true', 1, null, 0]) {
+      expect(fp({ on: true, chosen: true, held: junk, damaged: junk })).toEqual({ on: true, chosen: true });
+    }
+    // An `on` or a `chosen` that is not a boolean, or no object at all: no
+    // switch, never one guessed as on.
+    for (const bad of [null, undefined, 'on', 1, true, [], {}, { on: true }, { chosen: true }, { on: 'true', chosen: true }, { on: 1, chosen: false }, { on: true, chosen: null }]) {
+      expect(fp(bad)).toBeUndefined();
+      expect(parseChiaListing(bad)).toBeUndefined();
+    }
+    // Nothing else is copied.
+    expect(fp({ on: false, chosen: true, at: 1_700_000_000, path: '/home/x/chia_listing.json' })).toEqual({ on: false, chosen: true });
+  });
+
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
     const listed = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: listed })?.chia_presence).toEqual(listed);
@@ -275,5 +303,50 @@ describe('the house key', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 'A+/z'.repeat(10) + 'abc' })?.house).toBeUndefined();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 43 })?.house).toBeUndefined();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.house).toBeUndefined();
+  });
+});
+
+describe("the node's fold report", () => {
+  /** What a node of today sends (ssf-p2p-node `HouseFoldReport`): it folds house tables in shadow. */
+  const today = {
+    rules: { r: 'h1', d: 'h1' }, letters: 'rd', attest: false, shadowAgreed: 3, shadowMismatches: 0, shadowSkipped: 0, coldFolds: 1, dirty: 0, lost: 0,
+    badResults: 0, workerStarts: 1, workerRestarts: 0, workerFailures: 0, rooms: 1, tables: 2, tablesOver: 0,
+  };
+
+  it('is kept as the letters it folds, the rules versions it serves and whether it is off, and nothing else', () => {
+    expect(parseHouseFold(today)).toEqual({ letters: 'rd', rv: [] });
+    expect(parseHouseFold({ ...today, letters: 'rdpq', rv: ['f1'] })).toEqual({ letters: 'rdpq', rv: ['f1'] });
+    expect(parseHouseFold({ letters: 'pq', rv: ['f1', 'f2', 'a0bcdefg'] })).toEqual({ letters: 'pq', rv: ['f1', 'f2', 'a0bcdefg'] });
+    // Off, as the node sends it turned off in its environment: no letters, and a reason.
+    expect(parseHouseFold({ rules: {}, letters: '', attest: false, off: 'env' })).toEqual({ letters: '', rv: [], off: true });
+    for (const off of ['crashes', '', true, 0, false, {}]) expect(parseHouseFold({ ...today, off }), String(off)).toEqual({ letters: 'rd', rv: [], off: true });
+    for (const off of [undefined, null]) expect(parseHouseFold({ ...today, off }), String(off)).toEqual({ letters: 'rd', rv: [] });
+    // The list is the report's own: the page's copy does not follow it.
+    const rv = ['f1'];
+    const fold = parseHouseFold({ letters: 'pq', rv })!;
+    rv.push('f2');
+    expect(fold.rv).toEqual(['f1']);
+  });
+
+  it('is no report when the page cannot read it', () => {
+    for (const v of [undefined, null, 'rd', 7, true, [], ['rd']]) expect(parseHouseFold(v), String(v)).toBeUndefined();
+    for (const letters of [undefined, null, 7, ['r', 'd'], 'RD', 'r d', 'r1', 'a'.repeat(27)]) {
+      expect(parseHouseFold({ ...today, letters }), String(letters)).toBeUndefined();
+    }
+    expect(parseHouseFold({ letters: 'a'.repeat(26) })).toEqual({ letters: 'a'.repeat(26), rv: [] });
+    const versions = Array.from({ length: 17 }, (_, i) => `f${i}`);
+    for (const rv of [null, 'f1', 7, {}, ['F1'], ['1f'], [''], ['f1', 7], [null], [true], ['f12345678'], versions]) {
+      expect(parseHouseFold({ letters: 'pq', rv }), JSON.stringify(rv)).toBeUndefined();
+    }
+    expect(parseHouseFold({ letters: 'pq', rv: versions.slice(0, 16) })?.rv).toHaveLength(16);
+  });
+
+  it('rides in the fingerprint as `house_fold`, left out when it is no report', () => {
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house_fold: { ...today, letters: 'rdpq', rv: ['f1'] } })?.house_fold)
+      .toEqual({ letters: 'rdpq', rv: ['f1'] });
+    const fp = parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house_fold: { letters: 7 } });
+    expect(fp).not.toBeNull();
+    expect(fp && 'house_fold' in fp).toBe(false);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.house_fold).toBeUndefined();
   });
 });

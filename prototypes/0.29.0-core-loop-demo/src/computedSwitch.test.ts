@@ -1662,16 +1662,16 @@ describe('a computed table, played as World plays it', () => {
 // ── 🪪 The lease's build ─────────────────────────────────────────────────────
 
 describe('the table lease carries the build', () => {
-  it('takeTableTurn writes build: 3 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
+  it('takeTableTurn writes build: 4 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
     const [a, b] = await room(['A', 'B']);
     at(a, T0);
     a.croupier.takeTableTurn(T0);
-    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 3 });
+    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 4 });
     for (let T = T0 + STEP; T <= T0 + 2 * a.croupier.TABLE_LEASE_RENEW_MS; T += STEP) {
       at(a, T);
       a.croupier.takeTableTurn(T);
     }
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 3 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 4 });
     expect(a.croupier.leaseIsOldBuild(T0 + 4_000)).toBe(false);
     // An earlier build's page renews what it read: {page, player, beat}.
     sync(T0 + 4_000, a, b);
@@ -1683,7 +1683,7 @@ describe('the table lease carries the build', () => {
     // This build's next renewal puts it back.
     at(a, T0 + 6_000);
     a.croupier.takeTableTurn(T0 + 6_000);
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 3 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 4 });
   });
 
   it('reads a build that is no safe integer from 1 to 1000 as none', async () => {
@@ -1696,7 +1696,7 @@ describe('the table lease carries the build', () => {
       a.doc.getMap('casino').set('table-operator', { page: 'p', player: 'q', beat: 1, build });
       expect(a.casino.readTableOperatorLease()).toEqual({ page: 'p', player: 'q', beat: 1, build });
     }
-    expect(a.casino.TABLE_BUILD).toBe(3);
+    expect(a.casino.TABLE_BUILD).toBe(4);
   });
 });
 
@@ -1821,7 +1821,7 @@ describe('leaving the room', () => {
     const leave = body.indexOf('leaveComputedTables();');
     expect(leave).toBeGreaterThan(-1);
     expect(leave).toBeLessThan(body.indexOf('sync.flush()'));
-    expect(main).toMatch(/import \{ leaveComputedTables, setLocalHouse \} from "\.\/computedTable";/);
+    expect(main).toMatch(/import \{ leaveComputedTables, setLocalHouse, setLocalHouseFold \} from "\.\/computedTable";/);
   });
 });
 
@@ -1847,9 +1847,11 @@ describe("World's frame (world.ts updateCroupier)", () => {
   });
 
   it('marks the frame while a removed computed table waits to be compacted or recovered, with no table left in the room too', () => {
-    expect(body).toContain('if (tables.length || computedCompactionPending() || computedRecoveryPending()) noteTablesRunning();');
-    expect(world).toMatch(/import \{ autoSwitchComputed, computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
-    expect(world).toMatch(/import \{ computedRecoveryPending, [^}]*\} from "\.\/casinoDoc";/);
+    // (World asks computedTable, whose tableFrame holds the terms: the specs' frames ask it too.)
+    expect(body).toContain('if (tableFrame(tables.length)) noteTablesRunning();');
+    expect(world).toMatch(/import \{ autoSwitchComputed, tableFrame, tickComputedTables \} from "\.\/computedTable";/);
+    const table = readFileSync(new URL('./computedTable.ts', import.meta.url), 'utf8');
+    expect(table).toContain('return tables > 0 || computedCompactionPending() || computedRecoveryPending() || computedFairOnlyPending();');
   });
 
   it("switches each owner-run table on by itself on the house's driving page (the table lease), before its beat", () => {

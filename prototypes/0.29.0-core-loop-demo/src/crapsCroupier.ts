@@ -43,6 +43,7 @@ import { hasLocalStand, localStandOf, setLocalStand } from './localStands';
 import {
   casinoDocEpoch,
   casinoWhole,
+  computedSwitchChecking,
   computedSwitchLost,
   isComputedFor,
   putTableBack,
@@ -157,6 +158,9 @@ export function openCrapsBetting(
   if (!tableWritable(tableId)) return;
   // 🧮 Nor on a computed table (the card's NEXT ROLL comes here too).
   if (runsItself(tableId)) return;
+  // 🔒 Nor while the switch names a FAIR ONLY game this page is still
+  // checking: it may be the table's game a moment on (computedSwitchChecking).
+  if (computedSwitchChecking(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeCrapsTableState(tableId, {
     kind: 'craps',
@@ -594,8 +598,9 @@ export function tickAutoStickman(tableId: string): void {
  */
 export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone. (On a
-  // doc holding every update whole: croupier.closeWhenWhole.)
-  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing)));
+  // doc holding every update whole: croupier.closeWhenWhole. What closes is a
+  // craps table: clearTableKeys `closes`.)
+  closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────

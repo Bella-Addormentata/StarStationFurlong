@@ -40,6 +40,7 @@ const status = (net: ChiaNetwork | null, address: string): FaucetStatus => ({
   walletMojos: 5_000_000_000_000n,
   walletSpendableMojos: 5_000_000_000_000n,
   walletPartial: false,
+  walletSkipped: false,
   partial: false,
   note: '',
   spending: false,
@@ -93,6 +94,15 @@ describe.each([TESTNET11, MAINNET])('the faucet dish screen on $name', (net) => 
     expect(h).toContain(`(2.500 ${net.ticker})`);
     expect(h).toContain(`Your wallet: 5,000,000,000,000 mojos (5.000 ${net.ticker})`);
     expect(h).toContain(`· ${net.name}`);
+  });
+
+  // ⛓️ Off a test network the node leaves the wallet unread for the dish's
+  // own polls, and the figures the store keeps then are the Bank's last
+  // read: the dish shows the jar and no wallet line.
+  it('shows no wallet line from a status that left the wallet unread', () => {
+    const h = screen({ ...status(net, address), walletSkipped: true }, net);
+    expect(h).toContain(`(2.500 ${net.ticker})`);
+    expect(h).not.toContain('Your wallet');
   });
 
   // 🛑 Stage 4 design §4.5 (4): TAKE pays into the SSF wallet, which the

@@ -726,6 +726,92 @@ describe('a page holding part of another page\'s update', () => {
     expect(x.casino.readChips(amy)).toBe(70);
   });
 
+  /** The check main.ts registers, over this furniture: is a table of the
+   *  game under the id? */
+  function furnish(x: Page, items: { id: string; kind: string }[]): void {
+    x.croupier.setTableInRoomPredicate((id, game) => x.croupier.tableOfGameAmong(items, id, game));
+  }
+  const big6 = { type: 'big6' as const, amount: 10 };
+
+  /** The same at a craps table Amy has a big 6 down on: page p writes a
+   *  seat, then closes the window, and page x is given the close first. */
+  async function crapsCloseArrivesFirst(): Promise<{ x: Page; rest: Uint8Array[] }> {
+    const x = await loadPage(1);
+    const p = await loadPage(2);
+    x.casino.writeCrapsFairnessPref(CRAPS, 'rng');
+    x.casino.buyInChips(amy, 100);
+    x.craps.openCrapsBetting(CRAPS, 1, null);
+    x.casino.writeMyCrapsBets(CRAPS, amy, [big6]);
+    sync(x, p);
+    const [seat, close] = updatesOf(p, () => {
+      p.casino.writeMySeat(CRAPS, amy, { stand: 0, angle: 0, at: 1 });
+      p.craps.closeCrapsBetting(CRAPS, p.casino.readCrapsTableState(CRAPS)!);
+    });
+    Y.applyUpdate(x.doc, close);
+    expect(x.casino.casinoWhole()).toBe(false);
+    return { x, rest: [seat] };
+  }
+
+  it('nor is other furniture the id came to hold by then the table back: under a sofa the removal waits for the rest, then hands back', async () => {
+    const { x, rest } = await closeArrivesFirst();
+    furnish(x, [{ id: TABLE, kind: 'sofa' }, { id: 'roulette-2', kind: 'roulette-table' }]); // (another table of the game is not it either)
+    x.croupier.closeTable(TABLE, 'heard');
+    expect(x.doc.getMap('casino').has(`bets:${TABLE}:${amy}`)).toBe(true); // nothing yet
+    for (const u of rest) Y.applyUpdate(x.doc, u);
+    await flush();
+    expect(x.doc.getMap('casino').has(`bets:${TABLE}:${amy}`)).toBe(false);
+    expect(x.casino.readTableState(TABLE)).toBeNull();
+    expect(x.casino.readChips(amy)).toBe(100);
+    expect(x.casino.readChips(eve)).toBe(100);
+  });
+
+  it('nor a table of the other game: a roulette table\'s removal runs under a craps table, which opens on an incarnation of its own', async () => {
+    const { x, p, rest } = await closeArrivesFirst();
+    const was = p.casino.readTableState(TABLE)!.inc;
+    expect(was).toBeDefined();
+    furnish(x, [{ id: TABLE, kind: 'craps-table' }]);
+    x.croupier.closeTable(TABLE, 'heard');
+    for (const u of rest) Y.applyUpdate(x.doc, u);
+    await flush();
+    expect(x.doc.getMap('casino').has(`table:${TABLE}`)).toBe(false);
+    expect(x.doc.getMap('casino').has(`bets:${TABLE}:${amy}`)).toBe(false);
+    expect(x.casino.readChips(amy)).toBe(100);
+    expect(x.casino.readChips(eve)).toBe(100);
+    x.craps.openCrapsBetting(TABLE, 1, null);
+    const up = x.casino.readCrapsTableState(TABLE)!;
+    expect(up).toMatchObject({ kind: 'craps', phase: 'betting', round: 1, bk: '-' });
+    expect(up.inc).not.toBe(was);
+  });
+
+  it('and a craps table\'s under a roulette table', async () => {
+    const { x, rest } = await crapsCloseArrivesFirst();
+    furnish(x, [{ id: CRAPS, kind: 'roulette-table' }]);
+    x.craps.closeCrapsTable(CRAPS, 'heard');
+    expect(x.casino.readChips(amy)).toBe(90); // nothing yet
+    for (const u of rest) Y.applyUpdate(x.doc, u);
+    await flush();
+    expect(x.doc.getMap('casino').has(`table:${CRAPS}`)).toBe(false);
+    expect(x.doc.getMap('casino').has(`bets:${CRAPS}:${amy}`)).toBe(false);
+    expect(x.casino.readChips(amy)).toBe(100);
+  });
+
+  it('a table of the game taken down, back under the id, drops it as before: roulette, craps', async () => {
+    const r = await closeArrivesFirst();
+    furnish(r.x, [{ id: TABLE, kind: 'roulette-table' }]);
+    r.x.croupier.closeTable(TABLE, 'heard');
+    for (const u of r.rest) Y.applyUpdate(r.x.doc, u);
+    await flush();
+    expect(r.x.casino.readTableState(TABLE)).toMatchObject({ phase: 'closing', round: 1 });
+    expect(r.x.casino.readChips(amy)).toBe(70);
+    const c = await crapsCloseArrivesFirst();
+    furnish(c.x, [{ id: CRAPS, kind: 'craps-table' }]);
+    c.x.craps.closeCrapsTable(CRAPS, 'heard');
+    for (const u of c.rest) Y.applyUpdate(c.x.doc, u);
+    await flush();
+    expect(c.x.casino.readCrapsTableState(CRAPS)).toMatchObject({ phase: 'closing', round: 1 });
+    expect(c.x.casino.readChips(amy)).toBe(90);
+  });
+
   it("claims no lease while it holds part of an update: the driver's renewal parked there reads as none", async () => {
     const y = await loadPage(1); // driving
     const x = await loadPage(2); // another of the owner's pages

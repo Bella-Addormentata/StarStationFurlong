@@ -319,6 +319,12 @@ pub struct FaucetStatus {
     /// read hold (the wallet holds more) and GIVE spends from those coins
     /// (#245 review, round 5).
     pub wallet_partial: bool,
+    /// A wallet is loaded and this snapshot left it unread
+    /// ([`status_reads_wallet`]): the three wallet fields above say nothing,
+    /// and the browser keeps the figures of the last snapshot that read it.
+    /// False with no wallet loaded, and from an older node.
+    #[serde(default)]
+    pub wallet_skipped: bool,
     /// The coin listing hit [`MAX_FAUCET_PAGES`]: `coins`, `ready` and
     /// `total_mojos` cover the pages read, the jar holds more.
     pub partial: bool,
@@ -347,6 +353,21 @@ pub struct FaucetStatus {
     /// requests were sent in. The browser keeps the highest it has seen. 0
     /// from `summarize` alone (a snapshot `status` has not numbered).
     pub snapshot: u64,
+}
+
+/// 🛑 Whether a status snapshot on `net` reads the SSF wallet's coins from
+/// the chain. A read of them asks full nodes for the wallet's puzzle hash,
+/// the money address, and the same two nodes are asked for the burner keys'
+/// coins before each of their writes (`docs/TDD/ChiaLanePrivacy.md` §3): the
+/// asking itself shows them which money address goes with which burner
+/// addresses, by IP. On a test network the dish needs the wallet for TAKE and
+/// GIVE, so every snapshot reads it, as it always did. Off one the dish
+/// offers neither ([`network_part`]) and no spend of the wallet's exists to
+/// settle (`chia_publish::refuse_money_memo`), so the wallet is read only for
+/// a request that says its asker shows the balance (`asked`: the Bank's
+/// RECEIVE, the request's `wallet`), never for the dish's own polls.
+pub fn status_reads_wallet(net: ChiaNet, asked: bool) -> bool {
+    net.is_test() || asked
 }
 
 /// The network's word on the dish, after the wallet's: GIVE, TAKE and the
@@ -432,6 +453,7 @@ pub fn summarize(net: ChiaNet, params: &FaucetParams, peak: u32, coins: &[Faucet
         wallet_mojos: None,
         wallet_spendable_mojos: None,
         wallet_partial: false,
+        wallet_skipped: false,
         partial,
         note: String::new(),
         network: net,
@@ -538,12 +560,19 @@ pub(crate) async fn records_at(client: &impl ChainAccess, puzzle_hash: Bytes32) 
 
 // ── The browser lane: `faucet` envelopes ────────────────────────────────────
 
-/// `{ "op": "status" | "claim" | "give", "amount": <mojos, give only> }`.
+/// `{ "op": "status" | "claim" | "give", "amount": <mojos, give only>,
+/// "wallet": <true when the asker shows the wallet's balance> }`.
 #[derive(Deserialize, Debug)]
 struct FaucetRequest {
     op: String,
     #[serde(default)]
     amount: u64,
+    /// The asker shows the SSF wallet's balance: the Bank's RECEIVE, open
+    /// when the request was sent. Off a test network only such a request
+    /// has the wallet's coins read ([`status_reads_wallet`]). An older page
+    /// sends none, which reads as false.
+    #[serde(default)]
+    wallet: bool,
 }
 
 /// The answer, written back on the same stream the request came in on.
@@ -644,7 +673,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
     let params = FaucetParams::for_room(ctx.net, &room_key);
     let client = crate::chia_chain::connect();
     let result = match req.op.as_str() {
-        "status" => status(ctx, &client, &params).await.map(|s| FaucetReply {
+        "status" => status(ctx, &client, &params, req.wallet).await.map(|s| FaucetReply {
             op: "status".into(),
             ok: true,
             error: None,
@@ -675,7 +704,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             if reply.ok && matches!(reply.op.as_str(), "claim" | "give") {
                 let _turn = STATUS_TURN.lock().await;
                 reply.after_snapshot = Some(STATUS_SNAPSHOTS.load(std::sync::atomic::Ordering::SeqCst));
-                match status_under_turn(ctx, &client, &params).await {
+                match status_under_turn(ctx, &client, &params, req.wallet).await {
                     Ok(st) => reply.status = Some(st),
                     Err(e) => eprintln!("⛓️🥣 faucet: {} went out but the status read after it failed: {e:#}", reply.op),
                 }
@@ -686,16 +715,17 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
     }
 }
 
-async fn status(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
+async fn status(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams, asked: bool) -> Result<FaucetStatus> {
     // One snapshot at a time, numbered as it completes (see STATUS_TURN). Taken
     // before the wallet lease below, never after it: the writers take the lease
     // alone, so the two never wait on each other in a cycle.
     let _turn = STATUS_TURN.lock().await;
-    status_under_turn(ctx, client, params).await
+    status_under_turn(ctx, client, params, asked).await
 }
 
-/// The snapshot itself; the caller holds `STATUS_TURN`.
-async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetStatus> {
+/// The snapshot itself; the caller holds `STATUS_TURN`. `asked`: the request
+/// said its asker shows the wallet's balance ([`status_reads_wallet`]).
+async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams, asked: bool) -> Result<FaucetStatus> {
     let peak = crate::chia_resolve::peak_height(client)
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
@@ -704,6 +734,11 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
     #[cfg(feature = "chia-publish")]
     {
         match &ctx.wallet {
+            // 🛑 Off a test network, a snapshot nobody asked the balance of
+            // asks no full node for the wallet's address, and takes neither
+            // the lease nor its reconciliation: the dish offers no TAKE or
+            // GIVE there (`network_part` below), so nothing here needs them.
+            Some(_) if !status_reads_wallet(ctx.net, asked) => st.wallet_skipped = true,
             Some(sk) => {
                 // What the chain and the mempool say about parked coins decides
                 // what reads as confirming or landing, not a timer. Under the
@@ -744,6 +779,8 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
     }
     #[cfg(not(feature = "chia-publish"))]
     {
+        // This build holds no wallet, so there is none to read or to leave unread.
+        let _ = status_reads_wallet(ctx.net, asked);
         st.note = "this node was built without publishing; it can show the dish but not take or give".into();
     }
     (st.can_give, st.can_claim, st.note) = network_part(ctx.net, params, st.can_give, st.can_claim, std::mem::take(&mut st.note));
@@ -2088,8 +2125,9 @@ mod tests {
             let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
             let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
             let jar = || crate::chia_chain::testing::Scripted::new(vec![page.clone()]).with_peak(200);
-            let st = rt.block_on(status(&ctx, &jar(), &params)).unwrap();
+            let st = rt.block_on(status(&ctx, &jar(), &params, false)).unwrap();
             assert_eq!((st.network, st.coins, st.ready, st.total_mojos), (ChiaNet::Mainnet, 1, 1, 1000), "the jar is read");
+            assert!(!st.wallet_skipped, "no wallet is loaded, so none was left unread");
             assert_eq!(st.address, params.address(ChiaNet::Mainnet));
             assert!(st.address.starts_with("xch1"), "{}", st.address);
             assert!(!st.can_give && !st.can_claim, "{st:?}");
@@ -2102,7 +2140,7 @@ mod tests {
                 use crate::chia_wallet_switch::EnvSwitch;
                 for (env, turnable) in [(EnvSwitch::Off, true), (EnvSwitch::Unset, false)] {
                     let held_off = FaucetContext { net: ChiaNet::Mainnet, chia_off: false, rooms: &rooms, wallet: None, env, turnable, burners: false };
-                    let st = rt.block_on(status(&held_off, &jar(), &params)).unwrap();
+                    let st = rt.block_on(status(&held_off, &jar(), &params, false)).unwrap();
                     assert!(!st.can_give && !st.can_claim, "{st:?}");
                     assert_eq!(st.note, note);
                 }
@@ -2110,12 +2148,13 @@ mod tests {
         }
     }
 
-    /// The status a mainnet node with its SSF wallet on serves, end to end
-    /// through `status`, at the lobby's dish: an empty jar (as every mainnet
-    /// jar is until someone pays one) and then a funded wallet. Neither TAKE
-    /// nor GIVE, and the network's note alone, whatever the wallet holds;
-    /// the balance is read all the same. Nothing is parked in the wallet
-    /// lease, so it reads no chain.
+    /// The status a mainnet node with its SSF wallet on serves the Bank (a
+    /// request that asks for the balance), end to end through `status`, at
+    /// the lobby's dish: an empty jar (as every mainnet jar is until someone
+    /// pays one) and then a funded wallet. Neither TAKE nor GIVE, and the
+    /// network's note alone, whatever the wallet holds; the balance is read
+    /// all the same. Nothing is parked in the wallet lease, so it reads no
+    /// chain.
     #[cfg(feature = "chia-publish")]
     #[test]
     fn a_mainnet_status_with_a_wallet_on_offers_no_take_or_give() {
@@ -2138,15 +2177,75 @@ mod tests {
         let note = format!("{MAINNET_NO_TAKE} {MAINNET_NO_GIVE}");
         // The jar's listing first, then the wallet's.
         let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![])]).with_peak(200);
-        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
+        let st = rt.block_on(status(&ctx, &chain, &params, true)).unwrap();
         assert_eq!((st.coins, st.wallet_mojos), (0, Some(0)), "{st:?}");
+        assert!(!st.wallet_skipped, "{st:?}");
         assert!(!st.can_give && !st.can_claim, "an empty wallet takes nothing on mainnet: {st:?}");
         assert_eq!(st.note, note);
         let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![funded])]).with_peak(200);
-        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
+        let st = rt.block_on(status(&ctx, &chain, &params, true)).unwrap();
         assert_eq!(st.wallet_mojos, Some(5_000), "{st:?}");
         assert!(!st.can_give && !st.can_claim, "a funded wallet still gives nothing on mainnet: {st:?}");
         assert_eq!(st.note, note);
+    }
+
+    /// 🛑 The dish's own polls on mainnet (a status whose request does not
+    /// ask for the balance) ask no full node for the SSF wallet's address,
+    /// with a wallet on. The chain here answers one listing, the jar's: a
+    /// second, the wallet's, would find the script empty and fail the
+    /// status. The snapshot says the wallet was left unread, carries no
+    /// balance, and offers neither TAKE nor GIVE under the network's note,
+    /// as the Bank's does. The wallet lease is not reached on this path.
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn a_mainnet_status_nobody_asked_the_balance_of_reads_no_wallet() {
+        let sk = chia_bls::SecretKey::from_seed(&[6u8; 32]);
+        let rooms = Mutex::new(HashMap::new());
+        let ctx = FaucetContext {
+            net: ChiaNet::Mainnet,
+            rooms: &rooms,
+            chia_off: false,
+            wallet: Some(sk),
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            turnable: true,
+            burners: true,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let lobby_note = format!("{MAINNET_NO_TAKE} {MAINNET_NO_GIVE}");
+        let room_note = format!("{MAINNET_NO_ROOM_DISH} {MAINNET_NO_GIVE}");
+        for (params, note) in [(lobby_params(ChiaNet::Mainnet), lobby_note), (test_params(), room_note)] {
+            let coin = Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000);
+            let record = crate::chia_chain::CoinRecord { coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
+            let jar = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
+            let chain = crate::chia_chain::testing::Scripted::new(vec![jar]).with_peak(200);
+            let st = rt.block_on(status(&ctx, &chain, &params, false)).unwrap();
+            assert_eq!(chain.asked_spent.lock().unwrap().len(), 1, "one listing was asked for, the jar's");
+            assert_eq!((st.coins, st.ready, st.total_mojos), (1, 1, 1000), "the jar is read: {st:?}");
+            assert!(st.wallet_skipped, "{st:?}");
+            assert_eq!((st.wallet_mojos, st.wallet_spendable_mojos, st.wallet_partial), (None, None, false), "{st:?}");
+            assert!(!st.spending && !st.landing && !st.can_give && !st.can_claim, "{st:?}");
+            assert_eq!(st.note, note);
+            assert!(st.snapshot > 0, "numbered as it completed");
+        }
+    }
+
+    /// The rule itself, and the request's word for it: a test network reads
+    /// the wallet at every status, as the dish there needs it for TAKE and
+    /// GIVE; off one only a request that asks does. A request that says
+    /// nothing (an older page's, the dish's polls) does not ask.
+    #[test]
+    fn only_a_request_that_asks_has_the_wallet_read_off_a_test_network() {
+        assert!(status_reads_wallet(ChiaNet::Testnet11, false) && status_reads_wallet(ChiaNet::Testnet11, true));
+        assert!(!status_reads_wallet(ChiaNet::Mainnet, false));
+        assert!(status_reads_wallet(ChiaNet::Mainnet, true));
+        let parse = |json: &str| serde_json::from_str::<FaucetRequest>(json).unwrap().wallet;
+        assert!(!parse(r#"{"op":"status"}"#), "an older page's request");
+        assert!(!parse(r#"{"op":"status","wallet":false}"#));
+        assert!(parse(r#"{"op":"status","wallet":true}"#));
+        // A status from an older node, which never left a wallet unread.
+        let mut old = serde_json::to_value(summarize(ChiaNet::Mainnet, &lobby_params(ChiaNet::Mainnet), 1, &[], false)).unwrap();
+        assert_eq!(old.as_object_mut().unwrap().remove("walletSkipped"), Some(serde_json::Value::Bool(false)));
+        assert!(!serde_json::from_value::<FaucetStatus>(old).unwrap().wallet_skipped);
     }
 
     /// Stage 4 design §4.4 at the dish: the snapshot's "still confirming" goes
