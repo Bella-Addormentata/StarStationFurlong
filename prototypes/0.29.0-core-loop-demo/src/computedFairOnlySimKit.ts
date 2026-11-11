@@ -70,24 +70,73 @@ export async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSu
 }
 
 /** What a FAIR ONLY room adds to a finish (the header's list). */
-export function fairOnlyFinish(sim: Sim, s: SimSummary): void {
+export function fairOnlyFinish(sim: Sim, s: SimSummary, ended: readonly string[] = []): void {
   const node = sim.node!;
   const line = `[fair only] ${sim.label}: opened ${JSON.stringify([...sim.opened])} (refused before: ${JSON.stringify(sim.openRefusals)}), `
     + `house ${JSON.stringify(node.wrote)} trims ${node.trims} sweeps ${node.sweeps} put back: checkpoints ${node.rowPutBacks}, sessions ${node.newSessions}; `
-    + `cross-check refusals ${node.crossCheckMismatches}, refused rounds ${node.refusals}, blocked closes ${node.blockedSeen}; bases held to the oracle ${sim.basesCounted}`;
+    + `cross-check refusals ${node.crossCheckMismatches}, refused rounds ${node.refusals}, blocked closes ${node.blockedSeen}; `
+    + `ends: the house's ${node.ends}, the holder's ${sim.ownerEndsWritten}; bases held to the oracle ${sim.basesCounted}`;
   lines.push(line);
   console.log(line);
   expect([...sim.opened.keys()].sort(), sim.label).toEqual([...sim.tables].sort());
   // Every page up plays the game at every table.
   for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
     sim.enter(sp);
-    for (const t of sim.tables) expect(isFairOnlyInc(sp.p.casino.computedIncOf(t)), `${sim.label} ${sp.name} ${t}`).toBe(true);
+    // (…but a table whose game its holder ended: `ended`. That plays none.)
+    for (const t of sim.tables) {
+      if (ended.includes(t)) expect(sp.p.casino.isComputedTable(t), `${sim.label} ${sp.name} ${t}`).toBe(false);
+      else expect(isFairOnlyInc(sp.p.casino.computedIncOf(t)), `${sim.label} ${sp.name} ${t}`).toBe(true);
+    }
   }
   expect(s.byReveals + s.byForfeit, sim.label).toBe(0);
   expect(sim.gameProblems(), sim.label).toEqual([]);
   expect(node.crossCheckMismatches, sim.label).toBe(0);
   // Every checkpoint past the roots is one the house wrote, and the pages counted from them.
-  expect(sim.houseCheckpoints, sim.label).toBe(node.trims + node.sweeps);
+  // (…or an end: the house's, or one the game's holder signed on its own page.)
+  expect(sim.houseCheckpoints, sim.label).toBe(node.trims + node.sweeps + node.ends);
   if (node.trims > 0) expect(sim.basesCounted, sim.label).toBeGreaterThan(0);
-  expect(sim.basesCounted, sim.label).toBeLessThanOrEqual(node.trims + node.sweeps);
+  expect(sim.basesCounted, sim.label).toBeLessThanOrEqual(node.trims + node.sweeps + node.ends + sim.ownerEndsWritten);
+  // One end to a game that ended, and none to one that plays.
+  expect(node.ends + sim.ownerEndsWritten, sim.label).toBe(ended.length);
+}
+
+/** The holder's press at table `t`, on every tick from `from` ms into the run
+ *  while `when()` (and, at craps, a second press after 'contract') until it
+ *  answers 'ok'; with `once`, no press after one that answered 'ending' (the
+ *  end is then the house's, or the page's own duty's). What each press
+ *  answered, in order without repeats, and when the first one was made and
+ *  the game was over on the holder's page; and how many presses were refused
+ *  for contract bets riding. */
+export function pressEnd(sim: Sim, t: string, game: 'roulette' | 'craps', from: number, when: () => boolean = () => true, once = false): { said: string[]; first: number | null; over: number | null; contracts: number } {
+  const { house } = sim;
+  const out: { said: string[]; first: number | null; over: number | null; contracts: number } = { said: [], first: null, over: null, contracts: 0 };
+  let go = false;
+  let again = false;
+  let done = false;
+  sim.at(from, () => { go = true; });
+  sim.every(() => {
+    const now = sim.enter(house);
+    if (go && out.over === null && out.first !== null && !house.p.casino.isComputedTable(t)) out.over = sim.elapsed;
+    if (!go || done || house.mode !== 'up') return;
+    if (out.first === null && !when()) return;
+    const res = house.p.table.switchFairOnlyOff(t, game, now, again);
+    if (out.first === null) out.first = sim.elapsed;
+    if (out.said[out.said.length - 1] !== res) out.said.push(res);
+    if (res === 'contract') {
+      again = true;
+      out.contracts += 1;
+    }
+    if (res === 'ending' && once) done = true;
+    if (res === 'ok') {
+      done = true;
+      if (!house.p.casino.isComputedTable(t)) out.over = sim.elapsed;
+    }
+  });
+  return out;
+}
+
+/** Whether a round of the game at `t` is in flight on the holder's page. */
+export function inFlight(sim: Sim, t: string): boolean {
+  const res = sim.house.p.casino.computedFoldOf(t);
+  return !!res && !res.pending && (res.tip !== null || res.openCloses.some((c) => c.state !== 'invalid'));
 }

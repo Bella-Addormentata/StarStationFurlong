@@ -228,7 +228,7 @@ import type {
 import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash, signBytes, TableFold, utf8Length } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
 import { asFin, asXf, finKey, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId, xfKey } from './computedFairOnly';
-import type { CkRead, CkRec } from './computedFairOnly';
+import type { CkRead, CkRec, FinRec } from './computedFairOnly';
 import { resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
 import type { Resolution } from './computedFairOnlyAuth';
 import {
@@ -3249,6 +3249,43 @@ export function writeFairOnlyOn(tableId: string, root: { key: string; value: CkR
   return true;
 }
 
+/**
+ * 🔒 Write the end of FAIR ONLY game `inc` of table `tableId` (design §8.6:
+ * computedTable switchFairOnlyOff and fairEndDuty, the page that holds the
+ * game), in ONE transaction: the end order `fin` under the game's one key,
+ * when given (pages stop closing, the house commits and joins no more: the
+ * fold has no rule for it), and the ended checkpoint `end`, when given, under
+ * its own key, with the table's switch taken away where it names the game
+ * (a hint that names an ended game names nothing). Nothing of the game is
+ * deleted: its session and its other records are the compaction's (P6), and
+ * its `gone:` mark is no part of a game's end (S7).
+ *
+ * All of it or nothing: refused (false, nothing written) for a game this page
+ * does not track, on a doc that does not hold the table whole, for a `fin`
+ * that reads as none, and for an `end` that does not read as an ended
+ * checkpoint of this game (readCk). The signatures, and whether the signer
+ * holds the game, are the resolver's to check, here as on every page.
+ */
+export function writeFairOnlyEnd(tableId: string, inc: string, fin: FinRec | null, end: { key: string; value: CkRec } | null): boolean {
+  const map = computedMap;
+  if (!map || !computedIncs.get(`${tableId}:${inc}`)?.fo || !casinoWhole(tableId)) return false;
+  if (fin === null && end === null) return false;
+  if (fin !== null && asFin(fin) === null) return false;
+  if (end !== null) {
+    const read = readCk(boundRoomId, end.key, end.value);
+    if (read.kind !== 'ok' || read.t !== tableId || read.inc !== inc || read.ck.e !== 1) return false;
+  }
+  const casino = ensureMap();
+  boundDoc!.transact(() => {
+    if (fin !== null) map.set(finKey(tableId, inc), fin);
+    if (end !== null) {
+      map.set(end.key, end.value);
+      if (switchIncOf(tableId) === inc) casino.delete(`cfg:computed:${tableId}`);
+    }
+  });
+  return true;
+}
+
 /** 🔒 Whether table `tableId`'s switch names a FAIR ONLY game whose records
  *  this page is still checking (its resolution pending: a signature's check
  *  put off past a recount's budget, made by the slice that queues). Until the
@@ -4090,6 +4127,19 @@ export function delegationOf(pub: string): DelegationRec | null {
  *  as live (foLive), which a game whose check waits is not yet. */
 export function computedGamesHeldBy(tableId: string, pub: string): string[] {
   return [...(foLive.get(tableId)?.values() ?? [])].filter((g) => g.holder === pub).map((g) => g.inc).sort();
+}
+
+/** 🔒 The live FAIR ONLY games key `pub` holds over which an end order
+ *  stands (S5: a fin an owner-level key holding the game signed), by table and
+ *  name, sorted: the games whose holder's page writes the end once no round
+ *  is in flight, if their house has not (computedTable fairEndDuty). Read-only,
+ *  of the games this page counts as live. */
+export function computedGamesEnding(pub: string): { t: string; inc: string }[] {
+  const out: { t: string; inc: string }[] = [];
+  for (const [t, games] of foLive) {
+    for (const g of games.values()) if (g.holder === pub && computedIncs.get(`${t}:${g.inc}`)?.fo?.res?.fin) out.push({ t, inc: g.inc });
+  }
+  return out.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : a.inc < b.inc ? -1 : a.inc > b.inc ? 1 : 0));
 }
 
 /** 🏠 Write a delegation the deed holder's page signed (computedHouse). */

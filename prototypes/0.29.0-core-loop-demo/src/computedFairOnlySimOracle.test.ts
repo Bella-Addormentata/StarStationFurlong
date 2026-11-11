@@ -10,17 +10,21 @@
  * it. One its own cross-check catches is never signed. A page that writes
  * a checkpoint is a violation. And the oracle's own reading of a doc (its
  * cold fold, from its own base rule) is not moved by an old checkpoint laid
- * back in or by one the house did not sign, as the pages' is not.
+ * back in or by one the house did not sign, as the pages' is not. An end
+ * (PR 6c-5b-1) is held as a trim is: the house's with the wrong nets is
+ * named, as is one at its base's round that does not hold what the base
+ * held; and only the page that holds a game may sign one itself.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { sealCk } from './computedFairOnly';
+import { sealCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
 import { houseSign } from './computedHouse';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
+import { inFlight, pressEnd } from './computedFairOnlySimKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -187,6 +191,129 @@ describe('the checkpoint oracle and a sweep', () => {
     expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(swept.key);
     const problems = sim.gameProblems();
     expect(problems.some((p) => p.includes(swept.key) && /repeats no checkpoint the room held/.test(p)), problems.join('\n')).toBe(true);
+  }, TIMEOUT);
+});
+
+describe('the checkpoint oracle and an end', () => {
+  const T = 'roulette-1';
+
+  it("the house's end of a game with nets no honest page folded is counted from by the pages, and named", async () => {
+    const sim = await Sim.open({ name: 'fair-only-wrong-end', seed: seed(1221), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const node = sim.node!;
+    let faulted = 0;
+    node.faultTrim = (body) => {
+      const n = body.n as Record<string, string>;
+      const pid = Object.keys(n).sort()[0];
+      if (body.e !== 1 || pid === undefined) return body;
+      faulted += 1;
+      return { ...body, n: { ...n, [pid]: (BigInt(n[pid]) + 5n).toString() } };
+    };
+    const end = pressEnd(sim, T, 'roulette', 30_000, () => inFlight(sim, T), true);
+    while (sim.elapsed < RUN_MS && node.ends < 1) await sim.run(2_000);
+    await sim.run(4_000);
+    await sim.syncAll();
+    expect(end.said, sim.label).toEqual(['ending']);
+    expect([node.ends, faulted, node.crossCheckMismatches], sim.label).toEqual([1, 1, 0]);
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    sim.enter(A);
+    expect(A.p.casino.isComputedTable(T), sim.label).toBe(false);
+    const problems = sim.gameProblems();
+    expect(problems.some((p) => /holding .* the honest pages folded/.test(p)), problems.join('\n')).toBe(true);
+    expect(problems.some((p) => /did not sign|no end order/.test(p)), problems.join('\n')).toBe(false);
+  }, TIMEOUT);
+
+  it("an end at its base's round that the house's key signed, a thousand chips more to one player in it, is counted from by the pages, and named: it repeats no checkpoint", async () => {
+    const sim = await Sim.open({ name: 'fair-only-wrong-end-base', seed: seed(1223), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    while (sim.elapsed < RUN_MS && sim.node!.trims < 1) await sim.run(2_000);
+    sim.heal();
+    await sim.quiet(120_000);
+    sim.nodeUp = false;
+    await sim.syncAll();
+    expect(sim.gameProblems(), sim.label).toEqual([]);
+    sim.enter(B);
+    const inc = B.p.casino.computedIncOf(T)!;
+    const real = B.p.casino.computedResolutionOf(T, inc)!.base!.ck;
+    expect(real.u, sim.label).toBeGreaterThan(0);
+    const ctx = sim.ctxOf(T, inc);
+    const { house } = sim;
+    sim.enter(house);
+    const fin = sealFin(ctx, house.p.pub, house.p.keypair.signIdentity);
+    const { g: _g, s: _s, h: _h, w: _w, ...body } = real;
+    const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
+    const seal = (n: Record<string, string>) => sealCk(ctx, { ...body, b: B.p.fold.nextSid3(ctx, real), n, e: 1, f: fin.value }, (bytes) => houseSign(secret, bytes));
+    // (The same end holding what the base holds would be none: the control, below.)
+    const wrong = seal({ ...real.n, [B.pid]: (BigInt(real.n[B.pid] ?? '0') + 1000n).toString() });
+    B.cheats = true;
+    sim.enter(B);
+    B.p.doc.transact(() => {
+      B.p.doc.getMap<unknown>('casinoComputed').set(fin.key, fin.value);
+      B.p.doc.getMap<unknown>('casinoComputed').set(wrong.key, wrong.value);
+    });
+    await sim.run(2_000);
+    await sim.syncAll();
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(wrong.key);
+    const problems = sim.gameProblems();
+    expect(problems.some((p) => p.includes(wrong.key) && /a round no honest page folded decided on that close/.test(p)), problems.join('\n')).toBe(true);
+  }, TIMEOUT);
+
+  it("…and the same end holding what its base holds is named for nothing", async () => {
+    const sim = await Sim.open({ name: 'fair-only-right-end-base', seed: seed(1223), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    while (sim.elapsed < RUN_MS && sim.node!.trims < 1) await sim.run(2_000);
+    sim.heal();
+    await sim.quiet(120_000);
+    sim.nodeUp = false;
+    await sim.syncAll();
+    sim.enter(B);
+    const inc = B.p.casino.computedIncOf(T)!;
+    const real = B.p.casino.computedResolutionOf(T, inc)!.base!.ck;
+    const ctx = sim.ctxOf(T, inc);
+    const { house } = sim;
+    sim.enter(house);
+    const fin = sealFin(ctx, house.p.pub, house.p.keypair.signIdentity);
+    const { g: _g, s: _s, h: _h, w: _w, ...body } = real;
+    const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
+    const right = sealCk(ctx, { ...body, b: B.p.fold.nextSid3(ctx, real), e: 1, f: fin.value }, (bytes) => houseSign(secret, bytes));
+    B.cheats = true;
+    sim.enter(B);
+    B.p.doc.transact(() => {
+      B.p.doc.getMap<unknown>('casinoComputed').set(fin.key, fin.value);
+      B.p.doc.getMap<unknown>('casinoComputed').set(right.key, right.value);
+    });
+    await sim.run(2_000);
+    await sim.syncAll();
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(right.key);
+    expect(sim.gameProblems(), sim.label).toEqual([]);
+    expect(sim.basesCounted, sim.label).toBeGreaterThanOrEqual(2);
+  }, TIMEOUT);
+
+  it('a page that does not hold the game and signs an end of it writes a checkpoint no house signed: a violation, and no page counts from it', async () => {
+    const sim = await Sim.open({ name: 'fair-only-page-end', seed: seed(1225), pages: named('ABC'), houseNode: true, fairOnly: true });
+    await sim.run(20_000);
+    expect(sim.violations, sim.label).toEqual([]);
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    expect(B, sim.label).not.toBe(sim.house);
+    sim.enter(B);
+    const inc = B.p.casino.computedIncOf(T)!;
+    const real = B.p.casino.computedResolutionOf(T, inc)!.base!.ck;
+    const ctx = sim.ctxOf(T, inc);
+    const fin = sealFin(ctx, B.p.pub, B.p.keypair.signIdentity);
+    const { g: _g, s: _s, h: _h, w: _w, dl: _dl, ...body } = real;
+    const end = sealCk(ctx, { ...body, b: B.p.fold.nextSid3(ctx, real), e: 1, f: fin.value, k: B.p.pub }, B.p.keypair.signIdentity);
+    B.p.doc.transact(() => B.p.doc.getMap<unknown>('casinoComputed').set(end.key, end.value));
+    await sim.run(2_000);
+    await sim.syncAll();
+    expect(sim.violations.filter((v) => v.includes(`B wrote the checkpoint ${end.key} `) && /which no house signed/.test(v)), sim.violations.join('\n')).toHaveLength(1);
+    for (const sp of sim.pages) {
+      sim.enter(sp);
+      expect(sp.p.casino.computedResolutionOf(T, inc)?.base?.key, `${sim.label} ${sp.name}`).not.toBe(end.key);
+      expect(sp.p.casino.isComputedTable(T), `${sim.label} ${sp.name}`).toBe(true);
+    }
   }, TIMEOUT);
 });
 
