@@ -5543,11 +5543,15 @@ function fairQuiet(res: FoldResult): boolean {
  *  (the closer's) or themselves out of its count (another's): ended then,
  *  the bet would be theirs again and the winners unpaid. The pages that
  *  showed the round put the slip back in their turns, within seconds. A page
- *  that never looked at the game holds nothing back but a slip the fold
- *  itself reads missing. */
+ *  that never looked at the game notes what the fold reads missing from its
+ *  first look here, and waits as long. */
 function fairSound(t: string, inc: string, res: FoldResult, now: number): boolean {
-  const st = fairTables.get(`${t}:${inc}`);
-  if (!st) return res.rounds.every((v) => !v.decided || v.missing.length === 0);
+  // (A game this page holds and has not served since it loaded, the table
+  // playing another: its state begins here, so the waits below run out, and
+  // goes with the game as any state does.)
+  const key = `${t}:${inc}`;
+  let st = fairTables.get(key);
+  if (!st) fairTables.set(key, st = newTable(t, inc));
   if (!forgedStands(st)) noteChain(st, now);
   noteMissing(st, now);
   if (witnessLost(st, res, now).size > 0) return false;

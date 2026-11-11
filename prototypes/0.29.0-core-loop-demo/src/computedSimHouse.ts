@@ -595,6 +595,12 @@ export class SimHouse {
       if (!read) continue;
       this.tableDuties(mem, read, res.fin !== null, now, writes, out);
       if (now - mem.tables.get(`${t}|${inc}`)!.firstRead >= SETTLE_MS) settled += 1;
+      // 🔒 No checkpoint from a doc that holds part of an update (Yjs parks
+      // what came out of order): a close, or a frozen slip a page is putting
+      // back, may be in the part to come, and a trim, a sweep or an end
+      // deletes the session it would land in. As a page's own trim waits for
+      // its doc to be whole.
+      if (partial) continue;
       if (res.fin === null) this.trimDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, now, writes);
       else this.endDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, res.fin, now, writes);
     }
@@ -1017,10 +1023,14 @@ export class SimHouse {
     mem.lastFold = now;
     const res = this.foldOf(doc, room, g);
     mem.kept = res.keptBytes;
-    if (res.pending || res.tip) return;
+    if (res.pending) return;
+    // (Noted at every checked fold, a close of the open round in or not: a
+    // wait that began for one loss must not stand in for the next.)
+    const short = this.readsShort(g, res, mem, now);
+    if (res.tip) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
-    if (this.readsShort(g, res, mem, now)) return;
+    if (short) return;
     if (!D || D.r <= B.u) {
       this.sweepDuty(doc, g, read, res, mem, now, writes);
       return;
@@ -1138,10 +1148,13 @@ export class SimHouse {
     mem.lastFold = now;
     const res = this.foldOf(doc, room, g);
     mem.kept = res.keptBytes;
-    if (res.pending || res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
+    if (res.pending) return;
+    // (Noted at every checked fold, as trimDuty notes it.)
+    const short = this.readsShort(g, res, mem, now);
+    if (res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
-    if (this.readsShort(g, res, mem, now)) return;
+    if (short) return;
     const past = D !== undefined && D.r > B.u ? D : null;
     const done = this.lastOf(ctx);
     let own: Kept | undefined;

@@ -1004,6 +1004,73 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
     }
   });
 
+  for (const ending of [false, true]) {
+    it(`a wait that began for one loss does not stand in for the next${ending ? ', at a game ending' : ''}: the slip back with a close of the next round in, then both gone again half a minute on, the session is not ${ending ? 'ended' : 'swept'} for MISSING_WAIT_MS more`, () => {
+      const room = new GameRoom().start();
+      const r1 = room.played(1, SID);
+      room.doc.transact(() => room.ses().delete(r1.a.key));
+      room.run(2_000, 1_000);
+      // Back, and round 2 closed on the commitment the reveal carried: a close in, nothing swept or ended.
+      room.put(r1.a);
+      const r2 = room.closed(2, r1.c.hash);
+      if (ending) order(room);
+      expect(room.fold().tip).toMatchObject({ r: 2 });
+      room.tick(1_000);
+      // Both gone before its next look, 29 s on: the first wait would have run out.
+      room.doc.transact(() => {
+        for (const k of [r2.c.key, r2.a.key, r2.b.key, r1.a.key]) room.ses().delete(k);
+      });
+      if (!ending) room.junk(HOUSE_SWEEP_BYTES);
+      expect(room.fold()).toMatchObject({ tip: null, openCloses: [{ state: 'invalid' }] });
+      expect(room.fold().rounds.filter((v) => v.decided)).toEqual([]);
+      room.tick(29_000);
+      room.run(27_000, 1_000);
+      expect(room.house.sweeps + room.house.trims + room.house.ends).toBe(0);
+      expect(room.cks().map((x) => x.key)).toEqual([ROOT.key]);
+      room.run(5_000, 1_000);
+      expect({ sweeps: room.house.sweeps, ends: room.house.ends }).toEqual(ending ? { sweeps: 0, ends: 1 } : { sweeps: 1, ends: 0 });
+    });
+  }
+
+  it('no checkpoint from a doc that holds part of an update: no trim, no sweep and no end until the rest is in', () => {
+    // (The second of two updates alone: the doc parks it until the first comes.)
+    const park = (room: GameRoom): (() => void) => {
+      const other = new Y.Doc();
+      const ups: Uint8Array[] = [];
+      other.on('update', (u: Uint8Array) => ups.push(u));
+      other.transact(() => other.getMap('scratch').set('a', 1));
+      other.transact(() => other.getMap('scratch').set('b', 2));
+      Y.applyUpdate(room.doc, ups[1]);
+      return () => Y.applyUpdate(room.doc, ups[0]);
+    };
+    // An end.
+    const { room } = lastRound();
+    const rest = park(room);
+    room.run(HOUSE_TRIM_AFTER_MS + 10_000, 1_000);
+    expect(room.house.ends).toBe(0);
+    rest();
+    room.run(2_000, 1_000);
+    expect(room.house.ends).toBe(1);
+    // A trim (a session idle for HOUSE_IDLE_MS).
+    const idle = new GameRoom().start();
+    idle.played(1, SID);
+    const restIdle = park(idle);
+    idle.run(HOUSE_IDLE_MS + 10_000, 1_000);
+    expect(idle.house.trims).toBe(0);
+    restIdle();
+    idle.run(2_000, 1_000);
+    expect(idle.house.trims).toBe(1);
+    // A sweep.
+    const junked = new GameRoom().start();
+    const restJunk = park(junked);
+    junked.junk(HOUSE_SWEEP_BYTES);
+    junked.run(HOUSE_SWEEP_MIN_MS + 5_000, 1_000);
+    expect(junked.house.sweeps).toBe(0);
+    restJunk();
+    junked.run(2_000, 1_000);
+    expect(junked.house.sweeps).toBe(1);
+  });
+
   it("the closer deletes the frozen slip its last reveal counted (another bettor's is a slip missing, waited for as a trim waits): the game is not ended at the base's round, without the round, for MISSING_WAIT_MS; the slip back, the end counts the round", () => {
     const { room, r1 } = lastRound();
     room.doc.transact(() => room.ses().delete(r1.a.key));

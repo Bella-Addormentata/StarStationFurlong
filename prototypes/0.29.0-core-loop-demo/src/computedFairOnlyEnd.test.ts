@@ -469,6 +469,30 @@ describe("the end order standing, the round decided: the holder's wait", () => {
     });
   }
 
+  it("the holder's page loaded again, the game not served since: a press notes the missing slip from its first look and ends MISSING_WAIT_MS on, not never", async () => {
+    const { pages, inc, kit, at, close, closeHash } = await endingRoom(true);
+    const [a, b] = pages;
+    house(b, kit.houseReveal(H, 1, [closeHash], frozenOf(close), { c: null }));
+    sync(at, ...pages);
+    const closer = pages.find((p) => p.pub === close.k)!;
+    const cheat = pages.slice(1).find((p) => p !== closer)!;
+    const slip = keysIn(a, 's', 1).find((k) => k.startsWith(`s:1:${cheat.pid}:`) && frozenOf(close).includes(hashIn(k)))!;
+    expect(slip).toBeDefined();
+    a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(slip));
+    // The holder's device loads the page again: its key, the room's doc, and no state of the game.
+    const again = await loadPage('A', 9, { reloadOf: a });
+    sync(at, a, again);
+    expect(again.casino.computedFoldOf(TABLE, inc)!.rounds.find((x) => x.r === 1)).toMatchObject({ decided: 'house', missing: [cheat.pid] });
+    const MISSING = again.table.MISSING_WAIT_MS;
+    // (Presses only, no frame of the table: nothing else has looked at the game on this load.)
+    const said: string[] = [];
+    for (let T = at + STEP; T < at + MISSING; T += STEP) said.push(off(again, T));
+    expect(new Set(said)).toEqual(new Set(['ending']));
+    expect(endOf(again, inc)).toBeUndefined();
+    expect(off(again, at + STEP + MISSING)).toBe('ok');
+    expect(endOf(again, inc)).toMatchObject({ e: 1, u: 1 });
+  });
+
   it("a close of the next round that names the house's standing commitment, in from a page that had not heard the end order, starts the wait again; voided, the end follows", async () => {
     const { pages, inc, kit, at, close, closeHash } = await endingRoom();
     const [a, b] = pages;
