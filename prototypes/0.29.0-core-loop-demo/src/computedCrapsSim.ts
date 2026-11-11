@@ -50,6 +50,7 @@ import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { CHIP_DENOMS } from './chipDisplay';
+import { NO_CLOSE } from './computedFairOnly';
 import { canon, gameOfInc, houseCommitOf, parseKey, seedTable, slipCommit } from './computedFold';
 import type { CloseRec, CrapsSlipRec, FoldCtx, FoldResult, RoundView } from './computedFold';
 import type { ComputedCrapsState, ComputedSlipWrite } from './computedTable';
@@ -1652,6 +1653,13 @@ export class CrapsHarness {
   checkEnded(sp: SimPage, ctx: FoldCtx, res: FoldResult): void {
     if (!res.base.ended || res.base.l === null || this.walked.has(res)) return;
     this.walked.add(res);
+    // (Ended before any roll was decided, as the opening of a FAIR ONLY game
+    // over a fresh house table ends it: its final checkpoint names no close,
+    // and hands on no chips.)
+    if (res.base.l === NO_CLOSE) {
+      if (res.base.n.size > 0) this.sim.violate(`${sp.name} ${ctx.t} at ${this.sim.elapsed} ms: the final checkpoint ${res.base.sid} names no close and nets ${netsText(res.base.n)}`);
+      return;
+    }
     const at = this.expectNetsAt.get(res.base.l);
     const mine = netsText(res.base.n);
     if (at && !at.has(mine)) this.sim.violate(`${sp.name} ${ctx.t} at ${this.sim.elapsed} ms: the final checkpoint ${res.base.sid} nets ${mine}, the checker handed on ${[...at].join(' or ')} at ${res.base.l}`);
