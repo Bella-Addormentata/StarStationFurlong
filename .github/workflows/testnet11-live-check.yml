@@ -1,8 +1,15 @@
 name: "🧪 testnet11 live check (probe branch, never to merge)"
 
 # Contact between the node's own Chia peer lane and real full nodes, on
-# GitHub's machines. READS ONLY: no wallet coin exists on these machines,
-# burner keys stay off, and nothing is spent.
+# GitHub's machines. Steps 1 to 3 only read: no wallet coin exists on these
+# machines and burner keys stay off in them.
+#
+# Steps 4 and 5 (testnet11 alone, since 2026-11-11) turn burner keys on. They
+# WRITE to testnet11 when, and only when, the welcome room's faucet dish holds
+# a ready coin: each claims one mojo from the dish and writes one record. With
+# an empty dish they read the dish and write nothing. The owner was told on
+# 2026-11-11 that writes follow once he funds the dish. Mainnet stays reads
+# only: no wallet file is made there and the real binary is never started.
 #
 # Two networks: testnet11 (all three steps below) and mainnet (step 1 alone:
 # the lane asked directly in a chia-mainnet test build, with no wallet file
@@ -18,6 +25,14 @@ name: "🧪 testnet11 live check (probe branch, never to merge)"
 #      restart (the stored peers should come before the introducer).
 #   3. The real binary with the SSF wallet on (SSF_CHIA_LANE=1): a new, empty
 #      wallet, so the publisher reads and can write nothing.
+#   4. Linux alone: the claim-and-write self-test on the burner path
+#      (SSF_CHIA_BURNERS=1 SSF_CHIA_CLAIM_WRITE_TEST=1, the listing held off
+#      with SSF_CHIA_FINDABLE=0): a burner claims one dish mojo and writes 64
+#      random bytes in the same bundle, waits for the chain's verdict and reads
+#      the record back.
+#   5. The real binary on the burner path (SSF_CHIA_BURNERS=1): the
+#      publisher's own Phone Book listing, funded by the dish, then the
+#      watcher's read of it.
 #
 # Logs are printed with every address and every 64-digit hex cut short.
 
@@ -40,7 +55,7 @@ jobs:
   live-check:
     name: ${{ matrix.net }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -130,16 +145,47 @@ jobs:
           PID=$!; sleep 300; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
           echo "files after the run (names only):"; ls
 
+      - name: "4. The claim-and-write self-test on the burner path (Linux; writes only if the dish holds a ready coin)"
+        if: always() && matrix.net == 'testnet11' && runner.os == 'Linux'
+        timeout-minutes: 12
+        env:
+          SSF_CHIA_LANE: "1"
+          SSF_CHIA_BURNERS: "1"
+          SSF_CHIA_CLAIM_WRITE_TEST: "1"
+          SSF_CHIA_FINDABLE: "0"
+          SSF_CHIA_BEAT_BLOCKS: "2"
+        run: |
+          BIN="$PWD/$NODE_DIR/target/debug/ssf-p2p-node"
+          mkdir -p run-claimwrite && cd run-claimwrite
+          "$BIN" > ../node-claimwrite.log 2>&1 &
+          PID=$!; sleep 540; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
+          echo "files after the run (names only):"; ls
+
+      - name: "5. The real binary on the burner path: its own listing, funded by the dish (writes only if the dish holds a ready coin)"
+        if: always() && matrix.net == 'testnet11'
+        timeout-minutes: 20
+        env:
+          SSF_CHIA_LANE: "1"
+          SSF_CHIA_BURNERS: "1"
+          SSF_CHIA_BEAT_BLOCKS: "2"
+        run: |
+          BIN="$PWD/$NODE_DIR/target/debug/ssf-p2p-node"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          mkdir -p run-burner && cd run-burner
+          "$BIN" > ../node-burner.log 2>&1 &
+          PID=$!; sleep 960; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
+          echo "files after the run (names only):"; ls
+
       - name: The logs, with addresses and long hex cut short
         if: always()
         run: |
           cut_short() { sed -E 's/t?xch1[a-z0-9]{20,}/<address>/g; s/([0-9a-fA-F]{8})[0-9a-fA-F]{56,}/\1…/g'; }
-          for f in node-default-1.log node-default-2.log node-wallet.log; do
+          for f in node-default-1.log node-default-2.log node-wallet.log node-claimwrite.log node-burner.log; do
             echo "=================== $f ($(wc -l < "$f" 2>/dev/null || echo 0) lines) ==================="
             if [ -f "$f" ]; then cut_short < "$f" | head -400; fi
           done
           mkdir -p logs-out
-          for f in probe.log node-default-1.log node-default-2.log node-wallet.log; do
+          for f in probe.log node-default-1.log node-default-2.log node-wallet.log node-claimwrite.log node-burner.log; do
             if [ -f "$f" ]; then cut_short < "$f" > "logs-out/$f"; fi
           done
 
@@ -162,4 +208,9 @@ jobs:
         if: always()
         run: |
           grep -E "PROBE .*(VERDICT|ANSWERED|GAVE UP|lobby dish \(|beacons|watch:)" probe.log || true
+          echo "--- the write legs ---"
+          cut_short() { sed -E 's/t?xch1[a-z0-9]{20,}/<address>/g; s/([0-9a-fA-F]{8})[0-9a-fA-F]{56,}/\1…/g'; }
+          for f in node-claimwrite.log node-burner.log; do
+            if [ -f "$f" ]; then echo "$f:"; grep -E "claim-write selftest|ChiaHub burners|published for era|own presence confirmed|no mojo|lobby dish|waits its turn|never landed|FAIL|PASS" "$f" | cut_short | head -40 || true; fi
+          done
           [ "${{ steps.probe.outcome }}" = "success" ]
