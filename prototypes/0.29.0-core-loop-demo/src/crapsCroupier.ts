@@ -35,7 +35,7 @@
  */
 
 import {
-  closeWhenWhole, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, dropBareSwitch, RECONNECTING_NOTICE, refundAndClear,
+  closeWhenWhole, closingLocally, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, dropBareSwitch, RECONNECTING_NOTICE, refundAndClear,
   sweepLegacyRound, TABLE_CLOCK_SLACK_MS, tablesAwake, tablesWakeCount, timerOnThisClock,
 } from './croupier';
 import { FURNITURE_DEFS } from './furniture';
@@ -600,7 +600,10 @@ export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'
   // One transaction: no page sees the refunds without the table gone. (On a
   // doc holding every update whole: croupier.closeWhenWhole. What closes is a
   // craps table: clearTableKeys `closes`.)
-  closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));
+  closeWhenWhole(tableId, 'craps', () => transactCasino(() => {
+    closingLocally(tableId, 'craps', closing);
+    refundAndClear(tableId, closing, { closes: 'craps' });
+  }));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────

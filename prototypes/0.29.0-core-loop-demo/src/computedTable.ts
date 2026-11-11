@@ -246,7 +246,8 @@ import type { CkRec, FinRec } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
 import {
-  BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
+  BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, setLocalClosing,
+  SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
 } from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
@@ -5686,6 +5687,27 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
   });
   return !done ? 'reconnecting' : end ? 'ok' : 'ending';
 }
+
+/**
+ * 🔒 The page that holds a FAIR ONLY game of `game` at table `t` takes the
+ * table out of the room (design §8.6, B14.3): the game ends with its table,
+ * as a press of the switch ends it (switchFairOnlyOff, a second press: bets
+ * that ride a craps point go back with the end), in the removal's own
+ * transaction (croupier closeTable and crapsCroupier closeCrapsTable call it
+ * first, through croupier's localClosing). Quiet, the end order and the ended
+ * checkpoint; with a round in flight the end order alone, and the end follows
+ * (the house's, or fairEndDuty's). Either way the order stands as the table
+ * goes, so no page puts the table back (casinoDoc fairOnlyTableOut).
+ *
+ * Only that page's removal: a page that holds no game at the table writes
+ * nothing here, and the pages put the table back (P5). So too where the press
+ * is refused ('asleep', 'reconnecting'): the table goes from this page's room
+ * and comes back with the game still on.
+ */
+export function endFairOnlyAtRemoval(t: string, game: GameName, now = Date.now()): FairOnlyOffResult {
+  return switchFairOnlyOff(t, game, now, true);
+}
+setLocalClosing((t, game) => { endFairOnlyAtRemoval(t, game); });
 
 /** By `<tableId>:<inc>`: when this page first saw the game quiet under an end
  *  order, on its clock (fairEndDuty). */

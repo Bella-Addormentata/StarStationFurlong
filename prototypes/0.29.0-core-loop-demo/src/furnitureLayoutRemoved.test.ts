@@ -217,8 +217,13 @@ describe("World's removal of a table", () => {
     expect(body.indexOf('} else if (removedKind === "craps-table") {\n      closeCrapsTable(itemId, closing);')).toBeGreaterThan(-1);
     const croupier = readFileSync(new URL('./croupier.ts', import.meta.url), 'utf8');
     const craps = readFileSync(new URL('./crapsCroupier.ts', import.meta.url), 'utf8');
-    expect(croupier).toContain("closeWhenWhole(tableId, 'roulette', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));");
-    expect(craps).toContain("closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));");
+    // (and each, first and in the same transaction, lets the page that holds a FAIR ONLY game there end it when the
+    // removal is its own: computedTable endFairOnlyAtRemoval through croupier's localClosing, design §8.6)
+    expect(croupier).toContain("closeWhenWhole(tableId, 'roulette', () => transactCasino(() => {\n    closingLocally(tableId, 'roulette', closing);\n    refundAndClear(tableId, closing, { closes: 'roulette' });\n  }));");
+    expect(craps).toContain("closeWhenWhole(tableId, 'craps', () => transactCasino(() => {\n    closingLocally(tableId, 'craps', closing);\n    refundAndClear(tableId, closing, { closes: 'craps' });\n  }));");
+    expect(croupier).toContain("if (closing === 'local') localClosing?.(tableId, game);");
+    const computed = readFileSync(new URL('./computedTable.ts', import.meta.url), 'utf8');
+    expect(computed).toContain('setLocalClosing((t, game) => { endFairOnlyAtRemoval(t, game); });');
     expect(croupier).toContain('clearTableKeys(tableId, closing, opts);');
     // (EditMode.removeSelected: the visuals and the table's session first, the layout's record after)
     const edit = readFileSync(new URL('./editMode.ts', import.meta.url), 'utf8');

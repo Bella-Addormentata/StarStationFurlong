@@ -772,7 +772,28 @@ export function timerOnThisClock(
 export function closeTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone. (What
   // closes is a roulette table: clearTableKeys `closes`.)
-  closeWhenWhole(tableId, 'roulette', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));
+  closeWhenWhole(tableId, 'roulette', () => transactCasino(() => {
+    closingLocally(tableId, 'roulette', closing);
+    refundAndClear(tableId, closing, { closes: 'roulette' });
+  }));
+}
+
+/** 🔒 What this page does first, in the removal's own transaction, when it
+ *  takes a table of `game` out of the room itself (`local`): computedTable
+ *  ends the FAIR ONLY game it holds there (endFairOnlyAtRemoval, design §8.6:
+ *  only the page that holds a game takes its table out for good; anyone
+ *  else's removal the pages undo). Set by computedTable as it loads (it
+ *  imports this module, so the call can't be made the other way round). */
+let localClosing: ((tableId: string, game: GameName) => void) | null = null;
+export function setLocalClosing(fn: ((tableId: string, game: GameName) => void) | null): void {
+  localClosing = fn;
+}
+
+/** A table's removal as it starts, inside its transaction (closeTable,
+ *  crapsCroupier closeCrapsTable): localClosing, when this page removes the
+ *  table itself. */
+export function closingLocally(tableId: string, game: GameName, closing: TableClosing): void {
+  if (closing === 'local') localClosing?.(tableId, game);
 }
 
 /** 📒 A table's removal, on a doc holding every update whole (casinoWhole):
