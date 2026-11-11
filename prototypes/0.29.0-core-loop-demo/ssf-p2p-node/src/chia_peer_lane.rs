@@ -38,8 +38,9 @@
 //!     nothing queued that the next dial could try (a queue the full pool
 //!     holds no pair for counts as nothing), or a money request without a
 //!     pin that has no fresh peer yet; at most every [`INTRODUCE_EVERY`],
-//!     sooner only after a
-//!     lookup that named nobody; a stored or gossiped peer it names this run
+//!     sooner only after a lookup that named nobody, or, every
+//!     [`INTRODUCE_WANTING`], for a money request without a pin while no
+//!     fresh peer is connected; a stored or gossiped peer it names this run
 //!     counts as fresh from then on, up to the per-source cap below and never
 //!     the last stored or gossiped peer the lane knows while another fresh
 //!     peer is at hand, so a second source stays to pair with),
@@ -229,6 +230,14 @@ pub const INTRODUCE_EVERY: Duration = Duration::from_secs(1800);
 /// How soon it is asked again after a lookup that named nobody (DNS down, the
 /// machine offline): a first run has nothing else to try.
 pub const INTRODUCE_RETRY: Duration = Duration::from_secs(60);
+/// How soon it is asked again by a money request without a pin that still has
+/// no fresh peer connected. Only the introducer can supply one, each answer is
+/// another handful of its addresses, and on a thin network most of a handful
+/// take no connection: at [`INTRODUCE_EVERY`] a node whose one introducer peer
+/// had gone stood four stored and gossiped peers strong and answered no chain
+/// read for 83 minutes, until the third answer happened to name two of the
+/// peers it was connected to (two-computer drill, 2026-11-11).
+pub const INTRODUCE_WANTING: Duration = Duration::from_secs(300);
 /// How long a connection whose gossip request failed waits before it is asked
 /// again (a request that failed says nothing about the peer's address book).
 pub const GOSSIP_RETRY: Duration = Duration::from_secs(60);
@@ -403,6 +412,10 @@ struct LaneState {
     cooling: HashMap<SocketAddr, Instant>,
     /// When the introducer may be asked again (`None`: now).
     introduce_after: Option<Instant>,
+    /// When a money request without a pin that has no fresh peer connected
+    /// may ask it again, ahead of `introduce_after` ([`INTRODUCE_WANTING`]
+    /// after an answer that named somebody; `None`: not ahead of it).
+    introduce_sooner: Option<Instant>,
     /// When the pins may be dialled again after failing (`None`: now).
     pin_retry_after: Option<Instant>,
     /// What the last pin dial learnt: how many pin connections the pins can
@@ -1198,7 +1211,8 @@ impl Lane {
     /// dial, or a money request without a pin that has no fresh peer yet,
     /// which the store and gossip can never supply) and it is due (its last
     /// answer used up and [`INTRODUCE_EVERY`] passed, or [`INTRODUCE_RETRY`]
-    /// after an answer that named nobody); and gossip from every connection
+    /// after an answer that named nobody, or [`INTRODUCE_WANTING`] for that
+    /// money request while no fresh peer is connected); and gossip from every connection
     /// not yet asked, from one whose request failed once [`GOSSIP_RETRY`] has
     /// passed, and from one that answered once nothing queued is left to dial
     /// and [`GOSSIP_AGAIN`] has passed ([`gossip_take`] says what an answer
@@ -1251,7 +1265,11 @@ impl Lane {
             let need_fresh = trust == Trust::Agreed && self.pins.is_empty() && !state.conns.iter().any(|c| c.source().is_fresh());
             // No veto for introducer candidates still queued: those are cooling
             // after failed dials, and only the deadline and the need decide.
-            let introduce = !self.net.introducers.is_empty() && state.introduce_after.is_none_or(|at| now >= at) && (need_fresh || !ready);
+            // Due at its interval, or sooner for a request that needs a fresh
+            // peer and has none connected: nothing queued, stored or gossiped
+            // can supply that one, however much of it there is to try.
+            let due = state.introduce_after.is_none_or(|at| now >= at) || (need_fresh && state.introduce_sooner.is_some_and(|at| now >= at));
+            let introduce = !self.net.introducers.is_empty() && due && (need_fresh || !ready);
             // A connection is asked for gossip when it never was; again once
             // a failed request's wait has passed; and again after an answer,
             // once nothing queued is left to dial and [`GOSSIP_AGAIN`] has
@@ -1330,7 +1348,9 @@ impl Lane {
         }
         if let Some(found) = found {
             let n = found.len();
-            state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
+            let now = Instant::now();
+            state.introduce_after = Some(now + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
+            state.introduce_sooner = (n > 0).then(|| now + INTRODUCE_WANTING);
             push_candidates(state, found.into_iter().map(|addr| Candidate::new(addr, Source::Introducer)).collect());
             eprintln!("⛓️ chain peers: the introducer named {n} full nodes");
         }
@@ -2503,10 +2523,13 @@ fn gossip_take(named: Vec<(SocketAddr, u64)>, held: &HashSet<SocketAddr>, now: u
 /// in full would both turn introducer, one source, with no pair to be made
 /// until gossip adds another), so a second source stays to pair with. A full
 /// queue admits a newcomer in place of the queued address that has failed the
-/// most dials, so dead addresses cannot shut fresh ones out; a queue full of
+/// most dials, so dead addresses cannot shut new ones out; a queue full of
 /// addresses that never failed admits a newcomer of a source and network group
-/// it holds none of, in place of one it holds twice over ([`displaceable`]),
-/// and otherwise keeps what it has. Whatever named it, an
+/// it holds none of, in place of one it holds twice over, and otherwise keeps
+/// what it has; except that of the two sorts a pair needs (an address the
+/// introducer names, a stored or gossiped one), a newcomer of the sort the
+/// queue holds fewer of always finds a place among the other, and never loses
+/// one to it ([`displaceable`]). Whatever named it, an
 /// address off the public internet (loopback, LAN, link-local, carrier-grade
 /// NAT: [`public`]) is set aside, never queued; only a pin may name one.
 fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
@@ -2570,28 +2593,57 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
 }
 
 /// Which queued address a newcomer may take the place of when the queue is
-/// full: the one that has failed the most dials, if any has failed; else,
-/// when the newcomer brings a source and network group the queue holds none
-/// of, the last queued address of a source and group the queue holds twice or
-/// more. A queue full of untried addresses all in one network group would
-/// otherwise shut out the one candidate from elsewhere that could complete a
-/// pair for as long as none of them is dialled (a full pool that cannot pair,
-/// and cannot swap any of them in, never dials them), and money requests would
-/// stay unanswered with a usable peer in hand. `None`: the queue keeps what it
-/// has.
+/// full. A pair needs a fresh peer (one the introducer named this run) and a
+/// stored or gossiped one, so the queue must not lose either sort to the
+/// other: a newcomer of the sort the queue holds FEWER of always finds a
+/// place among the other sort, and never the other way round. Among its own
+/// sort a newcomer is judged as an equal (below).
+///
+/// Judged all alike, the two sorts starved each other. A full pool of stored
+/// and gossiped peers dials nothing but a candidate that would complete a
+/// pair ([`Lane::dial`]), so the untried gossip it keeps collecting is never
+/// taken out of the queue by a dial: that gossip pushed out the introducer's
+/// addresses cooling after a failed dial (the most failed go first), and a
+/// queue it had filled with addresses of all different kinds refused whatever
+/// the introducer named next. A node stood so for 83 minutes, four peers
+/// connected and no chain read answered: the introducer named six addresses
+/// twice in that time and not one was dialled (two-computer drill,
+/// 2026-11-11). The mirror case is a queue of nothing but the introducer's
+/// addresses, none of which can pair with a pool in their own network group:
+/// the gossiped address from elsewhere that could must get in too.
+///
+/// Among the places a newcomer may take: the one that has failed the most
+/// dials, if any has failed, so dead addresses cannot shut new ones out; else
+/// the last queued address of a source and network group the queue holds
+/// twice or more. A newcomer of the scarcer sort with neither takes the last
+/// address of the other sort. An equal gets that redundant place only when it
+/// brings a source and network group the queue holds none of: a queue full of
+/// untried addresses all in one network group would otherwise shut out the
+/// one candidate from elsewhere that could complete a pair for as long as
+/// none of them is dialled, and money requests would stay unanswered with a
+/// usable peer in hand. `None`: the queue keeps what it has.
 fn displaceable(queue: &VecDeque<Candidate>, cand: &Candidate) -> Option<usize> {
-    if let Some(worst) = queue.iter().map(|c| c.failures).max().filter(|f| *f > 0) {
-        return queue.iter().position(|c| c.failures == worst);
+    let fresh = cand.source().is_fresh();
+    let alike = queue.iter().filter(|c| c.source().is_fresh() == fresh).count();
+    // The newcomer's sort is the scarcer one: its places are the other sort's.
+    let scarce = alike < queue.len() - alike;
+    let open = |c: &Candidate| (c.source().is_fresh() == fresh) != scarce;
+    if let Some(worst) = queue.iter().filter(|c| open(c)).map(|c| c.failures).max().filter(|f| *f > 0) {
+        return queue.iter().position(|c| open(c) && c.failures == worst);
     }
     let kind = |c: &Candidate| (c.source(), group_of(c.addr));
-    if queue.iter().any(|c| kind(c) == kind(cand)) {
-        return None;
-    }
     let mut held: HashMap<(Source, Group), usize> = HashMap::new();
     for c in queue {
         *held.entry(kind(c)).or_default() += 1;
     }
-    queue.iter().rposition(|c| held[&kind(c)] > 1)
+    let redundant = queue.iter().rposition(|c| open(c) && held[&kind(c)] > 1);
+    if scarce {
+        return redundant.or_else(|| queue.iter().rposition(|c| open(c)));
+    }
+    if queue.iter().any(|c| kind(c) == kind(cand)) {
+        return None;
+    }
+    redundant
 }
 
 /// Is a discovered address one the lane may dial? Only a public,
@@ -6656,6 +6708,200 @@ mod tests {
             assert!(state.candidates.iter().any(|c| c.addr == live.addr), "the newcomer took a failed address's place");
         }
         assert_eq!(PeerLane::new(crowded.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+    }
+
+    /// A loopback address nothing listens on, one network group each
+    /// (loopback groups by port): the untried gossip a thin network fills the
+    /// queue with.
+    fn untried(n: usize) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 20_000 + n as u16))
+    }
+
+    #[test]
+    fn a_full_queue_always_has_a_place_for_an_address_the_introducer_names() {
+        // 256 untried gossiped addresses of 256 network groups: nothing has
+        // failed and no kind is held twice, so the queue keeps what it has
+        // against one more gossiped address. The introducer's address gets
+        // in all the same, and so does the next one, of the same network
+        // group as the first.
+        let mut state = LaneState::default();
+        for n in 0..CANDIDATE_CAP {
+            state.candidates.push_back(Candidate::new(untried(n), Source::Gossip));
+        }
+        let more = untried(CANDIDATE_CAP);
+        push_candidates(&mut state, vec![Candidate::new(more, Source::Gossip)]);
+        assert!(!state.candidates.iter().any(|c| c.addr == more), "gossip from one more group finds no place: nothing queued is redundant");
+        let named = SocketAddr::from(([127, 0, 0, 1], 30_000));
+        let twin = SocketAddr::from(([127, 0, 0, 2], 30_000));
+        assert_eq!(group_of(named), group_of(twin));
+        push_candidates(&mut state, vec![Candidate::new(named, Source::Introducer), Candidate::new(twin, Source::Introducer)]);
+        assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
+        assert!(state.candidates.iter().any(|c| c.addr == named) && state.candidates.iter().any(|c| c.addr == twin), "both of the introducer's addresses are queued");
+        assert_eq!(state.candidates.iter().filter(|c| c.source() == Source::Gossip).count(), CANDIDATE_CAP - 2, "each in place of a gossiped one");
+        assert!(state.candidates.iter().any(|c| c.addr == untried(0)), "the last gossiped addresses made room, not the first");
+    }
+
+    #[test]
+    fn gossip_never_takes_the_place_of_an_address_the_introducer_named() {
+        // The introducer's address failed a dial and cools in a full queue.
+        // Untried gossip keeps arriving: it may take the place of gossip that
+        // failed, or of redundant gossip, never of the one address that could
+        // complete a pair.
+        let mut state = LaneState::default();
+        let named = SocketAddr::from(([127, 0, 0, 1], 30_000));
+        state.candidates.push_back(Candidate { failures: 2, ..Candidate::new(named, Source::Introducer) });
+        for n in 1..CANDIDATE_CAP {
+            state.candidates.push_back(Candidate::new(untried(n), Source::Gossip));
+        }
+        let first = untried(CANDIDATE_CAP);
+        push_candidates(&mut state, vec![Candidate::new(first, Source::Gossip)]);
+        assert!(state.candidates.iter().any(|c| c.addr == named), "the failed introducer address keeps its place");
+        assert!(!state.candidates.iter().any(|c| c.addr == first), "and with no gossip failed or redundant, the newcomer finds none");
+        state.candidates.iter_mut().find(|c| c.addr == untried(7)).unwrap().failures = 1;
+        push_candidates(&mut state, vec![Candidate::new(first, Source::Gossip)]);
+        assert!(state.candidates.iter().any(|c| c.addr == first) && !state.candidates.iter().any(|c| c.addr == untried(7)), "failed gossip makes room for it");
+        assert!(state.candidates.iter().any(|c| c.addr == named), "the introducer's address is still queued");
+        assert_eq!(state.candidates.len(), CANDIDATE_CAP);
+        // A queue of nothing but fresh addresses treats a fresh newcomer as
+        // it treats equals: the most failed makes room.
+        let mut fresh_only = LaneState::default();
+        for n in 0..CANDIDATE_CAP {
+            fresh_only.candidates.push_back(Candidate::new(untried(n), Source::Introducer));
+        }
+        fresh_only.candidates[3].failures = 1;
+        push_candidates(&mut fresh_only, vec![Candidate::new(named, Source::Introducer)]);
+        assert!(fresh_only.candidates.iter().any(|c| c.addr == named) && !fresh_only.candidates.iter().any(|c| c.addr == untried(3)));
+    }
+
+    #[test]
+    fn a_queue_full_of_the_introducers_addresses_still_takes_a_gossiped_one() {
+        // The mirror of the drill's stall: every queued address is the
+        // introducer's, untried, all in one network group, the pool's own, so
+        // none can pair with it. The gossiped address from elsewhere that
+        // could is the scarce sort here, and gets in; so does the next. Once
+        // the queue holds as many of one sort as of the other, each keeps to
+        // its own places.
+        let mut state = LaneState::default();
+        let crowd = |n: usize| SocketAddr::from(([10, 9, (n / 256) as u8, (n % 256) as u8], 58444));
+        for n in 0..CANDIDATE_CAP {
+            state.candidates.push_back(Candidate::new(crowd(n), Source::Introducer));
+        }
+        let elsewhere = |n: u8| SocketAddr::from(([10, 20 + n, 0, 1], 58444));
+        push_candidates(&mut state, vec![Candidate::new(elsewhere(0), Source::Gossip), Candidate::new(elsewhere(1), Source::Store)]);
+        assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
+        assert!(state.candidates.iter().any(|c| c.addr == elsewhere(0)) && state.candidates.iter().any(|c| c.addr == elsewhere(1)), "the scarce sort gets in");
+        assert_eq!(state.candidates.iter().filter(|c| c.source() == Source::Introducer).count(), CANDIDATE_CAP - 2, "each in place of one of the introducer's");
+        // And an introducer address named now does not push them out again:
+        // its own sort is the plentiful one, and holds its kind already.
+        let late = SocketAddr::from(([10, 9, 200, 1], 58444));
+        push_candidates(&mut state, vec![Candidate::new(late, Source::Introducer)]);
+        assert!(!state.candidates.iter().any(|c| c.addr == late), "an equal of a kind the queue holds finds no place");
+        assert!(state.candidates.iter().any(|c| c.addr == elsewhere(0)) && state.candidates.iter().any(|c| c.addr == elsewhere(1)), "and the two from elsewhere stay");
+        // Half and half: neither sort is scarce, neither takes from the other.
+        let mut even = LaneState::default();
+        for n in 0..CANDIDATE_CAP / 2 {
+            even.candidates.push_back(Candidate::new(untried(n), Source::Introducer));
+            even.candidates.push_back(Candidate::new(untried(1000 + n), Source::Gossip));
+        }
+        for source in [Source::Introducer, Source::Gossip] {
+            let newcomer = untried(5000);
+            push_candidates(&mut even, vec![Candidate::new(newcomer, source)]);
+            assert!(!even.candidates.iter().any(|c| c.addr == newcomer), "{source:?}: nothing of its own sort has failed or is redundant");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_with_no_fresh_peer_pairs_once_the_introducer_names_a_live_one() {
+        // The drill's stall (2026-11-11): four stored and gossiped peers
+        // connected, none the introducer named this run, so no money read is
+        // answered; a queue full of untried gossip the full pool never dials.
+        // When the introducer is due and names a live peer, that peer must be
+        // queued, a connection let go for it, and the pair formed.
+        let stored_a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let stored_b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let gossiped_a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let gossiped_b = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let fresh = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let net = Network { introducers: vec!["127.0.0.1".to_string()], port: fresh.addr.port(), ..net() };
+        let lane = Arc::new(
+            Lane::new(net, vec![], false, None)
+                .with_candidates(vec![
+                    (stored_a.addr, Source::Store),
+                    (gossiped_a.addr, Source::Gossip),
+                    (gossiped_b.addr, Source::Gossip),
+                    (stored_b.addr, Source::Store),
+                ])
+                .with_tls(TLS.clone()),
+        );
+        // The introducer answered a while ago: not due for this request.
+        lane.state.lock().await.introduce_after = Some(Instant::now() + INTRODUCE_EVERY);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("4 connected"), "{err}");
+        {
+            let mut state = lane.state.lock().await;
+            assert!(state.candidates.is_empty(), "nothing is left to dial: {:?}", state.candidates.iter().map(|c| c.addr).collect::<Vec<_>>());
+            for n in 0..CANDIDATE_CAP {
+                state.candidates.push_back(Candidate::new(untried(n), Source::Gossip));
+            }
+        }
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("4 connected"), "a full pool that cannot pair dials no gossip: {err}");
+        assert_eq!(lane.state.lock().await.candidates.len(), CANDIDATE_CAP, "so the queue stays full");
+        // Due now, as a money request with no fresh peer makes it after
+        // INTRODUCE_WANTING.
+        lane.state.lock().await.introduce_sooner = Some(Instant::now());
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        let conns = lane.live_conns().await;
+        assert!(conns.iter().any(|c| c.addr() == fresh.addr && c.source() == Source::Introducer), "the peer the introducer named was dialled");
+        assert_eq!(conns.len(), MAX_CONNS, "in place of one of the four");
+    }
+
+    #[tokio::test]
+    async fn the_introducer_is_asked_sooner_only_by_a_money_read_with_no_fresh_peer() {
+        let stored = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let gossiped = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let fresh = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let net = Network { introducers: vec!["127.0.0.1".to_string()], port: fresh.addr.port(), ..net() };
+        let lane = Arc::new(
+            Lane::new(net, vec![], false, None).with_candidates(vec![(stored.addr, Source::Store), (gossiped.addr, Source::Gossip)]).with_tls(TLS.clone()),
+        );
+        let regular = Instant::now() + INTRODUCE_EVERY;
+        {
+            let mut state = lane.state.lock().await;
+            state.introduce_after = Some(regular);
+            state.introduce_sooner = Some(Instant::now() + INTRODUCE_WANTING);
+        }
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("2 connected"), "not due yet, sooner or later: {err}");
+        lane.state.lock().await.introduce_sooner = Some(Instant::now());
+        // A presence read has its peer and needs no fresh one: it does not
+        // ask, due or not.
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        assert_eq!(lane.state.lock().await.introduce_after, Some(regular), "the presence read left the introducer alone");
+        // The money read does, and its answer sets both waits anew.
+        assert_eq!(money.peak_height().await.unwrap(), 100);
+        let state = lane.state.lock().await;
+        assert!(state.conns.iter().any(|c| c.addr() == fresh.addr && c.source() == Source::Introducer));
+        let (after, sooner) = (state.introduce_after.unwrap(), state.introduce_sooner.unwrap());
+        assert!(after > regular && sooner < after, "asked now: the interval starts again, with the sooner turn ahead of it");
+        drop(state);
+        // With its fresh peer connected, the sooner turn is nobody's: a money
+        // read that lost its second peer waits for the interval (gossip and
+        // the store can supply a second source; only a fresh one needs the
+        // introducer).
+        {
+            let mut guard = lane.state.lock().await;
+            let state = &mut *guard;
+            for peer in state.conns.clone().into_iter().filter(|c| !c.source().is_fresh()) {
+                lane.let_go(state, &peer, RETRY_AFTER, "the test takes the second source away");
+            }
+            state.introduce_sooner = Some(Instant::now());
+        }
+        let err = money.peak_height().await.unwrap_err();
+        assert!(err.to_string().contains("1 connected"), "{err}");
+        assert_eq!(lane.state.lock().await.introduce_after, Some(after), "a pool with its fresh peer does not ask sooner");
     }
 
     #[tokio::test]
