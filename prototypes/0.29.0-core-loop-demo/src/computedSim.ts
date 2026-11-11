@@ -764,6 +764,9 @@ export class Sim {
   private readonly houseCks = new Set<string>();
   /** The opening roots their openers wrote (the keys). */
   private readonly openedRoots = new Set<string>();
+  /** 🔒 The ended checkpoints an honest page signed for a game it opened
+   *  (computedTable switchFairOnlyOff, fairEndDuty: design §8.6), by key. */
+  private readonly ownerEnds = new Set<string>();
   /** Every checkpoint a page's doc held that reads whole, by the session it
    *  opens (`<t>:<inc>:<nextSid3>`): what a sweep says it repeats. Each of
    *  them: the session id binds no signer, so a copy of a checkpoint under
@@ -1068,10 +1071,13 @@ export class Sim {
           // a house's checkpoint (casinoDoc putBackFairOnlyRecords, the
           // opener asleep too): the record itself, which its key is the hash
           // of, and nothing else under a key the room has known.
-          const v = computed.get(k) as { b?: unknown; k?: unknown } | undefined;
+          // And the page that holds a game signs its end (design §8.6): an
+          // ended checkpoint under its own key, of a game it opened.
+          const v = computed.get(k) as { b?: unknown; k?: unknown; ok?: unknown; e?: unknown; dl?: unknown } | undefined;
           const whole = readCk(PAGE_ROOM, k, v).kind === 'ok';
-          if (whole && (this.houseCks.has(k) || this.openedRoots.has(k))) continue;
+          if (whole && (this.houseCks.has(k) || this.openedRoots.has(k) || this.ownerEnds.has(k))) continue;
           if (whole && v!.b === 'g' && v!.k === p.pub) this.openedRoots.add(k);
+          else if (whole && v!.e === 1 && v!.k === p.pub && v!.ok === p.pub && v!.dl === undefined) this.ownerEnds.add(k);
           else this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
         }
       }
@@ -1799,6 +1805,11 @@ export class Sim {
     if (!at.some((c) => c.key === key)) at.push({ key, ck });
   }
 
+  /** 🔒 How many ended checkpoints the honest pages signed for games they opened. */
+  get ownerEndsWritten(): number {
+    return this.ownerEnds.size;
+  }
+
   get houseCheckpoints(): number {
     return this.houseCks.size;
   }
@@ -1821,10 +1832,18 @@ export class Sim {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
       const { g, ...body } = ck;
       const dl = ck.dl;
-      const signed = dl !== undefined && dl.h === ck.k && dl.k === ck.ok && ck.x === undefined
-        && verify(dl.k, roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g)
-        && verify(ck.k, signBytes('ck', ctx, body), g);
+      const byHouse = dl !== undefined && dl.h === ck.k && dl.k === ck.ok
+        && verify(dl.k, roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g);
+      // (An end may be the opener's own: design §8.6.)
+      const byOpener = ck.e === 1 && dl === undefined && ck.k === ck.ok;
+      const signed = (byHouse || byOpener) && ck.x === undefined && verify(ck.k, signBytes('ck', ctx, body), g);
       if (!signed) out.push(`${by} counted ${key}, which the game's house did not sign`);
+      // An end holds its opener's end order, and hands nothing on.
+      if (ck.e === 1) {
+        const fin = ck.f;
+        if (!fin || fin.k !== ck.ok || !verify(fin.k, signBytes('fin', ctx, fin), fin.g)) out.push(`${by} counted the end ${key}, which holds no end order of the game's opener`);
+        if (ck.s !== undefined || ck.h !== undefined || ck.w !== undefined) out.push(`${by} counted the end ${key}, which hands on a carry, a commitment or a sweep count`);
+      }
       // A sweep (design §8.5 N3s) repeats the checkpoint whose session it
       // closes, one sweep on: back along those to the trim or the root they
       // began from, each holding what the one before held. The trim is held to
@@ -1836,6 +1855,15 @@ export class Sim {
       // root among them counts if its opener wrote it: a copy under another
       // signature beside it is nobody's root.)
       let grounds: { key: string; ck: CkRec }[] = [{ key, ck }];
+      // An end at its base's round (nothing decided in the session it closes)
+      // repeats that base's round, close, decider, outcome and nets: back to
+      // the checkpoints that open the session, and on as from them.
+      if (ck.e === 1) {
+        const ended = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, x: c.x });
+        const held = ended(ck);
+        const bases = (this.ckBySession.get(`${t}:${inc}:${ck.b}`) ?? []).filter((prev) => held !== null && prev.ck.e !== 1 && ended(prev.ck) === held);
+        if (bases.length > 0) grounds = bases;
+      }
       while (grounds.length > 0 && grounds[0].ck.w !== undefined) {
         const swept: CkRec = grounds[0].ck;
         const held = content(swept);
@@ -2286,9 +2314,14 @@ export class Sim {
       const dl = ck.dl;
       const dlOk = dl !== undefined && dl.k === ck.ok && ok(`dl|${dl.h}|${dl.g}`, dl.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g);
       const root = ck.b === 'g';
-      if (!(root ? ck.k === ck.ok && dlOk : dlOk && dl!.h === ck.k)) continue;
+      // (An end is its house's too, or the opener's own, with no delegation;
+      // and holds the opener's end order: S5.)
+      const ownEnd = ck.e === 1 && dl === undefined && ck.k === ck.ok;
+      if (!(root ? ck.k === ck.ok && dlOk : ownEnd || (dlOk && dl!.h === ck.k))) continue;
+      const fin = ck.f;
+      if (fin !== undefined && !(fin.k === ck.ok && ok(`fin|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) continue;
       if (!ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g)) continue;
-      houses.add(dl!.h);
+      if (dl !== undefined) houses.add(dl.h);
       if (best === null || outranks(ck, id, best.ck, best.id)) best = { key, id, ck };
     }
     // A page holds the base it counts from (casinoDoc's held records, design

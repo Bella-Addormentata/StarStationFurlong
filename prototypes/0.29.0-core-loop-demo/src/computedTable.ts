@@ -159,6 +159,7 @@ import {
   computedFairOnlyReturns,
   computedFoldOf,
   computedGameMovesOf,
+  computedGamesEnding,
   computedGamesHeldBy,
   computedRedecide,
   computedIncEnded,
@@ -220,6 +221,7 @@ import {
   writeComputedOff,
   writeComputedOn,
   writeDelegation,
+  writeFairOnlyEnd,
   writeFairOnlyOn,
   writeFairSetting,
   writeHouseSum,
@@ -239,7 +241,8 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
-import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, sealCk } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, sealCk, sealFin } from './computedFairOnly';
+import type { CkRec, FinRec } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
 import {
@@ -597,8 +600,10 @@ interface TableState {
    *  the one on the round the checkpoint kept (noteResult). */
   check: { res: FoldResult; gen: number; out: ComputedRoundCheck | null } | null;
   checks: Map<string, ComputedRoundCheck>;
-  /** By close hash: when this page first saw that decided round with a
-   *  frozen slip missing (a trim waits MISSING_WAIT_MS for it). */
+  /** By close hash and bettor (`<close>:<pid>`): when this page first saw
+   *  that decided round with that bettor's frozen slip missing (a trim waits
+   *  MISSING_WAIT_MS for each; one no longer missing is forgotten, so the
+   *  same slip gone again, or another in its place, waits afresh). */
   missingAt: Map<string, number>;
   /** By close hash: the seeds seen opening its frozen slips (revealsSeen). */
   opened: Map<string, Opened>;
@@ -625,6 +630,15 @@ interface TableState {
    *  a modified game rewriting a round it has seen the seeds of). */
   chainClose: Map<number, string>;
   replaced: number | null;
+  /** 🔒 At a FAIR ONLY game, by round: the close this page first saw a
+   *  house reveal decide on the live session's chain; and when it first saw
+   *  each thing an end waits for (fairSound), one wait for each: the chain
+   *  short of a round it saw decided (by the round it reads to), such a
+   *  round decided under another close (by round and close: the closer took
+   *  their frozen slip away and laid another close of the round in), a
+   *  frozen slip missing from a decided round (by close and bettor). */
+  houseClose: Map<number, string>;
+  gone: Map<string, number>;
 }
 
 /** The binding the per-table state belongs to, the wake count and clock
@@ -713,6 +727,7 @@ function forgetWaits(st: TableState): void {
   st.seedOutAt = null;
   st.askedFor = null;
   st.shortAt = null;
+  st.gone.clear();
   // (A copy keeps its value: only when it went missing starts again.)
   for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
 }
@@ -743,6 +758,8 @@ function lookAtClock(now: number): void {
     recoveryRanks.clear();
     keeping.clear();
     keptAt = null;
+    endingSince.clear();
+    endLookedAt = null;
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -808,7 +825,7 @@ function newTable(t: string, inc: string): TableState {
     tickedAt: null, reputAt: null, wakeAt: 0,
     lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
-    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
+    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null, houseClose: new Map(), gone: new Map(),
   };
 }
 
@@ -1366,10 +1383,15 @@ function rodeAsBuilt(rec: AnySlipRec | null): boolean {
  *  the ⚙ card only. A session change starts the record afresh (what a
  *  checkpoint covers is final); the flag stays. */
 function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
-  if (moved) st.chainClose.clear();
+  if (moved) {
+    st.chainClose.clear();
+    st.houseClose.clear();
+    st.gone.clear();
+  }
   let sc: Scan | null = null;
   for (const v of res.rounds) {
     if (!v.decided) continue;
+    if (v.decided === 'house' && !st.houseClose.has(v.r)) st.houseClose.set(v.r, v.close);
     const was = st.chainClose.get(v.r);
     st.chainClose.set(v.r, v.close);
     if (was === undefined || was === v.close || !watchedClose(st, v)) continue;
@@ -2840,6 +2862,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   compactDuty(getIdentityPub(), now);
   recoverDuty(getIdentityPub(), now);
   fairKeepDuty(getIdentityPub(), now);
+  fairEndDuty(getIdentityPub(), now);
   houseDuty(now);
 }
 
@@ -4151,10 +4174,7 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   if (!res || res.tip) return;
   if (witnessLost(st, res, now).size > 0) return;
   if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return;
-  for (const round of res.rounds) {
-    const at = st.missingAt.get(round.close);
-    if (round.missing.length > 0 && (at === undefined || now - at < MISSING_WAIT_MS)) return;
-  }
+  if (missingWaits(st, res, now)) return;
   const D = lastDecided(res);
   if (!D) return;
   const sc = scanOf(st, res);
@@ -4212,17 +4232,34 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   writeCheckpointAndTrim(st.t, st.inc, cp, copies);
 }
 
-/** When this page first saw each decided round of table st with a frozen
- *  slip missing, for the trim's wait: timed from the room's state in, asleep
+/** When this page first saw each frozen slip missing from a decided round
+ *  of table st, for the trim's wait: timed from the room's state in, asleep
  *  or awake (a wake starts it again, as every timer), whatever else holds
- *  the trim back meanwhile. */
+ *  the trim back meanwhile. One time for each slip, and none kept for a slip
+ *  the fold does not read missing now (it came back, or its round is off
+ *  the chain): no wait that began for one loss stands in for the next. */
 function noteMissing(st: TableState, now: number): void {
   const res = resultOf(st);
   if (!res) return;
+  const gone = new Set<string>();
   for (const round of res.rounds) {
-    if (!round.decided || round.missing.length === 0) st.missingAt.delete(round.close);
-    else if (!st.missingAt.has(round.close)) st.missingAt.set(round.close, now);
+    if (round.decided) for (const pid of round.missing) gone.add(`${round.close}:${pid}`);
   }
+  for (const id of [...st.missingAt.keys()]) if (!gone.has(id)) st.missingAt.delete(id);
+  for (const id of gone) if (!st.missingAt.has(id)) st.missingAt.set(id, now);
+}
+
+/** Whether a trim of table st, folded as `res`, still waits for a frozen
+ *  slip: one missing from a decided round for less than MISSING_WAIT_MS as
+ *  this page noted it (noteMissing), or not noted yet. */
+function missingWaits(st: TableState, res: FoldResult, now: number): boolean {
+  for (const round of res.rounds) {
+    for (const pid of round.missing) {
+      const at = st.missingAt.get(`${round.close}:${pid}`);
+      if (at === undefined || now - at < MISSING_WAIT_MS) return true;
+    }
+  }
+  return false;
 }
 
 /** A fold's nets as a checkpoint carries them: decimal (the fold has
@@ -5498,6 +5535,214 @@ export function switchFairOnlyOn(t: string, game: GameName = 'roulette', now = D
     return true;
   });
   return done ? 'ok' : 'reconnecting';
+}
+
+// ── 🔒 Ending a FAIR ONLY game ───────────────────────────────────────────────
+
+/** How long the page that holds a game waits, an end order standing and no
+ *  round in flight, before it writes the game's end itself (fairEndDuty): the
+ *  time its house has to write it first (design §8.5 N6), which a house that
+ *  is away never does. */
+export const FAIR_END_WAIT_MS = 5_000;
+
+/** Why a FAIR ONLY game is not ended at a press: a switch's reasons that
+ *  apply ('asleep', 'reconnecting', and at craps 'contract': bets ride, and a
+ *  second press ends the game all the same), or the game is another key's
+ *  ('theirs': only the page that holds a game ends it). */
+export type FairOnlyOffRefusal = 'asleep' | 'reconnecting' | 'contract' | 'theirs';
+/** 'ok': the game is ended, or this page holds none of `game` at the table.
+ *  'ending': the end order stands and a round is in flight; the end follows
+ *  when it is decided or void. */
+export type FairOnlyOffResult = 'ok' | 'ending' | FairOnlyOffRefusal;
+
+/** Whether no round of the game folded as `res` is in flight: no close of the
+ *  open round is in (valid, or still to be checked), so nothing waits for a
+ *  house reveal or an abandon. */
+function fairQuiet(res: FoldResult): boolean {
+  return res.tip === null && res.openCloses.every((c) => c.state === 'invalid');
+}
+
+/** Whether an end of game `inc` at table `t`, folded as `res`, would count
+ *  every round this page knows was decided, as it was decided. An end is a
+ *  trim that is final, so it holds back as this page's own trim of a
+ *  page-signed table does (trimDuty), on what the page noted as it served the
+ *  game: not while a record a round rests on that this page showed is gone
+ *  from the session (witnessLost), not for MISSING_WAIT_MS while the chain
+ *  reads short of a round this page saw decided (noteChain), and not while a
+ *  decided round's frozen slip is missing, for as long. A bettor who deletes
+ *  their own frozen slip on seeing the result takes the round off the chain
+ *  (the closer's) or themselves out of its count (another's): ended then,
+ *  the bet would be theirs again and the winners unpaid. The pages that
+ *  showed the round put the slip back in their turns, within seconds. A page
+ *  that never looked at the game notes what the fold reads missing from its
+ *  first look here, and waits as long. One wait for each thing gone
+ *  (`st.gone`), noted whenever this is asked, a round in flight or not, and
+ *  forgotten once the thing is no longer so, whatever else holds the end
+ *  back at that look: the same loss again, or another in its place, waits
+ *  MISSING_WAIT_MS afresh. */
+function fairSound(t: string, inc: string, res: FoldResult, now: number): boolean {
+  // (A game this page holds and has not served since it loaded, the table
+  // playing another: its state begins here, so the waits below run out, and
+  // goes with the game as any state does.)
+  const key = `${t}:${inc}`;
+  let st = fairTables.get(key);
+  if (!st) fairTables.set(key, st = newTable(t, inc));
+  if (!forgedStands(st)) noteChain(st, now);
+  // What is gone now, each thing by what it is. (Noted and forgotten on every
+  // look, one that a lost witness copy holds back too: a wait kept through
+  // such a look would stand for a loss that was mended meanwhile, and run out
+  // on the next one.)
+  const gone = new Set<string>();
+  if (st.shortAt !== null) gone.add(`short:${lastDecided(res)?.r ?? res.base.u}`);
+  for (const v of res.rounds) {
+    if (!v.decided) continue;
+    // (A round the house decided that reads decided under another close: the
+    // chain is as long, and short of the round all the same.)
+    const saw = st.houseClose.get(v.r);
+    if (saw !== undefined && saw !== v.close) gone.add(`swap:${v.r}:${v.close}`);
+    for (const pid of v.missing) gone.add(`slip:${v.close}:${pid}`);
+  }
+  for (const id of [...st.gone.keys()]) if (!gone.has(id)) st.gone.delete(id);
+  let waits = false;
+  for (const id of gone) {
+    let since = st.gone.get(id);
+    if (since === undefined || since > now) st.gone.set(id, since = now);
+    if (now - since < MISSING_WAIT_MS) waits = true;
+  }
+  return witnessLost(st, res, now).size === 0 && !waits;
+}
+
+/** The ended checkpoint of a game at base `B` folded as `res`, quiet, under
+ *  end order `fin`, as the page that holds the game signs it (design §8.6, and
+ *  §8.5 N6 for the form): at the last round its fold decided past the base, or
+ *  at the base's with the base's `l`/`d`/`o`; the session it closes the live
+ *  one either way; the fold's nets, which count on; no carry, no commitment
+ *  and no sweep count (an end plays nothing on, so every bet riding at craps
+ *  is its player's again); the transfers that brought the game to this key. */
+function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec): { key: string; value: CkRec } {
+  const D = lastDecided(res);
+  const at = D && D.r > B.u
+    ? {
+        u: D.r, l: D.close, d: D.house ? `h:${D.house.hash}` : `z:${D.abandon!.hash}`,
+        // (A round a house reveal voided, counting nobody, has no outcome.)
+        ...(D.decided === 'house' ? { o: (gameOfInc(ctx.inc) === 'craps' ? D.craps!.dice : D.pocket) as number | [number, number] } : {}),
+      }
+    : { u: B.u, l: B.l, ...(B.d !== undefined ? { d: B.d } : {}), ...(B.o !== undefined ? { o: B.o } : {}) };
+  return sealCk(ctx, {
+    v: 1, ok: B.ok, j: B.j, rv: B.rv, ts: B.ts, b: res.base.sid, ...at, n: netsOf(res), e: 1, f: fin,
+    ...(B.x !== undefined ? { x: B.x } : {}), k: getIdentityPub(),
+  }, signIdentity);
+}
+
+/**
+ * 🔒 The page that holds FAIR ONLY game of `game` at table `t` ends it (design
+ * §8.6; the ⚙ card's way back, once it has the line). Only the game's holder
+ * can: the end order is signed by this page's key, and counts on every page
+ * only from an owner-level key that holds the game (S5).
+ * - **No round in flight** (no close of the open round in): ONE transaction
+ *   with the end order (`fin:`), the ended checkpoint this key signs at the
+ *   last decided round with the fold's nets, and the switch taken away where
+ *   it names the game (writeFairOnlyEnd). The game is over on every page that
+ *   hears it: felts on the open round stop holding, a bet riding at craps is
+ *   its player's again, the nets count on.
+ * - **A round in flight**, or a decided round short of a record it rests on
+ *   (fairSound): the end order alone ('ending'). Pages stop closing
+ *   (closePaused), the house reveals for the close that is in or a bettor's
+ *   abandon voids it, and the end follows: the house's (N6), or this page's
+ *   FAIR_END_WAIT_MS after the table went quiet (fairEndDuty).
+ * It marks the house's choice of owner-run play (ownerRunChosen), as a
+ * switch-off does, so the driving page does not switch the table on again by
+ * itself. Refused (nothing written) on a page asleep or not whole, while the
+ * game's records are still being checked, at craps while contract bets ride
+ * until the second press (`again`), and for a game another key holds. 'ok'
+ * with nothing written where this page holds no live game of `game` at `t`.
+ * Nothing calls this yet but the specs: the ⚙ card's line is PR 6c-4c's.
+ */
+export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = Date.now(), again = false): FairOnlyOffResult {
+  lookAtClock(now);
+  const gate = switchGate(t, now);
+  if (gate === 'asleep' || gate === 'reconnecting') return gate;
+  const me = getIdentityPub();
+  const inc = computedGamesHeldBy(t, me).find((held) => gameOfInc(held) === game);
+  if (inc === undefined) {
+    const played = computedIncOf(t);
+    return played !== null && isFairOnlyInc(played) && gameOfInc(played) === game && isComputedTable(t) ? 'theirs' : 'ok';
+  }
+  const resolved = computedResolutionOf(t, inc);
+  const res = computedFoldOf(t, inc);
+  if (!resolved || resolved.pending || !resolved.base || !res || res.pending) return 'reconnecting';
+  if (game === 'craps' && !again && contractRides(res.carry as CrapsCarry)) return 'contract';
+  const ctx: FoldCtx = { room: casinoRoomId(), t, inc };
+  const fin = resolved.fin ?? sealFin(ctx, me, signIdentity).value;
+  // (Sound first: what it notes is noted with a round in flight too, so a
+  // wait that began for one loss does not stand in for the next.)
+  const sound = fairSound(t, inc, res, now);
+  const end = fairQuiet(res) && sound ? fairEndOf(ctx, resolved.base.ck, res, fin) : null;
+  if (end === null && resolved.fin !== null) return 'ending';
+  const done = transactCasino(() => {
+    if (!writeFairOnlyEnd(t, inc, resolved.fin === null ? fin : null, end)) return false;
+    writeOwnerRunChosen(t, true);
+    return true;
+  });
+  return !done ? 'reconnecting' : end ? 'ok' : 'ending';
+}
+
+/** By `<tableId>:<inc>`: when this page first saw the game quiet under an end
+ *  order, on its clock (fairEndDuty). */
+const endingSince = new Map<string, number>();
+/** When fairEndDuty last looked (at most every TICK_MS). */
+let endLookedAt: number | null = null;
+
+/**
+ * 🔒 The end of a game whose end order stands, written by the page that holds
+ * the game when its house has not (design §8.6: a press mid-round leaves the
+ * end order alone, and a house that is away writes no end). Once no round is
+ * in flight and has not been for FAIR_END_WAIT_MS on this page's clock (a
+ * close that comes in meanwhile starts the wait again: the house reveals for
+ * it, or a bettor's abandon voids it), the ended checkpoint and the switch, as
+ * a press on a quiet table writes them. A decided round short of a record it
+ * rests on holds the end as it holds a press (fairSound). On an awake page
+ * with its doc whole and the game's records checked; a frame that isn't
+ * starts the wait again, and fairSound's waits with it, as does a clock gone
+ * back to before it began.
+ */
+function fairEndDuty(pub: string, now: number): void {
+  if (endLookedAt !== null && now >= endLookedAt && now - endLookedAt < TICK_MS) return;
+  endLookedAt = now;
+  const ending = computedGamesEnding(pub);
+  const listed = new Set<string>();
+  const looked = new Set<string>();
+  for (const { t, inc } of ending) {
+    const key = `${t}:${inc}`;
+    listed.add(key);
+    const resolved = computedResolutionOf(t, inc);
+    const res = computedFoldOf(t, inc);
+    const checked = tablesAwake(now) && casinoWhole(t) && computedSettled()
+      && !!resolved && !resolved.pending && !!resolved.base && !!resolved.fin && !!res && !res.pending;
+    // (Sound before quiet, as the press: noted with a round in flight too.)
+    if (checked) looked.add(key);
+    const sound = checked && fairSound(t, inc, res!, now);
+    const ready = sound && fairQuiet(res!);
+    if (!ready) {
+      endingSince.delete(key);
+      continue;
+    }
+    const since = endingSince.get(key);
+    if (since === undefined || since > now) {
+      endingSince.set(key, now);
+      continue;
+    }
+    if (now - since < FAIR_END_WAIT_MS) continue;
+    const end = fairEndOf({ room: casinoRoomId(), t, inc }, resolved!.base!.ck, res!, resolved!.fin!);
+    transactCasino(() => writeFairOnlyEnd(t, inc, null, end));
+    endingSince.delete(key);
+  }
+  for (const key of [...endingSince.keys()]) if (!listed.has(key)) endingSince.delete(key);
+  // 🔒 A wait stands only through looks that read its thing gone (fairSound):
+  // where this one could not check a game (asleep, the doc holding part of
+  // an update, its records still being checked, no end order read), what was
+  // gone may have come back and gone again unseen, so its waits begin again.
+  for (const [key, st] of fairTables) if (st.gone.size > 0 && !looked.has(key)) st.gone.clear();
 }
 
 /** What the ⚙ card shows of the switch: the row at all (`show`: the house,
