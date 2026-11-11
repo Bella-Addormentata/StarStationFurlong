@@ -1047,11 +1047,15 @@ export class Sim {
       for (const k of top ?? []) {
         if (!k?.startsWith('ck:') || !computed.has(k)) continue;
         if (tr.origin === HOUSE_ORIGIN) this.houseCks.add(k);
-        else if (tr.origin !== NET && !sp.cheats && !this.houseCks.has(k) && !this.openedRoots.has(k)) {
-          // (Its own root at the opening; any page may put that root back
-          // later: casinoDoc putBackFairOnlyRecords, the opener asleep too.)
+        else if (tr.origin !== NET && !sp.cheats) {
+          // Its own root at the opening. Any page may put back that root or
+          // a house's checkpoint (casinoDoc putBackFairOnlyRecords, the
+          // opener asleep too): the record itself, which its key is the hash
+          // of, and nothing else under a key the room has known.
           const v = computed.get(k) as { b?: unknown; k?: unknown } | undefined;
-          if (v && v.b === 'g' && v.k === p.pub) this.openedRoots.add(k);
+          const whole = readCk(PAGE_ROOM, k, v).kind === 'ok';
+          if (whole && (this.houseCks.has(k) || this.openedRoots.has(k))) continue;
+          if (whole && v!.b === 'g' && v!.k === p.pub) this.openedRoots.add(k);
           else this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
         }
       }

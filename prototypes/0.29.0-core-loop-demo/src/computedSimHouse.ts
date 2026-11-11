@@ -546,7 +546,7 @@ export class SimHouse {
       const { t, inc, cks, xfs, fin } = byGame.get(key)!;
       const row = this.rows.get(`${room}|${t}|${inc}`);
       const rec: AuthRecords = { cks: row ? [...cks, [row.key, row.value]] : cks, xfs, fin, delegations };
-      const res = resolveGame({ room, sig: (id, pub, bytes, sig) => this.verified(['auth', id, '', '', ''], pub, bytes, sig) }, t, inc, rec);
+      const res = resolveGame({ room, sig: (id, pub, bytes, sig) => this.verified(['auth', room, id, '', ''], pub, bytes, sig) }, t, inc, rec);
       // N5: its last checkpoint, gone from the doc or with something else under
       // its key, while no authority's stands above it.
       const held = row ? comp.get(row.key) : undefined;
@@ -1052,7 +1052,7 @@ export class SimHouse {
       // (As a page reads it, and the best of the game with it in: else no page would count from it.)
       if (sealed) {
         const with_: AuthRecords = { cks: [[g.base.key, B], [sealed.key, sealed.value]], xfs: [], delegations: [g.dl] };
-        const after = resolveGame({ room: ctx.room, sig: (id, pub, bytes, sig) => this.verified(['auth', id, '', '', ''], pub, bytes, sig) }, ctx.t, ctx.inc, with_);
+        const after = resolveGame({ room: ctx.room, sig: (id, pub, bytes, sig) => this.verified(['auth', ctx.room, id, '', ''], pub, bytes, sig) }, ctx.t, ctx.inc, with_);
         if (after.base?.key !== sealed.key) sealed = null;
       }
     }

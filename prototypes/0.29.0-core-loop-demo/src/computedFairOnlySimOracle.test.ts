@@ -111,9 +111,16 @@ describe('a page that writes a checkpoint', () => {
     expect(sim.violations, sim.label).toEqual([]);
     const B = sim.pages.find((sp) => sp.name === 'B')!;
     const inc = B.p.casino.computedIncOf('roulette-1')!;
-    B.p.doc.getMap('casinoComputed').set(`ck:roulette-1:${inc}:${'0'.repeat(16)}`, { v: 1, b: 'g', k: 'nobody' });
+    const top = B.p.doc.getMap<unknown>('casinoComputed');
+    top.set(`ck:roulette-1:${inc}:${'0'.repeat(16)}`, { v: 1, b: 'g', k: 'nobody' });
     await sim.run(2_000);
-    expect(sim.violations.some((v) => /B wrote the checkpoint .* which no house signed/.test(v)), sim.violations.join('\n')).toBe(true);
+    expect(sim.violations.filter((v) => /B wrote the checkpoint .* which no house signed/.test(v)), sim.violations.join('\n')).toHaveLength(1);
+    // Nor may it lay something else under a key the room knows (the opening root's): only the record itself goes back there.
+    const [root] = [...top.keys()].filter((k) => k.startsWith(`ck:roulette-1:${inc}:`) && (top.get(k) as { u?: unknown }).u === 0);
+    expect(root, sim.label).toBeDefined();
+    top.set(root, { ...(top.get(root) as Record<string, unknown>), n: { [B.pid]: '1000' } });
+    await sim.run(2_000);
+    expect(sim.violations.filter((v) => v.includes(`B wrote the checkpoint ${root} `)), sim.violations.join('\n')).toHaveLength(1);
   }, TIMEOUT);
   it('but a page that puts the opening root back, the opener asleep, is none: any page may (casinoDoc putBackFairOnlyRecords)', async () => {
     const sim = await Sim.open({ name: 'fair-only-root-back', seed: seed(1217), pages: named('ABC'), houseNode: true, fairOnly: true });

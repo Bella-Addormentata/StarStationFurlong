@@ -13,10 +13,10 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { basisOf, canonFelt } from './computedCraps';
-import { ckKey, readCk, sealFin } from './computedFairOnly';
+import { ckKey, faironlyInc, readCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
-import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, trimOf } from './computedFairOnlyKit';
+import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, NAME, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, trimOf } from './computedFairOnlyKit';
 import { foldGameOf, MAX_HELD_ROUNDS, nextSid3, recHash, TableFold } from './computedFold';
 import type { CloseRec, FoldCtx, FoldResult, SlipRec } from './computedFold';
 import { beatKey, delegationKey, HEARTBEAT_MS } from './computedHouse';
@@ -187,6 +187,24 @@ describe("the simulations' house at a FAIR ONLY game: whose game, and its rounds
     room.run(2 * TICK);
     expect(room.house.wrote.beats).toBe(beats + 1);
     expect([...(room.top().get(ses) as Y.Map<unknown>).keys()].filter((k) => k.startsWith('o:1:'))).toHaveLength(1);
+  });
+
+  it('a delegation it checked in one room is not checked for another: a root of another room that carries it gets nothing', () => {
+    const room = new GameRoom().start();
+    expect(room.recs('o:1:')).toHaveLength(1);
+    // The same name opened in another room, its root signed for that room, the delegation the first room's.
+    const other = 'room-other';
+    const ctx: FoldCtx = { room: other, t: T, inc: faironlyInc('p', other, T, NAME) };
+    const root = rootOf(ctx, 'p');
+    const doc = new Y.Doc();
+    const ses = new Y.Map<unknown>();
+    doc.transact(() => {
+      doc.getMap('casinoComputed').set(root.key, root.value);
+      doc.getMap('casinoComputed').set(`ses:${T}:${ctx.inc}:${nextSid3(ctx, root.value)}`, ses);
+    });
+    for (let t = 0; t <= SETTLE_MS + 2 * TICK; t += TICK) room.house.tick(other, doc, room.now + t, 1_700_000_000_000 + room.now + t);
+    expect(ses.size).toBe(0);
+    expect(doc.getMap('casinoComputed').has(beatKey(H.pub))).toBe(false);
   });
 
   it('craps: a frozen slip with no chips on (a take-down) is counted like any other: with its seed gone from the session the roll is not decided, and the next roll waits', () => {
