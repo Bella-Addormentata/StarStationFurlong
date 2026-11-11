@@ -803,6 +803,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             // Its reply addresses, whether or not the book takes the
                             // knock as new: after a restart the book already holds it
                             // and this map is empty.
+                            let first_word = !knock_reply.contains_key(&from);
                             if knock_reply.get(&from).is_none_or(|(issued_at, _)| *issued_at <= f.item.issued_at) {
                                 knock_reply.insert(from.clone(), (f.item.issued_at, f.item.reply.clone()));
                             }
@@ -825,6 +826,17 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                 new
                             };
                             if !new {
+                                // Once per knocker per start: the line that
+                                // shows a restarted host has the knock's reply
+                                // addresses again (they are kept in memory
+                                // only), which no other line says.
+                                if first_word {
+                                    println!(
+                                        "⛓️ ChiaHub inbox: a knock of {} for room {room} read again (the knock book holds its knock) · {} reply addr(s) in the knock",
+                                        short(&from),
+                                        f.item.reply.len()
+                                    );
+                                }
                                 continue;
                             }
                             println!(
