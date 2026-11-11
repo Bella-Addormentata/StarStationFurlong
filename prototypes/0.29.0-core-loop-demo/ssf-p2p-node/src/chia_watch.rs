@@ -17,6 +17,18 @@
 //! confirming on chain (the peer will see US at its next beat) clears the
 //! room's cooldowns so the dance restarts in step.
 //!
+//! A cooldown ends on the BLOCK CLOCK where one is known: the chain's heights
+//! are cut into hold slots of `HOLD_SLOT_BLOCKS`, shifted per pair of nodes
+//! ([`hold_slot`]), and a target whose hold failed is tried again once the
+//! pair's next slot has begun. Both nodes of a pair compute the same slots, so
+//! after a break that brings no new record (a restart at the same addresses)
+//! the two retry within a tick of each other and their hold windows overlap.
+//! Two timers of `TARGET_COOLDOWN` started at different moments never meet
+//! except by luck: in the two-computer drill of 2026-11-11 a restarted host
+//! and its guest held for each other every 14 minutes, three minutes at a
+//! time, and missed each other every time. Without a chain height the timer
+//! still rules, as before.
+//!
 //! N5′ (#231 first follow-up): cached addresses are re-dialed first; the chain
 //! is read only on the beat. `SSF_CHIA_WATCH=0` turns the watcher off — and
 //! with it the knocks this node would write (`chia_knock::knocks_available`,
@@ -60,8 +72,15 @@ pub const HOLD_PERIOD: Duration = Duration::from_secs(15);
 pub const HOLD_WINDOW: Duration = Duration::from_secs(180);
 /// Concurrent holds per room (each is a dial task with open sockets).
 pub const MAX_HOLDS_PER_ROOM: usize = 4;
-/// A target whose hold failed is left alone this long (per room).
+/// A target whose hold failed is left alone this long (per room), when no
+/// chain height says where the pair's hold slots are ([`Cooldown`]).
 pub const TARGET_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Blocks per hold slot: with a chain height known, a target whose hold
+/// failed is tried again when the pair's next slot begins ([`hold_slot`]).
+/// 32 blocks is about the ten minutes of [`TARGET_COOLDOWN`]. A constant, not
+/// the beat (`SSF_CHIA_BEAT_BLOCKS` may differ between two nodes): both sides
+/// of a pair must cut the chain the same way.
+pub const HOLD_SLOT_BLOCKS: u32 = 32;
 /// Distinct contact keys read per watcher tick, at most (two hint scans each).
 /// The address book holds up to `MAX_PEERS` (512) peers — a private-room member
 /// can leave one card per node identity it cycles through — so the chain load
@@ -127,6 +146,66 @@ impl BeatSchedule {
     }
 }
 
+/// The hold slot the pair of nodes `a` and `b` is in at chain height `peak`.
+/// The same number on both sides, whichever of the two asks: the heights are
+/// cut every [`HOLD_SLOT_BLOCKS`], shifted by an offset taken from the two
+/// node ids in a fixed order. The shift spreads the pairs over the slot's
+/// length, so a node with many contacts does not start all its retries at one
+/// block (a room runs [`MAX_HOLDS_PER_ROOM`] holds at a time, and a retry that
+/// waits for a free place starts late, out of step with its peer). The ids
+/// enter as key bytes where they parse, so two spellings of one key give one
+/// answer. Nothing secret is in it: the slots of a pair follow from the two
+/// node ids and the chain's height.
+pub fn hold_slot(a: &str, b: &str, peak: u32) -> u64 {
+    use sha2::{Digest, Sha256};
+    let key_bytes = |id: &str| id.parse::<iroh::PublicKey>().map(|k| k.as_bytes().to_vec()).unwrap_or_else(|_| id.as_bytes().to_vec());
+    let (a, b) = (key_bytes(a), key_bytes(b));
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(b"ssf-hold-slot-v1");
+    h.update((lo.len() as u32).to_be_bytes());
+    h.update(&lo);
+    h.update(&hi);
+    let d = h.finalize();
+    let offset = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % HOLD_SLOT_BLOCKS;
+    (u64::from(peak) + u64::from(offset)) / u64::from(HOLD_SLOT_BLOCKS)
+}
+
+/// How long a target whose hold failed is left alone (per room).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cooldown {
+    /// The timer's end: [`TARGET_COOLDOWN`] after the hold ended. It rules
+    /// whenever the block clock cannot (no height at the hold's end, or none
+    /// now).
+    pub until: Instant,
+    /// The pair's hold slot the hold ended in ([`hold_slot`]), when a fresh
+    /// chain height was known then.
+    pub slot: Option<u64>,
+}
+
+impl Cooldown {
+    /// A cooldown for a hold that just ended at `now`, in the pair's slot
+    /// `slot` when the chain's height was known.
+    pub fn started(now: Instant, slot: Option<u64>) -> Self {
+        Self { until: now + TARGET_COOLDOWN, slot }
+    }
+
+    /// Is the target still left alone at `now`, the pair standing in
+    /// `slot_now` (`None`: no chain height this tick)? On the block clock the
+    /// target is free once the pair's next slot has begun, which may be
+    /// sooner than the timer and is the same moment for both sides. The timer
+    /// decides when either slot is unknown, and it bounds the block clock:
+    /// a height that was wrong when the hold ended (one carrier peer's word,
+    /// perhaps far ahead of the chain) keeps no target waiting longer than
+    /// twice [`TARGET_COOLDOWN`].
+    pub fn holds(&self, slot_now: Option<u64>, now: Instant) -> bool {
+        match (self.slot, slot_now) {
+            (Some(ended_in), Some(current)) => current <= ended_in && now < self.until + TARGET_COOLDOWN,
+            _ => self.until > now,
+        }
+    }
+}
+
 /// One hold to start: a node id and the public addresses to dial it at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldCandidate {
@@ -141,8 +220,11 @@ pub struct PlanContext<'a> {
     pub connected: &'a HashSet<String>,
     /// Node ids with a dial in flight (any path).
     pub dialing: &'a HashSet<String>,
-    /// Node id -> instant its cooldown ends (this room).
-    pub cooldown_until: &'a HashMap<String, Instant>,
+    /// Node id -> the cooldown its last failed hold left (this room).
+    pub cooldowns: &'a HashMap<String, Cooldown>,
+    /// The chain's height as read this tick, when it was read: what puts the
+    /// cooldowns on the block clock ([`Cooldown::holds`]).
+    pub peak: Option<u32>,
     /// Holds currently running for this room.
     pub active_holds: usize,
     /// Hold slots kept free for the rendezvous dial-backs due in this room
@@ -185,7 +267,8 @@ pub fn plan_holds(
         if r.expires_at != 0 && r.expires_at < ctx.now_unix {
             continue;
         }
-        if ctx.cooldown_until.get(&r.node_id).is_some_and(|until| *until > ctx.now) {
+        let slot_now = ctx.peak.map(|peak| hold_slot(ctx.self_id, &r.node_id, peak));
+        if ctx.cooldowns.get(&r.node_id).is_some_and(|c| c.holds(slot_now, ctx.now)) {
             continue;
         }
         let addrs = addr_filter(&r.addrs);
@@ -245,8 +328,8 @@ impl RoomCache {
 /// State shared with the hold tasks: cooldowns and the live hold count.
 #[derive(Default)]
 pub struct WatchShared {
-    /// (room, node id) -> instant the cooldown ends.
-    pub cooldowns: Mutex<HashMap<(String, String), Instant>>,
+    /// (room, node id) -> the cooldown the target's last failed hold left.
+    pub cooldowns: Mutex<HashMap<(String, String), Cooldown>>,
     /// room -> holds in flight.
     pub active: Mutex<HashMap<String, usize>>,
     /// room -> hold slots kept free for due rendezvous dial-backs that found
@@ -580,21 +663,15 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             if records.is_empty() {
                 continue;
             }
-            let cooldown_until: HashMap<String, Instant> = shared
-                .cooldowns
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((r, _), _)| r == &room)
-                .map(|((_, node), until)| (node.clone(), *until))
-                .collect();
+            let cooldowns = room_cooldowns(&shared, &room);
             let active_holds = shared.active.lock().unwrap().get(&room).copied().unwrap_or(0);
             let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
             let ctx = PlanContext {
                 self_id: &self_id,
                 connected: &connected,
                 dialing: &dialing,
-                cooldown_until: &cooldown_until,
+                cooldowns: &cooldowns,
+                peak: (peak > 0).then_some(peak),
                 active_holds,
                 reserved,
                 now_unix,
@@ -751,9 +828,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                 continue;
                             }
                             println!(
-                                "⛓️ ChiaHub inbox: {} knocked for room {room} (confirmed at height {}) — dialing it back on the schedule",
+                                "⛓️ ChiaHub inbox: {} knocked for room {room} (confirmed at height {}) — dialing it back on the schedule · {} reply addr(s) in the knock",
                                 short(&from),
-                                f.confirmed_height
+                                f.confirmed_height,
+                                f.item.reply.len()
                             );
                             if let Some(ck) = f.item.ck_from {
                                 let mut book = hub.peers.lock().unwrap();
@@ -1050,21 +1128,15 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     continue;
                 }
                 let (connected, dialing) = snapshot_peers(&hub, room);
-                let cooldown_until: HashMap<String, Instant> = shared
-                    .cooldowns
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|((r, _), _)| r == room)
-                    .map(|((_, node), until)| (node.clone(), *until))
-                    .collect();
+                let cooldowns = room_cooldowns(&shared, room);
                 let active_holds = shared.active.lock().unwrap().get(room).copied().unwrap_or(0);
                 let reserved = shared.reserved.lock().unwrap().get(room.as_str()).copied().unwrap_or(0);
                 let ctx = PlanContext {
                     self_id: &self_id,
                     connected: &connected,
                     dialing: &dialing,
-                    cooldown_until: &cooldown_until,
+                    cooldowns: &cooldowns,
+                    peak: (peak > 0).then_some(peak),
                     active_holds,
                     reserved,
                     now_unix,
@@ -1112,8 +1184,11 @@ fn spawn_hold(
         return false;
     }
     *shared.active.lock().unwrap().entry(room.to_string()).or_insert(0) += 1;
+    // The height beside it, while one is fresh: it is how two nodes' logs are
+    // laid side by side (a pair's hold slots, a knock's set heights).
+    let at_height = hub.chia_peak.lock().unwrap().fresh(chia_resolve::unix_now()).map(|h| format!(" · chain height {h}")).unwrap_or_default();
     println!(
-        "⛓️ ChiaHub watcher: holding for {} in room {room} at {} public addr(s) ({source})",
+        "⛓️ ChiaHub watcher: holding for {} in room {room} at {} public addr(s) ({source}){at_height}",
         &cand.node_id[..cand.node_id.len().min(16)],
         cand.addrs.len()
     );
@@ -1121,6 +1196,7 @@ fn spawn_hold(
     let ep_h = iroh_ep.clone();
     let shared_h = shared.clone();
     let room_h = room.to_string();
+    let self_id = iroh_ep.id().to_string();
     tokio::spawn(async move {
         let ok = crate::hold_dial(
             hub_h.clone(),
@@ -1154,11 +1230,11 @@ fn spawn_hold(
             }
         }
         if !ok {
-            shared_h
-                .cooldowns
-                .lock()
-                .unwrap()
-                .insert((room_h, cand.node_id), Instant::now() + TARGET_COOLDOWN);
+            // The pair's slot as the hold ends, from the height the watcher
+            // (or the publisher) last read, while that is fresh: the retry
+            // then waits for the pair's next slot, as the other side's does.
+            let slot = hub_h.chia_peak.lock().unwrap().fresh(chia_resolve::unix_now()).map(|peak| hold_slot(&self_id, &cand.node_id, peak));
+            shared_h.cooldowns.lock().unwrap().insert((room_h, cand.node_id), Cooldown::started(Instant::now(), slot));
         }
     });
     true
@@ -1282,6 +1358,11 @@ fn rooms_connected_to(hub: &crate::SharedHub, node_id: &str) -> HashSet<String> 
         .filter(|(_, r)| r.remote_peers.contains_key(&key))
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// The cooldowns of `room`'s targets, by node id.
+fn room_cooldowns(shared: &WatchShared, room: &str) -> HashMap<String, Cooldown> {
+    shared.cooldowns.lock().unwrap().iter().filter(|((r, _), _)| r == room).map(|((_, node), c)| (node.clone(), *c)).collect()
 }
 
 /// Node ids connected in `room`, and node ids with a dial in flight (global).
@@ -1531,7 +1612,7 @@ mod tests {
         let now_unix = 1_000_000u64;
         let connected: HashSet<String> = ["bob".to_string()].into_iter().collect();
         let dialing: HashSet<String> = ["carol".to_string()].into_iter().collect();
-        let cooldown: HashMap<String, Instant> = [("dave".to_string(), now + Duration::from_secs(60))].into_iter().collect();
+        let cooldown: HashMap<String, Cooldown> = [("dave".to_string(), Cooldown { until: now + Duration::from_secs(60), slot: None })].into_iter().collect();
         let records = vec![
             rec("me", 900_000, 0, &["198.51.100.1:1"]),
             rec("bob", 900_000, 0, &["198.51.100.2:1"]),
@@ -1546,7 +1627,8 @@ mod tests {
             self_id: "me",
             connected: &connected,
             dialing: &dialing,
-            cooldown_until: &cooldown,
+            cooldowns: &cooldown,
+            peak: None,
             active_holds: 0,
             reserved: 0,
             now_unix,
@@ -1563,7 +1645,7 @@ mod tests {
         let now = Instant::now();
         let empty: HashSet<String> = HashSet::new();
         // Six records, "f" the freshest. Its cooldown EXPIRED a second ago.
-        let expired: HashMap<String, Instant> = [("f".to_string(), now - Duration::from_secs(1))].into_iter().collect();
+        let expired: HashMap<String, Cooldown> = [("f".to_string(), Cooldown { until: now - Duration::from_secs(1), slot: None })].into_iter().collect();
         let records: Vec<ChiaPresenceRecord> = (0..6)
             .map(|i| rec(&format!("{}", (b'a' + i) as char), 1_000 + i as u64, 0, &["198.51.100.9:1"]))
             .collect();
@@ -1571,7 +1653,8 @@ mod tests {
             self_id: "me",
             connected: &empty,
             dialing: &empty,
-            cooldown_until: &expired,
+            cooldowns: &expired,
+            peak: None,
             active_holds: MAX_HOLDS_PER_ROOM - 1,
             reserved: 0,
             now_unix: 5,
@@ -1581,8 +1664,8 @@ mod tests {
         assert_eq!(plan.len(), 1, "one free slot -> one hold");
         assert_eq!(plan[0].node_id, "f", "an expired cooldown no longer blocks the freshest record");
         // The same target still COOLING is skipped and the next freshest takes the slot.
-        let cooling: HashMap<String, Instant> = [("f".to_string(), now + Duration::from_secs(60))].into_iter().collect();
-        let ctx_cooling = PlanContext { cooldown_until: &cooling, ..ctx };
+        let cooling: HashMap<String, Cooldown> = [("f".to_string(), Cooldown { until: now + Duration::from_secs(60), slot: None })].into_iter().collect();
+        let ctx_cooling = PlanContext { cooldowns: &cooling, ..ctx };
         let plan = plan_holds(&records, &ctx_cooling, &parse_all);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].node_id, "e", "a live cooldown skips 'f'; 'e' is next");
@@ -1596,6 +1679,87 @@ mod tests {
     }
 
     #[test]
+    fn both_nodes_of_a_pair_cut_the_chain_into_the_same_hold_slots() {
+        let ids: Vec<String> = (0..12).map(|_| iroh::SecretKey::generate().public().to_string()).collect();
+        let mut offsets: HashSet<u32> = HashSet::new();
+        for pair in ids.chunks(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            // The slot's first height at or after 1,000, found from one side.
+            let first = (1_000u32..1_000 + HOLD_SLOT_BLOCKS).find(|h| hold_slot(a, b, *h) != hold_slot(a, b, *h - 1)).expect("a boundary in every slot's length");
+            offsets.insert(first % HOLD_SLOT_BLOCKS);
+            for h in first..first + 3 * HOLD_SLOT_BLOCKS {
+                assert_eq!(hold_slot(a, b, h), hold_slot(b, a, h), "the same slot whichever side asks");
+                let steps = u64::from((h - first) / HOLD_SLOT_BLOCKS);
+                assert_eq!(hold_slot(a, b, h), hold_slot(a, b, first) + steps, "one slot every HOLD_SLOT_BLOCKS, no more and no less");
+            }
+        }
+        assert!(offsets.len() > 1, "pairs do not all start their slots at the same block");
+        // Ids that are no keys still give both sides one answer.
+        assert_eq!(hold_slot("alice", "bob", 77), hold_slot("bob", "alice", 77));
+        // The top of the height range does not wrap.
+        assert!(hold_slot("alice", "bob", u32::MAX) >= hold_slot("alice", "bob", u32::MAX - HOLD_SLOT_BLOCKS));
+    }
+
+    #[test]
+    fn a_failed_hold_is_tried_again_when_the_pairs_next_slot_begins_whatever_the_timer_says() {
+        // The drill of 2026-11-11: a host restarted at the same addresses, so
+        // no new record told either side to dial. Each side's hold failed at
+        // its own moment and was retried one timer later: 14 minutes apart on
+        // both, three minutes at a time, never overlapping. On the block clock
+        // both retry when the pair's next slot begins.
+        let now = Instant::now();
+        let (host, guest) = (iroh::SecretKey::generate().public().to_string(), iroh::SecretKey::generate().public().to_string());
+        let empty: HashSet<String> = HashSet::new();
+        let first = (5_000u32..5_000 + HOLD_SLOT_BLOCKS).find(|h| hold_slot(&host, &guest, *h) != hold_slot(&host, &guest, *h - 1)).unwrap();
+        // The host's hold ended 3 blocks into the slot, the guest's 20 blocks in
+        // (seven minutes later): each notes the slot it ended in.
+        let host_ended = Cooldown::started(now, Some(hold_slot(&host, &guest, first + 3)));
+        let guest_ended = Cooldown::started(now + Duration::from_secs(7 * 60), Some(hold_slot(&guest, &host, first + 20)));
+        assert_eq!(host_ended.slot, guest_ended.slot, "both ended in the same slot of the pair");
+        let plans = |me: &str, them: &str, cooled: Cooldown, peak: Option<u32>, at: Instant| {
+            let cooldowns: HashMap<String, Cooldown> = [(them.to_string(), cooled)].into_iter().collect();
+            let records = vec![rec(them, 900_000, 0, &["198.51.100.4:1"])];
+            let ctx = PlanContext { self_id: me, connected: &empty, dialing: &empty, cooldowns: &cooldowns, peak, active_holds: 0, reserved: 0, now_unix: 1_000_000, now: at };
+            !plan_holds(&records, &ctx, &parse_all).is_empty()
+        };
+        let next = first + HOLD_SLOT_BLOCKS;
+        // Still in the slot: neither side dials, though the host's timer has run out.
+        let late = now + TARGET_COOLDOWN + Duration::from_secs(60);
+        assert!(!plans(&host, &guest, host_ended, Some(next - 1), late), "the timer alone does not start the host's retry");
+        assert!(!plans(&guest, &host, guest_ended, Some(next - 1), late));
+        // The next slot's first block: both dial, the guest well before its timer ends.
+        assert!(late < guest_ended.until, "the guest's own timer would still be running");
+        assert!(plans(&host, &guest, host_ended, Some(next), late), "the host retries as the slot begins");
+        assert!(plans(&guest, &host, guest_ended, Some(next), late), "and so does the guest, at the same block");
+        // A slot begun seconds after the hold ended starts the retry at once.
+        assert!(plans(&host, &guest, host_ended, Some(next), now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_cooldown_falls_back_to_its_timer_and_never_waits_on_a_wrong_height_for_long() {
+        let now = Instant::now();
+        let before = now + TARGET_COOLDOWN - Duration::from_secs(1);
+        let after = now + TARGET_COOLDOWN + Duration::from_secs(1);
+        // No height when the hold ended: the timer, whatever the height is now.
+        let unslotted = Cooldown::started(now, None);
+        assert!(unslotted.holds(Some(9), before) && unslotted.holds(None, before));
+        assert!(!unslotted.holds(Some(9), after) && !unslotted.holds(None, after));
+        // A slot on record, no height this tick (an outage): the timer.
+        let slotted = Cooldown::started(now, Some(40));
+        assert!(slotted.holds(None, before));
+        assert!(!slotted.holds(None, after));
+        // Both known: the slot decides, earlier or later than the timer.
+        assert!(slotted.holds(Some(40), after), "the same slot: wait, though the timer ran out");
+        assert!(!slotted.holds(Some(41), now), "the next slot: go, though the timer just started");
+        // A height far ahead of the chain when the hold ended (one carrier
+        // peer's word): the real chain never reaches that slot, and the wait
+        // ends at twice the cooldown.
+        let wrong = Cooldown::started(now, Some(u64::MAX / 2));
+        assert!(wrong.holds(Some(41), now + 2 * TARGET_COOLDOWN - Duration::from_secs(1)));
+        assert!(!wrong.holds(Some(41), now + 2 * TARGET_COOLDOWN));
+    }
+
+    #[test]
     fn a_starved_dialback_keeps_the_next_free_slot_from_the_record_planners() {
         // #272 review round 11: the room-record planner runs before the
         // dial-back planner each tick and the contact-card planner after it,
@@ -1606,7 +1770,7 @@ mod tests {
         // dial-back takes it.
         let now = Instant::now();
         let empty: HashSet<String> = HashSet::new();
-        let none: HashMap<String, Instant> = HashMap::new();
+        let none: HashMap<String, Cooldown> = HashMap::new();
         let records: Vec<ChiaPresenceRecord> = (0..6)
             .map(|i| rec(&format!("{}", (b'a' + i) as char), 1_000 + i as u64, 0, &["198.51.100.9:1"]))
             .collect();
@@ -1614,7 +1778,8 @@ mod tests {
             self_id: "me",
             connected: &empty,
             dialing: &empty,
-            cooldown_until: &none,
+            cooldowns: &none,
+            peak: None,
             active_holds,
             reserved,
             now_unix: 5,
