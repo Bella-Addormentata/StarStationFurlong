@@ -14,8 +14,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as Y from 'yjs';
 import { sealCk } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
+import { houseSign } from './computedHouse';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
@@ -127,6 +129,9 @@ describe('a page that writes a checkpoint', () => {
     await sim.run(20_000);
     const T = 'roulette-1';
     const C = sim.pages.find((sp) => sp.name === 'C')!;
+    // (On until a round has moved chips: the pages' counts rest on the root then.)
+    while (sim.elapsed < RUN_MS && (C.p.casino.computedFoldOf(T)?.nets.size ?? 0) === 0) await sim.run(1_000);
+    expect(C.p.casino.computedFoldOf(T)?.nets.size ?? 0, sim.label).toBeGreaterThan(0);
     const inc = C.p.casino.computedIncOf(T)!;
     const top = C.p.doc.getMap<unknown>('casinoComputed');
     const roots = [...top.keys()].filter((k) => k.startsWith(`ck:${T}:${inc}:`));
@@ -136,15 +141,140 @@ describe('a page that writes a checkpoint', () => {
     await sim.run(1_000);
     C.cheats = true;
     C.p.doc.transact(() => top.delete(roots[0]));
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    // While the doc holds no root, a page counts from the one it held, and the oracle's cold count with it.
+    await sim.run(500);
+    sim.enter(B);
+    expect(B.p.doc.getMap('casinoComputed').has(roots[0]), sim.label).toBe(false);
+    expect(B.p.casino.computedFoldOf(T)?.nets.size ?? 0, sim.label).toBeGreaterThan(0);
+    expect(sim.ledgerProblems(B), sim.label).toEqual([]);
+    expect(sim.cageProblems(B), sim.label).toEqual([]);
     await sim.run(10_000);
     await sim.syncAll();
-    const B = sim.pages.find((sp) => sp.name === 'B')!;
     expect(B.p.doc.getMap('casinoComputed').has(roots[0]), sim.label).toBe(true);
     expect(sim.violations, sim.label).toEqual([]);
   }, TIMEOUT);
 });
 
+describe('the checkpoint oracle and a sweep', () => {
+  it("a sweep the house's key signed that does not hold what the checkpoint it sweeps held (a thousand chips more to one player) is counted from by the pages, and named", async () => {
+    const sim = await Sim.open({ name: 'fair-only-wrong-sweep', seed: seed(1218), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const T = 'roulette-1';
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    while (sim.elapsed < RUN_MS && sim.node!.trims < 1) await sim.run(2_000);
+    sim.heal();
+    await sim.quiet(120_000);
+    sim.nodeUp = false;
+    await sim.syncAll();
+    expect(sim.gameProblems(), sim.label).toEqual([]);
+    sim.enter(B);
+    const inc = B.p.casino.computedIncOf(T)!;
+    const real = B.p.casino.computedResolutionOf(T, inc)!.base!.ck;
+    expect(real.u, sim.label).toBeGreaterThan(0);
+    const ctx = sim.ctxOf(T, inc);
+    const { g: _g, ...body } = real;
+    const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
+    const swept = sealCk(
+      ctx, { ...body, b: B.p.fold.nextSid3(ctx, real), w: (real.w ?? 0) + 1, n: { ...real.n, [B.pid]: (BigInt(real.n[B.pid] ?? '0') + 1000n).toString() } },
+      (bytes) => houseSign(secret, bytes),
+    );
+    B.cheats = true;
+    B.p.doc.transact(() => B.p.doc.getMap<unknown>('casinoComputed').set(swept.key, swept.value));
+    await sim.run(2_000);
+    await sim.syncAll();
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(swept.key);
+    const problems = sim.gameProblems();
+    expect(problems.some((p) => p.includes(swept.key) && /repeats no checkpoint the room held/.test(p)), problems.join('\n')).toBe(true);
+  }, TIMEOUT);
+});
+
 describe("the oracle's own base rule", () => {
+  it("holds no checkpoint that came and went while the page's doc held part of an update (the page never counted from it), and holds one that was there when the rest came", async () => {
+    const sim = await Sim.open({ name: 'fair-only-parked-ck', seed: seed(1219), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    const T = 'roulette-1';
+    const A = sim.pages.find((sp) => sp.name === 'A')!;
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    while (sim.elapsed < RUN_MS && sim.node!.trims < 1) await sim.run(2_000);
+    sim.heal();
+    await sim.quiet(120_000);
+    sim.nodeUp = false;
+    await sim.syncAll();
+    sim.enter(A);
+    const inc = A.p.casino.computedIncOf(T)!;
+    const real = A.p.casino.computedResolutionOf(T, inc)!.base!;
+    const ctx = sim.ctxOf(T, inc);
+    // A checkpoint that outranks the base (one sweep on) and pays B a thousand chips, under the house's key.
+    const { g: _g, ...body } = real.ck;
+    const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
+    const paying = (chips: bigint) => sealCk(
+      ctx, { ...body, b: A.p.fold.nextSid3(ctx, real.ck), w: (real.ck.w ?? 0) + 1, n: { ...real.ck.n, [B.pid]: (BigInt(real.ck.n[B.pid] ?? '0') + chips).toString() } },
+      (bytes) => houseSign(secret, bytes),
+    );
+    const better = paying(1000n);
+    // Two writers the room never heard: one whose second update comes before its first (the doc holds part
+    // until then), one that writes the checkpoint and deletes it meanwhile.
+    const state = Y.encodeStateAsUpdate(A.p.doc);
+    const updatesOf = (writes: ((doc: Y.Doc) => void)[]): Uint8Array[] => {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, state);
+      const out: Uint8Array[] = [];
+      doc.on('update', (u: Uint8Array) => out.push(u));
+      for (const w of writes) doc.transact(() => w(doc));
+      return out;
+    };
+    const [first, second] = updatesOf([(d) => d.getMap('scratch').set('a', 1), (d) => d.getMap('scratch').set('b', 2)]);
+    const [came, went] = updatesOf([(d) => d.getMap('casinoComputed').set(better.key, better.value), (d) => d.getMap('casinoComputed').delete(better.key)]);
+    const partial = (): boolean => (A.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
+    A.cheats = true;
+    Y.applyUpdate(A.p.doc, second);
+    expect(partial(), sim.label).toBe(true);
+    Y.applyUpdate(A.p.doc, came);
+    expect(A.p.doc.getMap('casinoComputed').has(better.key), sim.label).toBe(true);
+    Y.applyUpdate(A.p.doc, went);
+    expect(partial(), sim.label).toBe(true);
+    Y.applyUpdate(A.p.doc, first);
+    expect(partial(), sim.label).toBe(false);
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(real.key);
+    expect(sim.ledgerProblems(A), sim.label).toEqual([]);
+    expect(sim.cageProblems(A), sim.label).toEqual([]);
+    // One still there when the rest comes, and gone in the next write: the page counted from it when the rest
+    // came, or had not yet (it checks what came meanwhile when it next counts the game); the oracle with it.
+    const [first1, second1] = updatesOf([(d) => d.getMap('scratch').set('e', 1), (d) => d.getMap('scratch').set('f', 2)]);
+    // (Another one, which the page has checked no signature of.)
+    const other = paying(2000n);
+    const [came1, went1] = updatesOf([(d) => d.getMap('casinoComputed').set(other.key, other.value), (d) => d.getMap('casinoComputed').delete(other.key)]);
+    Y.applyUpdate(A.p.doc, second1);
+    Y.applyUpdate(A.p.doc, came1);
+    Y.applyUpdate(A.p.doc, first1);
+    expect(partial(), sim.label).toBe(false);
+    Y.applyUpdate(A.p.doc, went1);
+    sim.enter(A);
+    expect(sim.ledgerProblems(A), sim.label).toEqual([]);
+    expect(sim.cageProblems(A), sim.label).toEqual([]);
+    // …and one still there when the rest of the update comes is counted from when the page next counts the
+    // game (at once, or frames on), and held when it goes: the page's count, and the oracle's with it.
+    const [first2, second2] = updatesOf([(d) => d.getMap('scratch').set('c', 1), (d) => d.getMap('scratch').set('d', 2)]);
+    const [came2] = updatesOf([(d) => d.getMap('casinoComputed').set(better.key, better.value)]);
+    Y.applyUpdate(A.p.doc, second2);
+    expect(partial(), sim.label).toBe(true);
+    Y.applyUpdate(A.p.doc, came2);
+    Y.applyUpdate(A.p.doc, first2);
+    expect(partial(), sim.label).toBe(false);
+    const from = sim.elapsed;
+    const counted = (): boolean => (sim.enter(A), A.p.casino.computedResolutionOf(T, inc)?.base?.key === better.key);
+    do await sim.run(500); while (sim.elapsed < from + 30_000 && !counted());
+    expect(counted(), sim.label).toBe(true);
+    A.p.doc.transact(() => A.p.doc.getMap('casinoComputed').delete(better.key));
+    expect(A.p.doc.getMap('casinoComputed').has(better.key), sim.label).toBe(false);
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(better.key);
+    expect(sim.ledgerProblems(A), sim.label).toEqual([]);
+    expect(sim.cageProblems(A), sim.label).toEqual([]);
+  }, TIMEOUT);
+
   it('reads past an old checkpoint laid back in and a higher one the house did not sign, as the pages do', async () => {
     const sim = await Sim.open({ name: 'fair-only-stray-cks', seed: seed(1216), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
     const T = 'roulette-1';

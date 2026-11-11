@@ -20,16 +20,17 @@
  *   - the pages agree on the base (in the finish's agreement);
  *   - the house's cross-check refused no trim.
  *
- * Not here yet: the cheats (junk, forgers, griefers, sybils), the ends,
- * transfers, two houses, migration back (design §16.3's other 6c scenarios).
+ * The cheats (junk, forgers, griefers) are computedFairOnlyCheats.test.ts.
+ * Not here yet: sybils, the ends, transfers, two houses, migration back
+ * (design §16.3's other 6c scenarios).
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { finish as crapsFinish, RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
-import { isFairOnlyInc } from './computedFairOnly';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import { HOUSE_TRIM_ROUNDS } from './computedSimHouse';
-import type { FlipKind, PageSpec, SimSummary } from './computedSim';
+import type { PageSpec } from './computedSim';
+import { fairOnlyFinish, lines, rouletteFinish } from './computedFairOnlySimKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -47,86 +48,9 @@ const TIMEOUT = SIM_LONG ? 1_800_000 : 300_000;
 const ROULETTE = 'roulette-1';
 const seed = (n: number): number => n + SIM_SEED_OFFSET;
 const named = (names: string, extra: Partial<PageSpec> = {}): PageSpec[] => names.split('').map((name) => ({ name, ...extra }));
-const lines: string[] = [];
-
 afterAll(() => {
   if (lines.length > 0) console.log(`\n${lines.join('\n')}`);
 });
-
-/** computedSim.test.ts's budgets (a cold fold, a warm transaction, the quiet period). */
-const COLD_FOLD_MS = 3 * 300;
-const WARM_MS = 3 * 5;
-const QUIET_MAX_MS = 120_000;
-
-interface Finish {
-  flips?: readonly FlipKind[];
-  awayFlips?: readonly FlipKind[];
-  /** The house is away for a while (the scenario's own doing): the table
-   *  waits for it, so the roulette sims' stall budget is not held. */
-  houseAway?: boolean;
-}
-
-/** The roulette sims' finish (computedSim.test.ts), for a room of roulette
- *  tables: the heal, the quiet period, everything synced, every shared
- *  assertion. The session's bound is the house's: it trims on what the fold
- *  used and on junk, a show after the round that took the session past either. */
-async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
-  const { table } = sim.pages[0].p;
-  sim.heal();
-  const quietMs = await sim.quiet(QUIET_MAX_MS);
-  await sim.syncAll();
-  sim.settleFlips();
-  const s = sim.summary();
-  const line = `${Sim.line(s, sim.worstStall.at)}\n${sim.robots.line()}`;
-  lines.push(line);
-  console.log(line);
-  const log = sim.pages.flatMap((sp) => sp.flipLog.map((f) => `${sp.name} ${f}`));
-  expect(sim.violations, sim.label).toEqual([]);
-  expect(quietMs, sim.label).toBeLessThan(QUIET_MAX_MS);
-  for (const sp of sim.pages.filter((q) => q.mode === 'up')) expect(sim.endProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
-  expect(sim.disagreements(), sim.label).toEqual([]);
-  expect(sim.violations, sim.label).toEqual([]);
-  for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
-    expect(sim.ledgerProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
-    expect(sim.cageProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
-  }
-  expect(s.maxDocBytes, sim.label).toBeLessThan(1_000_000);
-  expect(s.maxSessionBytes, sim.label).toBeLessThanOrEqual(table.TRIM_BYTES + 2 * s.maxRoundBytes);
-  // With its house there, a game stalls no longer than a house table does.
-  if (!opts.houseAway) expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(table.ABANDON_MS + 2 * table.GRACE_MAX_MS);
-  expect(s.coldFoldMs, sim.label).toBeLessThan(COLD_FOLD_MS);
-  expect(s.warmP95Ms, sim.label).toBeLessThan(WARM_MS);
-  const allowed = new Set([...(opts.flips ?? []), ...(opts.awayFlips ?? [])]);
-  const unexpected = sim.pages.flatMap((sp) => (Object.entries(sp.flipKinds) as [FlipKind, number][])
-    .filter(([k]) => !allowed.has(k)).map(([k, n]) => `${sp.name}: ${n} × ${k}`));
-  expect(unexpected, `${sim.label}\n${log.join('\n')}`).toEqual([]);
-  expect(sim.unexplained(opts.awayFlips ?? []), `${sim.label}\n${log.join('\n')}`).toEqual([]);
-  if (Object.values(s.flips).every((n) => n === 0)) expect([...sim.debts.values()], sim.label).toEqual([]);
-  return s;
-}
-
-/** What a FAIR ONLY room adds to a finish (the header's list). */
-function fairOnlyFinish(sim: Sim, s: SimSummary): void {
-  const node = sim.node!;
-  const line = `[fair only] ${sim.label}: opened ${JSON.stringify([...sim.opened])} (refused before: ${JSON.stringify(sim.openRefusals)}), `
-    + `house ${JSON.stringify(node.wrote)} trims ${node.trims} put back: checkpoints ${node.rowPutBacks}, sessions ${node.newSessions}; `
-    + `cross-check refusals ${node.crossCheckMismatches}, refused rounds ${node.refusals}, blocked closes ${node.blockedSeen}; bases held to the oracle ${sim.basesCounted}`;
-  lines.push(line);
-  console.log(line);
-  expect([...sim.opened.keys()].sort(), sim.label).toEqual([...sim.tables].sort());
-  // Every page up plays the game at every table.
-  for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
-    sim.enter(sp);
-    for (const t of sim.tables) expect(isFairOnlyInc(sp.p.casino.computedIncOf(t)), `${sim.label} ${sp.name} ${t}`).toBe(true);
-  }
-  expect(s.byReveals + s.byForfeit, sim.label).toBe(0);
-  expect(sim.gameProblems(), sim.label).toEqual([]);
-  expect(node.crossCheckMismatches, sim.label).toBe(0);
-  // Every checkpoint past the roots is one the house wrote, and the pages counted from them.
-  expect(sim.houseCheckpoints, sim.label).toBe(node.trims);
-  if (node.trims > 0) expect(sim.basesCounted, sim.label).toBeGreaterThan(0);
-  expect(sim.basesCounted, sim.label).toBeLessThanOrEqual(node.trims);
-}
 
 describe('FAIR ONLY roulette, end to end: the owner opens the game, the node is its house', () => {
   it('steady, heavy felts: the house decides every round and trims the session; every page counts from its checkpoints', async () => {

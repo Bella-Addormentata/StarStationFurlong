@@ -31,7 +31,7 @@ import type { CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Counted, Resolution } from './computedFairOnlyAuth';
 import {
-  asAbandon, asCheckpointFor, asForfeit, asHouseCommit, asHouseReveal, asSlipFor, dutyRank, foldGameOf, gameOfInc, hasFields, houseCommitOf, houseRules,
+  asAbandon, asCheckpointFor, canon, asForfeit, asHouseCommit, asHouseReveal, asSlipFor, dutyRank, foldGameOf, gameOfInc, hasFields, houseCommitOf, houseRules,
   isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_HOUSE_COUNTED, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash,
   signBytes, slipCommit, TableFold,
 } from './computedFold';
@@ -79,6 +79,12 @@ export const HOUSE_IDLE_MS = 60_000;
  *  would pile up until the session was long or idle. So junk presses a trim
  *  as it would a sweep. */
 export const HOUSE_SWEEP_BYTES = 48 * 1024;
+/** The sweep (design §8.5 N3s, §8.9 SWEEP_KEYS, SWEEP_MIN_MS): a session with
+ *  no round decided since its base is cleared of junk by the base's content
+ *  signed again, one sweep on (`w`), when the junk weighs HOUSE_SWEEP_BYTES or
+ *  is this many keys (a key of nothing weighs little), and at most this often. */
+export const HOUSE_SWEEP_KEYS = 2_048;
+export const HOUSE_SWEEP_MIN_MS = 10_000;
 /** A game's session is folded for a trim at most this often (the fold is the
  *  engine's work, off the tick in the node: §7.3). */
 const FOLD_EVERY_MS = 1_000;
@@ -160,6 +166,11 @@ interface TableMem {
   lastFold: number | null;
   /** The session's kept bytes as it last folded them (the room's pressure). */
   kept: number;
+  /** When it last swept the game (HOUSE_SWEEP_MIN_MS). */
+  lastSweep: number | null;
+  /** The round-u copies its last trim carried into the session of checkpoint
+   *  `base`: a sweep of that session carries them on. */
+  carried: { base: string; keys: string[] } | null;
 }
 
 /** 🔒 A FAIR ONLY game this house serves: its resolution, the base its live
@@ -224,6 +235,8 @@ export class SimHouse {
   /** 🔒 What it did at FAIR ONLY games: trims written, checkpoints and session
    *  maps put back, and trims its cross-check refused to sign. */
   trims = 0;
+  /** 🔒 Sweeps written: a game's base signed again to clear a junked session. */
+  sweeps = 0;
   rowPutBacks = 0;
   newSessions = 0;
   crossCheckMismatches = 0;
@@ -833,7 +846,7 @@ export class SimHouse {
     if (!mem) {
       room.tables.set(tkey, mem = {
         firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: now,
-        fo, decidedAt: new Map(), missingAt: new Map(), keys: read.keys, lastNewKey: now, lastFold: null, kept: 0,
+        fo, decidedAt: new Map(), missingAt: new Map(), keys: read.keys, lastNewKey: now, lastFold: null, kept: 0, lastSweep: null, carried: null,
       });
       // After a start: its reveals from before go back as this run's do.
       for (const k of this.lastOf(ctx)?.kept ?? []) mem.written.push([k.ses, k.key, k.rec]);
@@ -988,7 +1001,8 @@ export class SimHouse {
     if (!mem) return;
     // (Nothing of its own into the session it would close, this tick.)
     if (writes.some((w) => 'ses' in w && w.ses === g.sesKey)) return;
-    if (read.closes.length === 0) return;
+    // (Nothing in the session: nothing to trim to, and nothing to sweep.)
+    if (read.closes.length === 0 && read.keys === 0) return;
     if (mem.lastFold !== null && now - mem.lastFold < FOLD_EVERY_MS) return;
     mem.lastFold = now;
     const res = this.foldOf(doc, room, g);
@@ -996,7 +1010,10 @@ export class SimHouse {
     if (res.pending || res.tip) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
-    if (!D || D.r <= B.u) return;
+    if (!D || D.r <= B.u) {
+      this.sweepDuty(doc, g, read, res, mem, now, writes);
+      return;
+    }
     const done = this.lastOf(ctx);
     let own: Kept | undefined;
     if (D.house) {
@@ -1048,38 +1065,112 @@ export class SimHouse {
       const carried = done!.r === D.r ? own.rec.c : undefined;
       agrees &&= body.l === done!.d![1] && body.d === `h:${recHash(own.rec)}` && body.h === carried;
     }
-    let sealed: { key: string; value: CkRec } | null = null;
-    if (agrees) {
-      try {
-        sealed = sealCk(ctx, body as unknown as Omit<CkRec, 'g'>, (bytes) => houseSign(this.secret, bytes));
-      } catch {
-        sealed = null;
-      }
-      // (As a page reads it, and the best of the game with it in: else no page would count from it.)
-      if (sealed) {
-        const with_: AuthRecords = { cks: [[g.base.key, B], [sealed.key, sealed.value]], xfs: [], delegations: [g.dl] };
-        const after = resolveGame({ room: ctx.room, sig: (id, pub, bytes, sig) => this.verified(['auth', ctx.room, id, '', ''], pub, bytes, sig) }, ctx.t, ctx.inc, with_);
-        if (after.base?.key !== sealed.key) sealed = null;
-      }
-    }
+    const sealed = agrees ? this.sealAsBase(g, body) : null;
     if (!sealed) {
       this.crossCheckMismatches += 1;
       return;
     }
+    const carried = D.deciderCopies ?? [];
+    this.rows.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, sealed);
+    this.trims += 1;
+    mem.carried = { base: sealed.key, keys: carried };
+    writes.push({ trim: { t: ctx.t, inc: ctx.inc, key: sealed.key, value: sealed.value, ses: `ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, sealed.value)}`, copies: this.copiesOf(doc, g, res, carried) } });
+  }
+
+  /** 🔒 The sweep (design §8.5 N3s): no round decided since the base, no close
+   *  of the open round, and junk piled up in the session (HOUSE_SWEEP_BYTES of
+   *  what the fold does not use, or HOUSE_SWEEP_KEYS keys of it). The base's
+   *  content signed again by this house with one sweep more, closing the
+   *  junked session: a checkpoint of the same round that outranks the base
+   *  (S3) and opens a session of its own, into which go what a trim would
+   *  carry: the open round's felts and joins, and the copies of round u the
+   *  swept session held. Cross-checked as a trim is; at most one per
+   *  HOUSE_SWEEP_MIN_MS. A trim sweeps too, so this is only for a session
+   *  with nothing decided in it. */
+  private sweepDuty(doc: Y.Doc, g: Game, read: TableRead, res: FoldResult, mem: TableMem, now: number, writes: Write[]): void {
+    const { ctx } = g;
+    const B = g.base.ck;
+    if (mem.lastSweep !== null && now - mem.lastSweep < HOUSE_SWEEP_MIN_MS) return;
+    // Round u's decider, and the reveals its trim copied with it (a house
+    // that restarted since carries the decider alone: the rest is for show).
+    // Each is what its key says, or is junk as any other key is: junk a peer
+    // wrote over one would else ride every sweep and press the next, and
+    // would not be counted among the keys this sweep clears. What is carried
+    // is no junk by its weight either (the fold keeps none of round u, so
+    // `rawBytes - keptBytes` holds it): a sweep would clear none of it, and
+    // a round whose records weigh HOUSE_SWEEP_BYTES would be swept every
+    // HOUSE_SWEEP_MIN_MS for nothing.
+    const ses = doc.getMap('casinoComputed').get(g.sesKey) as Y.Map<unknown>;
+    const carried: string[] = [];
+    let carriedBytes = 0;
+    for (const key of mem.carried?.base === g.base.key ? mem.carried.keys : B.d === undefined ? [] : [`${B.d.slice(0, 1)}:${B.u}:${B.d.slice(2)}`]) {
+      const v = ses.get(key);
+      let hash: string | null = null;
+      try {
+        hash = recHash(v);
+      } catch {
+        hash = null;
+      }
+      if (hash === null || hash !== key.slice(key.lastIndexOf(':') + 1)) continue;
+      carried.push(key);
+      carriedBytes += key.length + canon(v)!.length;
+    }
+    const junkKeys = read.keys - res.felts.size - res.joins.length - carried.length;
+    if (res.rawBytes - res.keptBytes - carriedBytes < HOUSE_SWEEP_BYTES && junkKeys < HOUSE_SWEEP_KEYS) return;
+    const { g: _sig, e: _e, f: _f, ...content } = B;
+    let body: Record<string, unknown> = { ...content, b: read.sid, w: (B.w ?? 0) + 1, dl: g.dl, k: this.pub };
+    if (this.faultTrim) body = this.faultTrim(body);
+    // The cross-check: the session it closes, one sweep on, this house's under
+    // its delegation, and for the rest the base's content, field for field.
+    const { b: b_, w: w_, dl: dl_, k: k_, ...rest } = body;
+    const { b: _b, w: _w, dl: _dl, k: _k, ...held } = content;
+    let agrees = false;
+    try {
+      agrees = b_ === read.sid && w_ === (B.w ?? 0) + 1 && k_ === this.pub && recHash(dl_) === recHash(g.dl) && recHash(rest) === recHash(held);
+    } catch {
+      agrees = false;
+    }
+    const sealed = agrees ? this.sealAsBase(g, body) : null;
+    if (!sealed) {
+      this.crossCheckMismatches += 1;
+      return;
+    }
+    this.rows.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, sealed);
+    this.sweeps += 1;
+    mem.lastSweep = now;
+    mem.carried = { base: sealed.key, keys: carried };
+    writes.push({ trim: { t: ctx.t, inc: ctx.inc, key: sealed.key, value: sealed.value, ses: `ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, sealed.value)}`, copies: this.copiesOf(doc, g, res, carried) } });
+  }
+
+  /** A checkpoint body signed, if it reads as a page reads one and is the
+   *  best of the game with it in (else no page would count from it); else null. */
+  private sealAsBase(g: Game, body: Record<string, unknown>): { key: string; value: CkRec } | null {
+    const { ctx } = g;
+    let sealed: { key: string; value: CkRec };
+    try {
+      sealed = sealCk(ctx, body as unknown as Omit<CkRec, 'g'>, (bytes) => houseSign(this.secret, bytes));
+    } catch {
+      return null;
+    }
+    const with_: AuthRecords = { cks: [[g.base.key, g.base.ck], [sealed.key, sealed.value]], xfs: [], delegations: [g.dl] };
+    const after = resolveGame({ room: ctx.room, sig: (id, pub, bytes, sig) => this.verified(['auth', ctx.room, id, '', ''], pub, bytes, sig) }, ctx.t, ctx.inc, with_);
+    return after.base?.key === sealed.key ? sealed : null;
+  }
+
+  /** What a trim or a sweep carries into the session it opens (the L7 copies):
+   *  the open round's felts whose seed is not out, the house's joins of it,
+   *  and round u's decider with the reveals it counted (`carried`). */
+  private copiesOf(doc: Y.Doc, g: Game, res: FoldResult, carried: string[]): [string, unknown][] {
     const ses = doc.getMap('casinoComputed').get(g.sesKey) as Y.Map<unknown>;
     const copies: [string, unknown][] = [];
     const copy = (key: string): void => {
       const v = ses.get(key);
       if (v !== undefined && !copies.some(([k]) => k === key)) copies.push([key, v]);
     };
-    // The open round's felts whose seed is not out, the house's joins of it,
-    // and round D's decider with the reveals it counted (the L7 copies).
     for (const s of res.felts.values()) if (!res.revealedCommits.has(s.rec.c)) copy(s.key);
     for (const j of res.joins) copy(`o:${res.open}:${j.hash}`);
-    for (const key of D.deciderCopies ?? []) copy(key);
-    this.rows.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, sealed);
-    this.trims += 1;
-    writes.push({ trim: { t: ctx.t, inc: ctx.inc, key: sealed.key, value: sealed.value, ses: `ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, sealed.value)}`, copies } });
+    for (const key of carried) copy(key);
+    return copies;
   }
 
   private writeSession(mem: TableMem, ses: string, kind: 'h' | 'o', r: number, rec: Record<string, unknown>, writes: Write[]): void {
