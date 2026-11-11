@@ -159,8 +159,11 @@ import {
   computedFairOnlyReturns,
   computedFoldOf,
   computedGameMovesOf,
+  computedFairOnlyGames,
   computedGamesEnding,
   computedGamesHeldBy,
+  deedHeldBy,
+  deedOffersTo,
   computedRedecide,
   computedIncEnded,
   computedIncFor,
@@ -221,6 +224,7 @@ import {
   writeComputedOff,
   writeComputedOn,
   writeDelegation,
+  writeFairOnlyAdoption,
   writeFairOnlyEnd,
   writeFairOnlyOn,
   writeFairSetting,
@@ -241,8 +245,8 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
-import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, sealCk, sealFin } from './computedFairOnly';
-import type { CkRec, FinRec } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, OFFER_SKEW_MS, sealCk, sealFin, sealXf } from './computedFairOnly';
+import type { CkRec, DeedOffer, FinRec, XferRec } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
 import {
@@ -258,7 +262,12 @@ import { randomSeedHex } from './games/fairDice';
 import { isRouletteBet } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
-import { getIdentityPub, signIdentity } from './keypair';
+import { getIdentityPub, signIdentity, verifyIdentityStrict } from './keypair';
+import { offerSignBytes } from './offerBytes';
+import type { TransferOffer } from './offerBytes';
+import { setDeedRedeemed } from './offers';
+import type { Resolution } from './computedFairOnlyAuth';
+import { asDeedOffer, definedOffer } from './computedFairOnly';
 import { localStandOf } from './localStands';
 import type { HouseFold } from './nodeFingerprint';
 import { heardThrough, noteClockRead } from './roomHearing';
@@ -761,6 +770,8 @@ function lookAtClock(now: number): void {
     keptAt = null;
     endingSince.clear();
     endLookedAt = null;
+    adoptTried.clear();
+    adoptLookedAt = null;
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -2864,6 +2875,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   recoverDuty(getIdentityPub(), now);
   fairKeepDuty(getIdentityPub(), now);
   fairEndDuty(getIdentityPub(), now);
+  adoptDuty(now);
   houseDuty(now);
 }
 
@@ -5619,6 +5631,15 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
   return witnessLost(st, res, now).size === 0 && !waits;
 }
 
+/** The transfers that brought a FAIR ONLY game to its holder, in order (the
+ *  chain's steps): what a checkpoint the holder's key signs must carry as `x`
+ *  to speak for the holder (S1). Not the base's `x`: after a hand-over the
+ *  base can still be the seller's checkpoint of the same round, which carries
+ *  one transfer fewer than the buyer's records must. */
+function transfersOf(resolved: Resolution): XferRec[] {
+  return resolved.chain.slice(1).map((h) => h.step!.xf);
+}
+
 /** The ended checkpoint of a game at base `B` folded as `res`, quiet, under
  *  end order `fin`, as the page that holds the game signs it (design §8.6, and
  *  §8.5 N6 for the form): at the last round its fold decided past the base, or
@@ -5626,7 +5647,7 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
  *  one either way; the fold's nets, which count on; no carry, no commitment
  *  and no sweep count (an end plays nothing on, so every bet riding at craps
  *  is its player's again); the transfers that brought the game to this key. */
-function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec): { key: string; value: CkRec } {
+function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec, x: XferRec[]): { key: string; value: CkRec } {
   const D = lastDecided(res);
   const at = D && D.r > B.u
     ? {
@@ -5637,7 +5658,7 @@ function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec): { key:
     : { u: B.u, l: B.l, ...(B.d !== undefined ? { d: B.d } : {}), ...(B.o !== undefined ? { o: B.o } : {}) };
   return sealCk(ctx, {
     v: 1, ok: B.ok, j: B.j, rv: B.rv, ts: B.ts, b: res.base.sid, ...at, n: netsOf(res), e: 1, f: fin,
-    ...(B.x !== undefined ? { x: B.x } : {}), k: getIdentityPub(),
+    ...(x.length > 0 ? { x } : {}), k: getIdentityPub(),
   }, signIdentity);
 }
 
@@ -5681,12 +5702,12 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
     const played = computedIncOf(t);
     return played !== null && isFairOnlyInc(played) && gameOfInc(played) === game && isComputedTable(t) ? 'theirs' : 'ok';
   }
-  const games: { inc: string; fin: FinRec | null; base: CkRec; res: FoldResult }[] = [];
+  const games: { inc: string; fin: FinRec | null; base: CkRec; res: FoldResult; x: XferRec[] }[] = [];
   for (const inc of held) {
     const resolved = computedResolutionOf(t, inc);
     const res = computedFoldOf(t, inc);
     if (!resolved || resolved.pending || !resolved.base || !res || res.pending) return 'reconnecting';
-    games.push({ inc, fin: resolved.fin, base: resolved.base.ck, res });
+    games.push({ inc, fin: resolved.fin, base: resolved.base.ck, res, x: transfersOf(resolved) });
   }
   if (game === 'craps' && !again && games.some((g) => contractRides(g.res.carry as CrapsCarry))) return 'contract';
   const writes = games.map((g) => {
@@ -5695,7 +5716,7 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
     // (Sound first: what it notes is noted with a round in flight too, so a
     // wait that began for one loss does not stand in for the next.)
     const sound = fairSound(t, g.inc, g.res, now);
-    const end = fairQuiet(g.res) && sound ? fairEndOf(ctx, g.base, g.res, fin) : null;
+    const end = fairQuiet(g.res) && sound ? fairEndOf(ctx, g.base, g.res, fin, g.x) : null;
     return { inc: g.inc, fin: g.fin === null ? fin : null, end };
   });
   // (A game whose order stands and whose end waits has nothing to write.)
@@ -5733,6 +5754,101 @@ export function endFairOnlyAtRemoval(t: string, game: GameName, now = Date.now()
   return switchFairOnlyOff(t, game, now, true);
 }
 setLocalClosing((t, game) => { endFairOnlyAtRemoval(t, game); });
+
+/** By `<tableId>:<inc>:<nonce>`: the hand-overs this page has written (one
+ *  write each: a transfer every page refuses is not written again and again). */
+const adoptTried = new Set<string>();
+/** When adoptDuty last looked (at most every TICK_MS). */
+let adoptLookedAt: number | null = null;
+
+/** Whether deed offer `o` carries its maker's signature. */
+function offerSigned(o: DeedOffer): boolean {
+  const { sig, ...unsigned } = o;
+  return verifyIdentityStrict(o.makerPub, offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
+}
+
+/**
+ * 🔒 The FAIR ONLY games of the room move to this page's key with the deed
+ * (design §8.7, deed handover). For each live game whose holder made a deed
+ * offer out to this key, ONE write (writeFairOnlyAdoption): the transfer
+ * (`xf:`: the offer, the round the game changes hands at, this key, signed by
+ * it) and, where the base stands at that round, the adoption: the base's
+ * content signed by this key with the transfer added to the chain's. The
+ * round is the last decided one, or the one in flight (the design has the
+ * base's: but the rounds a house decided since the base count only while its
+ * delegator holds the game for them, and would be undone). With rounds since
+ * the base, or the base the opening root (its opener's alone to sign), the
+ * transfer alone moves the game, and the base stays the seller's. Every page then reads this key as the game's holder from that
+ * round on (S2); the live session is the one it was, so felts, a round in
+ * flight and the nets go on. The seller's house, which sees the transfer,
+ * reveals nothing past that round and stops joining; the game waits for a
+ * house of this key's (the simulations' and the node's half).
+ *
+ * `redeeming` is the offer this page is redeeming now (offers
+ * redeemDeedOffer, inside its transaction, which has checked it): it counts
+ * whoever this page read as the deed's holder a moment ago. Without it, the
+ * offers the doc holds for this key (`do:`, left by whoever settled the deed)
+ * count, and only while this page reads its own key as the deed's holder: a
+ * buyer whose page was not the one that settled, or could not check the game
+ * then, moves it on a later look (adoptDuty).
+ *
+ * An offer moves a game only if its maker holds it, it was made after the
+ * game opened (the resolver's skew, OFFER_SKEW_MS), its nonce is new to the
+ * game's chain and its maker signed it. A game is left as it is while the doc
+ * holds part of an update or its records are still being checked. Returns
+ * how many games it moved.
+ */
+export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer): number {
+  lookAtClock(now);
+  const me = getIdentityPub();
+  const theirs = computedFairOnlyGames().filter((g) => g.holder !== me);
+  if (theirs.length === 0) return 0;
+  const room = casinoRoomId();
+  const mine = redeeming !== undefined ? asDeedOffer(definedOffer(redeeming), room) : null;
+  if (redeeming === undefined && !deedHeldBy(me)) return 0;
+  const offers = (mine ? [mine] : redeeming === undefined ? deedOffersTo(me) : []).filter((o) => o.toPub === me);
+  if (offers.length === 0) return 0;
+  let moved = 0;
+  for (const { t, inc, holder } of theirs) {
+    const resolved = computedResolutionOf(t, inc);
+    const res = computedFoldOf(t, inc);
+    if (!resolved || resolved.pending || !resolved.base || !resolved.name || !res || res.pending || !casinoWhole(t) || !computedSettled(t)) continue;
+    const used = new Set(resolved.chain.map((h) => h.step?.xf.o.nonce));
+    const name = resolved.name;
+    const o = offers.find((c) => c.makerPub === holder && c.issuedAt >= name.ts - OFFER_SKEW_MS && !used.has(c.nonce)
+      && !adoptTried.has(`${t}:${inc}:${c.nonce}`) && (c === mine || offerSigned(c)));
+    if (!o) continue;
+    const ctx: FoldCtx = { room, t, inc };
+    const B = resolved.base.ck;
+    // The round the game changes hands at: the last this page reads decided,
+    // or the one in flight. The seller's key holds the game up to it, so the
+    // reveals of the seller's house that decided the rounds since the base
+    // count on (a house counts for the rounds its delegator held, S2), the
+    // seller's house may still trim them, and the round in flight is its to
+    // reveal. At the base's own round they would all read undecided again.
+    const u = Math.max(B.u, lastDecided(res)?.r ?? 0) + (fairQuiet(res) ? 0 : 1);
+    const xf = sealXf(ctx, { v: 1, o, u, k: me }, signIdentity);
+    // (The base's content: all of it but who signed, who delegated the signer and the chain.)
+    const { g: _g, dl: _dl, x: _x, k: _k, ...content } = B;
+    // The adoption only where the base is at that round, and is no opening root
+    // (a root is its opener's alone to sign, S0): this key holds the game from
+    // round `u` on, and can sign nothing under it.
+    const adoption = B.b === 'g' || B.u !== u ? null : sealCk(ctx, { ...content, x: [...transfersOf(resolved), xf.value], k: me }, signIdentity);
+    adoptTried.add(`${t}:${inc}:${o.nonce}`);
+    if (writeFairOnlyAdoption(t, inc, xf, adoption)) moved++;
+    else adoptTried.delete(`${t}:${inc}:${o.nonce}`);
+  }
+  return moved;
+}
+setDeedRedeemed((o) => { adoptFairOnlyGames(Date.now(), o); });
+
+/** 🔒 The tick's look for games to move to this key (adoptFairOnlyGames): at
+ *  most every TICK_MS. */
+function adoptDuty(now: number): void {
+  if (adoptLookedAt !== null && now >= adoptLookedAt && now - adoptLookedAt < TICK_MS) return;
+  adoptLookedAt = now;
+  adoptFairOnlyGames(now);
+}
 
 /** By `<tableId>:<inc>`: when this page first saw the game quiet under an end
  *  order, on its clock (fairEndDuty). */
@@ -5780,7 +5896,7 @@ function fairEndDuty(pub: string, now: number): void {
       continue;
     }
     if (now - since < FAIR_END_WAIT_MS) continue;
-    const end = fairEndOf({ room: casinoRoomId(), t, inc }, resolved!.base!.ck, res!, resolved!.fin!);
+    const end = fairEndOf({ room: casinoRoomId(), t, inc }, resolved!.base!.ck, res!, resolved!.fin!, transfersOf(resolved!));
     transactCasino(() => writeFairOnlyEnd(t, inc, null, end));
     endingSince.delete(key);
   }

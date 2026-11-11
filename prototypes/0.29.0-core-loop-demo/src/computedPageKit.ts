@@ -40,6 +40,8 @@ export interface Page {
   casino: typeof import('./casinoDoc');
   croupier: typeof import('./croupier');
   table: typeof import('./computedTable');
+  /** Its transfer offers (offers), bound to its doc. */
+  offers: typeof import('./offers');
   fair: typeof import('./fairTableSeeds');
   fold: typeof import('./computedFold');
   keypair: typeof import('./keypair');
@@ -97,6 +99,7 @@ export async function loadPage(
   const casino = await import('./casinoDoc');
   const croupier = await import('./croupier');
   const table = await import('./computedTable');
+  const offers = await import('./offers');
   const fair = await import('./fairTableSeeds');
   const fold = await import('./computedFold');
   const keypair = await import('./keypair');
@@ -108,9 +111,10 @@ export async function loadPage(
   doc.clientID = clientID;
   casino.setComputedVerifyForTests(opts.verify ?? { now: () => 0 });
   casino.bindCasinoDoc(doc, PAGE_ROOM, opts.resync);
+  offers.bindOffers(doc);
   const pub = keypair.getIdentityPub();
   doc.transact(() => doc.getMap('players').set(pid, { keyB64: pub, name: pid }));
-  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair, stands, robot, seeds };
+  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, offers, fair, fold, keypair, stands, robot, seeds };
 }
 
 /** Pages for `names` (Yjs clients 1, 2, …, clocks `skews` ahead of the
