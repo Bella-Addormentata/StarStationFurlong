@@ -5957,6 +5957,14 @@ pub fn knock_leave(
     Ok(cap.hands_out_own_card(key_durable, share_enabled).then_some(*contact_key))
 }
 
+/// The endpoint's addresses as it knows them now, as text (F3 rule: hints
+/// are live data, not a boot-time snapshot): what the listing is built from
+/// each tick, and what a knock's reply addresses are built from when its
+/// spend is made.
+fn live_addrs(iroh_ep: &iroh::Endpoint) -> Vec<String> {
+    iroh_ep.addr().ip_addrs().filter(|sock| !sock.ip().is_unspecified()).map(|sock| sock.to_string()).collect()
+}
+
 /// What a knock carries of its writer beside the node id, as the room's word
 /// stands at spend time: the contact key where the card may be handed out
 /// ([`knock_leave`]), and the addresses the host can dial back
@@ -7011,12 +7019,7 @@ pub async fn heartbeat_loop(
             continue;
         }
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
-        let addrs: Vec<String> = iroh_ep
-            .addr()
-            .ip_addrs()
-            .filter(|sock| !sock.ip().is_unspecified())
-            .map(|sock| sock.to_string())
-            .collect();
+        let addrs: Vec<String> = live_addrs(&iroh_ep);
         // No early exit on an empty address list here: the per-node record may
         // carry ZERO addresses (the codec allows it), and a node that lost its
         // last address must say so, or its peers keep dialing the old ones until
@@ -7483,18 +7486,23 @@ pub async fn heartbeat_loop(
                 // private — a private pass's word admits its cards, not ours).
                 // A bare knock still names our node id, which the host dials
                 // back through the DHT.
-                // Our public addresses of this tick ride in it wherever the
-                // knock itself may go ([`knock_reply_addrs`]): a first visit's
-                // knock has no contact key to give, and the host dials back
-                // at these with no DHT.
+                // Our public addresses ride in it wherever the knock itself
+                // may go ([`knock_reply_addrs`]): a first visit's knock has no
+                // contact key to give, and the host dials back at these with
+                // no DHT. They are read at spend time too, not from this
+                // tick's snapshot: the tick's lookups and writes come between
+                // the two, a knock is written once per host per era, and one
+                // that named addresses the node had just lost would leave a
+                // first visit's host nothing to dial for the rest of the era.
                 let leave = {
                     let hub = hub.clone();
+                    let iroh_ep = iroh_ep.clone();
                     let (room, host) = (req.room.clone(), req.host.clone());
-                    let reply = knock_reply_addrs(&addrs);
                     move || {
                         let cap = hub.chia_rooms.lock().unwrap().get(&room).cloned();
                         let linked = host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &room, &pk));
-                        knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key).map(|ck| KnockCarry { ck, reply })
+                        knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key)
+                            .map(|ck| KnockCarry { ck, reply: knock_reply_addrs(&live_addrs(&iroh_ep)) })
                     }
                 };
                 // The arm's whole step from here to the write is one seam

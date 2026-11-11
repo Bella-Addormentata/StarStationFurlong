@@ -1737,11 +1737,15 @@ fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
 /// needs no NAT traversal at all, so it gets the first Initials of every hold.
 #[cfg(feature = "chia-read")]
 pub(crate) fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
-    const CAP: usize = 8;
     let mut kept = chia_public_addrs(addrs);
-    kept.truncate(CAP);
+    kept.truncate(CHIA_DIAL_ADDR_CAP);
     kept
 }
+
+/// How many self-declared addresses one dial is fed at most
+/// ([`chia_public_dial_addrs`]).
+#[cfg(feature = "chia-read")]
+pub(crate) const CHIA_DIAL_ADDR_CAP: usize = 8;
 
 /// Every public, internet-routable address among `addrs`, v6 first (stable:
 /// publisher order within each family), with no cap: the presence publisher
