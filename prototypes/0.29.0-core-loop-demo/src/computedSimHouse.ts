@@ -599,8 +599,13 @@ export class SimHouse {
       // what came out of order): a close, or a frozen slip a page is putting
       // back, may be in the part to come, and a trim, a sweep or an end
       // deletes the session it would land in. As a page's own trim waits for
-      // its doc to be whole.
-      if (partial) continue;
+      // its doc to be whole. And what it waits for (waitsOn) it waits for
+      // afresh after: a wait stands only through folds that read its thing
+      // gone, and through this one it may have come back and gone again.
+      if (partial) {
+        mem.tables.get(`${t}|${inc}`)!.waits.clear();
+        continue;
+      }
       if (res.fin === null) this.trimDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, now, writes);
       else this.endDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, res.fin, now, writes);
     }
@@ -1023,7 +1028,10 @@ export class SimHouse {
     mem.lastFold = now;
     const res = this.foldOf(doc, room, g);
     mem.kept = res.keptBytes;
-    if (res.pending) return;
+    if (res.pending) {
+      mem.waits.clear();
+      return;
+    }
     // (Noted at every checked fold, a close of the open round in or not: a
     // wait that began for one loss must not stand in for the next.)
     const waits = this.waitsOn(g, res, mem, now);
@@ -1106,7 +1114,9 @@ export class SimHouse {
    *    slip, by its close and its bettor.
    *  A thing no longer so at a fold is forgotten, so the same loss again, or
    *  another in its place, waits afresh: no wait that began for one loss
-   *  stands in for the next. The pages that showed the round put the record
+   *  stands in for the next. And a tick that could check no fold (the doc
+   *  holding part of an update, the fold's records still being checked)
+   *  forgets them all, for what it could not see come back and go again. The pages that showed the round put the record
    *  back in their turns (their witness copies), within seconds; so no sweep,
    *  trim or end meanwhile, as a page's own trim holds (computedTable
    *  trimDuty). If nobody has put it back by then nobody is left who can, and
@@ -1157,7 +1167,10 @@ export class SimHouse {
     mem.lastFold = now;
     const res = this.foldOf(doc, room, g);
     mem.kept = res.keptBytes;
-    if (res.pending) return;
+    if (res.pending) {
+      mem.waits.clear();
+      return;
+    }
     // (Noted at every checked fold, as trimDuty notes it.)
     const waits = this.waitsOn(g, res, mem, now);
     if (res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;

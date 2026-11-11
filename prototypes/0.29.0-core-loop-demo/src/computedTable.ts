@@ -5577,8 +5577,9 @@ function fairQuiet(res: FoldResult): boolean {
  *  that never looked at the game notes what the fold reads missing from its
  *  first look here, and waits as long. One wait for each thing gone
  *  (`st.gone`), noted whenever this is asked, a round in flight or not, and
- *  forgotten once the thing is no longer so: the same loss again, or another
- *  in its place, waits MISSING_WAIT_MS afresh. */
+ *  forgotten once the thing is no longer so, whatever else holds the end
+ *  back at that look: the same loss again, or another in its place, waits
+ *  MISSING_WAIT_MS afresh. */
 function fairSound(t: string, inc: string, res: FoldResult, now: number): boolean {
   // (A game this page holds and has not served since it loaded, the table
   // playing another: its state begins here, so the waits below run out, and
@@ -5587,8 +5588,10 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
   let st = fairTables.get(key);
   if (!st) fairTables.set(key, st = newTable(t, inc));
   if (!forgedStands(st)) noteChain(st, now);
-  if (witnessLost(st, res, now).size > 0) return false;
-  // What is gone now, each thing by what it is.
+  // What is gone now, each thing by what it is. (Noted and forgotten on every
+  // look, one that a lost witness copy holds back too: a wait kept through
+  // such a look would stand for a loss that was mended meanwhile, and run out
+  // on the next one.)
   const gone = new Set<string>();
   if (st.shortAt !== null) gone.add(`short:${lastDecided(res)?.r ?? res.base.u}`);
   for (const v of res.rounds) {
@@ -5606,7 +5609,7 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
     if (since === undefined || since > now) st.gone.set(id, since = now);
     if (now - since < MISSING_WAIT_MS) waits = true;
   }
-  return !waits;
+  return witnessLost(st, res, now).size === 0 && !waits;
 }
 
 /** The ended checkpoint of a game at base `B` folded as `res`, quiet, under
@@ -5700,14 +5703,15 @@ let endLookedAt: number | null = null;
  * a press on a quiet table writes them. A decided round short of a record it
  * rests on holds the end as it holds a press (fairSound). On an awake page
  * with its doc whole and the game's records checked; a frame that isn't
- * starts the wait again, as does a clock gone back to before it began.
+ * starts the wait again, and fairSound's waits with it, as does a clock gone
+ * back to before it began.
  */
 function fairEndDuty(pub: string, now: number): void {
   if (endLookedAt !== null && now >= endLookedAt && now - endLookedAt < TICK_MS) return;
   endLookedAt = now;
   const ending = computedGamesEnding(pub);
-  if (ending.length === 0 && endingSince.size === 0) return;
   const listed = new Set<string>();
+  const looked = new Set<string>();
   for (const { t, inc } of ending) {
     const key = `${t}:${inc}`;
     listed.add(key);
@@ -5716,6 +5720,7 @@ function fairEndDuty(pub: string, now: number): void {
     const checked = tablesAwake(now) && casinoWhole(t) && computedSettled()
       && !!resolved && !resolved.pending && !!resolved.base && !!resolved.fin && !!res && !res.pending;
     // (Sound before quiet, as the press: noted with a round in flight too.)
+    if (checked) looked.add(key);
     const sound = checked && fairSound(t, inc, res!, now);
     const ready = sound && fairQuiet(res!);
     if (!ready) {
@@ -5733,6 +5738,11 @@ function fairEndDuty(pub: string, now: number): void {
     endingSince.delete(key);
   }
   for (const key of [...endingSince.keys()]) if (!listed.has(key)) endingSince.delete(key);
+  // 🔒 A wait stands only through looks that read its thing gone (fairSound):
+  // where this one could not check a game (asleep, the doc holding part of
+  // an update, its records still being checked, no end order read), what was
+  // gone may have come back and gone again unseen, so its waits begin again.
+  for (const [key, st] of fairTables) if (st.gone.size > 0 && !looked.has(key)) st.gone.clear();
 }
 
 /** What the ⚙ card shows of the switch: the row at all (`show`: the house,

@@ -657,6 +657,90 @@ describe("the end order standing, the round decided: the holder's wait", () => {
     expect(Object.keys(endOf(a, inc)!.n).sort()).toEqual([X.pid, Y.pid].sort());
   });
 
+  it("a slip back in the update that takes away a record of another round this page showed, then gone again as that record returns, the first wait run out: the end waits MISSING_WAIT_MS afresh", async () => {
+    const { pages, at: t0, inc, kit } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    // Round 1 the pages play (the holder keeps copies of what it rests on); round 2 two others play, the holder watching.
+    const { at } = houseRound(pages, kit, 1, t0);
+    const c1 = hashIn(keysIn(a, 'c', 1)[0]);
+    const [X, Y] = [testIdentity('xena'), testIdentity('yuri')];
+    a.doc.transact(() => {
+      for (const id of [X, Y]) a.doc.getMap('players').set(id.pid, { keyB64: id.pub, name: id.pid });
+    });
+    for (const id of [X, Y]) a.casino.buyInChips(id.pid, 100);
+    const [x2, y2] = [kit.slip(X, 2, [red(10)]), kit.slip(Y, 2, [black(20)])];
+    const c2 = kit.close(X, 2, c1, [x2, y2], kit.houseCommit(H, 2));
+    house(a, x2, y2, c2, kit.reveal(2, X.pid), kit.reveal(2, Y.pid), kit.houseReveal(H, 2, [c2.hash], [x2.hash, y2.hash], { c: null }));
+    run(pages, at + STEP, at + 4 * STEP);
+    const round = (r: number) => foldOf(a).rounds.find((v) => v.r === r);
+    expect(round(2)).toMatchObject({ decided: 'house', missing: [] });
+    // (The other page's, which this one puts back in a witness's turn, STAGGER_MS on at the soonest: the round
+    // stands without that bettor, or is off the chain with round 2 where they closed it.)
+    const held = keysIn(a, 's', 1).find((k) => k.startsWith(`s:1:${b.pid}:`))!;
+    const heldRec = recOf<unknown>(a, held);
+    const ses = () => a.casino.computedSessionForWrite(TABLE)!;
+    a.doc.transact(() => ses().delete(y2.key));
+    const T = at + 5 * STEP;
+    expect(off(a, T)).toBe('ending');
+    run([a], T + STEP, T + 29_000);
+    expect(endOf(a, inc)).toBeUndefined();
+    // Round 2's slip back in the same update that takes a slip of round 1 away, which this page holds a copy of
+    // (it puts that back in its turn)…
+    a.doc.transact(() => {
+      ses().set(y2.key, y2.rec);
+      ses().delete(held);
+    });
+    run([a], T + 29_000 + STEP, T + 29_000 + 3 * STEP);
+    expect(ses().has(held)).toBe(false);
+    // …and before it does, round 1's back and round 2's gone again: this page never read the session whole.
+    a.doc.transact(() => {
+      ses().set(held, heldRec);
+      ses().delete(y2.key);
+    });
+    expect(round(1)).toMatchObject({ decided: 'house', missing: [] });
+    expect(round(2)).toMatchObject({ decided: 'house', missing: [Y.pid] });
+    const MISSING = a.table.MISSING_WAIT_MS;
+    const from = T + 29_000 + 4 * STEP;
+    run([a], from, from + MISSING - 2 * STEP);
+    expect(endOf(a, inc)).toBeUndefined();
+    run([a], from + MISSING - STEP, from + MISSING + a.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 2, l: c2.hash });
+    expect(Object.keys(endOf(a, inc)!.n)).not.toContain(Y.pid);
+  });
+
+  it('a slip back and gone again while the doc holds part of an update, the first wait all but run out: the end waits MISSING_WAIT_MS afresh', async () => {
+    const { pages, a, at, inc, kit, X, Y: yuri, sid, join, round } = await watched();
+    const [x1, y1] = [kit.slip(X, 1, [red(10)]), kit.slip(yuri, 1, [black(20)])];
+    const c1 = kit.close(X, 1, sid, [x1, y1], join.rec.c);
+    house(a, x1, y1, c1, kit.reveal(1, X.pid), kit.reveal(1, yuri.pid), kit.houseReveal(H, 1, [c1.hash], [x1.hash, y1.hash], { c: null }));
+    run(pages, at, at + 4 * STEP);
+    const ses = () => a.casino.computedSessionForWrite(TABLE)!;
+    a.doc.transact(() => ses().delete(y1.key));
+    const T = at + 5 * STEP;
+    expect(off(a, T)).toBe('ending');
+    run(pages, T + STEP, T + 29_000);
+    expect(endOf(a, inc)).toBeUndefined();
+    // (The second of two updates alone: the doc waits for the first.)
+    const other = new Y.Doc();
+    const ups: Uint8Array[] = [];
+    other.on('update', (u: Uint8Array) => ups.push(u));
+    other.transact(() => other.getMap('scratch').set('a', 1));
+    other.transact(() => other.getMap('scratch').set('b', 2));
+    Y.applyUpdate(a.doc, ups[1]);
+    a.doc.transact(() => ses().set(y1.key, y1.rec));
+    run(pages, T + 29_000 + STEP, T + 29_000 + 3 * STEP);
+    a.doc.transact(() => ses().delete(y1.key));
+    Y.applyUpdate(a.doc, ups[0]);
+    expect(round()).toMatchObject({ decided: 'house', missing: [yuri.pid] });
+    const MISSING = a.table.MISSING_WAIT_MS;
+    const from = T + 29_000 + 4 * STEP;
+    run(pages, from, from + MISSING - 2 * STEP);
+    expect(endOf(a, inc)).toBeUndefined();
+    run(pages, from + MISSING - STEP, from + MISSING + a.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: c1.hash });
+    expect(Object.keys(endOf(a, inc)!.n)).toEqual([X.pid]);
+  });
+
   it("the house's reveal lists two closes of the round: the closer of the one that decided it takes their slip away, and the other decides it, by the house too; the end waits all the same", async () => {
     const { pages, a, at, inc, kit, X, Y, sid, join, round } = await watched();
     const [x1, y1] = [kit.slip(X, 1, [red(10)]), kit.slip(Y, 1, [black(20)])];
