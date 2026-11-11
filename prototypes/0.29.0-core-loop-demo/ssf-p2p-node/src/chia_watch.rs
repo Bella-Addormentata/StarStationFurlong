@@ -417,6 +417,13 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // #231 P6b: our inbox (knocks sealed to our card key), one cursor per hint,
     // and the knock book's two clocks (confirmations we wait for, dial-backs due).
     let mut inbox_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+    // Where each knock read says its knocker can be dialed back
+    // (`KnockV2::reply`), by knocker: the newest knock's word and when it was
+    // issued. A knocker on its first visit hands out no contact key, so these
+    // are all its dial-back has without the DHT. In memory only: a restart
+    // reads the inbox again from empty cursors and fills it again, and no file
+    // on this computer names a knocker's address.
+    let mut knock_reply: HashMap<String, (u64, Vec<SocketAddr>)> = HashMap::new();
     let kx_secret = crate::chia_contact::kx_card_secret(&hub.secret_key);
     // The network the node runs on: its own state files, and the network
     // whose contact-key and inbox hints the v2 reads below take and whose v2
@@ -716,6 +723,12 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                             if from == self_id {
                                 continue;
                             }
+                            // Its reply addresses, whether or not the book takes the
+                            // knock as new: after a restart the book already holds it
+                            // and this map is empty.
+                            if knock_reply.get(&from).is_none_or(|(issued_at, _)| *issued_at <= f.item.issued_at) {
+                                knock_reply.insert(from.clone(), (f.item.issued_at, f.item.reply.clone()));
+                            }
                             let new = {
                                 let mut book = hub.knocks.lock().unwrap();
                                 let new = book.record_inbox(InboxKnock {
@@ -757,7 +770,6 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             sched.forget_where(|key| {
                 key.starts_with(INBOX_SCHED_PREFIX) && !inbox_rooms.iter().any(|(r, _)| inbox_sched_key(r) == key)
             });
-
             // ── #231 P6b: the knock book's own clock is an AGREED peak (plan
             // §14 (5)): pruning and planning forget or move rendezvous state,
             // and one carrier peer naming a future height would otherwise
@@ -949,12 +961,22 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     let _ = book.save(knocks_path);
                 }
             }
+            // A knocker's reply addresses are kept only while the book holds a
+            // knock of its. Here, after every step of this tick that takes a
+            // read knock out of the book (dropped or void by the chain's word
+            // above, pruned with its era just now), so they go in the same
+            // tick as its last knock: the ticks after may be idle ones that
+            // never come this far.
+            forget_reply_of_gone_knockers(&mut knock_reply, &hub.knocks.lock().unwrap().inbox);
 
             // ── #231 P6b: RENDEZVOUS — every dial-back whose boundary fell since
             // the last, on both sides: the knocker toward the host, the host
             // toward the knocker, in the knock's room. Addresses come from the
-            // target's freshest presence when we hold its key; with none, iroh
-            // asks the DHT for the node id (the shipped posture for a bare id).
+            // target's freshest presence when we hold its key, and, toward a
+            // knocker, from the reply addresses its knock carried
+            // ([`dialback_addrs`]): a knocker on its first visit hands out no
+            // key. With neither, iroh asks the DHT for the node id (the
+            // shipped posture for a bare id).
             // Only in a room this node still holds and still shares cards in
             // (a room gone public dials nobody back), never a linked target,
             // never past the room's hold slots. A boundary is planned (its
@@ -982,10 +1004,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     *starved.entry(d.room.clone()).or_default() += 1; // no slot: still due, and the next free one is kept for it
                     continue;
                 }
-                let addrs = node_cache
-                    .get(&d.target)
-                    .map(|(_, f)| crate::chia_public_dial_addrs(&f.record.addrs))
-                    .unwrap_or_default();
+                // Only a knocker's own knock says where to dial it back: when WE
+                // knocked, the host's listing is all we dial.
+                let said = if d.we_knocked { None } else { knock_reply.get(&d.target).map(|(issued_at, reply)| (*issued_at, reply.as_slice())) };
+                let addrs = dialback_addrs(node_cache.get(&d.target).map(|(_, f)| (f.record.issued_at, f.record.addrs.as_slice())), said);
                 let source = if d.we_knocked { "knock rendezvous: we knocked" } else { "knock rendezvous: they knocked" };
                 if spawn_hold(&hub, &iroh_ep, &shared, &d.room, HoldCandidate { node_id: d.target.clone(), addrs }, source) {
                     planned.push(d);
@@ -1142,6 +1164,48 @@ fn spawn_hold(
     true
 }
 
+/// Where a rendezvous dials its target: the addresses of the target's
+/// freshest presence record when we hold its contact key (`listing`), and
+/// the reply addresses its knock carried when it is the knocker (`knock`),
+/// each with the time its writer signed it at. Both are the target's own
+/// word, so the NEWER one is taken whole and the older one fills what is
+/// left of the cap, each address once: a listing cached from before an
+/// address change never crowds out the addresses a later knock named, nor
+/// the other way round (a tie goes to the listing, the word that is written
+/// again when the addresses change). Judged and capped as every hold's
+/// addresses are ([`crate::chia_public_addrs`], [`crate::CHIA_DIAL_ADDR_CAP`]:
+/// public and internet-routable only, at most eight, so a knock cannot
+/// point a dial at a LAN or loopback address), then IPv6 first. A knocker on
+/// its first visit has no listing we can read (it hands out no contact key
+/// before it knows the room is private), and its knock's word is then all
+/// there is short of the DHT.
+fn dialback_addrs(listing: Option<(u64, &[String])>, knock: Option<(u64, &[SocketAddr])>) -> Vec<SocketAddr> {
+    let knock_newer = matches!((listing, knock), (Some((listed_at, _)), Some((knocked_at, _))) if knocked_at > listed_at);
+    let of_listing: Vec<SocketAddr> = listing.map(|(_, addrs)| crate::chia_public_addrs(addrs)).unwrap_or_default();
+    let of_knock: Vec<SocketAddr> =
+        knock.map(|(_, addrs)| crate::chia_public_addrs(&addrs.iter().map(|addr| addr.to_string()).collect::<Vec<_>>())).unwrap_or_default();
+    let (newer, older) = if knock_newer { (of_knock, of_listing) } else { (of_listing, of_knock) };
+    let mut kept: Vec<SocketAddr> = Vec::new();
+    for addr in newer.into_iter().chain(older) {
+        if kept.len() == crate::CHIA_DIAL_ADDR_CAP {
+            break;
+        }
+        if !kept.contains(&addr) {
+            kept.push(addr);
+        }
+    }
+    kept.sort_by_key(|addr| addr.is_ipv4());
+    kept
+}
+
+/// Keep reply addresses only of the knockers the knock book still holds a
+/// read knock of (`inbox`): a knock pruned with its era, dropped or made void
+/// by the chain's word takes its knocker's addresses with it, unless another
+/// knock of the same knocker is still in the book.
+fn forget_reply_of_gone_knockers(knock_reply: &mut HashMap<String, (u64, Vec<SocketAddr>)>, inbox: &[InboxKnock]) {
+    knock_reply.retain(|from, _| inbox.iter().any(|k| &k.from == from));
+}
+
 /// The order contact keys are offered a read in this tick: never-read keys
 /// first, then by the peak height of their last read (longest waiting first),
 /// ties broken by the key bytes so the order is stable.
@@ -1252,6 +1316,75 @@ mod tests {
 
     fn parse_all(addrs: &[String]) -> Vec<SocketAddr> {
         addrs.iter().filter_map(|s| s.parse().ok()).collect()
+    }
+
+    /// A rendezvous dial-back's addresses: the knocker's listing when we
+    /// hold its key and what its knock said, public ones only and each once,
+    /// the newer of the two words whole and the older filling what the cap
+    /// leaves. A first visit's knocker has no listing we can read, and its
+    /// knock's word alone gives the host something to dial with the DHT off;
+    /// with neither there is nothing, as before the reply addresses.
+    #[test]
+    fn a_dial_back_takes_the_newer_word_whole_then_fills_from_the_older() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let listing: Vec<String> = vec!["8.8.8.8:44442".into(), "[2001:4860:4860::8888]:44442".into(), "192.168.1.9:44442".into()];
+        let knock = vec![sa("[2001:4860:4860::8844]:44452"), sa("8.8.8.8:44442"), sa("8.8.4.4:44452"), sa("10.0.0.7:44452"), sa("127.0.0.1:44452")];
+        assert_eq!(
+            dialback_addrs(None, Some((50, &knock))),
+            vec![sa("[2001:4860:4860::8844]:44452"), sa("8.8.8.8:44442"), sa("8.8.4.4:44452")],
+            "a first visit: the knock's public addresses, IPv6 first, never a LAN or loopback one"
+        );
+        assert_eq!(
+            dialback_addrs(Some((60, &listing)), Some((50, &knock))),
+            vec![sa("[2001:4860:4860::8888]:44442"), sa("[2001:4860:4860::8844]:44452"), sa("8.8.8.8:44442"), sa("8.8.4.4:44452")],
+            "the listing newer: its addresses first within each family, the address they share once"
+        );
+        assert_eq!(
+            dialback_addrs(Some((50, &listing)), Some((60, &knock))),
+            vec![sa("[2001:4860:4860::8844]:44452"), sa("[2001:4860:4860::8888]:44442"), sa("8.8.8.8:44442"), sa("8.8.4.4:44452")],
+            "the knock newer: its addresses first within each family"
+        );
+        assert_eq!(dialback_addrs(Some((50, &listing)), Some((50, &knock))), dialback_addrs(Some((60, &listing)), Some((50, &knock))), "a tie goes to the listing");
+        assert_eq!(dialback_addrs(Some((50, &listing)), None), crate::chia_public_dial_addrs(&listing), "the listing alone: what a hold dialed before");
+        assert!(dialback_addrs(None, None).is_empty(), "neither: nothing to dial but the node id");
+        assert!(dialback_addrs(None, Some((50, &[]))).is_empty(), "a knock that carried none says nothing");
+        let many: Vec<SocketAddr> = (1..=12u8).map(|i| sa(&format!("8.8.{i}.8:44442"))).collect();
+        assert_eq!(dialback_addrs(None, Some((50, &many))).len(), 8, "capped as every hold's addresses are");
+        // A listing cached from before an address change, full to the cap,
+        // and a later knock that names where the knocker is now: the cap
+        // cuts the older word, never the newer one.
+        let full: Vec<String> = (1..=8u8).map(|i| format!("[2001:4860:4860::{i}]:44442")).collect();
+        let moved = vec![sa("[2001:4860:4860::99]:44452"), sa("8.8.4.4:44452")];
+        let dial = dialback_addrs(Some((50, &full)), Some((60, &moved)));
+        assert_eq!(dial.len(), 8);
+        assert!(moved.iter().all(|addr| dial.contains(addr)), "both of the newer knock's addresses are dialed");
+        assert_eq!(dial[0], moved[0], "its IPv6 address first");
+        assert_eq!(dial[7], moved[1], "its IPv4 address after every IPv6 one");
+        assert_eq!(dial[1..7], full[..6].iter().map(|s| sa(s)).collect::<Vec<_>>()[..], "the older listing fills the six places left");
+        // The same two the other way round in time: the listing is the newer
+        // word and fills the cap by itself.
+        assert_eq!(dialback_addrs(Some((60, &full)), Some((50, &moved))), full.iter().map(|s| sa(s)).collect::<Vec<_>>());
+    }
+
+    /// The reply addresses live as long as the book holds a read knock of
+    /// their knocker, and no longer: the last knock gone (pruned with its
+    /// era, dropped or void), they are gone with it.
+    #[test]
+    fn reply_addresses_go_with_their_knockers_last_knock() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let read = |from: &str, coin: &str| InboxKnock { from: from.into(), room: "r".into(), era: 7, confirmed_height: 100, coin_id: coin.into(), last_rendezvous: 100, settled: false };
+        let mut knock_reply: HashMap<String, (u64, Vec<SocketAddr>)> = HashMap::new();
+        knock_reply.insert("alice".into(), (50, vec![sa("8.8.8.8:44442")]));
+        knock_reply.insert("bob".into(), (60, vec![sa("8.8.4.4:44442")]));
+        let mut inbox = vec![read("alice", "a1"), read("alice", "a2"), read("bob", "b1")];
+        forget_reply_of_gone_knockers(&mut knock_reply, &inbox);
+        assert_eq!(knock_reply.len(), 2, "both still have a knock in the book");
+        inbox.retain(|k| k.coin_id != "a1" && k.coin_id != "b1");
+        forget_reply_of_gone_knockers(&mut knock_reply, &inbox);
+        assert!(knock_reply.contains_key("alice"), "another knock of alice's is still in the book");
+        assert!(!knock_reply.contains_key("bob"), "bob's only knock is gone, and his addresses with it");
+        forget_reply_of_gone_knockers(&mut knock_reply, &[]);
+        assert!(knock_reply.is_empty(), "an empty book keeps no address");
     }
 
     #[test]

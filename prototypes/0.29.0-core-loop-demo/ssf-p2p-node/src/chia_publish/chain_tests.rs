@@ -562,6 +562,7 @@ impl Setup {
         let at = self.later();
         let (root, gate) = (root(wallet), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(seed);
+        let leave = move || leave().map(KnockCarry::from);
         sendable(publish_knock_with(&self.lease, &self.fuse, NET, &self.money, at, &root, Payer::of(&self::wallet(wallet)), node, &gate, leave, req, &ROOM_KEY, era, unix_now(), &mut rng)).await
     }
 
@@ -582,6 +583,7 @@ impl Setup {
     ) -> Result<(Bytes32, MemoWrite)> {
         let at = self.later();
         let gate = tokio::sync::Mutex::new(());
+        let leave = move || leave().map(KnockCarry::from);
         sendable(publish_knock_on(&self.lease, NET, &self.money, move || at, node, payer, &gate, leave, req, &ROOM_KEY, era, unix_now())).await
     }
 
@@ -610,6 +612,7 @@ impl Setup {
         let at = self.later();
         let (keys, gate) = (keys_on(wallet_n, burner_path), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(seed);
+        let leave = move || leave().map(KnockCarry::from);
         sendable(knock_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, &keys, burner_path, node, &gate, leave, req, &ROOM_KEY, era, now_unix, &mut rng)).await
     }
 
@@ -5105,7 +5108,7 @@ async fn a_knock_with_a_burner_root_of_another_network_is_refused_and_writes_not
         let root = BurnerRoot::of(&MoneyKey::new(w.clone()), other);
         let at = s.later();
         let mut rng = StdRng::seed_from_u64(1);
-        let refused = publish_knock_with(&s.lease, &s.fuse, NET, &s.money, at, &root, Payer::of(&w), &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng)
+        let refused = publish_knock_with(&s.lease, &s.fuse, NET, &s.money, at, &root, Payer::of(&w), &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, unix_now(), &mut rng)
             .await
             .err()
             .expect("a root of another network is refused");
@@ -5470,7 +5473,7 @@ async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_
             lease.park_with_bundle_at([(coin.coin_id(), made)], Some((&theirs, money)), at).expect("W's knock, parked between the step's read and the writer's");
             at + reads
         };
-        let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, &keys, true, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+        let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, &keys, true, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
         let e = done.as_ref().err().expect("K(h) does not write beside W's knock");
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&wait), "{what}: {e:#}");
         assert!(is_typed_wait(e), "a wait: no attempt used");
@@ -6729,7 +6732,7 @@ async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and
     for (net, keys, words) in &cases {
         let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(1);
-        let knocked = knock_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+        let knocked = knock_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
         let at = s.later();
         let beaconed = beacon_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &empty, 0, unix_now(), &mut rng).await;
         for (what, e) in [("knock", knocked.err().expect("no knock without the wallet key")), ("beacon", beaconed.err().expect("no beacon without the wallet key"))] {
@@ -6776,7 +6779,7 @@ async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_
 
     let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
     let mut rng = StdRng::seed_from_u64(1);
-    let (hint, write, from_burner) = arm_wrote(knock_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await);
+    let (hint, write, from_burner) = arm_wrote(knock_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await);
     assert!(from_burner, "written on the burner path");
     assert_eq!(hint, knock_hint(NET, &req, &ROOM_KEY, 0));
     assert_eq!(write.payer, Payer::of_burner(&k), "K(h) pays");
@@ -6940,7 +6943,7 @@ async fn a_mainnet_listing_and_knock_are_written_from_keys_of_their_own_and_fund
     let dry = publish_node_presence_with(&s.lease, &s.fuse, Mainnet, &s.money, at, root, money, &node, &CK, 0, &entries(), unix_now(), &mut rng).await.map(|(_, write)| write);
     assert_eq!(waited(&dry), Some(BurnerWait::NoCoinReady), "the listing waits for a coin in mainnet's lobby dish");
     let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
-    let dry = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+    let dry = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
     let e = dry.err().expect("the knock waits too");
     assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::NoCoinReady), "{e:#}");
     assert!(is_typed_wait(&e), "a wait: no knock attempt used");
@@ -6970,7 +6973,7 @@ async fn a_mainnet_listing_and_knock_are_written_from_keys_of_their_own_and_fund
     // The knock, from K(h), on the path the heartbeat hands its arm.
     let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
     let (knock_hint_now, knock, from_burner) =
-        arm_wrote(knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, now, &mut rng).await);
+        arm_wrote(knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, now, &mut rng).await);
     assert!(from_burner, "written on the burner path");
     assert_eq!(knock_hint_now, knock_hint(Mainnet, &req, &ROOM_KEY, 0), "the host's inbox hint on mainnet");
     assert_ne!(knock_hint_now, knock_hint(NET, &req, &ROOM_KEY, 0), "which is not testnet11's");
@@ -6991,7 +6994,7 @@ async fn a_mainnet_listing_and_knock_are_written_from_keys_of_their_own_and_fund
     restore(&s.lease, &path, &w);
     assert!(s.lease.outgoing_pending_for(knock.payer) && s.lease.outgoing_pending_for(listing.payer), "both spends restored, parked");
     let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
-    let again = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, now, &mut rng).await;
+    let again = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(KnockCarry::default()), &req, &ROOM_KEY, 0, now, &mut rng).await;
     let filed = arm_refiled(&again).expect("the knock the lease still holds is filed again");
     assert_eq!(
         (filed.host.as_str(), filed.era, filed.coin_id, filed.parked, filed.payer),
