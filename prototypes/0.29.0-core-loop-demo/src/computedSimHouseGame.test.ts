@@ -639,6 +639,17 @@ describe("the simulations' house at a FAIR ONLY game: what it puts back", () => 
     const room = new GameRoom().start();
     room.run(1_200);
     expect(room.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
+    // Also where something that is no delegation of it lies there; one of it that differs stays (the deed holder's newer one).
+    for (const junk of ['junk', { v: 1 }, { ...DL_HOUSE, h: H2.pub }]) {
+      room.doc.transact(() => room.top().set(delegationKey(H.pub), junk));
+      room.run(1_200);
+      expect(room.top().get(delegationKey(H.pub)), JSON.stringify(junk)).toEqual(DL_HOUSE);
+    }
+    const newer = delegation(owner, H.pub);
+    const other = { ...newer, g: `${newer.g.slice(0, -2)}AA` };
+    room.doc.transact(() => room.top().set(delegationKey(H.pub), other));
+    room.run(1_200);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(other);
     const [join] = room.keys('o:1:');
     room.doc.transact(() => room.ses().delete(join));
     room.run(1_200);

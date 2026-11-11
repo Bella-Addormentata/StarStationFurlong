@@ -28,6 +28,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { finish as crapsFinish, RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { isFairOnlyInc } from './computedFairOnly';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
+import { HOUSE_TRIM_ROUNDS } from './computedSimHouse';
 import type { FlipKind, PageSpec, SimSummary } from './computedSim';
 
 vi.stubGlobal('window', { location: { search: '' } });
@@ -146,15 +147,20 @@ describe('FAIR ONLY roulette, end to end: the owner opens the game, the node is 
     expect(node.rowPutBacks + node.newSessions, sim.label).toBe(0);
   }, TIMEOUT);
 
-  it('light felts: under no pressure the house leaves the session be, and the game plays on from its root', async () => {
+  it('light felts: under no pressure the house leaves the session be, and the game plays on from its root (a long run trims on its rounds)', async () => {
     const sim = await Sim.open({ name: 'fair-only-light', seed: seed(1203), pages: named('ABC'), houseNode: true, fairOnly: true });
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim);
     fairOnlyFinish(sim, s);
     expect(s.byHouse, sim.label).toBeGreaterThanOrEqual(4);
     expect(s.voids, sim.label).toBe(0);
-    expect(sim.node!.trims, sim.label).toBe(0);
-    expect(s.maxSessionBytes, sim.label).toBeLessThan(sim.pages[0].p.table.TRIM_BYTES);
+    if (s.byHouse + s.voids < HOUSE_TRIM_ROUNDS) {
+      expect(sim.node!.trims, sim.label).toBe(0);
+      expect(s.maxSessionBytes, sim.label).toBeLessThan(sim.pages[0].p.table.TRIM_BYTES);
+    } else {
+      // (SIM_LONG: the session is long by its rounds alone.)
+      expect(sim.node!.trims, sim.label).toBeGreaterThanOrEqual(1);
+    }
   }, TIMEOUT);
 
   it('a page that comes late, after the house has trimmed, counts from the checkpoint it finds and plays on', async () => {

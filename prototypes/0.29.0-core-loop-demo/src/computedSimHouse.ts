@@ -564,7 +564,13 @@ export class SimHouse {
         if (!partial) reput.push({ newSession: sesKey });
         continue;
       }
-      if (!isPlain(comp.get(delegationKey(this.pub)))) reput.push({ ses: null, key: delegationKey(this.pub), value: by.value as unknown as Record<string, unknown> });
+      // (Its delegation under its key, where the doc holds none of this house
+      // there: nothing, or something that is no delegation of it. One of it
+      // that differs from the root's stays: the deed holder's newer one.)
+      const dNow = comp.get(delegationKey(this.pub));
+      if (!(isPlain(dNow) && hasFields(dNow, ['v', 'h', 'k', 'g']) && dNow.v === 1 && dNow.h === this.pub)) {
+        reput.push({ ses: null, key: delegationKey(this.pub), value: by.value as unknown as Record<string, unknown> });
+      }
       const read = this.readTable(comp, ctx, { u: B.u, h: B.h, sid }, (k, r) => res.houseAt(k, r) === true);
       if (!read) continue;
       this.tableDuties(mem, read, res.fin !== null, now, writes, out);
