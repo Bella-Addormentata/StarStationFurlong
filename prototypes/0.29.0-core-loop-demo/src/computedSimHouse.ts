@@ -158,8 +158,10 @@ interface TableMem {
   /** When each close was decided, as this house saw it: its own reveal, as it
    *  wrote it; an abandon, as it first read the close decided by one. */
   decidedAt: Map<string, number>;
-  /** When it first read each decided close with a frozen slip missing. */
-  missingAt: Map<string, number>;
+  /** 🔒 When it first read each thing a checkpoint waits for (waitsOn): its
+   *  own round not as it decided it, by what the round reads; a decided
+   *  round's frozen slip missing, by close and bettor. */
+  waits: Map<string, number>;
   /** The live session's keys as last read, and when one last came. */
   keys: number;
   lastNewKey: number;
@@ -171,8 +173,6 @@ interface TableMem {
   /** The round-u copies its last trim carried into the session of checkpoint
    *  `base`: a sweep of that session carries them on. */
   carried: { base: string; keys: string[] } | null;
-  /** 🔒 When it first saw the session read short of a round it revealed (readsShort). */
-  shortAt: number | null;
 }
 
 /** 🔒 A FAIR ONLY game this house serves: its resolution, the base its live
@@ -860,7 +860,7 @@ export class SimHouse {
     if (!mem) {
       room.tables.set(tkey, mem = {
         firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: now,
-        fo, decidedAt: new Map(), missingAt: new Map(), keys: read.keys, lastNewKey: now, lastFold: null, kept: 0, lastSweep: null, carried: null, shortAt: null,
+        fo, decidedAt: new Map(), waits: new Map(), keys: read.keys, lastNewKey: now, lastFold: null, kept: 0, lastSweep: null, carried: null,
       });
       // After a start: its reveals from before go back as this run's do.
       for (const k of this.lastOf(ctx)?.kept ?? []) mem.written.push([k.ses, k.key, k.rec]);
@@ -1009,7 +1009,7 @@ export class SimHouse {
    *  commitment it carried) must agree, and the record must read as a page
    *  reads one, or it signs nothing (the cross-check). Then Write::Trim. And
    *  neither it nor the sweep while the session reads short of a round this
-   *  house revealed (readsShort). */
+   *  house revealed, or of a frozen slip (waitsOn). */
   private trimDuty(doc: Y.Doc, room: RoomMem, g: Game, read: TableRead, now: number, writes: Write[]): void {
     const { ctx } = g;
     const B = g.base.ck;
@@ -1026,12 +1026,11 @@ export class SimHouse {
     if (res.pending) return;
     // (Noted at every checked fold, a close of the open round in or not: a
     // wait that began for one loss must not stand in for the next.)
-    const short = this.readsShort(g, res, mem, now);
-    const waits = this.missingWaits(res, mem, now);
+    const waits = this.waitsOn(g, res, mem, now);
     if (res.tip) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
-    if (short) return;
+    if (waits) return;
     if (!D || D.r <= B.u) {
       this.sweepDuty(doc, g, read, res, mem, now, writes);
       return;
@@ -1048,7 +1047,7 @@ export class SimHouse {
     }
     let at = mem.decidedAt.get(D.close);
     if (at === undefined) mem.decidedAt.set(D.close, at = now);
-    if (waits || now - at < HOUSE_TRIM_AFTER_MS) return;
+    if (now - at < HOUSE_TRIM_AFTER_MS) return;
     let roomKept = 0;
     for (const table of room.tables.values()) if (table.fo) roomKept += table.kept;
     const craps = gameOfInc(ctx.inc) === 'craps';
@@ -1089,52 +1088,49 @@ export class SimHouse {
     writes.push({ trim: { t: ctx.t, inc: ctx.inc, key: sealed.key, value: sealed.value, ses: `ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, sealed.value)}`, copies: this.copiesOf(doc, g, res, carried) } });
   }
 
-  /** Whether a decided round of the session folded as `res` has a frozen
-   *  slip missing, and has for less than MISSING_WAIT_MS as this house read
-   *  it. Noted at every checked fold, a close of the open round in or not:
-   *  a slip that came back ends its wait, so one that goes again waits
-   *  afresh. */
-  private missingWaits(res: FoldResult, mem: TableMem, now: number): boolean {
-    let waits = false;
+  /** 🔒 Whether a checkpoint of game g's session, folded as `res`, must wait
+   *  for a record that is gone: for MISSING_WAIT_MS from when this house first
+   *  read each thing so, one wait for each, all kept in one place
+   *  (`mem.waits`) and noted at every checked fold, a close of the open round
+   *  in or not. What it waits for:
+   *  - **its own round.** The round this house itself revealed in this
+   *    session (its state file's last reveal, past the base) does not read
+   *    decided under the close its reveal listed first. Records only come, so
+   *    the round has lost a record it rests on: a frozen slip its reveal
+   *    counted, deleted by the bettor who lost the round. The round then
+   *    reads undecided (the session as one with nothing decided, which a
+   *    sweep would close for good), or decided under another close (one the
+   *    closer laid in beside the deleted slip and voided with their own
+   *    abandon). One wait for each such reading: a new reading is a new loss.
+   *  - **a frozen slip missing** from a decided round: one wait for each
+   *    slip, by its close and its bettor.
+   *  A thing no longer so at a fold is forgotten, so the same loss again, or
+   *  another in its place, waits afresh: no wait that began for one loss
+   *  stands in for the next. The pages that showed the round put the record
+   *  back in their turns (their witness copies), within seconds; so no sweep,
+   *  trim or end meanwhile, as a page's own trim holds (computedTable
+   *  trimDuty). If nobody has put it back by then nobody is left who can, and
+   *  the round is as the fold reads it. */
+  private waitsOn(g: Game, res: FoldResult, mem: TableMem, now: number): boolean {
+    const gone = new Set<string>();
+    const done = this.lastOf(g.ctx);
+    const r = done?.d?.[0];
+    if (r !== undefined && r > g.base.ck.u && done!.kept.some((k) => k.ses === g.sesKey && k.key.startsWith(`h:${r}:`))) {
+      const at = res.rounds.find((v) => v.r === r);
+      const reads = at?.decided ? `${at.decided}:${at.close}` : '';
+      if (!(at?.decided && at.close === done!.d![1])) gone.add(`round:${r}:${reads}`);
+    }
     for (const v of res.rounds) {
-      if (!v.decided || v.missing.length === 0) {
-        mem.missingAt.delete(v.close);
-        continue;
-      }
-      let since = mem.missingAt.get(v.close);
-      if (since === undefined) mem.missingAt.set(v.close, since = now);
+      if (v.decided) for (const pid of v.missing) gone.add(`slip:${v.close}:${pid}`);
+    }
+    for (const id of [...mem.waits.keys()]) if (!gone.has(id)) mem.waits.delete(id);
+    let waits = false;
+    for (const id of gone) {
+      let since = mem.waits.get(id);
+      if (since === undefined || since > now) mem.waits.set(id, since = now);
       if (now - since < MISSING_WAIT_MS) waits = true;
     }
     return waits;
-  }
-
-  /** 🔒 Whether game g's session, folded as `res`, reads short of a round
-   *  this house itself revealed in it (its state file's last reveal: a round
-   *  past the base whose reveal it wrote into this session), and has for less
-   *  than MISSING_WAIT_MS. Records only come, so a round it decided that the
-   *  fold no longer reads decided has lost a record it rests on: a frozen
-   *  slip its reveal counted, deleted by the bettor who lost the round. With
-   *  the round off the chain the session reads as one with nothing decided,
-   *  which a sweep would close for good, and an end would end without the
-   *  round: the bet back to the one who deleted, the winners unpaid. The
-   *  pages that showed the round put the record back in their turns (their
-   *  witness copies), within seconds; so no sweep, trim or end meanwhile, as a
-   *  page's own trim holds (computedTable trimDuty, noteChain). If nobody has
-   *  put it back by then nobody is left who can, and the round is void. */
-  private readsShort(g: Game, res: FoldResult, mem: TableMem, now: number): boolean {
-    const done = this.lastOf(g.ctx);
-    const r = done?.d?.[0];
-    // (As it decided it: under the close its reveal listed first. A round
-    // that reads decided under another close, say one the closer laid in
-    // beside the deleted slip and voided with their own abandon, is as short
-    // of its round as one that reads undecided.)
-    const stands = res.rounds.some((v) => v.r === r && !!v.decided && v.close === done!.d![1]);
-    if (r === undefined || r <= g.base.ck.u || stands || !done!.kept.some((k) => k.ses === g.sesKey && k.key.startsWith(`h:${r}:`))) {
-      mem.shortAt = null;
-      return false;
-    }
-    if (mem.shortAt === null || mem.shortAt > now) mem.shortAt = now;
-    return now - mem.shortAt < MISSING_WAIT_MS;
   }
 
   /** 🔒 The end of a FAIR ONLY game whose end order `fin` stands (design §8.5
@@ -1163,12 +1159,11 @@ export class SimHouse {
     mem.kept = res.keptBytes;
     if (res.pending) return;
     // (Noted at every checked fold, as trimDuty notes it.)
-    const short = this.readsShort(g, res, mem, now);
-    const waits = this.missingWaits(res, mem, now);
+    const waits = this.waitsOn(g, res, mem, now);
     if (res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
-    if (short) return;
+    if (waits) return;
     const past = D !== undefined && D.r > B.u ? D : null;
     const done = this.lastOf(ctx);
     let own: Kept | undefined;
@@ -1183,7 +1178,7 @@ export class SimHouse {
       }
       let at = mem.decidedAt.get(past.close);
       if (at === undefined) mem.decidedAt.set(past.close, at = now);
-      if (waits || now - at < HOUSE_TRIM_AFTER_MS) return;
+      if (now - at < HOUSE_TRIM_AFTER_MS) return;
     }
     const n: Record<string, string> = {};
     for (const [pid, net] of res.nets) n[pid] = net.toString();

@@ -600,8 +600,10 @@ interface TableState {
    *  the one on the round the checkpoint kept (noteResult). */
   check: { res: FoldResult; gen: number; out: ComputedRoundCheck | null } | null;
   checks: Map<string, ComputedRoundCheck>;
-  /** By close hash: when this page first saw that decided round with a
-   *  frozen slip missing (a trim waits MISSING_WAIT_MS for it). */
+  /** By close hash and bettor (`<close>:<pid>`): when this page first saw
+   *  that decided round with that bettor's frozen slip missing (a trim waits
+   *  MISSING_WAIT_MS for each; one no longer missing is forgotten, so the
+   *  same slip gone again, or another in its place, waits afresh). */
   missingAt: Map<string, number>;
   /** By close hash: the seeds seen opening its frozen slips (revealsSeen). */
   opened: Map<string, Opened>;
@@ -629,12 +631,14 @@ interface TableState {
   chainClose: Map<number, string>;
   replaced: number | null;
   /** 🔒 At a FAIR ONLY game, by round: the close this page first saw a
-   *  house reveal decide on the live session's chain, and when it first saw
-   *  such a round read decided under another close since (fairSound): the
-   *  closer took their frozen slip away and laid another close of the round
-   *  in, and an end waits. */
+   *  house reveal decide on the live session's chain; and when it first saw
+   *  each thing an end waits for (fairSound), one wait for each: the chain
+   *  short of a round it saw decided (by the round it reads to), such a
+   *  round decided under another close (by round and close: the closer took
+   *  their frozen slip away and laid another close of the round in), a
+   *  frozen slip missing from a decided round (by close and bettor). */
   houseClose: Map<number, string>;
-  swapAt: number | null;
+  gone: Map<string, number>;
 }
 
 /** The binding the per-table state belongs to, the wake count and clock
@@ -723,7 +727,7 @@ function forgetWaits(st: TableState): void {
   st.seedOutAt = null;
   st.askedFor = null;
   st.shortAt = null;
-  st.swapAt = null;
+  st.gone.clear();
   // (A copy keeps its value: only when it went missing starts again.)
   for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
 }
@@ -821,7 +825,7 @@ function newTable(t: string, inc: string): TableState {
     tickedAt: null, reputAt: null, wakeAt: 0,
     lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
-    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null, houseClose: new Map(), swapAt: null,
+    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null, houseClose: new Map(), gone: new Map(),
   };
 }
 
@@ -1382,7 +1386,7 @@ function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
   if (moved) {
     st.chainClose.clear();
     st.houseClose.clear();
-    st.swapAt = null;
+    st.gone.clear();
   }
   let sc: Scan | null = null;
   for (const v of res.rounds) {
@@ -4170,10 +4174,7 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   if (!res || res.tip) return;
   if (witnessLost(st, res, now).size > 0) return;
   if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return;
-  for (const round of res.rounds) {
-    const at = st.missingAt.get(round.close);
-    if (round.missing.length > 0 && (at === undefined || now - at < MISSING_WAIT_MS)) return;
-  }
+  if (missingWaits(st, res, now)) return;
   const D = lastDecided(res);
   if (!D) return;
   const sc = scanOf(st, res);
@@ -4231,17 +4232,34 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   writeCheckpointAndTrim(st.t, st.inc, cp, copies);
 }
 
-/** When this page first saw each decided round of table st with a frozen
- *  slip missing, for the trim's wait: timed from the room's state in, asleep
+/** When this page first saw each frozen slip missing from a decided round
+ *  of table st, for the trim's wait: timed from the room's state in, asleep
  *  or awake (a wake starts it again, as every timer), whatever else holds
- *  the trim back meanwhile. */
+ *  the trim back meanwhile. One time for each slip, and none kept for a slip
+ *  the fold does not read missing now (it came back, or its round is off
+ *  the chain): no wait that began for one loss stands in for the next. */
 function noteMissing(st: TableState, now: number): void {
   const res = resultOf(st);
   if (!res) return;
+  const gone = new Set<string>();
   for (const round of res.rounds) {
-    if (!round.decided || round.missing.length === 0) st.missingAt.delete(round.close);
-    else if (!st.missingAt.has(round.close)) st.missingAt.set(round.close, now);
+    if (round.decided) for (const pid of round.missing) gone.add(`${round.close}:${pid}`);
   }
+  for (const id of [...st.missingAt.keys()]) if (!gone.has(id)) st.missingAt.delete(id);
+  for (const id of gone) if (!st.missingAt.has(id)) st.missingAt.set(id, now);
+}
+
+/** Whether a trim of table st, folded as `res`, still waits for a frozen
+ *  slip: one missing from a decided round for less than MISSING_WAIT_MS as
+ *  this page noted it (noteMissing), or not noted yet. */
+function missingWaits(st: TableState, res: FoldResult, now: number): boolean {
+  for (const round of res.rounds) {
+    for (const pid of round.missing) {
+      const at = st.missingAt.get(`${round.close}:${pid}`);
+      if (at === undefined || now - at < MISSING_WAIT_MS) return true;
+    }
+  }
+  return false;
 }
 
 /** A fold's nets as a checkpoint carries them: decimal (the fold has
@@ -5557,7 +5575,10 @@ function fairQuiet(res: FoldResult): boolean {
  *  the bet would be theirs again and the winners unpaid. The pages that
  *  showed the round put the slip back in their turns, within seconds. A page
  *  that never looked at the game notes what the fold reads missing from its
- *  first look here, and waits as long. */
+ *  first look here, and waits as long. One wait for each thing gone
+ *  (`st.gone`), noted whenever this is asked, a round in flight or not, and
+ *  forgotten once the thing is no longer so: the same loss again, or another
+ *  in its place, waits MISSING_WAIT_MS afresh. */
 function fairSound(t: string, inc: string, res: FoldResult, now: number): boolean {
   // (A game this page holds and has not served since it loaded, the table
   // playing another: its state begins here, so the waits below run out, and
@@ -5566,22 +5587,26 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
   let st = fairTables.get(key);
   if (!st) fairTables.set(key, st = newTable(t, inc));
   if (!forgedStands(st)) noteChain(st, now);
-  noteMissing(st, now);
   if (witnessLost(st, res, now).size > 0) return false;
-  if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return false;
-  // (A round the house decided that reads decided under another close: the
-  // chain is as long, and short of the round all the same.)
-  if (res.rounds.some((v) => v.decided && st.houseClose.has(v.r) && st.houseClose.get(v.r) !== v.close)) {
-    st.swapAt ??= now;
-    if (now - st.swapAt < MISSING_WAIT_MS) return false;
-  } else {
-    st.swapAt = null;
+  // What is gone now, each thing by what it is.
+  const gone = new Set<string>();
+  if (st.shortAt !== null) gone.add(`short:${lastDecided(res)?.r ?? res.base.u}`);
+  for (const v of res.rounds) {
+    if (!v.decided) continue;
+    // (A round the house decided that reads decided under another close: the
+    // chain is as long, and short of the round all the same.)
+    const saw = st.houseClose.get(v.r);
+    if (saw !== undefined && saw !== v.close) gone.add(`swap:${v.r}:${v.close}`);
+    for (const pid of v.missing) gone.add(`slip:${v.close}:${pid}`);
   }
-  for (const round of res.rounds) {
-    const at = st.missingAt.get(round.close);
-    if (round.missing.length > 0 && (at === undefined || now - at < MISSING_WAIT_MS)) return false;
+  for (const id of [...st.gone.keys()]) if (!gone.has(id)) st.gone.delete(id);
+  let waits = false;
+  for (const id of gone) {
+    let since = st.gone.get(id);
+    if (since === undefined || since > now) st.gone.set(id, since = now);
+    if (now - since < MISSING_WAIT_MS) waits = true;
   }
-  return true;
+  return !waits;
 }
 
 /** The ended checkpoint of a game at base `B` folded as `res`, quiet, under

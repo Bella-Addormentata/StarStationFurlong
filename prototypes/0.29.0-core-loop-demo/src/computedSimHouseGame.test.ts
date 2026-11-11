@@ -1058,6 +1058,50 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
     });
   }
 
+  for (const ending of [false, true]) {
+    it(`one bettor's slip back as another's goes, the first wait all but run out: the session is not ${ending ? 'ended' : 'trimmed'} without the second for MISSING_WAIT_MS of its own`, () => {
+      const room = new GameRoom().start();
+      if (ending) order(room);
+      const [a, b, m] = [kit.slip(alice, 1, [red(5)]), kit.slip(bob, 1, [red(5)]), kit.slip(mallory, 1, [red(5)])];
+      const c = kit.close(alice, 1, SID, [a, b, m], kit.houseCommit(H, 1));
+      room.put(a, b, m, c, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'), kit.reveal(1, 'mallory'));
+      room.tick(TICK);
+      expect(room.fold().rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', missing: [] });
+      room.doc.transact(() => room.ses().delete(b.key));
+      if (!ending) room.junk(HOUSE_SWEEP_BYTES);
+      room.run(29_000, 1_000);
+      room.doc.transact(() => {
+        room.ses().set(b.key, b.rec);
+        room.ses().delete(m.key);
+      });
+      expect(room.fold().rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', missing: ['mallory'] });
+      room.run(28_000, 1_000);
+      expect(room.house.sweeps + room.house.trims + room.house.ends).toBe(0);
+      room.run(5_000, 1_000);
+      expect({ trims: room.house.trims, ends: room.house.ends }).toEqual(ending ? { trims: 0, ends: 1 } : { trims: 1, ends: 0 });
+      expect(Object.keys(room.base().n).sort()).toEqual(['alice', 'bob']);
+    });
+
+    it(`a slip missing, the round off the chain and back with the slip still missing, the first wait all but run out: the session is not ${ending ? 'ended' : 'trimmed'} without it for MISSING_WAIT_MS more`, () => {
+      const room = new GameRoom().start();
+      if (ending) order(room);
+      const r1 = room.played(1, SID);
+      room.doc.transact(() => room.ses().delete(r1.b.key));
+      if (!ending) room.junk(HOUSE_SWEEP_BYTES);
+      room.run(2_000, 1_000);
+      room.doc.transact(() => room.ses().delete(r1.a.key));
+      expect(room.fold().rounds.filter((v) => v.decided)).toEqual([]);
+      room.run(27_000, 1_000);
+      room.put(r1.a);
+      expect(room.fold().rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', missing: ['bob'] });
+      room.run(28_000, 1_000);
+      expect(room.house.sweeps + room.house.trims + room.house.ends).toBe(0);
+      room.run(5_000, 1_000);
+      expect({ trims: room.house.trims, ends: room.house.ends }).toEqual(ending ? { trims: 0, ends: 1 } : { trims: 1, ends: 0 });
+      expect(Object.keys(room.base().n)).toEqual(['alice']);
+    });
+  }
+
   it('no checkpoint from a doc that holds part of an update: no trim, no sweep and no end until the rest is in', () => {
     // (The second of two updates alone: the doc parks it until the first comes.)
     const park = (room: GameRoom): (() => void) => {

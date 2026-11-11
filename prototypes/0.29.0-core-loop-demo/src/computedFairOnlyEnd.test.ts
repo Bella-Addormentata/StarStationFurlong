@@ -602,6 +602,61 @@ describe("the end order standing, the round decided: the holder's wait", () => {
     expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: c2.hash });
   });
 
+  it('the swap, then the round in flight again, then the swap again half a minute on: the end waits MISSING_WAIT_MS afresh for it', async () => {
+    const { pages, a, at, inc, kit, X, Y, sid, join, round } = await watched();
+    const [x1, y1] = [kit.slip(X, 1, [red(10)]), kit.slip(Y, 1, [black(20)])];
+    const c1 = kit.close(X, 1, sid, [x1, y1], join.rec.c);
+    house(a, x1, y1, c1, kit.reveal(1, X.pid), kit.reveal(1, Y.pid), kit.houseReveal(H, 1, [c1.hash], [x1.hash, y1.hash]));
+    run(pages, at, at + 4 * STEP);
+    const x2 = kit.slip(X, 1, [red(1)]);
+    const c2 = kit.close(X, 1, sid, [x2], join.rec.c);
+    const z = kit.abandon(X, 1, c2.hash);
+    a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(x1.key));
+    house(a, x2, c2, z);
+    const T = at + 5 * STEP;
+    expect(off(a, T)).toBe('ending');
+    // The abandon gone: the round is in flight under the other close.
+    a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(z.key));
+    expect(round()?.decided ?? null).toBeNull();
+    expect(off(a, T + 2_000)).toBe('ending');
+    const MISSING = a.table.MISSING_WAIT_MS;
+    run(pages, T + 2_000 + STEP, T + MISSING);
+    // Back, the first wait run out.
+    house(a, z);
+    expect(round()).toMatchObject({ decided: 'void', close: c2.hash });
+    run(pages, T + MISSING + STEP, T + MISSING + 28_000);
+    expect(endOf(a, inc)).toBeUndefined();
+    run(pages, T + MISSING + 28_000 + STEP, T + 2 * MISSING + a.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: c2.hash });
+  });
+
+  it("one bettor's slip back as another's goes, the first wait all but run out: the end waits MISSING_WAIT_MS of its own for the second", async () => {
+    const { pages, a, at, inc, kit, X, Y, sid, join, round } = await watched();
+    const Z = testIdentity('zoe');
+    a.doc.transact(() => a.doc.getMap('players').set(Z.pid, { keyB64: Z.pub, name: Z.pid }));
+    a.casino.buyInChips(Z.pid, 100);
+    const [x1, y1, z1] = [kit.slip(X, 1, [red(10)]), kit.slip(Y, 1, [black(20)]), kit.slip(Z, 1, [red(5)])];
+    const c1 = kit.close(X, 1, sid, [x1, y1, z1], join.rec.c);
+    house(a, x1, y1, z1, c1, kit.reveal(1, X.pid), kit.reveal(1, Y.pid), kit.reveal(1, Z.pid), kit.houseReveal(H, 1, [c1.hash], [x1.hash, y1.hash, z1.hash], { c: null }));
+    run(pages, at, at + 4 * STEP);
+    expect(round()).toMatchObject({ decided: 'house', missing: [] });
+    const ses = () => a.casino.computedSessionForWrite(TABLE)!;
+    a.doc.transact(() => ses().delete(y1.key));
+    const T = at + 5 * STEP;
+    expect(off(a, T)).toBe('ending');
+    run(pages, T + STEP, T + 29_000);
+    a.doc.transact(() => {
+      ses().set(y1.key, y1.rec);
+      ses().delete(z1.key);
+    });
+    expect(round()).toMatchObject({ decided: 'house', missing: [Z.pid] });
+    run(pages, T + 29_000 + STEP, T + 29_000 + 28_000);
+    expect(endOf(a, inc)).toBeUndefined();
+    run(pages, T + 57_000 + STEP, T + 57_000 + 3_000 + a.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: c1.hash });
+    expect(Object.keys(endOf(a, inc)!.n).sort()).toEqual([X.pid, Y.pid].sort());
+  });
+
   it("the house's reveal lists two closes of the round: the closer of the one that decided it takes their slip away, and the other decides it, by the house too; the end waits all the same", async () => {
     const { pages, a, at, inc, kit, X, Y, sid, join, round } = await watched();
     const [x1, y1] = [kit.slip(X, 1, [red(10)]), kit.slip(Y, 1, [black(20)])];
