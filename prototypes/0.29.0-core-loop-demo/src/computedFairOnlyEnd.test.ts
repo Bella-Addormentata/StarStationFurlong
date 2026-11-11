@@ -944,6 +944,62 @@ describe('the page that holds a FAIR ONLY game takes its table out of the room',
     expect(layoutOf(a).has(TABLE)).toBe(false);
   });
 
+  for (const how of ['the press', 'the removal'] as const) {
+    it(`two games of the holder's at the table (two of its pages pressed FAIR ONLY at once): ${how} ends both in the one write, and the table plays neither`, async () => {
+      const { pages, at: t1 } = await houseRoom(['A', 'B']);
+      const [a, b] = pages;
+      const a2 = await loadPage('A2', 3, { reloadOf: a });
+      a2.table.setLocalHouse(H.pub);
+      a2.table.setLocalHouseFold(FOLD);
+      const all = [a, a2, b];
+      sync(t1, ...all);
+      const T = run(all, t1 + STEP, t1 + 30_000, { until: () => a2.casino.houseOnline() && a2.table.fairOnlyOfferRefusal() === null });
+      expect(press(a, T)).toBe('ok');
+      expect(press(a2, T, { j: 'fedcba9876543210' })).toBe('ok');
+      a.doc.transact(() => { layoutOf(a).set(TABLE, PLACED); });
+      sync(T, ...all);
+      const games = [nameOf(a, T), nameOf(a, T, 'p', TABLE, 'fedcba9876543210')].sort();
+      run(all, T + STEP, T + 3 * STEP);
+      expect(a.casino.computedGamesHeldBy(TABLE, a.pub)).toEqual(games);
+      const at = T + 4 * STEP;
+      let sent: Uint8Array[];
+      if (how === 'the press') {
+        let out: string | undefined;
+        sent = updatesOf(a, () => { out = off(a, at); });
+        expect(out).toBe('ok');
+        expect(sent).toHaveLength(1);
+      } else {
+        sent = removeAt(a, at);
+        expect(sent).toHaveLength(2);
+      }
+      for (const inc of games) expect(endOf(a, inc)).toMatchObject({ e: 1, u: 0, k: a.pub });
+      sync(at, ...all);
+      // (Longer than the pages wait to put a table back.)
+      run(all, at + STEP, at + 150_000);
+      for (const p of all) {
+        expect(p.casino.computedGamesHeldBy(TABLE, a.pub)).toEqual([]);
+        expect(p.casino.isComputedTable(TABLE)).toBe(false);
+        for (const inc of games) expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+        expect(layoutOf(p).has(TABLE)).toBe(how === 'the press');
+      }
+    });
+  }
+
+  it("the holder has no bet in the round and its table was the room's last: its page stays awake for the end it owes, and writes it once the round is decided", async () => {
+    const { pages, inc, kit, at, close, closeHash } = await endingRoom(true);
+    const [a, b] = pages;
+    // (The end order stands from the press of endingRoom; the house is slow. No table in the room from here.)
+    // (Longer than a page that marks no frame takes to read as asleep.)
+    const SLOW = 2 * a.croupier.TABLE_LEASE_LAPSE_MS;
+    run(pages, at + STEP, at + SLOW, { tables: [] });
+    expect(endOf(a, inc)).toBeUndefined();
+    expect(a.table.tableFrame(0)).toBe(true);
+    house(b, kit.houseReveal(H, 1, [closeHash], frozenOf(close), { c: null }));
+    sync(at + SLOW, ...pages);
+    run(pages, at + SLOW + STEP, at + SLOW + a.table.FAIR_END_WAIT_MS + 4_000, { tables: [] });
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: closeHash, k: a.pub });
+  });
+
   it('a removal the holder\'s page hears, not its own, ends nothing', async () => {
     const { pages, at, inc } = await placedRoom(['A', 'B']);
     const [a] = pages;

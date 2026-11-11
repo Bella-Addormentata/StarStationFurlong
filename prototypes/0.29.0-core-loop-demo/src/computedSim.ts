@@ -1433,15 +1433,15 @@ export class Sim {
    *  as World's furniture removal calls it); each other page hears it a
    *  link's delay later and closes the table too. */
   async remove(house: SimPage, t: string, game: GameName = 'roulette'): Promise<void> {
-    // (A craps table's teardown as crapsCroupier closeCrapsTable makes it on
-    // a whole doc: the pages load no crapsCroupier.)
+    // (A craps table's teardown as crapsCroupier closeCrapsTable makes it:
+    // the pages load no crapsCroupier.)
     const close = (sp: SimPage, closing: 'local' | 'heard'): void => {
       if (game === 'roulette') sp.p.croupier.closeTable(t, closing);
       else {
-        sp.p.casino.transactCasino(() => {
+        sp.p.croupier.closeWhenWhole(t, 'craps', () => sp.p.casino.transactCasino(() => {
           sp.p.croupier.closingLocally(t, 'craps', closing);
           sp.p.croupier.refundAndClear(t, closing, { closes: 'craps' });
-        });
+        }));
       }
     };
     house.inRoom.delete(t);
