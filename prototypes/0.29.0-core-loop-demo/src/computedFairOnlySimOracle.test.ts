@@ -208,10 +208,11 @@ describe("the oracle's own base rule", () => {
     // A checkpoint that outranks the base (one sweep on) and pays B a thousand chips, under the house's key.
     const { g: _g, ...body } = real.ck;
     const secret = (sim.node as unknown as { secret: Uint8Array }).secret;
-    const better = sealCk(
-      ctx, { ...body, b: A.p.fold.nextSid3(ctx, real.ck), w: (real.ck.w ?? 0) + 1, n: { ...real.ck.n, [B.pid]: (BigInt(real.ck.n[B.pid] ?? '0') + 1000n).toString() } },
+    const paying = (chips: bigint) => sealCk(
+      ctx, { ...body, b: A.p.fold.nextSid3(ctx, real.ck), w: (real.ck.w ?? 0) + 1, n: { ...real.ck.n, [B.pid]: (BigInt(real.ck.n[B.pid] ?? '0') + chips).toString() } },
       (bytes) => houseSign(secret, bytes),
     );
+    const better = paying(1000n);
     // Two writers the room never heard: one whose second update comes before its first (the doc holds part
     // until then), one that writes the checkpoint and deletes it meanwhile.
     const state = Y.encodeStateAsUpdate(A.p.doc);
@@ -237,6 +238,20 @@ describe("the oracle's own base rule", () => {
     expect(partial(), sim.label).toBe(false);
     sim.enter(A);
     expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(real.key);
+    expect(sim.ledgerProblems(A), sim.label).toEqual([]);
+    expect(sim.cageProblems(A), sim.label).toEqual([]);
+    // One still there when the rest comes, and gone in the next write: the page counted from it when the rest
+    // came, or had not yet (it checks what came meanwhile when it next counts the game); the oracle with it.
+    const [first1, second1] = updatesOf([(d) => d.getMap('scratch').set('e', 1), (d) => d.getMap('scratch').set('f', 2)]);
+    // (Another one, which the page has checked no signature of.)
+    const other = paying(2000n);
+    const [came1, went1] = updatesOf([(d) => d.getMap('casinoComputed').set(other.key, other.value), (d) => d.getMap('casinoComputed').delete(other.key)]);
+    Y.applyUpdate(A.p.doc, second1);
+    Y.applyUpdate(A.p.doc, came1);
+    Y.applyUpdate(A.p.doc, first1);
+    expect(partial(), sim.label).toBe(false);
+    Y.applyUpdate(A.p.doc, went1);
+    sim.enter(A);
     expect(sim.ledgerProblems(A), sim.label).toEqual([]);
     expect(sim.cageProblems(A), sim.label).toEqual([]);
     // …and one still there when the rest of the update comes is counted from when the page next counts the

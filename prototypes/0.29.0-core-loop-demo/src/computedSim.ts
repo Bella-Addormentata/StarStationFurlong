@@ -1075,6 +1075,7 @@ export class Sim {
           else this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
         }
       }
+      this.foCatchUp(sp, false);
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
       if (tr.origin === NET || tr.origin === HOUSE_ORIGIN || sp.p !== p || sp.cheats) return;
@@ -1491,7 +1492,7 @@ export class Sim {
     }
     for (const sp of this.pages) {
       if (sp.mode !== 'up') continue;
-      this.foCatchUp(sp);
+      this.foCatchUp(sp, true);
       this.observe(sp);
       if (beat) this.audit(sp);
     }
@@ -2324,17 +2325,18 @@ export class Sim {
     return base;
   }
 
-  /** After page sp's frame: a game whose best checkpoint the oracle read on
+  /** After page sp's frame, and after each transaction of its doc (the page
+   *  has counted by then): a game whose best checkpoint the oracle read on
    *  a doc that held part of an update is read again once the page counts
    *  from another base than the oracle holds for it (the doc whole, the
    *  page checks what came meanwhile when the game is next counted, which
    *  may be frames on), and held from here as the page holds it. Only the
    *  moment is the page's: which checkpoint is the oracle's own rule's, and
    *  a page that counted from another reads differently from the cold count. */
-  private foCatchUp(sp: SimPage): void {
+  private foCatchUp(sp: SimPage, frame: boolean): void {
     const behind = this.foBehind.get(sp.p);
     if (!behind || behind.size === 0) return;
-    this.enter(sp);
+    if (frame) this.enter(sp);
     if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) return;
     const computed = sp.p.doc.getMap('casinoComputed');
     for (const [name, ctx] of [...behind]) {
