@@ -816,7 +816,7 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     expect(top(a).get(key)).toEqual(end.value.f);
   });
 
-  it('an end order the page holds is held on while the base at which it stands no more is one the page has not counted from: the buyer\'s checkpoint comes while its doc holds part of an update, and with it and the order deleted before the page counts, the order stands at the base the page holds, and is put back', async () => {
+  it('the seller\'s end order stands no more once the game has changed hands, whatever base the page holds: the buyer\'s checkpoint comes while its doc holds part of an update, and with it and the order deleted before the page counts, the game is the buyer\'s at the root (the transfer is held), and the order is not put back', async () => {
     const [a, b] = await gameRoom(['A', 'B']);
     const fin = sealFin(G, owner.pub, owner.sign);
     set(a, fin.key, fin.value);
@@ -827,8 +827,8 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     });
     deliver(T0, a, [second]); // (it builds on the first, which has not come: the page counts nothing meanwhile)
     expect(a.casino.casinoWhole(TABLE)).toBe(false);
-    // the game handed over after round 1 all the same, and the buyer's house trims at round 3, where the owner's
-    // order stands no more: an answer that waits for nothing, and one the page does not count from
+    // the game handed over after round 1 all the same, and the buyer's house trims at round 3: the owner's order
+    // stands no more in the buyer's game (S5): an answer that waits for nothing, and one the page does not count from
     const xf = handOver(1);
     const trim = trimOf(G, 'p', { b: SID, u: 3, n: {}, h: kit.houseCommit(H2, 4), k: H2.pub, dl: delegation(buyer, H2.pub, PAGE_ROOM), x: [xf.value] });
     a.doc.transact(() => {
@@ -836,16 +836,19 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
       top(a).set(trim.key, trim.value);
     });
     expect(res(a)).toMatchObject({ pending: false, base: { key: trim.key }, holder: buyer.pub, fin: null });
-    // the page holds the root, not the buyer's checkpoint: with that one and the order deleted the game is at the
-    // root again, where the owner's order stands as the page held it
-    del(a, trim.key, fin.key);
-    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: root.key }, fin: { k: owner.pub } });
+    // the page holds the root, not the buyer's checkpoint: with that one, the transfer and the order deleted the
+    // game is at the root again, and the buyer's still (the page holds the transfer its answer followed): the
+    // owner's order, which the page held, stands no more there either
+    del(a, trim.key, xf.key, fin.key);
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: root.key }, holder: buyer.pub, fin: null });
     deliver(T0, a, [first]);
     expect(a.casino.casinoWhole(TABLE)).toBe(true);
-    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: root.key }, fin: { k: owner.pub } });
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: root.key }, holder: buyer.pub, fin: null });
+    // (the transfer is what the doc lacks, and what is put back: not the order)
     expect(lacks(a)).toMatchObject([{ missing: 1 }]);
     expect(putBack(a)).toBe(1);
-    expect(top(a).get(fin.key)).toEqual(fin.value);
+    expect(top(a).get(xf.key)).toEqual(xf.value);
+    expect(top(a).has(fin.key)).toBe(false);
   });
 
   it('and is let go of once the page counts from that base: whole again with the buyer\'s checkpoint there, the owner\'s order deleted is not put back', async () => {
@@ -2037,14 +2040,15 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
   it('while no check can run, the page keeps all it held: the transfer, the end order and a house\'s delegation stand again once checks run, though the doc lost them meanwhile', async () => {
     const { a, at } = await decidedBy(H2);
     const xf = handOver(1);
-    const fin = sealFin(G, owner.pub, owner.sign);
+    // (the end order is the buyer's: the game's holder's now, S5)
+    const fin = sealFin(G, buyer.pub, buyer.sign);
     a.doc.transact(() => {
       top(a).set(xf.key, xf.value);
       top(a).set(fin.key, fin.value);
     });
     const late = await oneVerdictFrom(a, at);
     const stands = (): void => {
-      expect(res(late)).toMatchObject({ pending: false, holder: buyer.pub, live: true, fin: { k: owner.pub }, base: { key: root.key } });
+      expect(res(late)).toMatchObject({ pending: false, holder: buyer.pub, live: true, fin: { k: buyer.pub }, base: { key: root.key } });
       expect(foldOf(late).rounds.map((v) => v.decided)).toEqual(['house']);
     };
     stands();
@@ -2512,14 +2516,14 @@ describe('the put-back duty', () => {
   it('puts a transfer, an end order and a house\'s delegation back with the base, in one write', async () => {
     const { a, b, at } = await decidedBy(H2);
     const xf = handOver(1);
-    // (the end order is of the key that held the game at the base, the owner's)
-    const fin = sealFin(G, owner.pub, owner.sign);
+    // (the end order is of the key that holds the game now, the buyer's: S5)
+    const fin = sealFin(G, buyer.pub, buyer.sign);
     a.doc.transact(() => {
       top(a).set(xf.key, xf.value);
       top(a).set(fin.key, fin.value);
     });
     let T = run([a, b], at + STEP, at + 2 * STEP);
-    for (const p of [a, b]) expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: owner.pub } });
+    for (const p of [a, b]) expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: buyer.pub } });
     const keys = [root.key, xf.key, fin.key, delegationKey(H2.pub)];
     clockOf(b, T);
     del(b, ...keys);
@@ -2538,7 +2542,7 @@ describe('the put-back duty', () => {
     for (const p of [a, b]) {
       expect(keys.map((k) => top(p).has(k))).toEqual([false, false, false, false]);
       // (the pages count on from what they hold)
-      expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: owner.pub } });
+      expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: buyer.pub } });
       expect(foldOf(p).rounds.map((v) => v.decided)).toEqual(['house']);
     }
     run([a, b], T, at0 + a.table.OUTSIDER_WAIT_MS);
@@ -2547,12 +2551,12 @@ describe('the put-back duty', () => {
     for (const w of wrote) expect(w).toEqual([...keys].sort());
     for (const p of [a, b]) {
       expect(keys.map((k) => top(p).get(k))).toEqual([root.value, xf.value, fin.value, delegation(owner, H2.pub, PAGE_ROOM)]);
-      expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: owner.pub } });
+      expect(res(p)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: buyer.pub } });
       expect(foldOf(p).rounds.map((v) => v.decided)).toEqual(['house']);
     }
     // a page that binds the doc now counts the game as they do
     const late = await lateFrom(a, at0 + a.table.OUTSIDER_WAIT_MS);
-    expect(late.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: owner.pub } });
+    expect(late.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ holder: buyer.pub, live: true, fin: { k: buyer.pub } });
   });
 
   it('opens a live session\'s map again OPEN_WAIT_MS on, in turn, and the bets come back into it', async () => {

@@ -22,6 +22,7 @@ import * as Y from 'yjs';
 import { getIdentityPub, signIdentity, verifyIdentity } from './keypair';
 import { offerSignBytes } from './offerBytes';
 import type { OfferAsset, TransferOffer } from './offerBytes';
+import { leaveDeedOffer } from './computedFairOnly';
 import {
   ventureRecord, isOfficeHere, transferShares, writeVentureLink,
   removeVentureLink, ventureLedger, type VentureLedgerEntry,
@@ -250,6 +251,15 @@ function checkCommon(o: TransferOffer, myPub: string): string | null {
   return null;
 }
 
+/** 🔒 What the casino does as a deed is redeemed on this page, inside the
+ *  redemption's transaction (computedTable registers adoptFairOnlyGames: the
+ *  maker's FAIR ONLY games move to the redeemer's key with the deed, design
+ *  §8.7). A hook, so that this module needs nothing of the tables. */
+let deedRedeemed: ((o: TransferOffer) => void) | null = null;
+export function setDeedRedeemed(fn: ((o: TransferOffer) => void) | null): void {
+  deedRedeemed = fn;
+}
+
 /** Redeem a DEED offer — standing in the offered module. Verifies the maker
  *  still holds the deed (owner-match through the players-map key bridge), then
  *  rewrites `roomInfo.owner` to US, adjusts the venture link per the offer's
@@ -295,6 +305,11 @@ export function redeemDeedOffer(o: TransferOffer, ctx: DeedRedeemCtx): RedeemRes
       status: 'redeemed', byPub: ctx.myPub, byName: ctx.myName,
       at: Date.now(), exp: o.expiresAt, kind: 'deed',
     } satisfies OfferMark);
+    // 🔒 The maker's FAIR ONLY games go with the deed, where the offer names
+    // its buyer: the offer is left for this key's pages (`do:`), and the
+    // games this page can check now are moved here and now.
+    leaveDeedOffer(boundDoc!.getMap('casinoComputed'), o, ctx.currentRoomId);
+    deedRedeemed?.(o);
   });
   // Venture link adjustments reuse the existing gated helpers (they transact
   // separately; acceptable — the ownership move above is the authoritative leg).
@@ -417,6 +432,11 @@ export function settleDeedInDoc(doc: Y.Doc, o: TransferOffer, owner: DocSettleOw
       status: 'redeemed', byPub: owner.keyB64, byName: owner.name || 'Clone',
       at: Date.now(), exp: o.expiresAt, kind: 'deed',
     } satisfies OfferMark);
+    // 🔒 The offer is left for the buyer's page (`do:`), which moves the
+    // maker's FAIR ONLY games to the buyer's key when it is next in the
+    // module: only the buyer's key can sign that. Until then the games are
+    // the maker's still, and the maker's house serves them.
+    leaveDeedOffer(doc.getMap('casinoComputed'), o, o.asset.kind === 'deed' ? o.asset.roomId : '');
   });
   return { ok: true };
 }

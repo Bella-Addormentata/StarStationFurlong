@@ -567,7 +567,7 @@ describe('ends and end orders (S5, S7)', () => {
     }
   });
 
-  it('a standing end order is the holder\'s at the base\'s round, and its signature holds', () => {
+  it('a standing end order is the game\'s holder\'s now, and its signature holds; a key the game has left orders nothing of a live game', () => {
     const root = rootOf(P, 'p');
     const trim = trimOf(P, 'p'); // u = 3
     const finBy = (who: typeof owner) => sealFin(P, who.pub, who.sign);
@@ -575,10 +575,17 @@ describe('ends and end orders (S5, S7)', () => {
     expect(resolve('p', [root, trim, finBy(buyer)]).res.fin, 'a buyer with no transfer').toBeNull();
     const forged = { key: finBy(owner).key, value: { ...finBy(owner).value, g: BAD_SIG } };
     expect(resolve('p', [root, trim, forged]).res.fin, 'forged').toBeNull();
-    // after the sale: the opener\'s order holds up to the round it gave the game, the buyer\'s from it
+    // after the sale: the buyer\'s order stands, the seller\'s no more, though the base is at a round the seller held
     const xf = xferOf(P, owner, buyer, 3);
-    expect(resolve('p', [root, trim, xf, finBy(owner)]).res.fin, 'at the round of the sale, the seller\'s').not.toBeNull();
+    expect(resolve('p', [root, trim, xf, finBy(owner)]).res, 'at the round of the sale, the seller\'s').toMatchObject({ fin: null, live: true, holder: buyer.pub });
     expect(resolve('p', [root, trim, xf, finBy(buyer)]).res.fin, 'at the round of the sale, the buyer\'s').not.toBeNull();
+    // (the buyer\'s stands with the base under the round it took the game at, too)
+    const xf5 = xferOf(P, owner, buyer, 5);
+    expect(resolve('p', [root, trim, xf5, finBy(owner)]).res.fin, 'under the round of the sale, the seller\'s').toBeNull();
+    expect(resolve('p', [root, trim, xf5, finBy(buyer)]).res.fin, 'under the round of the sale, the buyer\'s').toEqual(finBy(buyer).value);
+    // of a game that has ended, the order its end carries: a key\'s that held the game at the round it ended
+    const ended = trimOf(P, 'p', { e: 1, f: finBy(owner).value, s: undefined, h: undefined, k: owner.pub, dl: undefined });
+    expect(resolve('p', [root, ended, xf]).res, 'the seller\'s end at the round of the sale').toMatchObject({ fin: finBy(owner).value, live: false });
     const later = trimOf(P, 'p', { u: 6, l: hex('e', 32), k: buyer.pub, dl: undefined, x: [xf.value] });
     expect(resolve('p', [root, later, xf, finBy(owner)]).res.fin, 'after the sale, the seller\'s').toBeNull();
     expect(resolve('p', [root, later, xf, finBy(buyer)]).res.fin, 'after the sale, the buyer\'s').not.toBeNull();
@@ -589,7 +596,7 @@ describe('ends and end orders (S5, S7)', () => {
   it('an end order the caller holds stands where the doc has none that does: after the doc\'s own, each one held in turn, and what is no order of a holder\'s passed over', () => {
     const root = rootOf(P, 'p');
     const trim = trimOf(P, 'p'); // u = 3
-    // (at the round of the sale the seller and the buyer both hold the game: an order of either stands)
+    // (after the sale the buyer holds the game: its order stands, the seller\'s is passed over)
     const xf = xferOf(P, owner, buyer, 3);
     const mine = sealFin(P, owner.pub, owner.sign);
     const theirs = sealFin(P, buyer.pub, buyer.sign);
@@ -598,9 +605,10 @@ describe('ends and end orders (S5, S7)', () => {
     const held = (entries: Entry[], fins: unknown[] | undefined, hold: string[] = []) =>
       resolveGame(authEnv({ hold }).env, T, P.inc, { ...recordsOf(entries), fins });
     expect(held([root, trim], [mine.value])).toMatchObject({ fin: mine.value, live: true, pending: false, invalid: [] });
-    // the doc's own is named before one held
+    // the doc's own is looked at before one held, and the one that stands is named
     expect(held([root, trim, xf, theirs], [mine.value]).fin).toEqual(theirs.value);
-    expect(held([root, trim, xf, mine], [theirs.value]).fin).toEqual(mine.value);
+    expect(held([root, trim, xf, mine], [theirs.value]).fin).toEqual(theirs.value);
+    expect(held([root, trim, xf, mine], [mine.value]).fin).toBeNull();
     // what the doc has at the key does not stand: the one held does
     expect(held([root, trim, { key: mine.key, value: { junk: 1 } }], [mine.value]).fin).toEqual(mine.value);
     expect(held([root, trim, strangers], [mine.value]).fin).toEqual(mine.value);

@@ -370,6 +370,32 @@ export function asDo(key: string, v: unknown, room: string): DeedOffer | null {
   return o && o.nonce === k.nonce ? o : null;
 }
 
+/** `o` without the fields it holds as undefined, where it is an object: an
+ *  offer as its maker's page builds it names the recipients it has none of
+ *  (offers makeOffer), which its signed bytes read as none, and a record
+ *  holds none of them (asDeedOffer). */
+export function definedOffer(o: unknown): unknown {
+  return isPlain(o) ? Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) : o;
+}
+
+/** Leave deed offer `o` in room `room`'s doc for its buyer's page
+ *  (`do:<nonce>`, design §8.7): the page that settles a deed calls this in
+ *  the settlement's transaction, with the room doc's `casinoComputed` map, so
+ *  that the buyer's page can move the maker's FAIR ONLY games to the buyer's
+ *  key when it is next in the room. Only an offer made out to a person (a
+ *  bearer or a company offer moves no game), and only where the map holds a
+ *  checkpoint at all (a room that never had a FAIR ONLY game is left as it
+ *  is). False when nothing was written. */
+export function leaveDeedOffer(map: { get(key: string): unknown; set(key: string, value: unknown): unknown; keys(): IterableIterator<string> }, o: unknown, room: string): boolean {
+  const offer = asDeedOffer(definedOffer(o), room);
+  if (!offer) return false;
+  let any = false;
+  for (const key of map.keys()) if (key.startsWith('ck:')) { any = true; break; }
+  if (!any) return false;
+  map.set(doKey(offer.nonce), offer);
+  return true;
+}
+
 /** What reading a `ck:` key's value gives. */
 export type CkRead =
   | { kind: 'ok'; t: string; inc: string; id: string; letter: FairOnlyLetter; ck: CkRec }
