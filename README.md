@@ -64,7 +64,8 @@ of the room and keeps asking (the rules are in
 [`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). A link
 to the welcome room that another player hands a newcomer (`?seed=`) is used as
 given, with the bundled pass's routes beside its own, so the newcomer's computer
-also dials the node that link names. It no
+also dials the node that link names, and on arrival it is that pass, with both
+sets of routes, that MY ROOMS keeps for the room. It no
 longer falls back to a module of its own, so today a new player's first room
 depends on that one node: the
 [External Infrastructure Register](docs/TDD/ExternalInfrastructureRegister.md)

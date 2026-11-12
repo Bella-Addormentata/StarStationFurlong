@@ -192,6 +192,75 @@ export async function seekWelcome(deps: WelcomeSeekDeps): Promise<WelcomeSeekEnd
   }
 }
 
+/** What follows a lost link needs (main.ts hands these in; a test its own). */
+export interface LostLinkDeps {
+  /** Resolves once no room swap is under way; at once when none is. */
+  swapEnded(): Promise<void>;
+  /** Whether the session whose link was lost is still the live one. */
+  current(): boolean;
+  /** Leave that session: its transport is closed for good. */
+  leave(): Promise<void>;
+  /** Arm the docking's retry. */
+  retry(): void;
+}
+
+/**
+ * What follows a seek that ended `link-lost`: the dead session is left and
+ * the docking's retry is armed. A room swap under way is waited out first,
+ * since it owns the session until it ends. It may fail on the closed link
+ * and restore or strand by itself; or it may finish with the dead session
+ * still the live one (the link closed after its join, while it waited for
+ * the room's state or lifted the curtain), and that session is then left
+ * here: the retry does nothing while a session is live, so nothing would
+ * dock again. The retry is armed whichever way it went, and only after the
+ * leave, so its timer never finds a session that is about to go.
+ */
+export async function recoverLostLink(deps: LostLinkDeps): Promise<void> {
+  try {
+    await deps.swapEnded();
+    if (deps.current()) await deps.leave();
+  } finally {
+    deps.retry();
+  }
+}
+
+/** How a pass is read and written for {@link welcomePassToKeep}. */
+export interface PassCodec<B> {
+  /** A pass (a link or a bare seed) as a bootstrap; null when unreadable. */
+  decode(pass: string): B | null;
+  encode(boot: B): string;
+  /** `held` with `extra`'s routes beside its own (roomCap.ts withPassRoutes). */
+  withRoutes(held: B, extra: B): B;
+}
+
+/**
+ * The welcome room's pass an arrival files in MY ROOMS. With no pass of the
+ * player's own it is the bundled link. A pass the player already holds to the
+ * room, or supplied for this docking (?seed=), STANDS, as it does for the
+ * docking itself: it may name a holder of the room the bundled pass does not,
+ * and that holder may be how this install got in. The bundled pass's routes
+ * ride beside its own, so a later visit tries both.
+ *
+ * Never the live session's bootstrap: that one is bridged through the
+ * player's own node and names this computer and its addresses, and the pass
+ * in MY ROOMS is what the station atlas hands on for the room.
+ */
+export function welcomePassToKeep<B extends { roomId: string }>(
+  own: string | null | undefined,
+  bundled: string,
+  codec: PassCodec<B>,
+): string {
+  if (!own || own === bundled) return bundled;
+  try {
+    const held = codec.decode(own);
+    const extra = codec.decode(bundled);
+    if (!held || !extra || held.roomId !== extra.roomId) return bundled;
+    return codec.encode(codec.withRoutes(held, extra));
+  } catch {
+    return own; // it could not be rewritten: the player's pass stays as it is
+  }
+}
+
 /** The line once the first wait ends with no answer. */
 export function welcomeWaitingLine(name: string): string {
   return `⏳ ${name} has not answered yet. Your computer keeps trying, and this room fills in by itself when it answers. Until then it is empty.`;

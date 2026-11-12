@@ -480,11 +480,13 @@ import {
   bootRoute,
   clearWelcomePending,
   markWelcomePending,
+  recoverLostLink,
   seekWelcome,
   seekingWelcome,
   welcomeArrivedLine,
   welcomeMarked,
   welcomeNodeLostLine,
+  welcomePassToKeep,
   welcomeRetryLine,
   welcomeSeekDelayMs,
   welcomeStateHere,
@@ -847,6 +849,10 @@ let welcomeReachedThisPage = false;
 /** 🛰️ The session (sessionEpoch) the seek's one loop runs for, so no
  *  session ever runs two (seekWelcomeIn). */
 let welcomeSeekEpoch: number | null = null;
+/** 🛰️ A pass the page was opened with (?seed=), as it was given: the room it
+ *  names and the seed. An arrival at the welcome room by it keeps it in MY
+ *  ROOMS (welcomePassForMyRooms). */
+let suppliedUrlPass: { roomId: string; seed: string } | null = null;
 /** 🛰️ Dockings in a row that could not start: paces the retry
  *  (welcomeSeekDelayMs), and the line is said for the first only. */
 let welcomeDockFailures = 0;
@@ -876,12 +882,21 @@ function welcomeSeeking(): boolean {
     reached: welcomeReachedThisPage,
   });
 }
+// 🛰️ The mark goes down here, in the same step as the first-run snapshot
+// above and before anything can store the identity that makes the next start
+// a returning one. A page closed at any later moment (while a ?seed= link is
+// still being resolved through the local node, say) leaves an install that
+// still seeks, never one with an identity and no mark, which would boot home.
+if (welcomeSeeking()) markWelcomePending(welcomeStore());
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
 // ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
 /** Re-entrancy latch: one transit at a time (the player can only stand in
  *  one vestibule, and the fade/join sequence must never interleave). */
 let transitInProgress = false;
+/** Settles when the swap under way ends (performRoomSwap); settled while none
+ *  is. For what must wait a swap out instead of giving up (transitEnded). */
+let transitEnds: Promise<void> = Promise.resolve();
 /**
  * 🪃 Session return route (owner bug: "the lobby I return to from the casino
  * is an OLD lobby"). Shared hub rooms (casino / pool) keep ONE back-pointing
@@ -1444,9 +1459,9 @@ async function bootstrapNetworking() {
     // 🛰️ Welcome only (welcomeOnly.ts): an install that has not reached the
     // welcome room yet goes there at every start, and the mark keeps that true
     // on a later start, when the identity this run stores has made it no
-    // first run. Saved before anything below can end the boot early.
+    // first run. The mark was saved as the page loaded, before the identity
+    // could be (beside IS_FIRST_RUN_INSTALL).
     const seeking = welcomeSeeking();
-    if (seeking) markWelcomePending(welcomeStore());
     let savedLastRoom: string | null = null;
     try {
       savedLastRoom = localStorage.getItem("ssf-last-room");
@@ -4159,9 +4174,29 @@ function noteWelcomeReached(sync: YjsSync | null): boolean {
     window.clearTimeout(welcomeRetryTimer);
     welcomeRetryTimer = null;
   }
-  addPass(DEFAULT_STATION.welcomeRoomLink);
+  addPass(welcomePassForMyRooms());
   logToPhoneSystem(welcomeArrivedLine(DEFAULT_STATION.name));
   return true;
+}
+
+/**
+ * 🛰️ The welcome room's pass an arrival files in MY ROOMS (welcomeOnly.ts
+ * welcomePassToKeep): the bundled link, or the pass the player holds to the
+ * room (ADD PASS) or opened the page with (?seed=), as given, with the
+ * bundled pass's routes beside its own. addPass replaces the room's saved
+ * pass, so filing the bundled link over the player's own would drop the
+ * holder that pass names. Never activeBootstrap: bridged through this
+ * computer's node, it names this computer and its addresses, and the pass in
+ * MY ROOMS is the seed the atlas harvest hands on for the room.
+ */
+function welcomePassForMyRooms(): string {
+  const roomId = DEFAULT_STATION.welcomeRoomId;
+  const own = passSeed(roomId) ?? (suppliedUrlPass?.roomId === roomId ? suppliedUrlPass.seed : null);
+  return welcomePassToKeep(own, DEFAULT_STATION.welcomeRoomLink, {
+    decode: decodeBootstrapInput,
+    encode: encodeBootstrapSeed,
+    withRoutes: withPassRoutes,
+  });
 }
 
 /**
@@ -4193,22 +4228,26 @@ function seekWelcomeIn(epoch: number, sync: YjsSync): void {
     arrived: () => noteWelcomeReached(sync),
     current: live,
     say: logToPhoneSystem,
-  }).then(async (end) => {
+  }).then((end) => {
     if (end !== "link-lost") return;
     console.warn(`${DEFAULT_STATION.name}: the link to the local node closed while waiting — docking afresh.`);
     logToPhoneSystem(welcomeNodeLostLine(DEFAULT_STATION.name));
-    // A room swap under way owns the session: its own join fails on the
-    // closed link and it restores or strands by itself. The retry looks
-    // again once it has ended.
-    try {
-      if (!transitInProgress && live()) {
+    // A room swap under way owns the session until it ends, and is waited
+    // out: it can also END with this dead session still the live one (the
+    // link closed after its join), which is then left here like any other
+    // (welcomeOnly.ts recoverLostLink).
+    void recoverLostLink({
+      swapEnded: transitEnded,
+      current: live,
+      leave: async () => {
         await leaveRoom();
         updateHUDNode("OFFLINE", "#ff1744");
         updateHUDP2P("OFFLINE", "#ff1744");
-      }
-    } finally {
-      scheduleWelcomeRetry();
-    }
+      },
+      retry: scheduleWelcomeRetry,
+    }).catch((err) => {
+      console.warn(`${DEFAULT_STATION.name}: leaving the session whose link closed failed:`, err);
+    });
   });
 }
 
@@ -4310,6 +4349,10 @@ async function performRoomSwap(
 ): Promise<RoomSwapResult> {
   if (transitInProgress) return "busy";
   transitInProgress = true;
+  let endTransit: () => void = () => {};
+  transitEnds = new Promise<void>((resolve) => {
+    endTransit = resolve;
+  });
   // Snapshot BEFORE leaving: leaveRoom keeps activeBootstrap as last-room
   // memory, but joinRoom(target) overwrites it — this is the way back.
   const originalBoot = activeBootstrap;
@@ -4435,7 +4478,13 @@ async function performRoomSwap(
     return stranded ? new StrandedOfflineError(failure.message) : failure;
   } finally {
     transitInProgress = false;
+    endTransit();
   }
+}
+
+/** Resolves once no room swap is under way; at once when none is. */
+async function transitEnded(): Promise<void> {
+  while (transitInProgress) await transitEnds;
 }
 
 /** 🗺️🎫 #192: the pass this install holds for `roomId`, for the holotable's
@@ -10548,6 +10597,7 @@ function setupNetworkDetailsPanel() {
       // last-room resume and the default station whatever the timing — and
       // bootstrapNetworking awaits `urlSeedImport` to dial the bridged form.
       pendingBootstrapOverride = imported;
+      suppliedUrlPass = { roomId: imported.roomId, seed: urlSeed };
       urlSeedImport = resolveBridgeBootstrap(imported)
         .then((resolved) => {
           pendingBootstrapOverride = resolved;

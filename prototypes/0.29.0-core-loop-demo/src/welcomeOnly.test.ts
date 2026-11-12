@@ -7,18 +7,20 @@ import {
   bootRoute,
   clearWelcomePending,
   markWelcomePending,
+  recoverLostLink,
   seekWelcome,
   seekingWelcome,
   welcomeArrivedLine,
   welcomeMarked,
   welcomeNodeLostLine,
+  welcomePassToKeep,
   welcomeRetryLine,
   welcomeSeekDelayMs,
   welcomeStateHere,
   welcomeStillWaitingLine,
   welcomeWaitingLine,
 } from './welcomeOnly';
-import type { MarkStore, WelcomeFacts, WelcomeSeekDeps } from './welcomeOnly';
+import type { MarkStore, PassCodec, WelcomeFacts, WelcomeSeekDeps } from './welcomeOnly';
 
 const WELCOME = 'home-aaaaaaaaaaaa';
 const HOME = 'home-bbbbbbbbbbbb';
@@ -307,5 +309,104 @@ describe('welcome only: the seek of one welcome-room session (seekWelcome)', () 
     b.state.current = false; // our own leave closed that link: nothing to dock afresh for
     await b.loseLink();
     await expect(endB).resolves.toBe('superseded');
+  });
+});
+
+describe('welcome only: after the link to the player\'s own node is lost (recoverLostLink)', () => {
+  /** One lost session: what was done, in order, and a swap to end by hand. */
+  function lost(over: { current?: boolean; swapping?: boolean; leaveFails?: boolean } = {}) {
+    const did: string[] = [];
+    const state = { current: over.current ?? true };
+    let endSwap: () => void = () => {};
+    const swap = over.swapping ? new Promise<void>((resolve) => (endSwap = resolve)) : Promise.resolve();
+    const done = recoverLostLink({
+      swapEnded: () => swap,
+      current: () => state.current,
+      leave: async () => {
+        did.push('leave');
+        if (over.leaveFails) throw new Error('leave failed');
+      },
+      retry: () => void did.push('retry'),
+    });
+    return { did, state, endSwap: () => endSwap(), done };
+  }
+
+  it('leaves the dead session, then arms the retry', async () => {
+    const s = lost();
+    await s.done;
+    expect(s.did).toEqual(['leave', 'retry']);
+  });
+
+  it('waits a room swap out, and leaves the dead session the swap ended in', async () => {
+    const s = lost({ swapping: true });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(s.did).toEqual([]); // the swap owns the session: nothing is torn down under it
+    s.endSwap(); // it finished, the session whose link closed still the live one
+    await s.done;
+    expect(s.did).toEqual(['leave', 'retry']);
+  });
+
+  it('leaves nothing when the swap put another session in its place, and still arms the retry', async () => {
+    const s = lost({ swapping: true });
+    s.state.current = false; // the swap failed on the closed link and restored or stranded by itself
+    s.endSwap();
+    await s.done;
+    expect(s.did).toEqual(['retry']);
+  });
+
+  it('arms the retry even when the leave fails', async () => {
+    const s = lost({ leaveFails: true });
+    await expect(s.done).rejects.toThrow('leave failed');
+    expect(s.did).toEqual(['leave', 'retry']);
+  });
+});
+
+describe('welcome only: the pass an arrival keeps in MY ROOMS (welcomePassToKeep)', () => {
+  interface Boot {
+    roomId: string;
+    routes: string[];
+  }
+  /** A pass here is `room|route,route`. */
+  const codec: PassCodec<Boot> = {
+    decode: (pass) => {
+      const [roomId, routes] = pass.split('|');
+      return roomId && routes !== undefined ? { roomId, routes: routes.split(',').filter(Boolean) } : null;
+    },
+    encode: (boot) => `${boot.roomId}|${boot.routes.join(',')}`,
+    withRoutes: (held, extra) => ({ ...held, routes: [...new Set([...held.routes, ...extra.routes])] }),
+  };
+  const BUNDLED = `${WELCOME}|host`;
+
+  it('is the bundled link when the player has no pass of their own to the room', () => {
+    expect(welcomePassToKeep(null, BUNDLED, codec)).toBe(BUNDLED);
+    expect(welcomePassToKeep(undefined, BUNDLED, codec)).toBe(BUNDLED);
+    expect(welcomePassToKeep('', BUNDLED, codec)).toBe(BUNDLED);
+  });
+
+  it('keeps the player\'s own pass, its holder first, with the bundled routes beside it', () => {
+    expect(welcomePassToKeep(`${WELCOME}|friend`, BUNDLED, codec)).toBe(`${WELCOME}|friend,host`);
+  });
+
+  it('leaves the bundled link as it is when that is the pass the player holds', () => {
+    let encoded = 0;
+    const counting: PassCodec<Boot> = { ...codec, encode: (b) => (encoded++, codec.encode(b)) };
+    expect(welcomePassToKeep(BUNDLED, BUNDLED, counting)).toBe(BUNDLED);
+    expect(encoded).toBe(0);
+  });
+
+  it('is the bundled link when the player\'s pass is unreadable or names another room', () => {
+    expect(welcomePassToKeep('junk', BUNDLED, codec)).toBe(BUNDLED);
+    expect(welcomePassToKeep(`${OTHER}|friend`, BUNDLED, codec)).toBe(BUNDLED);
+  });
+
+  it('leaves the player\'s pass as it is when it cannot be rewritten', () => {
+    const failing: PassCodec<Boot> = {
+      ...codec,
+      encode: () => {
+        throw new Error('not Latin-1');
+      },
+    };
+    expect(welcomePassToKeep(`${WELCOME}|friend`, BUNDLED, failing)).toBe(`${WELCOME}|friend`);
   });
 });
