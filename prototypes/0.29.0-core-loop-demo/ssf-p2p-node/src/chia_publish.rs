@@ -2561,7 +2561,7 @@ impl std::error::Error for MoneyMemoRefused {}
 /// (`claim_write::build_burner_bundle`, stage 4 design §4.2), does not ask
 /// it: it signs with a `BurnerKey` alone and has no network check of its
 /// own. What reaches it is its callers' gate ([`burner_paths`]): on a test
-/// network, behind SSF_CHIA_BURNERS=1, the claim-and-write's self-test hook
+/// network, unless SSF_CHIA_BURNERS=0, the claim-and-write's self-test hook
 /// and the listing from P(e), each knock from K(h) and the beacon from B as
 /// a burner key (§13 rows 9 and 10); off a test network the beacon from B
 /// where the operator turned the beacon on, and the listing from P(e) and
@@ -4259,10 +4259,11 @@ pub fn beacon_enabled() -> bool {
     std::env::var("SSF_CHIA_BEACON").ok().as_deref() == Some("1")
 }
 
-/// The variable that turns burner keys on for a test network's run (stage 4
-/// design §8 (2), §13 row 9): `SSF_CHIA_BURNERS=1`. Off a test network there
-/// is no flag: burner keys are the only keys a write is made with there,
-/// whatever it holds ([`burners_of`]).
+/// The variable that turns burner keys off for a test network's run (stage 4
+/// design §8 (2), §13 rows 9 and 12): `SSF_CHIA_BURNERS=0`. Burner keys are
+/// on by default there. Off a test network there is no flag: burner keys
+/// are the only keys a write is made with there, whatever it holds
+/// ([`burners_of`]).
 pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 
 /// Whether burner keys are on for `net` with [`BURNERS_ENV`] set to `raw`,
@@ -4275,19 +4276,18 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// beacon is the operator's to turn on (`SSF_CHIA_BEACON=1`, D7), and the
 /// listing and the knocks are the player's (LIST ME, `chia_listing`, §4.5
 /// (6), off there until turned on), as [`money_memo_line`] says once. Set
-/// to `1` there the
-/// variable is said to change nothing, in one line, and nothing exits; any
-/// other value says nothing.
+/// to `0` or to `1` there the variable is said to change nothing, in one
+/// line, and nothing exits; any other value says nothing.
 ///
-/// On a test network exactly `1` turns them on, and the line says what that
-/// does in this build: the Phone Book listing written from the wallet's
-/// listing burner
-/// P(e), funded by the lobby dish, at its slot, after a late start or at
-/// once for a newcomer (§4.3, [`burner_listing_step`]); each knock written
-/// from its own burner key K(h), funded the same way, once per host and
-/// room per edition, since K(h) is one key per host and inbox hint, the
-/// host's for one room's lane in one era ([`knock_burner`]), and it writes
-/// once (§3.2, §4.1, the knock row, [`publish_knock_with`]); the knock rule of §5.2
+/// On a test network they are on by default (§13 row 12), and the line says
+/// what that does in this build: the Phone Book listing written from the
+/// wallet's listing burner P(e), funded by the lobby dish, at its slot,
+/// after a late start or at once for a newcomer (§4.3,
+/// [`burner_listing_step`]); each knock written from its own burner key
+/// K(h), funded the same way, once per host and room per edition, since
+/// K(h) is one key per host and inbox hint, the host's for one room's lane
+/// in one era ([`knock_burner`]), and it writes once (§3.2, §4.1, the knock
+/// row, [`publish_knock_with`]); the knock rule of §5.2
 /// ([`knock_attempt_counts`]), under which a knock that only waits, for a
 /// dish coin, for the fuse once the edition's
 /// `claim_write::MAX_GIFTS_PER_ERA` gifts are given, for a spend still
@@ -4297,21 +4297,32 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// after a late start (§4.1, the beacon rows; §4.3 T5, [`beacon_arm_due`]);
 /// and the claim-and-write self-test hook it opens
 /// ([`claim_write_selftest`]). The line names no busy chain among the waits:
-/// a push refused for its fee still uses an attempt (§10). Any other value
-/// there (unset, empty, `0`, `true`, a stray space, not UTF-8) is off and
-/// says nothing, as a hook's does (main.rs `test_hook`). It reads no
-/// environment, so its tests ask it every value on every network.
+/// a push refused for its fee still uses an attempt (§10).
+///
+/// Exactly `0` turns them off there, and its line says what pays then: the
+/// SSF wallet's own coin, at the wallet's address, as before stage 4. Any
+/// other value (unset, empty, `1`, `false`, a stray space, not UTF-8) leaves
+/// them on: a value this cannot read must not move a station's writes to
+/// its money address. It reads no environment, so its tests ask it every
+/// value on every network.
 pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsStr>) -> (bool, Option<String>) {
-    let set = raw == Some(std::ffi::OsStr::new("1"));
+    let said = |value: &str| raw == Some(std::ffi::OsStr::new(value));
     if !net.is_test() {
-        let line = set.then(|| format!("⛓️ ChiaHub: {BURNERS_ENV}=1 changes nothing on {}. Burner keys are the only keys this node writes with there, with or without it.", net.name()));
+        let line = ["0", "1"]
+            .into_iter()
+            .find(|value| said(value))
+            .map(|value| format!("⛓️ ChiaHub: {BURNERS_ENV}={value} changes nothing on {}. Burner keys are the only keys this node writes with there, with or without it.", net.name()));
         return (true, line);
     }
-    if !set {
-        return (false, None);
+    if said("0") {
+        let line = format!(
+            "⛓️ ChiaHub burners ({BURNERS_ENV}=0): off for {}. The SSF wallet's own coin pays for the Phone Book listing and for each knock, at the wallet's address, and with SSF_CHIA_BEACON=1 the beacon wallet pays for the beacon. This is the path from before burner keys, kept for testing: anyone who can find the listing can see the wallet's address beside it.",
+            net.name()
+        );
+        return (false, Some(line));
     }
     let line = format!(
-        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's {} gifts given, a spend still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup.",
+        "⛓️ ChiaHub burners: on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's {} gifts given, a spend still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. {BURNERS_ENV}=0 turns them off for a run: the SSF wallet then pays, at its own address.",
         net.name(),
         claim_write::MAX_GIFTS_PER_ERA,
         HEARTBEAT_RETRY_SECS / 60
@@ -6012,8 +6023,8 @@ pub(crate) enum KnockDone {
 /// takes from the request to the write, so the heartbeat decides nothing
 /// between them (stage 4 design §13 row 10). The path is `burners`, the
 /// listing's and the knocks' own ([`burner_paths`]): the burner path with
-/// burner keys on (SSF_CHIA_BURNERS=1 on a test network, and always off
-/// one), the money path with them off, which off a test network would end
+/// burner keys on (on a test network unless SSF_CHIA_BURNERS=0, and always
+/// off one), the money path with them off, which off a test network would end
 /// in the keys' refusal. Whether the arm runs at all is the player's LIST
 /// ME, asked by the heartbeat before this step (§4.5 (6)). The keys
 /// are the publisher's (`keys`, [`PublisherKeys`]): the step is handed no
@@ -6554,8 +6565,8 @@ pub(crate) async fn publish_beacon(
 /// mock chain): every step the arm takes from the try to the write, so the
 /// heartbeat decides nothing between them (stage 4 design §13 row 10). The
 /// path is `burners`, the beacon's own ([`burner_paths`]): the burner path
-/// with burner keys on (SSF_CHIA_BURNERS=1 on a test network, and always
-/// off one), the money path with them off, never chosen by which key paid.
+/// with burner keys on (on a test network unless SSF_CHIA_BURNERS=0, and
+/// always off one), the money path with them off, never chosen by which key paid.
 /// The keys are the publisher's (`keys`, [`PublisherKeys`]): the step is
 /// handed no wallet key.
 ///
@@ -6798,8 +6809,8 @@ pub async fn heartbeat_loop(
     // arm only off that arm's burner path, where the wallet would pay
     // ([`wallet_refusal`]).
     let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
-    // Which arms write from burner keys this run ([`burner_paths`]): with
-    // SSF_CHIA_BURNERS=1 on a test network, and always off one, where
+    // Which arms write from burner keys this run ([`burner_paths`]): on a
+    // test network unless SSF_CHIA_BURNERS=0, and always off one, where
     // burner keys are the only path (§13 row 10), all three. The listing
     // from this wallet's listing burner P(e) at its slot (stage 4 design
     // §4.3, [`burner_listing_step`]), each knock from its own burner key
@@ -13099,53 +13110,70 @@ mod tests {
         assert_ne!(t11.aggregated_signature, main.aggregated_signature);
     }
 
-    /// Stage 4 design §8 (2): `SSF_CHIA_BURNERS` is on with exactly `1` on a
-    /// test network, and its line says what it does in this build: the
+    /// Stage 4 design §8 (2), §13 row 12: on a test network burner keys are
+    /// on by default, and their line says what they do in this build: the
     /// listing and each knock written from burner keys of their own, a knock
     /// once per host and room per edition, the waits that use no attempt,
     /// and the beacon, where it is on, written from a key of its own that
     /// the lobby dish funds. It names no busy chain among the
     /// waits, since a push refused for its fee still uses an attempt (§10).
-    /// Any other value there is off and says nothing.
+    /// Exactly `0` turns them off there, and says that the SSF wallet pays
+    /// then, at its own address. Every other value leaves them on: a value
+    /// that cannot be read must not move a station's writes to its money
+    /// address.
     ///
     /// Off a test network there is no flag (§8 (2), §13 row 10): burner keys
     /// are on whatever the variable holds, set or not, since they are the
     /// only keys this node writes with there. Nothing is said of it but for
-    /// exactly `1`, whose one line says it changes nothing. No environment
-    /// is read.
+    /// exactly `0` or `1`, whose one line says it changes nothing. No
+    /// environment is read.
     #[test]
-    fn ssf_chia_burners_is_a_flag_on_a_test_network_and_always_on_off_one() {
+    fn burner_keys_are_on_by_default_on_a_test_network_and_always_on_off_one() {
         use crate::chia_network::ChiaNet;
         use std::ffi::OsStr;
+        const ON: &str = "⛓️ ChiaHub burners: on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's 16 gifts given, a spend still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. SSF_CHIA_BURNERS=0 turns them off for a run: the SSF wallet then pays, at its own address.";
         for net in ChiaNet::ALL {
-            // Off a test network every value is on; on one, every value but `1` is off.
-            let other = (!net.is_test(), None);
-            assert_eq!(burners_of(net, None), other, "unset on {net:?}");
-            for raw in ["", "0", "true", "yes", " 1", "1 ", "11", "01"] {
-                assert_eq!(burners_of(net, Some(OsStr::new(raw))), other, "{raw:?} on {net:?}");
+            // On everywhere, whatever the value, but for `0` on a test network.
+            let default = burners_of(net, None);
+            assert!(default.0, "unset is on on {net:?}");
+            assert_eq!(default.1.is_some(), net.is_test(), "unset is said on a test network alone ({net:?})");
+            for raw in ["", "true", "false", "yes", "no", "off", " 0", "0 ", "00", " 1", "1 ", "11", "01"] {
+                assert_eq!(burners_of(net, Some(OsStr::new(raw))), default, "{raw:?} on {net:?}");
             }
             #[cfg(unix)]
             {
                 use std::os::unix::ffi::OsStrExt;
-                for raw in [&[0xffu8][..], &[b'1', 0xff][..]] {
-                    assert_eq!(burners_of(net, Some(OsStr::from_bytes(raw))), other, "not UTF-8 ({raw:?}) on {net:?}");
+                for raw in [&[0xffu8][..], &[b'0', 0xff][..], &[b'1', 0xff][..]] {
+                    assert_eq!(burners_of(net, Some(OsStr::from_bytes(raw))), default, "not UTF-8 ({raw:?}) on {net:?}");
                 }
             }
             let (on, line) = burners_of(net, Some(OsStr::new("1")));
             assert!(on, "1 is on on {net:?}");
             assert!(line.is_some(), "1 is said on {net:?}");
             assert!(!line.unwrap_or_default().contains("busy"), "no busy chain among the waits on {net:?}");
+            let (on, line) = burners_of(net, Some(OsStr::new("0")));
+            assert_eq!(on, !net.is_test(), "0 turns them off on a test network alone ({net:?})");
+            assert!(line.is_some(), "0 is said on {net:?}");
+        }
+        for raw in [None, Some("1")] {
+            assert_eq!(burners_of(ChiaNet::Testnet11, raw.map(OsStr::new)), (true, Some(ON.to_string())), "{raw:?}");
         }
         assert_eq!(
-            burners_of(ChiaNet::Testnet11, Some(OsStr::new("1"))).1.as_deref(),
-            Some(
-                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's 16 gifts given, a spend still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup."
+            burners_of(ChiaNet::Testnet11, Some(OsStr::new("0"))),
+            (
+                false,
+                Some(
+                    "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=0): off for testnet11. The SSF wallet's own coin pays for the Phone Book listing and for each knock, at the wallet's address, and with SSF_CHIA_BEACON=1 the beacon wallet pays for the beacon. This is the path from before burner keys, kept for testing: anyone who can find the listing can see the wallet's address beside it."
+                        .to_string()
+                )
             )
         );
-        assert_eq!(
-            burners_of(ChiaNet::Mainnet, Some(OsStr::new("1"))).1.as_deref(),
-            Some("⛓️ ChiaHub: SSF_CHIA_BURNERS=1 changes nothing on Chia mainnet. Burner keys are the only keys this node writes with there, with or without it.")
-        );
+        for value in ["0", "1"] {
+            assert_eq!(
+                burners_of(ChiaNet::Mainnet, Some(OsStr::new(value))),
+                (true, Some(format!("⛓️ ChiaHub: SSF_CHIA_BURNERS={value} changes nothing on Chia mainnet. Burner keys are the only keys this node writes with there, with or without it.")))
+            );
+        }
     }
 
     /// Stage 4 design §13 row 10 and §4.5 (6): which of the heartbeat's
@@ -13155,7 +13183,8 @@ mod tests {
     /// ([`wallet_refusal`], [`refuse_money_memo`]).
     ///
     /// On a test network the flag moves the listing, the knocks and the
-    /// beacon together, as it has since they took the burner path, and the
+    /// beacon together, as it has since they took the burner path, off the
+    /// burner path with `0` and on it with anything else, and the
     /// wallet refuses nothing. Off one every arm is on the burner path
     /// whatever the flag holds, its only path there, and the wallet's
     /// refusal holds none of them: whether the listing's and the knocks'
@@ -13178,7 +13207,7 @@ mod tests {
         for net in ChiaNet::ALL {
             for raw in [None, Some("0"), Some("1")] {
                 let paths = burner_paths(burners_of(net, raw.map(OsStr::new)).0);
-                let on = !net.is_test() || raw == Some("1");
+                let on = !net.is_test() || raw != Some("0");
                 assert_eq!(paths, BurnerPaths { beacon: on, listing: on }, "{net:?} with {raw:?}");
                 let refused = refuse_money_memo(net).err().map(|e| e.0);
                 assert_eq!(refused.is_some(), !net.is_test(), "the wallet refuses off a test network alone ({net:?})");
@@ -13189,7 +13218,8 @@ mod tests {
             }
         }
         assert!(seen.contains(&(ChiaNet::Mainnet, BurnerPaths { beacon: true, listing: true })), "mainnet was walked");
-        assert!(seen.contains(&(ChiaNet::Testnet11, BurnerPaths { beacon: false, listing: false })), "so was a test network without the flag");
+        assert!(seen.contains(&(ChiaNet::Testnet11, BurnerPaths { beacon: false, listing: false })), "so was a test network with the flag at 0");
+        assert!(seen.contains(&(ChiaNet::Testnet11, BurnerPaths { beacon: true, listing: true })), "and one without the flag");
         assert!(seen.iter().all(|(net, paths)| net.is_test() || (paths.listing && paths.beacon)), "off a test network a burner key is every arm's path");
     }
 

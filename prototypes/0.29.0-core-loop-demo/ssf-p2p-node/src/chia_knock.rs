@@ -124,7 +124,7 @@ pub struct KnockRequest {
     pub kx_host: [u8; 32],
     /// Failed attempts to send it so far (the publisher drops it after
     /// `chia_publish::MAX_KNOCK_ATTEMPTS`). With burner keys on
-    /// (SSF_CHIA_BURNERS=1), the knock is written from its own burner key
+    /// (everywhere but a test network run with SSF_CHIA_BURNERS=0), the knock is written from its own burner key
     /// K(h), and a try that only waited, for a mojo ready in the lobby dish,
     /// for the fuse on the edition's gifts, for a spend still settling or for
     /// a chain that did not answer, is none (stage 4 design §5.2,

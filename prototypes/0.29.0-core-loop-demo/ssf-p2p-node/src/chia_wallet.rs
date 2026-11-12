@@ -1369,10 +1369,11 @@ pub fn address_to_puzzle_hash(net: ChiaNet, address: &str) -> Result<Bytes32> {
 
 /// Printed when the wallet loads (at startup, or when the Bank turns it on):
 /// what the load did, the key fingerprint, and on a test network the
-/// receive address, with how it is funded there. Off a test network no
-/// address of the wallet is printed ([`receive_line`], [`retired_line`]):
-/// the same log names the node's id. Never the words.
-pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
+/// receive address, with what a coin there is for (`burners`: burner keys
+/// are on for this run, `chia_publish::burners_enabled`). Off a test
+/// network no address of the wallet is printed ([`receive_line`],
+/// [`retired_line`]): the same log names the node's id. Never the words.
+pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity, burners: bool) {
     if let Some(r) = &id.retired {
         println!("{}", retired_line(net, r));
     }
@@ -1396,7 +1397,7 @@ pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
         };
         println!("🏦 SSF wallet: loaded the wallet made from 24 words, key fingerprint {}{kept}", id.fingerprint);
     }
-    println!("{}", receive_line(net, &receive_address(net, &id.wallet)));
+    println!("{}", receive_line(net, &receive_address(net, &id.wallet), burners));
 }
 
 /// The line of a raw-seed wallet the load retired: the archive's name, and
@@ -1420,9 +1421,14 @@ fn retired_line(net: ChiaNet, r: &RetiredSeed) -> String {
     }
 }
 
-/// The receive address's line, and how it is funded on `net`. On a test
-/// network it prints `addr`: a node run without a page is funded from this
-/// line, and test coins are free. Off a test network it prints no address
+/// The receive address's line, and what a coin there is for on `net`. On a
+/// test network it prints `addr`: a node run without a page is funded from
+/// this line, and test coins are free. With burner keys on there
+/// (`burners`, the default: `chia_publish::burners_of`) the lobby dish pays
+/// for the listing and the knocks, so the line promises neither for a coin
+/// and says what one is still for. With them off (`SSF_CHIA_BURNERS=0`) the
+/// wallet pays, and the line says what it always said. Off a test network,
+/// where burner keys are the only path, it prints no address
 /// and says where to read it: the log names the node's id at start, and an
 /// address beside it would tie the money address to the station in one file
 /// (docs/TDD/ChiaLanePrivacy.md §9). The lane pays for no write from this
@@ -1430,7 +1436,15 @@ fn retired_line(net: ChiaNet, r: &RetiredSeed) -> String {
 /// `chia_publish::money_memo_refusal`), so the line promises none: funding
 /// it would buy no listing. It says nothing of what the lane writes from
 /// other keys.
-fn receive_line(net: ChiaNet, addr: &str) -> String {
+fn receive_line(net: ChiaNet, addr: &str, burners: bool) -> String {
+    if net.is_test() && burners {
+        return format!(
+            "⛓️ ChiaHub lane: {} receive address {addr}\n   The lane pays for no Phone Book write from it: the lobby dish pays for the listing and the knocks, so it needs no coin for them. {} from a {} faucet is free, and a coin here is what GIVE at a faucet dish spends.",
+            net.name(),
+            net.ticker(),
+            net.name()
+        );
+    }
     if net.is_test() {
         return format!(
             "⛓️ ChiaHub lane: {} receive address {addr}\n   Fund it at a {} faucet. {} is free. Once it holds a coin, the lane can publish/resolve presence.",
@@ -3220,8 +3234,18 @@ mod tests {
     #[test]
     fn the_receive_line_says_how_each_network_is_funded() {
         let a = "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk";
+        // With burner keys on, a test network's default (stage 4 design §13
+        // row 12), the lobby dish pays for the listing and the knocks: the
+        // line promises neither for a coin, and says what one is for.
         assert_eq!(
-            receive_line(ChiaNet::Testnet11, a),
+            receive_line(ChiaNet::Testnet11, a, true),
+            format!(
+                "⛓️ ChiaHub lane: testnet11 receive address {a}\n   The lane pays for no Phone Book write from it: the lobby dish pays for the listing and the knocks, so it needs no coin for them. TXCH from a testnet11 faucet is free, and a coin here is what GIVE at a faucet dish spends."
+            )
+        );
+        // With them off (SSF_CHIA_BURNERS=0) the wallet pays, as it did.
+        assert_eq!(
+            receive_line(ChiaNet::Testnet11, a, false),
             format!("⛓️ ChiaHub lane: testnet11 receive address {a}\n   Fund it at a testnet11 faucet. TXCH is free. Once it holds a coin, the lane can publish/resolve presence.")
         );
         // Stage 4 design §4.5 (1): off a test network the SSF wallet pays
@@ -3232,7 +3256,10 @@ mod tests {
         // Off a test network the line names no address (privacy gaps,
         // docs/TDD/ChiaLanePrivacy.md §11): the log names the node's id,
         // and the Bank shows the address.
-        let line = receive_line(ChiaNet::Mainnet, "xch1q");
+        let line = receive_line(ChiaNet::Mainnet, "xch1q", true);
+        // Burner keys are the only path there (`chia_publish::burners_of`),
+        // and the line does not turn on what it is told of them.
+        assert_eq!(receive_line(ChiaNet::Mainnet, "xch1q", false), line);
         assert_eq!(
             line,
             "⛓️ ChiaHub lane: the Chia mainnet receive address is in the SpacePhone's 🏦 BANK, under RECEIVE; this log does not print it\n   It takes real XCH. On Chia mainnet the lane pays for no chain write from it."

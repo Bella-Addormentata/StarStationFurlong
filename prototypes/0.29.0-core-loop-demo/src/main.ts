@@ -5578,8 +5578,9 @@ function renderBankApp(): void {
       const networkHtml = wv.network
         ? `<div id="bank-network" style="font-size:9.5px; margin-top:5px; line-height:1.6; color:${wv.network.warn ? "#ffb300" : "rgba(212,168,75,0.6)"};${wv.network.warn ? " font-weight:800;" : ""}">${esc(wv.network.text)}</div>`
         : "";
-      // 📖 Off a test network: who pays for the Phone Book listing (never
-      // this wallet).
+      // 📖 Who pays for the Phone Book listing, where that is the lobby
+      // dish and not this wallet: off a test network, and on one whose node
+      // says so.
       const listingHtml = wv.listing
         ? `<div id="bank-listing-line" style="font-size:9px; margin-top:4px; line-height:1.6; color:rgba(212,168,75,0.6);">${esc(wv.listing)}</div>`
         : "";
@@ -5666,7 +5667,7 @@ function renderBankApp(): void {
         : owned === null
           ? err ? "not read yet" : "reading the chain…"
           : `${formatMojos(owned, net.ticker)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming, net.ticker)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
-      const note = receiveNote(net);
+      const note = receiveNote(net, liveFp?.chia_listing?.dish === true);
       return `${switchHtml}${backupHtml}
         <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: `QR code of this node's ${net.name} address` })}</div>
         <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">

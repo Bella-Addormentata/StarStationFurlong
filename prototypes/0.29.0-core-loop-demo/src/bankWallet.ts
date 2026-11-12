@@ -30,12 +30,16 @@
 // until the node stops, but writes nothing to the chain.
 //
 // 📖 What the wallet has to do with the Phone Book follows the network and
-// the player's LIST ME (listMe.ts, stage 4 PR 11). On a test network the
-// wallet pays for the listing, while LIST ME is on. On a network whose coins
+// the player's LIST ME (listMe.ts, stage 4 PR 11). On a network whose coins
 // are real money it pays for no chain write: the listing and the knocks are
 // written from keys of their own that the lobby dish pays for, only while
 // LIST ME is on, so the wallet's address is never in the book, and RECEIVE
-// says so (`listing`).
+// says so (`listing`). On a test network the node does the same by default
+// (stage 4 PR 12) and says so in its LIST ME readout (`dish`); the Bank
+// then promises no listing for a coin, and asks for one only to GIVE at the
+// faucet dish. A test-network node that does not say it (an older one, or
+// one started with SSF_CHIA_BURNERS=0) pays for the listing from its
+// wallet while LIST ME is on, and the Bank words that as it did.
 
 import { chiaBackOn, chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';
@@ -58,10 +62,12 @@ export interface BankWalletView {
    *  real money). None without a node, or on a network the page does not
    *  know (`text` says so instead). */
   network: { text: string; warn: boolean } | null;
-  /** 📖 Under the network line, off a test network, while the node has an
-   *  SSF wallet to turn on or holds one: who pays for the Phone Book
-   *  listing there (`BANK_LISTING_LINE`). None on a test network, where
-   *  the wallet may be the payer, or from a node older than LIST ME. */
+  /** 📖 Under the network line, while the node has an SSF wallet to turn on
+   *  or holds one: who pays for the Phone Book listing, where that is the
+   *  lobby dish (`BANK_LISTING_LINE` off a test network,
+   *  `BANK_LISTING_LINE_TEST` on one whose node says so). None on a test
+   *  network whose node does not say it, where the wallet may be the payer,
+   *  or from a node older than LIST ME. */
   listing: string | null;
   /** The line above the address, or instead of it. */
   text: string;
@@ -92,6 +98,11 @@ export const TURN_TIMEOUT_MS = 45_000;
  *  SSF wallet pays for no Phone Book write there, so its address is never
  *  on the chain beside one. */
 export const BANK_LISTING_LINE = "Your Phone Book listing is paid by the lobby dish, never by this wallet. This wallet's address is never in the book.";
+/** 📖 The same on a test network whose node says the lobby dish pays
+ *  (`ChiaListing.dish`). It says nothing of "never": an older version paid
+ *  for its listings from this wallet there, and those stay on the test
+ *  chain (docs/TDD/ChiaLanePrivacy.md). */
+export const BANK_LISTING_LINE_TEST = 'Your Phone Book listing is paid by the lobby dish, not by this wallet: it needs no coin to be listed.';
 
 /** Where the player finds LIST ME. */
 const LIST_ME_WHERE = '⚙️ SETTINGS → 🌐 NETWORK';
@@ -105,7 +116,9 @@ const LIST_ME_WHERE = '⚙️ SETTINGS → 🌐 NETWORK';
  *
  *  Off a test network it promises no listing from the wallet: there the
  *  lobby dish pays, and only while LIST ME is on. On a test network with
- *  LIST ME off it promises none either. */
+ *  LIST ME off it promises none either, and none where the node says the
+ *  lobby dish pays there too (`listing.dish`): a coin in the wallet then
+ *  lists nothing, so none is asked for. */
 export function listsWhen(net: ChiaNetwork, listing: ChiaListing | undefined, wallet = 'the wallet', dish = false): string {
   if (!net.test) {
     return listing
@@ -114,6 +127,9 @@ export function listsWhen(net: ChiaNetwork, listing: ChiaListing | undefined, wa
   }
   if (listing && !listing.on) {
     return `LIST ME is off for ${net.name} (${LIST_ME_WHERE}), so your node writes no Phone Book listing there until you turn it on.`;
+  }
+  if (listing?.dish) {
+    return `On ${net.name} ${wallet} pays for no Phone Book write: your station is listed there while LIST ME is on (${LIST_ME_WHERE}), paid by the lobby dish.`;
   }
   return `Once ${wallet} holds a coin${dish ? ' (one mojo from the faucet dish is enough)' : ''} it lists itself in the Phone Book on ${net.chain}.`;
 }
@@ -130,10 +146,11 @@ const CREATE_LEGACY_WARNING = (net: ChiaNetwork, listing: ChiaListing | undefine
   `Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its ${net.coins} stay at its old address), makes a new ${net.name} key from 24 words at a new address, and shows you the words to write down. ${listsWhen(net, listing, 'the new wallet')} Tap CONFIRM.`;
 /** The notice over a replaced wallet's new address. Only where the wallet
  *  pays for the listing does an empty one hold the listing back: on a test
- *  network, with LIST ME on. */
+ *  network, with LIST ME on, from a node that does not say the lobby dish
+ *  pays (`listing.dish`). */
 const REMINTED = (net: ChiaNetwork, listing: ChiaListing | undefined): string => {
   const replaced = `Your node replaced its old SSF wallet with a new one made from 24 words, at a new address. The old wallet's ${net.coins} stay at its old address.`;
-  return net.test && (!listing || listing.on) ? `${replaced} Until the new one holds a coin, your node is not listed in the Phone Book.` : replaced;
+  return net.test && !listing?.dish && (!listing || listing.on) ? `${replaced} Until the new one holds a coin, your node is not listed in the Phone Book.` : replaced;
 };
 
 /** ⛓️ The network line: what the node's coins are. */
@@ -168,12 +185,16 @@ export const UNKNOWN_NETWORK_TEXT = 'Your node runs on a Chia network this page 
 /** ⛓️ The note under RECEIVE's address, one per network: what to pay it
  *  with, and what one coin buys. `lead` is drawn bold. Off a test network
  *  a coin buys no chain write (the lobby dish pays for the listing and the
- *  knocks), so the note asks for none. */
-export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
+ *  knocks), so the note asks for none. On a test network whose node says
+ *  the lobby dish pays there too (`dish`: the node's `ChiaListing.dish`),
+ *  a coin is for GIVE at the faucet dish and nothing else. */
+export function receiveNote(net: ChiaNetwork, dish = false): { lead: string; text: string } {
   return net.test
     ? {
       lead: `${net.name} only.`,
-      text: `Scan the code or paste the address in a ${net.name} wallet (a testnet faucet gives ${net.ticker} for free). One coin pays this node's chain writes (presence, knocks, the dish) for good, since every write is a zero-fee spend to self. A mainnet wallet refuses a ${net.prefix} address, so real XCH cannot land here by mistake.`,
+      text: dish
+        ? `Scan the code or paste the address in a ${net.name} wallet (a testnet faucet gives ${net.ticker} for free). The lobby dish pays for this node's Phone Book listing and its knocks, so this wallet needs a coin only to GIVE at the faucet dish. A mainnet wallet refuses a ${net.prefix} address, so real XCH cannot land here by mistake.`
+        : `Scan the code or paste the address in a ${net.name} wallet (a testnet faucet gives ${net.ticker} for free). One coin pays this node's chain writes (presence, knocks, the dish) for good, since every write is a zero-fee spend to self. A mainnet wallet refuses a ${net.prefix} address, so real XCH cannot land here by mistake.`,
     }
     : {
       lead: `Real ${net.ticker}.`,
@@ -227,9 +248,11 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   // keeps none), no switch, and the reason.
   if (!net) return { network: null, listing: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };
   const listMe = fp.chia_listing;
-  // 📖 Who pays for the listing, off a test network: said wherever the
-  // node holds a wallet or can turn one on, and has a LIST ME to speak of.
-  const pays = !net.test && listMe && w && (w.state === 'on' || w.state === 'ready') ? BANK_LISTING_LINE : null;
+  // 📖 Who pays for the listing, where that is the lobby dish (off a test
+  // network, or on one whose node says so): said wherever the node holds a
+  // wallet or can turn one on, and has a LIST ME to speak of.
+  const dishLine = !net.test ? BANK_LISTING_LINE : listMe?.dish ? BANK_LISTING_LINE_TEST : null;
+  const pays = listMe && w && (w.state === 'on' || w.state === 'ready') ? dishLine : null;
   const bare = { network: networkLine(net), listing: null, warning: null, notice: null, button: null } as const;
   const none = { ...bare, listing: pays } as const;
   if (fp.chia_address) {

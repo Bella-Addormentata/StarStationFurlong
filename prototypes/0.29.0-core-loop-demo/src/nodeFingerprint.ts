@@ -346,12 +346,19 @@ export interface ChiaListing {
   held?: true;
   /** The switch's file is there but cannot be read, so it counts as off. */
   damaged?: true;
+  /** The node writes what the switch allows from keys of their own that the
+   *  lobby dish pays for, so its SSF wallet pays for no listing and no knock
+   *  and a coin in it lists nothing. On a test network the node says so
+   *  unless it was started with `SSF_CHIA_BURNERS=0`; a node from before
+   *  this field never says it, and its wallet may be the payer there. Off a
+   *  test network the lobby dish pays whether the node says so or not. */
+  dish?: true;
 }
 
 /** The node's `chia_listing` in its own shape, or undefined when `on` or
  *  `chosen` is not a boolean (or it is not an object at all): a switch this
- *  page cannot read is no switch, and the page then offers none. `held` and
- *  `damaged` are kept only as true. A switch that cannot be read never
+ *  page cannot read is no switch, and the page then offers none. `held`,
+ *  `damaged` and `dish` are kept only as true. A switch that cannot be read never
  *  reads as on here, whatever else the answer says. Nothing else is
  *  copied. */
 export function parseChiaListing(v: unknown): ChiaListing | undefined {
@@ -362,6 +369,7 @@ export function parseChiaListing(v: unknown): ChiaListing | undefined {
   const listing: ChiaListing = { on: r.on && !damaged, chosen: r.chosen };
   if (r.held === true) listing.held = true;
   if (damaged) listing.damaged = true;
+  if (r.dish === true) listing.dish = true;
   return listing;
 }
 

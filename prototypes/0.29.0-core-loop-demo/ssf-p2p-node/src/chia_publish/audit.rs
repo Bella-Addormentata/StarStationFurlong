@@ -93,7 +93,7 @@ pub fn audit_of(raw: Option<&OsStr>) -> (bool, Option<String>) {
         return (false, None);
     }
     let notice = format!(
-        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, unless SSF_CHIA_BURNERS=0), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
     );
     (true, Some(notice))
 }
@@ -284,7 +284,7 @@ mod tests {
             (
                 true,
                 Some(
-                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, unless SSF_CHIA_BURNERS=0), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
                         .to_string()
                 )
             )
