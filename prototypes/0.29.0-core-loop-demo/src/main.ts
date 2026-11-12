@@ -475,6 +475,21 @@ import {
   atlasForBundle,
   defaultStationAtlas,
 } from "./defaultStation";
+import {
+  WELCOME_FIRST_WAIT_MS,
+  bootRoute,
+  clearWelcomePending,
+  markWelcomePending,
+  seekingWelcome,
+  welcomeArrivedLine,
+  welcomeMarked,
+  welcomeRetryLine,
+  welcomeSeekDelayMs,
+  welcomeStateHere,
+  welcomeStillWaitingLine,
+  welcomeWaitingLine,
+} from "./welcomeOnly";
+import type { MarkStore } from "./welcomeOnly";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -826,8 +841,41 @@ let resumeRetried = false;
 /** 🛰️ "Is this a first run" — snapshotted before anything can lazily mint the
  *  identity seed, so the boot and the title screen agree (defaultStation.ts). */
 const IS_FIRST_RUN_INSTALL = !hasStoredIdentity();
-/** 🛰️ Guards a single default-station attempt per boot (defaultStation.ts). */
-let defaultStationAttempted = false;
+/** 🛰️ Welcome only (welcomeOnly.ts): this page has seen the welcome room's
+ *  shared state arrive. From then on the install is a returning one. */
+let welcomeReachedThisPage = false;
+/** 🛰️ The session (sessionEpoch) the seek's one loop runs for, so a boot
+ *  that was superseded mid-join never starts a second (keepSeekingWelcome). */
+let welcomeSeekEpoch: number | null = null;
+/** 🛰️ Dockings in a row that could not start: paces the retry
+ *  (welcomeSeekDelayMs), and the line is said for the first only. */
+let welcomeDockFailures = 0;
+let welcomeRetryTimer: number | null = null;
+/** 🛰️ The dial-failure advice was said once while seeking: the node dials
+ *  again at every ask, and the seek's own line says the rest. */
+let welcomeDialFailureSaid = false;
+
+/** 🛰️ Where the welcome mark is kept; null where storage is closed. */
+function welcomeStore(): MarkStore | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null; // privacy mode: seeking lasts this page only
+  }
+}
+
+/** 🛰️ Whether this install is still on its way to the welcome room
+ *  (welcomeOnly.ts): a first run, or a later start of one that never arrived.
+ *  While it is, no boot goes to the home module. */
+function welcomeSeeking(): boolean {
+  return seekingWelcome({
+    welcomeRoomId: DEFAULT_STATION.welcomeRoomId,
+    homeRoomId: getDefaultRoomId(),
+    firstRun: IS_FIRST_RUN_INSTALL,
+    marked: welcomeMarked(welcomeStore()),
+    reached: welcomeReachedThisPage,
+  });
+}
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
 // ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
@@ -1379,9 +1427,9 @@ async function bootstrapNetworking() {
   // 🆕 #79 P4: true while this boot is resuming a persisted last room, so a
   // dial failure (that room's host offline) can fall back to home once.
   let resumingLastRoom = false;
-  // 🛰️ True while this boot is a FIRST RUN docking at the default station
-  // (defaultStation.ts), so a station that does not answer falls back to home
-  // once, the same way.
+  // 🛰️ True while this boot is docking at the welcome room (welcomeOnly.ts):
+  // an install that has not reached it yet. A join, never a claim, and one
+  // that gets no answer waits there: nothing falls back to the home module.
   let arrivingAtDefaultStation = false;
   try {
     // One-time UI init: phone input behaviors, hooks, and date-stamps
@@ -1393,18 +1441,39 @@ async function bootstrapNetworking() {
     // the dial goes through the local node, and so the resume/default-station
     // branches below see the override whatever the timing.
     if (urlSeedImport) await urlSeedImport;
+    // 🛰️ Welcome only (welcomeOnly.ts): an install that has not reached the
+    // welcome room yet goes there at every start, and the mark keeps that true
+    // on a later start, when the identity this run stores has made it no
+    // first run. Saved before anything below can end the boot early.
+    const seeking = welcomeSeeking();
+    if (seeking) markWelcomePending(welcomeStore());
+    let savedLastRoom: string | null = null;
+    try {
+      savedLastRoom = localStorage.getItem("ssf-last-room");
+    } catch {
+      /* privacy mode — resume is best-effort */
+    }
+    // The one rule for where this boot goes: an explicit ?seed=/Use-link
+    // import always wins; a seeking install docks at the welcome room, and its
+    // saved last room is not resumed; a returning one resumes, else boots home.
+    const route = bootRoute(
+      seeking,
+      pendingBootstrapOverride?.roomId ?? null,
+      DEFAULT_STATION.welcomeRoomId,
+      !!savedLastRoom,
+    );
     // 🆕 #79 P4: resume the room the player last shut down in (persisted on
-    // entry). Only when there's no explicit override — a ?seed=/Use-link import
-    // always wins — and it becomes a normal JOIN into that room.
-    if (!pendingBootstrapOverride) {
+    // entry). It becomes a normal JOIN into that room.
+    if (route === "resume" && savedLastRoom) {
       try {
-        const saved = localStorage.getItem("ssf-last-room");
-        if (saved) {
-          pendingBootstrapOverride = JSON.parse(atob(saved)) as RoomBootstrap;
-          resumingLastRoom = true;
-        }
+        pendingBootstrapOverride = JSON.parse(atob(savedLastRoom)) as RoomBootstrap;
+        resumingLastRoom = true;
       } catch {
-        localStorage.removeItem("ssf-last-room");
+        try {
+          localStorage.removeItem("ssf-last-room");
+        } catch {
+          /* privacy mode */
+        }
       }
     }
     const override = pendingBootstrapOverride;
@@ -1449,32 +1518,31 @@ async function bootstrapNetworking() {
       return;
     }
 
-    // 🛰️ Default station (defaultStation.ts): a genuine first run — no stored
-    // identity, no ?seed=/Use-link override, nothing to resume — docks at the
-    // default station's welcome room instead of an empty freshly-minted home
-    // module. It rides the imported-pass path exactly: the pass is merged with
-    // the LOCAL node (resolveBridgeBootstrap), so the browser dials its own
-    // node and the node bridges to the station's iroh hints, and it is a JOIN,
-    // never a claim. Once per boot — after the fallback in the catch below
-    // this block is skipped and the boot proceeds home. The install that HOSTS
-    // the welcome room never treats its own home as a foreign join.
-    if (
-      !override &&
-      IS_FIRST_RUN_INSTALL &&
-      !defaultStationAttempted &&
-      DEFAULT_STATION.welcomeRoomId &&
-      DEFAULT_STATION.welcomeRoomId !== getDefaultRoomId()
-    ) {
-      defaultStationAttempted = true;
+    // 🛰️ Default station (defaultStation.ts, welcomeOnly.ts): an install that
+    // has not reached the welcome room yet — a first run, or a later start of
+    // one that never arrived — docks there instead of an empty freshly-minted
+    // home module, with no ?seed=/Use-link override to another room. It rides
+    // the imported-pass path exactly: the pass is merged with the LOCAL node
+    // (resolveBridgeBootstrap), so the browser dials its own node and the node
+    // bridges to the station's iroh hints, and it is a JOIN, never a claim. An
+    // override that is the welcome room itself (this docking's own, kept for
+    // Retry-node) docks afresh the same way. The install that HOSTS the
+    // welcome room is never seeking: its home IS that room. A welcome link no
+    // build should ship, one that names a room and does not decode here,
+    // leaves the boot as it was (defaultStation.test.ts parses the shipped
+    // one).
+    if (route === "dock") {
       const welcome = decodeBootstrapInput(DEFAULT_STATION.welcomeRoomLink);
       if (welcome) {
+        // Set before the resolve: a failure from here on is the docking's,
+        // and is tried again rather than left offline (the catch below).
+        arrivingAtDefaultStation = true;
         boot = await resolveBridgeBootstrap(welcome);
         // Persists like every override: a Retry-node stays classified as a
         // join and re-dials the station rather than claiming home.
         pendingBootstrapOverride = boot;
-        arrivingAtDefaultStation = true;
         console.info(
-          `🛰️ First run — docking at ${DEFAULT_STATION.name}, the default station.`,
+          `🛰️ Docking at ${DEFAULT_STATION.name}, the default station: this install has not reached it yet.`,
         );
       }
     }
@@ -1487,6 +1555,7 @@ async function bootstrapNetworking() {
     // race this prevents. pendingBootstrapOverride intentionally persists
     // after use, so a Retry-node following a seed import stays classified as
     // a join.
+    const epochBeforeJoin = sessionEpoch;
     await joinRoom(
       boot,
       /* claimRoomDefaults */ !override && !arrivingAtDefaultStation,
@@ -1494,27 +1563,24 @@ async function bootstrapNetworking() {
 
     if (arrivingAtDefaultStation) {
       // The join above only proves the LOCAL node answered. The station is
-      // reached when its host's room state lands over the bridge — the same
-      // signal the transit curtain waits on (linkedSynced, or roomInfo
-      // owner+name). Nothing is held meanwhile: the exterior already shows the
-      // station (bundled atlas), and entering early lands in a replica that
-      // fills in as the sync arrives.
+      // reached when the room's own state lands over the bridge (roomInfo
+      // owner+name: welcomeStateHere). Nothing is held meanwhile: the exterior
+      // already shows the station (bundled atlas), and entering early lands in
+      // a replica that fills in as the sync arrives.
+      // joinRoom claims exactly one epoch: any other count means a newer
+      // session (a link, a Retry-node) owns the state, and its own boot waits.
       const epochAtJoin = sessionEpoch;
-      await awaitInitialRoomState(DEFAULT_STATION_SYNC_GATE_MS);
-      if (epochAtJoin !== sessionEpoch) return; // a newer session owns the state
       const sync = yjsSync;
-      const reached = !!sync && initialRoomStateReady(sync);
-      if (!reached) {
-        throw new Error(
-          `${DEFAULT_STATION.name} did not answer within ${DEFAULT_STATION_SYNC_GATE_MS / 1000}s`,
-        );
-      }
-      // Into MY ROOMS (no prefetch — it is the active room), so the station
-      // is one tap away on every later visit.
-      addPass(DEFAULT_STATION.welcomeRoomLink);
-      logToPhoneSystem(
-        `🛰️ Welcome aboard ${DEFAULT_STATION.name}. Any door's keypad can PROVISION NEW MODULE when you want a room of your own.`,
-      );
+      if (epochAtJoin !== epochBeforeJoin + 1 || !sync) return;
+      welcomeDockFailures = 0;
+      await awaitWelcomeState(sync, WELCOME_FIRST_WAIT_MS);
+      // (The join's own watch has usually said so already: joinRoomAtEpoch.)
+      if (noteWelcomeReached(sync)) return;
+      if (epochAtJoin !== sessionEpoch || yjsSync !== sync) return;
+      // 🛰️ No answer yet. The install stays docked, says so, and keeps asking
+      // for as long as it takes — it never boots a module of its own instead
+      // (owner direction 2026-11-12). Detached: the boot itself is done.
+      void keepSeekingWelcome(epochAtJoin, sync);
     }
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
@@ -1524,36 +1590,22 @@ async function bootstrapNetworking() {
     // this catch (superseded joins return silently from joinRoom), so the
     // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
     await leaveRoom();
-    // 🛰️ The default station did not answer this first run (or its join failed
-    // outright) — forget it and boot HOME once, the way a failed resume does;
-    // defaultStationAttempted keeps the retry out of the station branch. The
-    // station still lands in MY ROOMS (after home is up, so the pass manager
-    // is initialised) — one tap away once its host is back; its row reads
-    // OFFLINE until then.
+    // 🛰️ Welcome only (welcomeOnly.ts): the docking itself could not start —
+    // the player's own node did not take the join. (A welcome room that does
+    // not answer is no failure: that boot stays docked and keeps asking,
+    // above.) It never falls back to the home module: said once, and tried
+    // again by itself at the seek's pace, then on to the offline readouts
+    // below. The override stays the welcome room's, so Retry-node docks too
+    // and nothing can claim a local fork of it (review of #156, round 2).
     if (arrivingAtDefaultStation) {
       console.warn(
-        `${DEFAULT_STATION.name} unreachable — falling back to home:`,
+        `${DEFAULT_STATION.name}: the docking could not start — trying again:`,
         err,
       );
-      try {
-        localStorage.removeItem("ssf-last-room"); // persisted at connect time
-      } catch {
-        /* privacy mode */
+      if (welcomeDockFailures === 0) {
+        logToPhoneSystem(welcomeRetryLine(DEFAULT_STATION.name));
       }
-      pendingBootstrapOverride = null;
-      // ⚠️ Forget the station as the ACTIVE room too. The connect succeeded
-      // before the gate gave up, so activeBootstrap names the station, and
-      // leaveRoom keeps it as last-room memory — fetchDefaultBootstrap would
-      // then mint the "home" boot from the station's id and key, rejoin a
-      // local replica of it with claimRoomDefaults=true, and CLAIM that fork
-      // (review of #156, round 2). Home is getDefaultRoomId(), nothing else.
-      activeBootstrap = null;
-      logToPhoneSystem(
-        `⚠️ ${DEFAULT_STATION.name} did not answer — booting your own module instead. It stays in ACCESS → ROOMS; enter it from there once it reads READY.`,
-      );
-      await bootstrapNetworking();
-      addPass(DEFAULT_STATION.welcomeRoomLink);
-      return;
+      scheduleWelcomeRetry();
     }
     // 🆕 #79 P4: if the RESUME into the last room failed (its host is offline),
     // forget it and fall back to the home station — once (resumeRetried guards
@@ -2468,9 +2520,19 @@ async function joinRoomAtEpoch(
               `FAILED → ${shortTarget} (see node log)`,
               "#ff1744",
             );
-            logToPhoneSystem(
-              `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
-            );
+            // 🛰️ While this install waits at the welcome room its node dials
+            // again at every ask (keepSeekingWelcome): the advice is said for
+            // the first failure, and the seek's own line says the rest. The
+            // NETWORK row above shows every one.
+            const seekingHere =
+              activeBootstrap?.roomId === DEFAULT_STATION.welcomeRoomId &&
+              welcomeSeeking();
+            if (!seekingHere || !welcomeDialFailureSaid) {
+              if (seekingHere) welcomeDialFailureSaid = true;
+              logToPhoneSystem(
+                `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
+              );
+            }
           }
         } catch (e) {
           console.warn("Unparseable bridge status envelope:", e);
@@ -3218,6 +3280,15 @@ async function joinRoomAtEpoch(
     );
   }, 1_000);
   setActivePassRoom(boot.roomId);
+  // 🛰️ Welcome only (welcomeOnly.ts): for an install still on its way here,
+  // this room's own state landing IS the arrival, by whichever path the join
+  // came (the docking at boot, Retry-node, GO TO, a pass) and however long
+  // after the join. After the pass manager is up: the arrival files the pass.
+  if (boot.roomId === DEFAULT_STATION.welcomeRoomId && welcomeSeeking()) {
+    onWelcomeState(sync, () => {
+      noteWelcomeReached(sync);
+    });
+  }
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap("roomInfo");
@@ -3922,12 +3993,6 @@ const SWAP_WATCHDOG_MS = 15_000;
  *  values. On timeout we enter with defaults, which the roomInfo observer
  *  (main.ts ~577) repaints live the moment the real state does arrive. */
 const SYNC_GATE_MS = 8_000;
-/** 🛰️ How long a FIRST RUN waits for the default station's room state before
- *  giving up on it and booting home (defaultStation.ts). Longer than the
- *  transit gate: this is a first cross-internet dial — DHT lookup, hole punch —
- *  the ACCESS app's own "up to ~30s". Nothing is held while it runs. */
-const DEFAULT_STATION_SYNC_GATE_MS = 30_000;
-
 /** 🛰️ The ONE rule for "has this room's shared state arrived": a post-link
  *  SyncStep2 (`linkedSynced`), or the host's roomInfo owner+name — the
  *  reasoning lives in awaitInitialRoomState below. It also gates the atlas
@@ -4017,6 +4082,108 @@ function onRoomStateReady(sync: YjsSync, fn: () => void): void {
   };
   roomMap.observe(check);
   void sync.whenLinkedSynced.then(check);
+}
+
+/** 🛰️ Run `fn` once the welcome room's own state is in `sync`'s doc
+ *  (welcomeStateHere: roomInfo owner+name): at once if it is, else when the
+ *  write that brings it lands. Narrower than onRoomStateReady on purpose: a
+ *  post-link sync with another install that is itself still waiting brings
+ *  no state, and is no arrival. The watch ends with the doc. */
+function onWelcomeState(sync: YjsSync, fn: () => void): void {
+  const roomMap = sync.doc.getMap("roomInfo");
+  if (welcomeStateHere(roomMap)) {
+    fn();
+    return;
+  }
+  let done = false;
+  const check = () => {
+    if (done || !welcomeStateHere(roomMap)) return;
+    done = true;
+    try {
+      roomMap.unobserve(check);
+    } catch {
+      /* doc may be destroyed */
+    }
+    fn();
+  };
+  roomMap.observe(check);
+}
+
+/** 🛰️ Resolve once the welcome room's own state is in `sync`'s doc
+ *  (onWelcomeState), or after `timeoutMs`. Never rejects; a doc destroyed
+ *  mid-wait resolves on the timer, and the caller checks its session. */
+function awaitWelcomeState(sync: YjsSync, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = window.setTimeout(resolve, timeoutMs);
+    onWelcomeState(sync, () => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/**
+ * 🛰️ Record the arrival, if `sync` is the live session, in the welcome room,
+ * and holds its state: the install stops seeking (the mark goes), the pass
+ * lands in MY ROOMS so the station is one tap away on every later visit (no
+ * prefetch — it is the active room), and the player is welcomed. Once per
+ * page; true when the welcome room has been reached, now or earlier.
+ */
+function noteWelcomeReached(sync: YjsSync | null): boolean {
+  if (welcomeReachedThisPage) return true;
+  if (
+    !sync ||
+    yjsSync !== sync ||
+    activeBootstrap?.roomId !== DEFAULT_STATION.welcomeRoomId ||
+    !welcomeStateHere(sync.doc.getMap("roomInfo"))
+  ) {
+    return false;
+  }
+  welcomeReachedThisPage = true;
+  clearWelcomePending(welcomeStore());
+  if (welcomeRetryTimer !== null) {
+    window.clearTimeout(welcomeRetryTimer);
+    welcomeRetryTimer = null;
+  }
+  addPass(DEFAULT_STATION.welcomeRoomLink);
+  logToPhoneSystem(welcomeArrivedLine(DEFAULT_STATION.name));
+  return true;
+}
+
+/**
+ * 🛰️ The welcome room has not answered the first wait: stay docked and keep
+ * asking until it does (welcomeOnly.ts). One loop per session. Each round
+ * re-issues the sync handshake — its envelope carries the pass's hints, and
+ * the node dials every hint it is not already dialing or linked to, so an ask
+ * while a dial runs costs nothing — then waits welcomeSeekDelayMs for the
+ * room's state. It ends on arrival, or when the session is no longer this one
+ * (the player followed a link, or Retry-node docked afresh and waits itself).
+ */
+async function keepSeekingWelcome(epoch: number, sync: YjsSync): Promise<void> {
+  if (welcomeSeekEpoch === epoch) return;
+  welcomeSeekEpoch = epoch;
+  logToPhoneSystem(welcomeWaitingLine(DEFAULT_STATION.name));
+  for (let round = 1; ; round++) {
+    sync.resync();
+    await awaitWelcomeState(sync, welcomeSeekDelayMs(round));
+    if (noteWelcomeReached(sync)) return;
+    if (epoch !== sessionEpoch || yjsSync !== sync) return;
+    logToPhoneSystem(welcomeStillWaitingLine(DEFAULT_STATION.name));
+  }
+}
+
+/** 🛰️ A docking that could not start is tried again by itself, one timer at
+ *  a time, at the seek's pace (bootstrapNetworking's catch). Nothing is done
+ *  when the install has arrived meanwhile, or a session is live or on its way
+ *  (the player followed a link, or pressed Retry-node). */
+function scheduleWelcomeRetry(): void {
+  if (welcomeRetryTimer !== null) return;
+  const wait = welcomeSeekDelayMs(welcomeDockFailures++);
+  welcomeRetryTimer = window.setTimeout(() => {
+    welcomeRetryTimer = null;
+    if (!welcomeSeeking() || yjsSync || transitInProgress) return;
+    void bootstrapNetworking();
+  }, wait);
 }
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).
