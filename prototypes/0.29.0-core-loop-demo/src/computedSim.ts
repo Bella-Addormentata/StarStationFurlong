@@ -797,8 +797,8 @@ export class Sim {
    *  read there (a page holds the transfers its game's chain stands on,
    *  design §8.4 P2; not one that never made the chain). */
   private readonly foXfs = new WeakMap<Page, Map<string, Map<string, XferRec>>>();
-  /** The delegations the chain's holders signed, as foBase last read them for each load of a page, by `<t>|<inc>`. */
-  private readonly foDls = new WeakMap<Page, Map<string, DelegationRec[]>>();
+  /** The delegations foBase holds on for each load of a page, by `<t>|<inc>`: those of the houses with a record in the session of the base named. */
+  private readonly foDls = new WeakMap<Page, Map<string, { base: string; dls: DelegationRec[] }>>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
@@ -2455,7 +2455,7 @@ export class Sim {
     const xfsOf = this.foXfs.get(sp.p) ?? new Map<string, Map<string, XferRec>>();
     this.foXfs.set(sp.p, xfsOf);
     const xfs = new Map<string, XferRec>(xfsOf.get(name) ?? []);
-    const dlsOf = this.foDls.get(sp.p) ?? new Map<string, DelegationRec[]>();
+    const dlsOf = this.foDls.get(sp.p) ?? new Map<string, { base: string; dls: DelegationRec[] }>();
     this.foDls.set(sp.p, dlsOf);
     const takeXf = (v: unknown, under?: string): void => {
       const xf = asXf(v, PAGE_ROOM);
@@ -2481,7 +2481,7 @@ export class Sim {
     // (The delegations the chain's holders signed, as this rule last read
     // them: a page holds those its count uses while the doc has lost one,
     // casinoDoc keepHouses.)
-    for (const d of dlsOf.get(name) ?? []) delegations.push(d);
+    for (const d of dlsOf.get(name)?.dls ?? []) delegations.push(d);
     // (The base the page holds while the doc has lost it, below: the game is
     // still its opener's, and its house still the one that base names.)
     const kept = this.foHeld.get(sp.p)?.get(name)?.ck;
@@ -2511,9 +2511,26 @@ export class Sim {
     const holdsAt = (i: number, u: number): boolean => chain[i].from <= u && (i + 1 === chain.length || u <= chain[i + 1].from);
     const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.k}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
     xfsOf.set(name, new Map(chain.flatMap((h) => (h.id === null ? [] : [[h.id, xfs.get(h.id)!] as [string, XferRec]]))));
-    const usedDls = new Map<string, DelegationRec>();
-    for (const d of delegations) if (chain.some((h) => h.k === d.k) && signed(d)) usedDls.set(`${d.h}|${d.g}`, d);
-    dlsOf.set(name, [...usedDls.values()]);
+    // Which delegations it holds on for this load (retain, below): those of
+    // a house with a record of its own in the session the base opens (a
+    // join or a reveal: what a count can rest on), read on a whole doc, and
+    // those it held already for this base. Not one that came and went
+    // unused, nor one read while the doc held part of an update.
+    const retain = (fb: FoBase): FoBase => {
+      if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) return fb;
+      const ses = map.get(`ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, fb.ck)}`);
+      const wrote = new Set<unknown>();
+      if (ses instanceof Y.Map) {
+        for (const [k, v] of ses.entries()) if ((k.startsWith('h:') || k.startsWith('o:')) && typeof v === 'object' && v !== null) wrote.add((v as { k?: unknown }).k);
+      }
+      const keep = new Map<string, DelegationRec>();
+      const prev = dlsOf.get(name);
+      const mine = (d: DelegationRec): boolean => chain.some((h) => h.k === d.k) && signed(d);
+      if (prev?.base === fb.key) for (const d of prev.dls) if (mine(d)) keep.set(`${d.h}|${d.k}|${d.g}`, d);
+      for (const d of delegations) if (wrote.has(d.h) && mine(d)) keep.set(`${d.h}|${d.k}|${d.g}`, d);
+      dlsOf.set(name, { base: fb.key, dls: [...keep.values()] });
+      return fb;
+    };
     const houseAt = (pub: string, r: number): boolean => delegations.some((d) => d.h === pub
       && chain.some((h, i) => h.k === d.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(d));
     let best: { key: string; id: string; ck: CkRec } | null = null;
@@ -2568,7 +2585,7 @@ export class Sim {
     }
     if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) {
       behind.delete(name);
-      return { ...was, houseAt };
+      return retain({ ...was, houseAt });
     }
     if (!best) return null;
     const base = { key: best.key, ck: best.ck, houseAt };
@@ -2578,7 +2595,7 @@ export class Sim {
     }
     behind.delete(name);
     held.set(name, base);
-    return base;
+    return retain(base);
   }
 
   /** After page sp's frame, and after each transaction of its doc (the page

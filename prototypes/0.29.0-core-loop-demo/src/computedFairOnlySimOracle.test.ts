@@ -20,7 +20,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { sealCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
-import { delegationKey, houseSign } from './computedHouse';
+import { delegationKey, houseSign, roomSignBytes } from './computedHouse';
+import { PAGE_ROOM } from './computedPageKit';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
@@ -318,6 +319,31 @@ describe('the checkpoint oracle and an end', () => {
 });
 
 describe("the oracle's own base rule", () => {
+  it('does not hold a delegation that came and went with no record of its house in the game: that key is a house while the record is in the doc, and none after', async () => {
+    const sim = await Sim.open({ name: 'fair-only-unused-key', seed: seed(1235), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    await sim.run(30_000);
+    const T = 'roulette-1';
+    const D = sim.pages[3];
+    const owner = sim.house;
+    const top = D.p.doc.getMap<unknown>('casinoComputed');
+    const inc = D.p.casino.computedIncOf(T)!;
+    const base = (): { houseAt(pub: string, r: number): boolean } | null => (sim as unknown as {
+      foBase(sp: typeof D, map: Y.Map<unknown>, ctx: { room: string; t: string; inc: string }): { houseAt(pub: string, r: number): boolean } | null;
+    }).foBase(D, top, { room: PAGE_ROOM, t: T, inc });
+    // (A key the holder delegates and that writes nothing: page D's own, as good a key as any.)
+    const h = D.p.pub;
+    const body = { v: 1, h, k: owner.p.pub };
+    const dl = { ...body, g: owner.p.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) };
+    expect(base()?.houseAt(sim.node!.pub, 1), sim.label).toBe(true);
+    expect(base()?.houseAt(h, 1), sim.label).toBe(false);
+    D.cheats = true;
+    D.p.doc.transact(() => top.set(delegationKey(h), dl));
+    expect(base()?.houseAt(h, 1), sim.label).toBe(true);
+    D.p.doc.transact(() => top.delete(delegationKey(h)));
+    expect(base()?.houseAt(h, 1), sim.label).toBe(false);
+    expect(base()?.houseAt(sim.node!.pub, 1), sim.label).toBe(true);
+  }, TIMEOUT);
+
   for (const what of ['delegation', 'transfer'] as const) {
     it(what === 'delegation'
       ? "holds the buyer's house's delegation its count uses while the doc has lost the record (as a page does, casinoDoc keepHouses): the rounds that house revealed stay counted"
