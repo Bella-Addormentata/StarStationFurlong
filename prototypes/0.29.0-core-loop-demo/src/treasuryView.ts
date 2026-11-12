@@ -884,7 +884,7 @@ export type RoomOwnerKey =
  * isLocalPlayerRoomOwner), but a deed is the personal owner's alone
  * (currentRoomDeedIsMine), and a binding is a statement about the room's
  * deed, not about its edit rights — so the deed holder's key is the one that
- * signs it. Widening to co-hosts or the company is PR F's call, through the
+ * signs it. Widening to the company is PR F's call, through the
  * authority head and the policy; a strict subset now cannot be invalidated by
  * that later.
  */

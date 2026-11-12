@@ -78,6 +78,38 @@ The project is structured according to game development industry standards to ma
 
 ---
 
+## Who serves a room
+
+No machine is picked to host a room. Every computer that has loaded a room keeps
+a copy on its own disk and hands it to visitors, so a room still loads while its
+owner's computer is off, as long as one computer that holds it can be reached
+([`roomHolders.ts`](prototypes/0.29.0-core-loop-demo/src/roomHolders.ts)).
+
+What that puts on record: once a room has finished loading, the game files its
+computer's node in that room (the node's id and relay addresses, signed with
+the player's key), where everyone with a pass to the room can read it. For a
+public room such as the welcome room, whose key ships in every build, that is
+anyone: the room lists the computers of its most recent visitors (64 at most,
+each for up to 30 days after its last visit), and a node's id is enough to
+look up its network addresses, because a node publishes them under its id by
+default (the Mainline DHT; `SSF_NO_DHT=1` turns that off). Passes minted in
+the room name the owner's computer and the seven most recent others. Only the
+owner's record carries direct network addresses itself.
+
+One switch keeps a computer off every room's list: SpacePhone → ACCESS → ROOM
+HOLDERS → *List my computer in the rooms it holds*. It is on by default.
+Switching it off takes the record down at once in the room you are in, and in
+any other room at your next visit there; a record not refreshed for 30 days
+stops counting by itself. Off, the computer still keeps and hands on its
+copies; other players' games just no longer count a copy that came from it
+alone as the whole room.
+
+What it does not promise: a holder's copy may be old, and nothing yet proves a
+copy is complete or unaltered. Copies merge, so an old one is brought up to
+date by the first fresher holder that answers.
+
+---
+
 ## Cutting a release
 
 A `vX.Y.Z` tag triggers [release.yml](.github/workflows/release.yml), which builds the
