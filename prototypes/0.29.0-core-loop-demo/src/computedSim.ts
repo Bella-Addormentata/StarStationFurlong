@@ -85,13 +85,16 @@ import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
 import { CrapsHarness, crapsChangeKind, crapsShownOf } from './computedCrapsSim';
 import type { CrapsBotSpec, Place } from './computedCrapsSim';
-import { FAIR_ONLY_RV, isFairOnlyInc, nextSid3, parseFairOnlyKey, readCk } from './computedFairOnly';
-import type { CkRec } from './computedFairOnly';
+import { asXf, FAIR_ONLY_RV, isFairOnlyInc, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, parseFairOnlyKey, readCk, xfId } from './computedFairOnly';
+import type { CkRec, XferRec } from './computedFairOnly';
 import { canon, gameOfInc, houseCommitOf, MAX_HELD_ROUNDS, parseKey, seedTable, signBytes, slipCommit } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
 import { loadPage, PAGE_ROOM } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
+import { asDelegation, committingHouse, HOUSE_HEARD_MS, houseOfCommit, roomSignBytes } from './computedHouse';
+import type { DelegationRec } from './computedHouse';
+import { offerSignBytes } from './offerBytes';
+import type { TransferOffer } from './offerBytes';
 import { HOUSE_ORIGIN, SimHouse } from './computedSimHouse';
 import { RobotWatch } from './computedSimRobot';
 import { b64url, snapshot } from './computedTestKit';
@@ -723,7 +726,10 @@ export interface SimOptions {
 }
 
 /** 🔒 A FAIR ONLY game's base as the oracle reads it from a doc (foBase). */
-interface FoBase { key: string; ck: CkRec; houses: Set<string> }
+/** A FAIR ONLY game's base as the oracle chose it, and which keys are houses
+ *  of a round: delegated by the key that holds the game for it (after the
+ *  round it took the game at, up to the round it gave it). */
+interface FoBase { key: string; ck: CkRec; houseAt: (pub: string, r: number) => boolean }
 
 /** ms for which no per-tick bookkeeping runs (a spec's own loop may). */
 export class Sim {
@@ -751,6 +757,13 @@ export class Sim {
   readonly node: SimHouse | null;
   nodeUp = true;
   private nodeOn: Page | null = null;
+  /** 🤝 After a hand-over (handOver): the page that took the deed, its own
+   *  node as its house (none for a buyer with no node), whether that runs,
+   *  and the load of the buyer's page it last told its key to. */
+  buyer: SimPage | null = null;
+  node2: SimHouse | null = null;
+  node2Up = true;
+  private node2On: Page | null = null;
   /** 🔒 fairOnly: when the house's page opened each table's game (ms into the
    *  run), and what its press answered before. */
   readonly opened = new Map<string, number>();
@@ -767,6 +780,9 @@ export class Sim {
   /** 🔒 The ended checkpoints an honest page signed for a game it opened
    *  (computedTable switchFairOnlyOff, fairEndDuty: design §8.6), by key. */
   private readonly ownerEnds = new Set<string>();
+  /** 🤝 The adoptions a buyer's honest page signed as it took a game (design
+   *  §8.7: the base's content under its own key, the transfer in its chain), by key. */
+  private readonly adoptions = new Set<string>();
   /** Every checkpoint a page's doc held that reads whole, by the session it
    *  opens (`<t>:<inc>:<nextSid3>`): what a sweep says it repeats. Each of
    *  them: the session id binds no signer, so a copy of a checkpoint under
@@ -777,10 +793,15 @@ export class Sim {
   /** …and the games whose best checkpoint in the doc it has not held yet,
    *  the doc holding part of an update when it was read (foBase, foCatchUp). */
   private readonly foBehind = new WeakMap<Page, Map<string, FoldCtx>>();
+  /** 🤝 Per load of a page, by game: the transfers of the chain foBase last
+   *  read there (a page holds the transfers its game's chain stands on,
+   *  design §8.4 P2; not one that never made the chain). */
+  private readonly foXfs = new WeakMap<Page, Map<string, Map<string, XferRec>>>();
+  /** The delegations foBase holds on for each load of a page, by `<t>|<inc>`: those of the houses with a record in the session of the base named. */
+  private readonly foDls = new WeakMap<Page, Map<string, { base: string; dls: DelegationRec[] }>>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
-  private noTransfers = false;
   /** What broke an invariant while it ran (empty when all held). */
   readonly violations: string[] = [];
   private readonly entropy: Rng;
@@ -1057,6 +1078,20 @@ export class Sim {
       for (const k of top ?? []) if (k?.startsWith('sum:')) this.sumsSeen.add(canon(computed.get(k)) ?? '');
       // 🔒 A FAIR ONLY game's checkpoints are its house's (design §8.4 P1): a
       // page writes its own opening root, and puts back one the house wrote.
+      // 🤝 (And as its transfers and delegations change: the chain and the
+      // houses the oracle holds for this load are the last the doc gave it,
+      // so one that comes and goes between two looks is read as it comes.)
+      for (const k of top ?? []) {
+        if (k?.startsWith('xf:')) {
+          const at = parseFairOnlyKey(k);
+          if (at?.kind === 'xf') this.foBase(sp, computed, { room: PAGE_ROOM, t: at.t, inc: at.inc });
+        } else if (k?.startsWith('hk:')) {
+          for (const name of [...(this.foHeld.get(sp.p)?.keys() ?? [])]) {
+            const [t, inc] = name.split('|');
+            this.foBase(sp, computed, { room: PAGE_ROOM, t, inc });
+          }
+        }
+      }
       for (const k of top ?? []) {
         if (!k?.startsWith('ck:')) continue;
         // (The oracle's own base for this page, kept as its doc's checkpoints
@@ -1075,9 +1110,13 @@ export class Sim {
           // ended checkpoint under its own key, of a game it opened.
           const v = computed.get(k) as { b?: unknown; k?: unknown; ok?: unknown; e?: unknown; dl?: unknown } | undefined;
           const whole = readCk(PAGE_ROOM, k, v).kind === 'ok';
-          if (whole && (this.houseCks.has(k) || this.openedRoots.has(k) || this.ownerEnds.has(k))) continue;
+          if (whole && (this.houseCks.has(k) || this.openedRoots.has(k) || this.ownerEnds.has(k) || this.adoptions.has(k))) continue;
+          // (A game it opened, or one that came to its key with the deed: handOver.)
+          const holds = v!.ok === p.pub || (sp === this.buyer && at?.kind === 'ck' && p.casino.computedResolutionOf(at.t, at.inc)?.chain.some((h) => h.k === p.pub) === true);
+          const x = (v as { x?: { k?: unknown }[] }).x;
           if (whole && v!.b === 'g' && v!.k === p.pub) this.openedRoots.add(k);
-          else if (whole && v!.e === 1 && v!.k === p.pub && v!.ok === p.pub && v!.dl === undefined) this.ownerEnds.add(k);
+          else if (whole && v!.e === 1 && v!.k === p.pub && holds && v!.dl === undefined) this.ownerEnds.add(k);
+          else if (whole && sp === this.buyer && v!.e === undefined && v!.k === p.pub && v!.dl === undefined && x !== undefined && x[x.length - 1].k === p.pub) this.adoptions.add(k);
           else this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
         }
       }
@@ -1305,7 +1344,23 @@ export class Sim {
         const t = this.tables.find((x) => casino.computedSessionForWrite(x) === ses);
         const w = t === undefined ? undefined : was.get(t);
         const round = w?.res && w.inc === casino.computedIncOf(t!) ? w.res.rounds.find((v) => v.close === z.x) : undefined;
-        const wait = fair && !casino.houseOnline(now) && round?.houseWaits === undefined ? HOUSE_HEARD_MS : table.ABANDON_MS;
+        // 🔒 At a FAIR ONLY game the house is the one whose commitment the
+        // close names, by the oracle's own base (computedHouse
+        // committingHouse; after a hand-over the room has two houses, and
+        // the seller's is the one a round in flight waits on): unheard by
+        // this page, the short wait; none it can tell, the full one.
+        let away = !casino.houseOnline(now);
+        const inc = w?.inc ?? null;
+        if (fair && t !== undefined && inc !== null && isFairOnlyInc(inc)) {
+          const fb = this.foBase(sp, computed, { room: PAGE_ROOM, t, inc });
+          const h = (ses.get(`c:${z.r}:${z.x}`) as { h?: string }).h;
+          const res = w!.res;
+          const house = fb && res
+            ? houseOfCommit(res, committingHouse(res, fb.ck.w === undefined ? fb.ck.dl?.h : undefined, (k) => fb.houseAt(k, res.open)), h)
+            : undefined;
+          away = house !== undefined && !casino.houseHeardFrom(house, now);
+        }
+        const wait = fair && away && round?.houseWaits === undefined ? HOUSE_HEARD_MS : table.ABANDON_MS;
         this.abandonsChecked += 1;
         if (now < from + wait) {
           this.violate(`${sp.name}'s abandon of round ${z.r} at ${this.elapsed} ms came ${now - closeIn.at} ms after the close came`
@@ -1497,6 +1552,7 @@ export class Sim {
     const beat = (this.T - SIM_T0) % RESYNC_MS === 0;
     if (beat) this.net.resync();
     if (this.node) await this.houseTick();
+    await this.houseTick2();
     if (this.opts.fairOnly) await this.openGames();
     for (const sp of this.pages) {
       if (sp.mode !== 'up' || this.T < sp.pauseUntil) continue;
@@ -1532,6 +1588,47 @@ export class Sim {
       }
       this.node!.tick(PAGE_ROOM, sp.p.doc, this.T, now);
     });
+  }
+
+  /** 🤝 The buyer's node's tick, on the doc of the buyer's page, as the
+   *  owner's node ticks on the house's page's. */
+  private async houseTick2(): Promise<void> {
+    const sp = this.buyer;
+    if (!sp || !this.node2 || !this.node2Up || !this.net.connected(sp)) return;
+    await this.as(sp, (now) => {
+      if (this.node2On !== sp.p) {
+        sp.p.table.setLocalHouse(this.node2!.pub);
+        if (this.opts.fairOnly) sp.p.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+        this.node2On = sp.p;
+      }
+      this.node2!.tick(PAGE_ROOM, sp.p.doc, this.T, now);
+    });
+  }
+
+  /** 🤝 The room's deed goes to page `buyer` by an offer made out to its key
+   *  (design §8.7): the page that holds the deed makes the offer (offers
+   *  makeOffer), the buyer's page redeems it (redeemDeedOffer, which moves
+   *  the FAIR ONLY games too: computedTable adoptFairOnlyGames). With `node`
+   *  (the default), the buyer's own node becomes its house (node2). What the
+   *  redemption answered. */
+  async handOver(buyer: SimPage, opts: { node?: boolean } = {}): Promise<{ ok: boolean }> {
+    const seller = this.holder;
+    const offer = await this.as(seller, () => seller.p.offers.makeOffer({ kind: 'deed', roomId: PAGE_ROOM, roomName: 'The Room' }, seller.name, { toPub: buyer.p.pub }));
+    // (Told first, so the oracle knows whose the checkpoint the redemption writes is.)
+    const before = this.buyer;
+    this.buyer = buyer;
+    const out = await this.as(buyer, () => buyer.p.offers.redeemDeedOffer(offer, { currentRoomId: PAGE_ROOM, myPlayerId: buyer.pid, myPub: buyer.p.pub, myName: buyer.name }));
+    if (!out.ok) {
+      this.buyer = before;
+      return out;
+    }
+    if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
+    return out;
+  }
+
+  /** 🤝 The page that holds the room's deed: the house's, or after a hand-over the buyer's. */
+  get holder(): SimPage {
+    return this.buyer ?? this.house;
   }
 
   /** 🔒 The house's page opens a FAIR ONLY game at each table (fairOnly), as
@@ -1821,6 +1918,11 @@ export class Sim {
     return this.ownerEnds.size;
   }
 
+  /** 🤝 How many adoptions a buyer's honest page signed. */
+  get adoptionsWritten(): number {
+    return this.adoptions.size;
+  }
+
   get houseCheckpoints(): number {
     return this.houseCks.size;
   }
@@ -1830,8 +1932,10 @@ export class Sim {
   }
 
   /** 🔒 Once the run is over: every base an honest page counted at a FAIR ONLY
-   *  game is its authority's (the opener's house, by the opener's signed
-   *  delegation: the oracle knows no transfers yet), and honestly reachable:
+   *  game is its authority's (the house of the key its transfers lead to
+   *  from the opener, each the holder's own signed offer taken up by the
+   *  next, by that key's signed delegation; or that key's own end or
+   *  adoption), and honestly reachable:
    *  some honest page's own fold of the session it closes reached that round
    *  on that close with those nets, decided so, with that outcome, and left
    *  the carry and the commitment the checkpoint hands on. */
@@ -1843,34 +1947,60 @@ export class Sim {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
       const { g, ...body } = ck;
       const dl = ck.dl;
-      const byHouse = dl !== undefined && dl.h === ck.k && dl.k === ck.ok
+      // 🤝 Whose game it says it is: from the opener along the transfers it carries.
+      const x = ck.x ?? [];
+      let holder = ck.ok;
+      let chained = true;
+      for (const xf of x) {
+        const { sig, ...unsigned } = xf.o;
+        const { g: xg, ...xb } = xf;
+        chained &&= xf.o.makerPub === holder && verify(xf.o.makerPub, offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig)
+          && verify(xf.k, signBytes('xf', ctx, xb), xg);
+        holder = xf.k;
+      }
+      const byHouse = dl !== undefined && dl.h === ck.k && dl.k === holder
         && verify(dl.k, roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g);
-      // (An end may be the opener's own: design §8.6.)
-      const byOpener = ck.e === 1 && dl === undefined && ck.k === ck.ok;
-      const signed = (byHouse || byOpener) && ck.x === undefined && verify(ck.k, signBytes('ck', ctx, body), g);
+      // (An end may be the holder's own: design §8.6. And an adoption is the
+      // buyer's own: §8.7, the checkpoint it took the game at under its key.)
+      const adoption = dl === undefined && ck.e === undefined && x.length > 0 && ck.b !== 'g';
+      const byHolder = dl === undefined && ck.k === holder && (ck.e === 1 || adoption);
+      const signed = (byHouse || byHolder) && chained && verify(ck.k, signBytes('ck', ctx, body), g);
       if (!signed) out.push(`${by} counted ${key}, which the game's house did not sign`);
       // An end holds its opener's end order, and hands nothing on.
       if (ck.e === 1) {
         const fin = ck.f;
-        if (!fin || fin.k !== ck.ok || !verify(fin.k, signBytes('fin', ctx, fin), fin.g)) out.push(`${by} counted the end ${key}, which holds no end order of the game's opener`);
+        if (!fin || ![ck.ok, ...x.map((xf) => xf.k)].includes(fin.k) || !verify(fin.k, signBytes('fin', ctx, fin), fin.g)) out.push(`${by} counted the end ${key}, which holds no end order of a key that held the game`);
         if (ck.s !== undefined || ck.h !== undefined || ck.w !== undefined) out.push(`${by} counted the end ${key}, which hands on a carry, a commitment or a sweep count`);
       }
       // A sweep (design §8.5 N3s) repeats the checkpoint whose session it
       // closes, one sweep on: back along those to the trim or the root they
       // began from, each holding what the one before held. The trim is held to
       // the folds, as any; a root, to its opener's.
-      // (Field for field, but the session closed, the sweep count and who signed. A record canon cannot read holds nothing.)
-      const content = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, s: c.s, h: c.h, x: c.x, e: c.e });
+      // (Field for field, but the session closed, the sweep count, who signed and for whom (the
+      // transfers, held to the chain above). A record canon cannot read holds nothing.)
+      const content = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, s: c.s, h: c.h, e: c.e });
       // (At each step every record that opens the swept session and holds
       // the same: they close one session, so the walk back is one walk. A
       // root among them counts if its opener wrote it: a copy under another
       // signature beside it is nobody's root.)
       let grounds: { key: string; ck: CkRec }[] = [{ key, ck }];
+      // 🤝 An adoption repeats the checkpoint its buyer took the game at (the
+      // same session closed, the same sweep count, fewer transfers): back to
+      // that one, and on as from it.
+      if (adoption) {
+        const held = content(ck);
+        grounds = (this.ckBySession.get(`${t}:${inc}:${nextSid3(ctx, ck)}`) ?? [])
+          .filter((prev) => held !== null && (prev.ck.x?.length ?? 0) < x.length && prev.ck.b === ck.b && (prev.ck.w ?? 0) === (ck.w ?? 0) && content(prev.ck) === held);
+        if (grounds.length === 0) {
+          out.push(`${by} counted the adoption ${key} (round ${ck.u}), which repeats no checkpoint the room held`);
+          continue;
+        }
+      }
       // An end at its base's round (nothing decided in the session it closes)
       // repeats that base's round, close, decider, outcome and nets: back to
       // the checkpoints that open the session, and on as from them.
       if (ck.e === 1) {
-        const ended = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, x: c.x });
+        const ended = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n });
         const held = ended(ck);
         const bases = (this.ckBySession.get(`${t}:${inc}:${ck.b}`) ?? []).filter((prev) => held !== null && prev.ck.e !== 1 && ended(prev.ck) === held);
         if (bases.length > 0) grounds = bases;
@@ -2261,7 +2391,7 @@ export class Sim {
         const fb = this.foBase(sp, map, ctx);
         const ses = fb ? map.get(`ses:${t}:${inc}:${fold.nextSid3(ctx, fb.ck)}`) : undefined;
         const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
-        const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf, fold.foldGameOf(ctx), (pub) => fb?.houses.has(pub) ?? false);
+        const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf, fold.foldGameOf(ctx), (pub, r) => fb?.houseAt(pub, r) ?? false);
         tf.setFairOnlyBase(fb?.ck ?? null);
         tf.reset(entries);
         const res = tf.result();
@@ -2290,12 +2420,17 @@ export class Sim {
   }
 
   /** 🔒 A FAIR ONLY game's base in page sp's doc, by the oracle's own rule
-   *  (design §8.3 S1 to S3, with no transfer: one in a record is a violation
-   *  until the oracle follows them): of the checkpoints that read whole
-   *  (readCk), the opener's root under the opener's signature and those a
-   *  house signed that the opener's signed delegation in the record names;
-   *  the best by round, then an end, then sweeps, then the lowest id. And the
-   *  houses those delegations name. */
+   *  (design §8.3 S1 to S3). The chain of holders first: from the opener,
+   *  the next holder is the buyer of the lowest-round transfer the holder's
+   *  own signed offer carries, at or after the round the holder took the
+   *  game at, each offer once and none older than the game. Then, of the
+   *  checkpoints that read whole (readCk), those that speak for the holder
+   *  their transfers lead to, at a round that holder holds: the opener's
+   *  root under the opener's signature, a house's under a delegation that
+   *  holder signed, a holder's own end, and a buyer's adoption; the best by
+   *  round, then an end, then sweeps, then the lowest id. And which keys are
+   *  houses of a round: those a holder's signed delegation names (in a
+   *  checkpoint or under its key in the room), for the rounds it holds. */
   private foBase(sp: SimPage, map: Y.Map<unknown>, ctx: FoldCtx): FoBase | null {
     // (S3: by round, then an end, then sweeps, then the lowest id.)
     const outranks = (a: CkRec, aId: string, b: CkRec, bId: string): boolean => a.u > b.u
@@ -2309,31 +2444,126 @@ export class Sim {
       return v;
     };
     const prefix = `ck:${ctx.t}:${ctx.inc}:`;
-    const houses = new Set<string>();
-    let best: { key: string; id: string; ck: CkRec } | null = null;
+    const name = `${ctx.t}|${ctx.inc}`;
+    const whole: { key: string; id: string; ck: CkRec }[] = [];
+    const delegations: DelegationRec[] = [];
+    // The transfers to choose from: the doc's, and the steps of the chain
+    // this rule last read for this load of the page (a page holds the steps
+    // its count stands on while the doc has lost them: casinoDoc
+    // keepStanding). Not every transfer it ever saw: one that never made
+    // the chain and is gone from the doc is gone.
+    const xfsOf = this.foXfs.get(sp.p) ?? new Map<string, Map<string, XferRec>>();
+    this.foXfs.set(sp.p, xfsOf);
+    const xfs = new Map<string, XferRec>(xfsOf.get(name) ?? []);
+    const dlsOf = this.foDls.get(sp.p) ?? new Map<string, { base: string; dls: DelegationRec[] }>();
+    this.foDls.set(sp.p, dlsOf);
+    const takeXf = (v: unknown, under?: string): void => {
+      const xf = asXf(v, PAGE_ROOM);
+      const id = xf && xfId(xf);
+      if (xf && id && (under === undefined || under === id) && !xfs.has(id)) xfs.set(id, xf);
+    };
+    const xfPrefix = `xf:${ctx.t}:${ctx.inc}:`;
     for (const [key, value] of map.entries()) {
+      if (key.startsWith('hk:')) {
+        const d = asDelegation(value);
+        if (d && key === `hk:${d.h}`) delegations.push(d);
+      } else if (key.startsWith(xfPrefix)) takeXf(value, key.slice(xfPrefix.length));
       if (!key.startsWith(prefix)) continue;
       const r = readCk(PAGE_ROOM, key, value);
       if (r.kind !== 'ok') continue;
-      const { ck, id } = r;
-      if (ck.x !== undefined) {
-        if (!this.noTransfers) this.violate(`${key} carries a transfer, which the oracle does not follow yet`);
-        this.noTransfers = true;
-        continue;
+      whole.push({ key, id: r.id, ck: r.ck });
+      if (r.ck.dl !== undefined) delegations.push(r.ck.dl);
+      // (Its transfers only where it speaks for the buyer of the last: the
+      // only records whose `x` the pages read, computedFairOnlyAuth claimed.)
+      const lastX = r.ck.x?.[r.ck.x.length - 1];
+      if (lastX !== undefined && lastX.k === (r.ck.dl?.k ?? r.ck.k)) for (const xf of r.ck.x!) takeXf(xf);
+    }
+    // (The delegations the chain's holders signed, as this rule last read
+    // them: a page holds those its count uses while the doc has lost one,
+    // casinoDoc keepHouses.)
+    for (const d of dlsOf.get(name)?.dls ?? []) delegations.push(d);
+    // (The base the page holds while the doc has lost it, below: the game is
+    // still its opener's, and its house still the one that base names.)
+    const kept = this.foHeld.get(sp.p)?.get(name)?.ck;
+    if (kept?.dl !== undefined) delegations.push(kept.dl);
+    for (const xf of kept?.x ?? []) takeXf(xf);
+    // The chain (S2).
+    const chain: { k: string; from: number; id: string | null }[] = [];
+    const first = whole[0]?.ck ?? kept;
+    if (first) {
+      const { ok: opener, ts } = first;
+      chain.push({ k: opener, from: 0, id: null });
+      const used = new Set<string>();
+      while (chain.length <= MAX_TRANSFERS) {
+        const last = chain[chain.length - 1];
+        const next = [...xfs].filter(([id, xf]) => {
+          if (xf.o.makerPub !== last.k || xf.u < last.from || used.has(xf.o.nonce) || xf.o.issuedAt < ts - OFFER_SKEW_MS) return false;
+          const { sig, ...unsigned } = xf.o;
+          const { g, ...body } = xf;
+          return ok(`offer|${id}`, xf.o.makerPub, () => offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig)
+            && ok(`xf|${id}`, xf.k, () => signBytes('xf', ctx, body), g);
+        }).sort(([aId, a], [bId, b]) => a.u - b.u || (aId < bId ? -1 : 1))[0];
+        if (!next) break;
+        chain.push({ k: next[1].k, from: next[1].u, id: next[0] });
+        used.add(next[1].o.nonce);
       }
+    }
+    const holdsAt = (i: number, u: number): boolean => chain[i].from <= u && (i + 1 === chain.length || u <= chain[i + 1].from);
+    const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.k}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
+    xfsOf.set(name, new Map(chain.flatMap((h) => (h.id === null ? [] : [[h.id, xfs.get(h.id)!] as [string, XferRec]]))));
+    // Which delegations it holds on for this load: those a count used.
+    // A lookup of its own cold fold (houseAt, below) that a signed
+    // delegation of a holder answered, on a whole doc, holds that
+    // delegation on for as long as the base stands (a new base starts
+    // afresh, and the records its session carries earn theirs again). Not
+    // one that came and went unused, one a malformed record names (the fold
+    // refuses the record before it asks), nor one read while the doc held
+    // part of an update.
+    const partial = (sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
+    let baseKey: string | null = null;
+    const retain = (fb: FoBase): FoBase => {
+      baseKey = fb.key;
+      if (!partial && dlsOf.get(name)?.base !== fb.key) dlsOf.set(name, { base: fb.key, dls: [] });
+      return fb;
+    };
+    const houseAt = (pub: string, r: number): boolean => {
+      const d = delegations.find((x) => x.h === pub
+        && chain.some((h, i) => h.k === x.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(x));
+      if (d === undefined) return false;
+      // (With the one that answered, every delegation of that house by a
+      // holder: a buyer who delegates the seller's node again writes its own
+      // under the same key, and a page holds that one on for the house it
+      // used, casinoDoc keepHouses.)
+      const e = baseKey === null || partial ? undefined : dlsOf.get(name);
+      if (e && e.base === baseKey) {
+        for (const y of delegations) {
+          if (y.h === pub && !e.dls.some((x) => x.h === y.h && x.k === y.k && x.g === y.g) && chain.some((h) => h.k === y.k) && signed(y)) e.dls.push(y);
+        }
+      }
+      return true;
+    };
+    let best: { key: string; id: string; ck: CkRec } | null = null;
+    const accepts = (id: string, ck: CkRec): boolean => {
+      // Whose it speaks for: the holder its transfers lead to, at a round that holder holds.
+      const i = ck.x?.length ?? 0;
+      if (i >= chain.length || !holdsAt(i, ck.u)) return false;
+      if ((ck.x ?? []).some((xf, j) => xfId(xf) !== chain[j + 1].id)) return false;
+      const holder = chain[i].k;
       const { g, ...body } = ck;
       const dl = ck.dl;
-      const dlOk = dl !== undefined && dl.k === ck.ok && ok(`dl|${dl.h}|${dl.g}`, dl.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g);
+      const dlOk = dl !== undefined && dl.k === holder && signed(dl);
       const root = ck.b === 'g';
-      // (An end is its house's too, or the opener's own, with no delegation;
-      // and holds the opener's end order: S5.)
-      const ownEnd = ck.e === 1 && dl === undefined && ck.k === ck.ok;
-      if (!(root ? ck.k === ck.ok && dlOk : ownEnd || (dlOk && dl!.h === ck.k))) continue;
+      // (An end is its house's too, or the holder's own, with no delegation;
+      // an adoption is the buyer's own, of a game that came to it: no root.)
+      const own = dl === undefined && ck.k === holder && (ck.e === 1 || (i > 0 && !root));
+      if (!(root ? i === 0 && ck.k === ck.ok && dlOk : own || (dlOk && dl!.h === ck.k))) return false;
+      // (An end order: a key's that holds the game at the round it ends, S1.)
       const fin = ck.f;
-      if (fin !== undefined && !(fin.k === ck.ok && ok(`fin|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) continue;
-      if (!ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g)) continue;
-      if (dl !== undefined) houses.add(dl.h);
-      if (best === null || outranks(ck, id, best.ck, best.id)) best = { key, id, ck };
+      if (fin !== undefined && !(chain.some((h, j) => h.k === fin.k && holdsAt(j, ck.u)) && ok(`fin|${fin.k}|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
+      return ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g);
+    };
+    for (const { key, id, ck } of whole) {
+      if (accepts(id, ck) && (best === null || outranks(ck, id, best.ck, best.id))) best = { key, id, ck };
     }
     // A page holds the base it counts from (casinoDoc's held records, design
     // §8.4 P2): while the doc has lost it (a peer's delete or junk over its
@@ -2352,21 +2582,29 @@ export class Sim {
     this.foHeld.set(sp.p, held);
     const behind = this.foBehind.get(sp.p) ?? new Map<string, FoldCtx>();
     this.foBehind.set(sp.p, behind);
-    const name = `${ctx.t}|${ctx.inc}`;
-    const was = held.get(name);
+    // (Which keys are houses is read afresh each time: a transfer or a
+    // delegation comes without the base changing.)
+    // (And the base it holds only while the chain still gives it: a
+    // transfer under its round takes it from the key it spoke for, and the
+    // page that held it counts from it no more.)
+    let was = held.get(name);
+    if (was && !accepts(was.key.slice(prefix.length), was.ck)) {
+      held.delete(name);
+      was = undefined;
+    }
     if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) {
       behind.delete(name);
-      return was;
+      return retain({ ...was, houseAt });
     }
     if (!best) return null;
-    const base = { key: best.key, ck: best.ck, houses };
+    const base = { key: best.key, ck: best.ck, houseAt };
     if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) {
       behind.set(name, ctx);
-      return was ?? base;
+      return was ? { ...was, houseAt } : base;
     }
     behind.delete(name);
     held.set(name, base);
-    return base;
+    return retain(base);
   }
 
   /** After page sp's frame, and after each transaction of its doc (the page
@@ -2647,7 +2885,7 @@ export class Sim {
     const cpu = process.cpuUsage();
     const tf = new sp.p.fold.TableFold(
       b.ctx, this.checkFor(sp, b.ctx, false), b.keyOf, sp.p.fold.foldGameOf(b.ctx),
-      b.fo ? (pub) => b.fo!.houses.has(pub) : (pub) => sp.p.casino.houseOkOf(pub),
+      b.fo ? (pub, r) => b.fo!.houseAt(pub, r) : (pub) => sp.p.casino.houseOkOf(pub),
     );
     if (isFairOnlyInc(b.ctx.inc)) tf.setFairOnlyBase(b.fo?.ck ?? null);
     else tf.setBase(b.cp);

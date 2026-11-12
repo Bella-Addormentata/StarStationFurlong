@@ -23,11 +23,20 @@
  * gone, or asleep with its doc not syncing, the house hears nothing and
  * writes nothing: a simplification (the real node stays on the mesh while
  * its tab sleeps), which only makes the house look offline more often.
+ *
+ * A FAIR ONLY game that changes hands (design §8.5 N1, §8.7; `games`): a
+ * house is a house of the rounds its delegator holds the game for. The
+ * seller's reveals what is left of the seller's rounds (a round in flight as
+ * the game moved), with no commitment for the round after, and then writes
+ * nothing more at the game; the buyer's joins from the round after the
+ * transfer's, and its checkpoints carry the chain of transfers and the
+ * buyer's delegation. A second instance on the buyer's page's doc is the
+ * buyer's node (computedSim handOver).
  */
 
 import * as Y from 'yjs';
 import { isFairOnlyInc, parseFairOnlyKey, sealCk } from './computedFairOnly';
-import type { CkRec, FinRec } from './computedFairOnly';
+import type { CkRec, FinRec, XferRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Counted, Resolution } from './computedFairOnlyAuth';
 import {
@@ -178,7 +187,14 @@ interface TableMem {
 /** 🔒 A FAIR ONLY game this house serves: its resolution, the base its live
  *  session continues from, and the delegation that makes this house the one
  *  that decides the rounds after it. */
-interface Game { ctx: FoldCtx; res: Resolution; base: Counted; dl: DelegationRec; sesKey: string }
+interface Game {
+  ctx: FoldCtx; res: Resolution; base: Counted; dl: DelegationRec; sesKey: string;
+  /** The transfers that brought the game to the key that delegated this
+   *  house (the chain's, S1: a checkpoint speaks for the holder whose steps
+   *  its `x` lists), and the round that key holds the game from: this house
+   *  signs no checkpoint under it. */
+  x: XferRec[]; from: number;
+}
 
 interface RoomMem {
   /** Each player's key as first seen (trust on first use, as the pages pin). */
@@ -573,9 +589,26 @@ export class SimHouse {
       if (row && !(isPlain(held) && recHash(held) === recHash(row.value)) && res.base?.key === row.key) reput.push({ ses: null, key: row.key, value: row.value as unknown as Record<string, unknown> });
       if (res.newer || res.pending || !res.live || !res.base) continue;
       const B = res.base.ck;
-      const by = res.houseBy(this.pub, B.u + 1);
+      // 🔒 Whose game (design §8.5 N1, §8.7): this house is a house of the
+      // rounds its delegator holds the game for. Delegated by the game's
+      // holder now (`now`), it serves the game: joins, reveals, checkpoints.
+      // Delegated by a key the game has left, it reveals what is left of that
+      // key's rounds past the base (a round in flight as the game changed
+      // hands is the seller's house's to reveal), with no commitment for a
+      // round that is not its own, joins nothing more and signs no checkpoint.
+      const last = res.chain.length - 1;
+      const holderNow = res.chain[last];
+      const now_ = res.houseBy(this.pub, Math.max(B.u, holderNow.from) + 1);
+      let by = now_;
+      // (A base at or past the round an earlier holder left at gives none: the first round past it is not theirs.)
+      for (let i = last - 1; !by && now_ === null && i >= 0; i--) by = res.houseBy(this.pub, Math.max(B.u, res.chain[i].from) + 1);
       if (!by) continue;
-      serving += 1;
+      const current = now_ !== null && now_ !== undefined;
+      // (Only a game it serves counts for the room's beat: a game that has
+      // left its key never settles here, and would hold the beat off the
+      // games this house still serves for as long as its base stays under
+      // the transfer's round.)
+      if (current) serving += 1;
       const ctx: FoldCtx = { room, t, inc };
       const sid = nextSid3(ctx, B);
       const sesKey = `ses:${t}:${inc}:${sid}`;
@@ -593,7 +626,9 @@ export class SimHouse {
       }
       const read = this.readTable(comp, ctx, { u: B.u, h: B.h, sid }, (k, r) => res.houseAt(k, r) === true);
       if (!read) continue;
-      this.tableDuties(mem, read, res.fin !== null, now, writes, out);
+      this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true, current);
+      // (A house of a key the game has left writes no checkpoint, and is heard at the game no more.)
+      if (!current) continue;
       if (now - mem.tables.get(`${t}|${inc}`)!.firstRead >= SETTLE_MS) settled += 1;
       // 🔒 No checkpoint from a doc that holds part of an update (Yjs parks
       // what came out of order): a close, or a frozen slip a page is putting
@@ -606,8 +641,9 @@ export class SimHouse {
         mem.tables.get(`${t}|${inc}`)!.waits.clear();
         continue;
       }
-      if (res.fin === null) this.trimDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, now, writes);
-      else this.endDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, res.fin, now, writes);
+      const g: Game = { ctx, res, base: res.base, dl: by.value, sesKey, x: res.chain.slice(1).map((h) => h.step!.xf), from: holderNow.from };
+      if (res.fin === null) this.trimDuty(doc, mem, g, read, now, writes);
+      else this.endDuty(doc, mem, g, read, res.fin, now, writes);
     }
     return { settled, serving, reput };
   }
@@ -842,7 +878,7 @@ export class SimHouse {
   }
 
   /** One table's reveal, step-down and join (house.rs table_duties). */
-  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut): void {
+  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true, joins = true): void {
     const { ctx } = read;
     const own = read.reveals.filter((h) => h.k === this.pub);
     const doneKey = `${ctx.room}|${ctx.t}|${ctx.inc}`;
@@ -886,6 +922,9 @@ export class SimHouse {
     const rounds = [...new Set(read.closes.map((c) => c.r).filter((r) => r > done))].sort((a, b) => a - b);
     let revealedNow: number | null = null;
     for (const r of rounds) {
+      // 🔒 (A round its delegator does not hold the game for is not this
+      // house's: no page would count its reveal.)
+      if (!mine(r)) continue;
       const commit = this.commit(ctx, r);
       const listed: Close[] = [];
       for (const c of closesAt(r).filter((x) => x.h === commit)) {
@@ -929,7 +968,8 @@ export class SimHouse {
       // saw: listing a rival too would show both outcomes, and let a bettor
       // carry on the one they liked.
       const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem!.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
-      const next = !friendly && !this.steppingDown;
+      // (No commitment for a round that is not its own: the game has changed hands at this one.)
+      const next = !friendly && !this.steppingDown && mine(r + 1);
       const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x: [best.hash], n };
       if (next) body.c = this.commit(ctx, r + 1);
       body.k = this.pub;
@@ -953,7 +993,7 @@ export class SimHouse {
           break;
         }
       }
-      if (r === null) return;
+      if (r === null || !mine(r)) return;
       const commit = this.commit(ctx, r);
       if (closesAt(r).some((c) => c.h === commit)) return;
       const rec = this.signed('hreveal', ctx, { r, s: this.seed(ctx, r), x: [], n: [], k: this.pub });
@@ -968,7 +1008,7 @@ export class SimHouse {
     // Join the next round, when it asks for no commitment of this house (nor
     // will: the round before is not one of its own still to reveal).
     const r = nextRound();
-    if (settling || r <= done || revealedNow !== null || carried(r) || joined(r)) return;
+    if (settling || r <= done || revealedNow !== null || carried(r) || joined(r) || !mine(r) || !joins) return;
     // Nor when another of the owner's houses has: it joined the round, or its
     // reveal of the round before carried a commitment no step-down has lifted
     // (one house to a round: two would let a bettor see both outcomes). Past a
@@ -1040,9 +1080,12 @@ export class SimHouse {
     for (const v of res.rounds) if (v.decided) D = v;
     if (waits) return;
     if (!D || D.r <= B.u) {
-      this.sweepDuty(doc, g, read, res, mem, now, writes);
+      // 🔒 (No sweep of a base under the round its delegator holds the game from: S1.)
+      if (B.u >= g.from) this.sweepDuty(doc, g, read, res, mem, now, writes);
       return;
     }
+    // 🔒 (Nor a trim under it: the rounds a seller's house decided, with none past them yet.)
+    if (D.r < g.from) return;
     const done = this.lastOf(ctx);
     let own: Kept | undefined;
     if (D.house) {
@@ -1074,7 +1117,7 @@ export class SimHouse {
       // (A round a house reveal voided, counting nobody, has no outcome.)
       ...(D.decided === 'house' ? { o: craps ? D.craps!.dice : D.pocket } : {}),
       n, ...(craps ? { s: res.carry } : {}), ...(res.required !== null ? { h: res.required } : {}),
-      dl: g.dl, ...(B.x !== undefined ? { x: B.x } : {}), k: this.pub,
+      dl: g.dl, ...(g.x.length > 0 ? { x: g.x } : {}), k: this.pub,
     };
     if (this.faultTrim) body = this.faultTrim(body);
     // The cross-check, before it signs.
@@ -1178,6 +1221,9 @@ export class SimHouse {
     for (const v of res.rounds) if (v.decided) D = v;
     if (waits) return;
     const past = D !== undefined && D.r > B.u ? D : null;
+    // 🔒 (No end under the round its delegator holds the game from, S1: the
+    // end waits for a decided round at or past it, as the holder's page waits.)
+    if ((past ? past.r : B.u) < g.from) return;
     const done = this.lastOf(ctx);
     let own: Kept | undefined;
     if (past) {
@@ -1205,7 +1251,7 @@ export class SimHouse {
             ...(past.decided === 'house' ? { o: craps ? past.craps!.dice : past.pocket } : {}),
           }
         : { u: B.u, l: B.l, ...(B.d !== undefined ? { d: B.d } : {}), ...(B.o !== undefined ? { o: B.o } : {}) }),
-      n, e: 1, f: fin, dl: g.dl, ...(B.x !== undefined ? { x: B.x } : {}), k: this.pub,
+      n, e: 1, f: fin, dl: g.dl, ...(g.x.length > 0 ? { x: g.x } : {}), k: this.pub,
     };
     if (this.faultTrim) body = this.faultTrim(body);
     // The cross-check, before it signs.
@@ -1263,16 +1309,17 @@ export class SimHouse {
     }
     const junkKeys = read.keys - res.felts.size - res.joins.length - carried.length;
     if (res.rawBytes - res.keptBytes - carriedBytes < HOUSE_SWEEP_BYTES && junkKeys < HOUSE_SWEEP_KEYS) return;
-    const { g: _sig, e: _e, f: _f, ...content } = B;
-    let body: Record<string, unknown> = { ...content, b: read.sid, w: (B.w ?? 0) + 1, dl: g.dl, k: this.pub };
+    const { g: _sig, e: _e, f: _f, x: _x, ...content } = B;
+    let body: Record<string, unknown> = { ...content, b: read.sid, w: (B.w ?? 0) + 1, dl: g.dl, ...(g.x.length > 0 ? { x: g.x } : {}), k: this.pub };
     if (this.faultTrim) body = this.faultTrim(body);
     // The cross-check: the session it closes, one sweep on, this house's under
     // its delegation, and for the rest the base's content, field for field.
-    const { b: b_, w: w_, dl: dl_, k: k_, ...rest } = body;
+    const { b: b_, w: w_, dl: dl_, k: k_, x: x_, ...rest } = body;
     const { b: _b, w: _w, dl: _dl, k: _k, ...held } = content;
     let agrees = false;
     try {
-      agrees = b_ === read.sid && w_ === (B.w ?? 0) + 1 && k_ === this.pub && recHash(dl_) === recHash(g.dl) && recHash(rest) === recHash(held);
+      agrees = b_ === read.sid && w_ === (B.w ?? 0) + 1 && k_ === this.pub && recHash(dl_) === recHash(g.dl) && recHash(rest) === recHash(held)
+        && canon((x_ as XferRec[] | undefined) ?? []) === canon(g.x);
     } catch {
       agrees = false;
     }
