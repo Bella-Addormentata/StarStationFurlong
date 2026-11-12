@@ -66,8 +66,11 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ state: 'on', stays: true, mnemonic: true, reminted: true })).toEqual({ state: 'on', stays: true, mnemonic: true, reminted: true });
     expect(fp({ state: 'on', stays: true, mnemonic: true, backed_up: true })).toEqual({ state: 'on', stays: true, mnemonic: true, backed_up: true });
     expect(fp({ state: 'on', seed: false, legacy: false, mnemonic: false, backed_up: false, reminted: false })).toEqual({ state: 'on' });
+    // 🆕 A wallet the node turned on by itself says so; false or absent is dropped.
+    expect(fp({ state: 'on', stays: true, auto: true, mnemonic: true })).toEqual({ state: 'on', stays: true, auto: true, mnemonic: true });
+    expect(fp({ state: 'on', stays: true, auto: false })).toEqual({ state: 'on', stays: true });
     // A flag that is not a boolean is no readout at all, whatever it holds.
-    for (const flag of ['legacy', 'mnemonic', 'backed_up', 'reminted']) {
+    for (const flag of ['legacy', 'auto', 'mnemonic', 'backed_up', 'reminted']) {
       for (const bad of [['a'], 'true', 1, null, { a: 1 }]) expect(fp({ state: 'on', [flag]: bad })).toBeUndefined();
     }
     // Fields the node never sends (words of any name, a key number) do not survive the parse.
