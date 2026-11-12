@@ -773,6 +773,9 @@ export class Sim {
   node2: SimHouse | null = null;
   node2Up = true;
   private node2On: Page | null = null;
+  /** 🤝 The owner's node went with the room (handOver, node 'same'): it runs
+   *  on the buyer's page's doc only, and never again on the house's page's. */
+  private nodeMoved = false;
   /** 🏠🏠 The other machines of the deed holder's that run a node (PageSpec
    *  node): each one's page, its node, whether that runs, and the load of
    *  the page it last told its key to. */
@@ -916,11 +919,6 @@ export class Sim {
     });
     vi.setSystemTime(sim.T);
     for (const spec of opts.pages) await sim.add(spec, { connect: false });
-    if (sim.node) {
-      for (const sp of sim.pages) {
-        if (sp.spec.node) sim.also.push({ sp, node: new SimHouse(sha256(utf8ToBytes(`sim-house-node-also|${opts.seed}|${sp.name}`))), up: true, on: null });
-      }
-    }
     const house = sim.house = sim.pages.find((sp) => sp.spec.house) ?? sim.pages[0];
     // 🏠 With a node, the house's page holds the room's deed.
     if (sim.node) await sim.as(house, () => house.p.doc.getMap('roomInfo').set('owner', house.pid));
@@ -1013,6 +1011,8 @@ export class Sim {
     sp.roomIn = opts.connect === false;
     await this.load(sp, spec, this.skewOf(spec));
     this.pages.push(sp);
+    // 🏠🏠 (Its machine's node, when it has one: at the start or as it comes later.)
+    if (this.node && spec.node) this.also.push({ sp, node: new SimHouse(sha256(utf8ToBytes(`sim-house-node-also|${this.opts.seed}|${sp.name}`))), up: true, on: null });
     if (opts.connect !== false) this.net.connect(sp);
     return sp;
   }
@@ -1597,7 +1597,7 @@ export class Sim {
    *  fingerprint), its clock the room's (monotonic) and the page's (wall). */
   private async houseTick(): Promise<void> {
     const sp = this.house;
-    if (!this.nodeUp || !this.net.connected(sp)) return;
+    if (!this.nodeUp || this.nodeMoved || !this.net.connected(sp)) return;
     await this.as(sp, (now) => {
       if (this.nodeOn !== sp.p) {
         sp.p.table.setLocalHouse(this.node!.pub);
@@ -1649,7 +1649,7 @@ export class Sim {
    *  starts again with what a restart keeps (SimHouse restart). */
   runs(node: SimHouse, up: boolean): void {
     if (up) node.restart();
-    if (node === this.node) this.nodeUp = up;
+    if (node === this.node && !this.nodeMoved) this.nodeUp = up;
     if (node === this.node2) this.node2Up = up;
     for (const m of this.also) if (m.node === node) m.up = up;
   }
@@ -1661,7 +1661,8 @@ export class Sim {
    *  (the default), the buyer's own node becomes its house (node2); with
    *  'same', the seller's node does (the machine goes with the room: one
    *  house key, delegated by the seller and then by the buyer, and the node
-   *  runs on the buyer's page's doc from here on). What the redemption
+   *  runs on the buyer's page's doc from here on, never on the seller's:
+   *  runs() starts and stops it there). What the redemption
    *  answered. */
   async handOver(buyer: SimPage, opts: { node?: boolean | 'same' } = {}): Promise<{ ok: boolean }> {
     const seller = this.holder;
@@ -1675,8 +1676,13 @@ export class Sim {
       return out;
     }
     if (opts.node === 'same') {
-      this.node2 = this.node;
-      this.nodeUp = false;
+      // (The seller's node: the owner's at the first hand-over; after one, the
+      // node the last buyer ran, node2 as it is, or none.)
+      if (before === null) {
+        this.node2 = this.node;
+        this.nodeUp = false;
+        this.nodeMoved = true;
+      }
     } else if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
     return out;
   }

@@ -357,6 +357,30 @@ describe("the oracle's own base rule", () => {
     expect(heldKeys(), sim.label).toContain(sim.node!.pub);
   }, TIMEOUT);
 
+  it('the harness: a machine that comes later brings its node, and a node that went with the room runs on the buyer\'s page only, through a second hand-over too', async () => {
+    const sim = await Sim.open({ name: 'fair-only-harness-nodes', seed: seed(1241), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    await sim.run(10_000);
+    const E = await sim.add({ name: 'E', pid: 'player-A', identity: 'A', node: true, bot: null });
+    expect(sim.also.map((m) => m.sp), sim.label).toEqual([E]);
+    expect(sim.nodes, sim.label).toHaveLength(2);
+    await sim.run(20_000);
+    expect(sim.also[0].node.wrote.beats, sim.label).toBeGreaterThan(0);
+    const [, B, C] = sim.pages;
+    expect(await sim.handOver(B, { node: 'same' }), sim.label).toEqual({ ok: true });
+    expect(sim.node2, sim.label).toBe(sim.node);
+    sim.runs(sim.node!, false);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, false]);
+    sim.runs(sim.node!, true);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, true]);
+    await sim.run(10_000);
+    // The next buyer keeps the node the last one ran.
+    const was = sim.node2;
+    expect(await sim.handOver(C, { node: 'same' }), sim.label).toEqual({ ok: true });
+    expect(sim.node2, sim.label).toBe(was);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, true]);
+    expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
+
   it("holds every holder's delegation of a house it used: the buyer's delegation of the seller's node from the first look that reads a round the node revealed for the seller, before the node has done anything for the buyer", async () => {
     const sim = await Sim.open({ name: 'fair-only-one-node-two-holders', seed: seed(1239), pages: named('ABCD'), houseNode: true, fairOnly: true });
     const T = 'roulette-1';
