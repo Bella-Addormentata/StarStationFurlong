@@ -2280,10 +2280,13 @@ async fn node_main() -> Result<()> {
     let wallet_starts = {
         match chia_wallet_switch::chosen_at_start(&chia_net.path(chia_wallet_switch::SWITCH_FILE), chia_off) {
             Ok(file) => {
-                let there = |name: &str| chia_net.path(name).try_exists().unwrap_or(true);
-                let legacy_only = there(chia_wallet_switch::LEGACY_SEED_FILE) && !there(chia_wallet_switch::IDENTITY_FILE);
-                wallet_unasked =
-                    chia_wallet_switch::starts_unasked(chia_net.is_test(), chia_off, chia_wallet_switch::env_switch(), file.as_ref(), legacy_only);
+                wallet_unasked = chia_wallet_switch::starts_unasked(
+                    chia_net.is_test(),
+                    chia_off,
+                    chia_wallet_switch::env_switch(),
+                    file.as_ref(),
+                    wallet_legacy_only(chia_net),
+                );
                 wallet_memo.remembered = file.as_ref().is_some_and(|f| f.on);
                 wallet_memo.auto = file.is_some_and(|f| f.on && f.auto);
             }
@@ -7073,6 +7076,16 @@ mod bank_on_line_tests {
 
 /// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
 ///
+/// 🆕 Whether the only wallet on this network's disk is a raw seed from
+/// before the 24 words: no start turns that one on unasked
+/// (chia_wallet_switch::starts_unasked). A file that cannot be probed counts
+/// as there.
+#[cfg(feature = "chia-publish")]
+fn wallet_legacy_only(net: chia_network::ChiaNet) -> bool {
+    let there = |name: &str| net.path(name).try_exists().unwrap_or(true);
+    there(chia_wallet_switch::LEGACY_SEED_FILE) && !there(chia_wallet_switch::IDENTITY_FILE)
+}
+
 /// On, when the wallet is not loaded: mint or load the 24-word identity
 /// (retiring a raw seed from before the words), restore the wallet lease
 /// (under its gate, before anything can spend), remember the switch, and
@@ -7106,24 +7119,26 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         Err(why)
     };
     // A save that failed: the memo takes what the file now holds, read back,
-    // and the words say so (chia_wallet_switch::after_failed_save).
+    // and the words say so. With no file there, where a start turns the
+    // wallet on unasked, the memo and the words say on: the next start with
+    // Chia on brings it back (chia_wallet_switch::after_failed_turn).
     let failed_save = |target: bool, e: std::io::Error, lead: &str| -> String {
-        let (previous, was_auto) = {
+        let previous = {
             let memo = hub.wallet_switch.lock().unwrap();
             (memo.remembered, memo.auto)
         };
-        let (remembered, why) =
-            chia_wallet_switch::after_failed_save(
-                target,
-                &e.to_string(),
-                chia_wallet_switch::remembered(switch_path),
-                previous,
-                chia_strict::strict(),
-                env,
-            );
+        let unasked_without = chia_wallet_switch::starts_unasked(net.is_test(), false, env, None, wallet_legacy_only(net));
+        let (remembered, auto, why) = chia_wallet_switch::after_failed_turn(
+            target,
+            &e.to_string(),
+            chia_wallet_switch::chosen(switch_path),
+            previous,
+            chia_strict::strict(),
+            env,
+            unasked_without,
+        );
         let why = format!("{lead}{why}");
         eprintln!("🏦 SSF wallet: {why}");
-        let auto = chia_wallet_switch::auto_after_failed_save(remembered, chia_wallet_switch::chosen(switch_path), was_auto);
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()), auto };
         why
     };

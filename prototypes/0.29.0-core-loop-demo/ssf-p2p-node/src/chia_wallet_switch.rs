@@ -263,8 +263,9 @@ pub fn chosen(path: &Path) -> Result<Option<SwitchFile>, String> {
 }
 
 /// Whether the switch file says on ([`chosen`]): `Ok(false)` when there is
-/// none.
-#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+/// none. For the tests: the node asks [`chosen`], since on a test network
+/// no file is not an off ([`starts_unasked`], [`after_failed_turn`]).
+#[cfg(test)]
 pub fn remembered(path: &Path) -> Result<bool, String> {
     chosen(path).map(|file| file.is_some_and(|f| f.on))
 }
@@ -422,6 +423,42 @@ pub fn after_failed_save(
             format!("the switch could not be saved ({err}) or read back ({read}), so whether the wallet is on at the next start is not known"),
         ),
     }
+}
+
+/// 🆕 What the memo holds after a Bank turn's save of `target` failed with
+/// `err`, and how to say so: `(remembered, auto, why)`. The file is read
+/// back whole (`reread`, [`chosen`]), because no file is not an off where a
+/// start turns the wallet on unasked. `unasked_without` is
+/// [`starts_unasked`] of this node at a start with Chia on and no switch
+/// file: there, with no file read back (the unasked start's own save never
+/// landed, or the file went since), the next start decides as that one did
+/// and the wallet comes back on with the mark, whatever was asked, so an
+/// off is never said to hold (#436 review). Every other case is
+/// [`after_failed_save`]'s, the mark kept as [`auto_after_failed_save`]
+/// says. `previous` is the memo's `(remembered, auto)` before the turn.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn after_failed_turn(
+    target: bool,
+    err: &str,
+    reread: Result<Option<SwitchFile>, String>,
+    previous: (bool, bool),
+    strict: bool,
+    env: EnvSwitch,
+    unasked_without: bool,
+) -> (bool, bool, String) {
+    if unasked_without && matches!(reread, Ok(None)) {
+        let off = if target { "" } else { "the off does not hold: " };
+        return (
+            true,
+            true,
+            format!(
+                "the switch could not be saved ({err}), and with no switch file this node turns the wallet on by itself, so {off}the wallet comes back on at the next start with Chia on"
+            ),
+        );
+    }
+    let says_on = reread.as_ref().map(|file| file.as_ref().is_some_and(|f| f.on)).map_err(Clone::clone);
+    let (remembered, why) = after_failed_save(target, err, says_on, previous.0, strict, env);
+    (remembered, auto_after_failed_save(remembered, reread, previous.1), why)
 }
 
 /// What `SSF_CHIA_LANE=1` does at a start with Chia on (no
@@ -1533,6 +1570,50 @@ mod tests {
         let (on, why) = after_failed_save(true, "disk full", Err("unreadable".into()), true, false, Unset);
         assert!(on && why.contains("not known"), "unreadable keeps the memo: {why}");
         assert!(!after_failed_save(true, "x", Err("y".into()), false, false, Unset).0);
+    }
+
+    /// 🆕 A Bank turn whose save failed and left no switch file, where a
+    /// start turns the wallet on unasked (#436 review): the memo says on,
+    /// with the mark, and the words never promise an off, since the next
+    /// start with Chia on brings the wallet back. Where no start is unasked,
+    /// or a file is there, the answer is `after_failed_save`'s as before.
+    #[test]
+    fn a_failed_turn_with_no_switch_file_never_promises_an_off_the_next_start_undoes() {
+        use EnvSwitch::*;
+        for strict in [false, true] {
+            for previous in [(true, true), (false, false)] {
+                let (on, auto, why) = after_failed_turn(false, "disk full", Ok(None), previous, strict, Unset, true);
+                assert!(on && auto, "{why}");
+                assert!(why.contains("the off does not hold") && why.contains("comes back on at the next start with Chia on"), "{why}");
+                assert!(!why.contains("stay off") && !why.contains("starts off") && !why.contains("read off"), "{why}");
+            }
+        }
+        let (on, auto, why) = after_failed_turn(true, "disk full", Ok(None), (true, true), false, Unset, true);
+        assert!(on && auto && why.contains("comes back on") && !why.contains("does not hold"), "{why}");
+        // No start is unasked here (off a test network, SSF_CHIA_LANE set,
+        // or only a raw seed on disk): no file reads as off, as it did.
+        for (target, previous) in [(false, (true, true)), (true, (false, false))] {
+            let (on, auto, why) = after_failed_turn(target, "disk full", Ok(None), previous, false, Unset, false);
+            assert_eq!((on, why), after_failed_save(target, "disk full", Ok(false), previous.0, false, Unset));
+            assert!(!auto);
+        }
+        // A file is there: it decides, whatever a start without one would do.
+        let file = |on: bool, auto: bool| Ok(Some(SwitchFile { on, at: 1, auto }));
+        for unasked in [false, true] {
+            let (on, auto, why) = after_failed_turn(false, "dir sync failed", file(false, false), (true, true), false, Unset, unasked);
+            assert!(!on && !auto && why.contains("stay off"), "the off landed: {why}");
+            let (on, auto, why) = after_failed_turn(false, "disk full", file(true, true), (true, true), false, Unset, unasked);
+            assert!(on && auto && why.contains("comes back on"), "the off did not land, and the node's on is still marked: {why}");
+            let (on, auto, _) = after_failed_turn(true, "dir sync failed", file(true, false), (true, true), false, Unset, unasked);
+            assert!(on && !auto, "the Bank's on landed: the on is the player's");
+            let (on, auto, why) = after_failed_turn(false, "disk full", Err("torn".into()), (true, true), false, Unset, unasked);
+            assert!(on && auto && why.contains("not known"), "unreadable keeps the memo: {why}");
+        }
+        // Chia off with SSF_CHIA_LANE=1: no start is unasked (`starts_unasked`
+        // wants it unset), so the environment's words stand.
+        assert!(!starts_unasked(true, false, On, None, false));
+        let (on, _, why) = after_failed_turn(false, "dir sync failed", file(false, false), (false, false), true, On, false);
+        assert!(!on && why.contains(STILL_ON_WORDS), "{why}");
     }
 
     /// ⛓️ A TURN OFF while Chia is off with `SSF_CHIA_LANE=1` saved but not
