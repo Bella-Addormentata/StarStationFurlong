@@ -338,7 +338,12 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     if (waiting.some(beats) || plausible.slice(cut).some(beats)) pending = true;
   }
 
-  // S5: an end order standing at the base: one an owner-level key holding the game there signed.
+  // S5: an end order standing at the base: one an owner-level key holding the game there signed,
+  // or the game's holder now. (After a hand-over the base can stand under the round the holder
+  // took the game at: a root, or a trim with rounds decided since, which the buyer's key cannot
+  // sign over. The holder's order must stand all the same, or no page would stop closing for it
+  // and the holder could not end its game with a round in flight. The end itself is at a round
+  // the holder holds, S1.)
   let fin: FinRec | null = null;
   if (base) {
     const finCandidates: FinRec[] = [];
@@ -348,7 +353,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       if (own) finCandidates.push(own);
     }
     for (const f of finCandidates) {
-      if (!holds(f.k, base.ck.u)) continue;
+      if (f.k !== chain[chain.length - 1].k && !holds(f.k, base.ck.u)) continue;
       const fh = recHash(f);
       if (fh === null) continue;
       const v = env.sig(sigId('fin', t, inc, fh), f.k, () => signBytes('fin', ctx, f), f.g);

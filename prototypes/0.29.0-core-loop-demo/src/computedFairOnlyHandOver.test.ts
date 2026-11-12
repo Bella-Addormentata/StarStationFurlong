@@ -474,14 +474,19 @@ describe('the deed is settled for a buyer whose page is away', () => {
     // The buyer's page comes: it moves the game on its tick.
     const T2 = T + 3_000;
     sync(T2, ...pages);
+    // (Not at once: its tables slept while it was away, and what it reads of the room may be behind. A lapse on it is awake.)
     run(pages, T2 + STEP, T2 + 2_000);
+    expect(xfsOf(b, inc)).toEqual([]);
+    const movedAt = run(pages, T2 + 2_000 + STEP, T2 + 60_000, { until: () => xfsOf(b, inc).length > 0 });
+    expect(movedAt - T2).toBeGreaterThanOrEqual(b.croupier.TABLE_LEASE_LAPSE_MS);
+    expect(movedAt - T2).toBeLessThan(b.croupier.TABLE_LEASE_LAPSE_MS + 1_000);
     expect(xfsOf(b, inc)).toHaveLength(1);
     expect(xfsOf(b, inc)[0]).toMatchObject({ u: 1, k: b.pub, o: { nonce: o.nonce } });
     for (const p of pages) {
       expect(res(p, inc)).toMatchObject({ live: true, pending: false, holder: b.pub });
       for (const q of [a, c]) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(played.deltas.get(q.pid)));
     }
-    run(pages, T2 + 2_000 + STEP, T2 + 6_000);
+    run(pages, movedAt + STEP, movedAt + 4_000);
     expect(xfsOf(b, inc)).toHaveLength(1);
     expect(cksOf(b, inc)).toHaveLength(1);
   });
@@ -520,5 +525,129 @@ describe('the buyer\'s page cannot check the game as it redeems', () => {
     run(pages, at + 2_000 + STEP, at + 5_000);
     expect(xfsOf(b, inc)).toHaveLength(1);
     for (const p of pages) expect(res(p, inc)).toMatchObject({ live: true, holder: b.pub });
+  });
+});
+
+describe('the round the game changes hands at is one every page will read', () => {
+  it('a decided round short of its closer\'s slip: no transfer while it is gone (the round would lose its house for good), and the transfer at that round once the slip is back', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B', 'C']);
+    const [a, , c] = pages;
+    const played = houseRound(pages, kit, 1, at);
+    const T = played.at;
+    const [close] = closesOf(a, 1);
+    const closer = pages.find((p) => p.pub === close.k)!;
+    const slip = keysIn(a, 's', 1).find((k) => k.startsWith(`s:1:${closer.pid}:`) && frozenOf(close).includes(hashIn(k)))!;
+    expect(slip).toBeDefined();
+    const gone = (now: number): void => {
+      beat?.each(now);
+      for (const p of pages) {
+        const ses = p.casino.computedSessionForWrite(TABLE);
+        if (ses?.has(slip)) p.doc.transact(() => ses.delete(slip));
+      }
+    };
+    gone(T);
+    sync(T, ...pages);
+    expect(foldOf(c).rounds.some((x) => x.r === 1 && x.decided)).toBe(false);
+    expect(redeem(c, offerAt(a, c, T), T)).toEqual({ ok: true });
+    expect(xfsOf(c, inc)).toEqual([]);
+    run(pages, T + STEP, T + 2_000, { each: gone });
+    expect(xfsOf(c, inc)).toEqual([]);
+    // Left alone the slip is put back, and the game moves at the round it decided.
+    const movedAt = run(pages, T + 2_000 + STEP, T + 40_000, { until: () => xfsOf(c, inc).length > 0 });
+    expect(movedAt).toBeLessThan(T + 40_000);
+    expect(xfsOf(c, inc)[0]).toMatchObject({ u: 1, k: c.pub });
+    sync(movedAt, ...pages);
+    run(pages, movedAt + STEP, movedAt + 2 * STEP);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: true, holder: c.pub });
+      for (const q of pages.slice(0, 2)) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(played.deltas.get(q.pid)));
+    }
+  });
+
+  it('never under the round the seller took the game at: a page that has the seller\'s transfer and none of the rounds under it writes one at that round', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    // A round in flight as B takes the game: B holds it from round 1.
+    house(a, kit.houseJoin(H, 1));
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], at)).toBe('ok');
+    sync(at, ...pages);
+    const closedAt = run(pages, at + STEP, at + 30_000, { until: () => keysIn(a, 'c', 1).length > 0 });
+    sync(closedAt, ...pages);
+    expect(redeem(b, offerAt(a, b, closedAt), closedAt)).toEqual({ ok: true });
+    expect(xfsOf(b, inc)[0]).toMatchObject({ u: 1 });
+    // The session's records go (a peer's delete), and a fresh load of C's page hears the room as it is then.
+    a.doc.transact(() => {
+      const ses = a.casino.computedSessionForWrite(TABLE)!;
+      for (const k of [...ses.keys()]) ses.delete(k);
+    });
+    const o = offerAt(b, c, closedAt);
+    const c2 = await loadPage('C', 9, { reloadOf: c });
+    clockOf(c2, closedAt);
+    sync(closedAt, a, b, c2);
+    run([c2], closedAt, closedAt);
+    expect(foldOf(c2).rounds).toEqual([]);
+    expect(res(c2, inc).chain.map((h) => [h.k, h.from])).toEqual([[a.pub, 0], [b.pub, 1]]);
+    expect(redeem(c2, o, closedAt + STEP)).toEqual({ ok: true });
+    expect(xfsOf(c2, inc).find((x) => x.k === c2.pub)).toMatchObject({ u: 1 });
+    expect(res(c2, inc)).toMatchObject({ holder: c2.pub, invalid: [] });
+  });
+});
+
+describe('the buyer ends the game it took with a round in flight', () => {
+  it('its end order stands though the base is under its range: no page closes again, and its page writes the end once the round is decided', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    house(a, kit.houseJoin(H, 1));
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], at)).toBe('ok');
+    clockOf(c, at);
+    expect(c.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    sync(at, ...pages);
+    const closedAt = run(pages, at + STEP, at + 30_000, { until: () => keysIn(a, 'c', 1).length > 0 });
+    sync(closedAt, ...pages);
+    expect(redeem(b, offerAt(a, b, closedAt), closedAt)).toEqual({ ok: true });
+    sync(closedAt, ...pages);
+    run(pages, closedAt + STEP, closedAt + 2 * STEP);
+    expect(off(b, closedAt + 3 * STEP)).toBe('ending');
+    sync(closedAt + 3 * STEP, ...pages);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: true, holder: b.pub, fin: { k: b.pub } });
+      expect(p.casino.computedGamesEnding(b.pub)).toEqual([{ t: TABLE, inc }]);
+    }
+    const [close] = closesOf(a, 1);
+    const seedsAt = run(pages, closedAt + 4 * STEP, closedAt + 12_000, { until: () => pages.every((p) => keysIn(p, 'x', 1).length === 2) });
+    house(c, kit.houseReveal(H, 1, [hashIn(keysIn(a, 'c', 1)[0])], frozenOf(close)));
+    sync(seedsAt, ...pages);
+    const v = foldOf(a).rounds.find((x) => x.r === 1)!;
+    expect(v).toMatchObject({ decided: 'house' });
+    run(pages, seedsAt + STEP, seedsAt + b.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(b, inc)).toMatchObject({ e: 1, u: 1, k: b.pub, f: { k: b.pub }, x: xfsOf(b, inc) });
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: false, pending: false, base: { ck: { e: 1, u: 1 } } });
+      for (const q of [a, c]) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(v.deltas.get(q.pid)));
+    }
+  });
+});
+
+describe('a flood of offers nobody signed', () => {
+  it('costs the buyer\'s page a bounded number of checks a look, each forgery checked once: the good offer behind five forged ones moves the game on the third look', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    expect(b.table.ADOPT_CHECKS_PER_LOOK).toBe(2);
+    const made = Array.from({ length: 6 }, () => offerAt(a, b, at)).sort((x, y) => (x.nonce < y.nonce ? -1 : 1));
+    const good = made[5];
+    const forged = made.slice(0, 5).map((o) => ({ ...o, sig: good.sig }));
+    b.doc.transact(() => {
+      b.doc.getMap('roomInfo').set('owner', b.pid);
+      for (const o of [...forged, good]) top(b).set(`do:${o.nonce}`, definedOffer(o));
+    });
+    sync(at, ...pages);
+    // (Looks at at + STEP, + 2 STEP, + 3 STEP: two forgeries, two, then the fifth and the good one.)
+    run(pages, at + STEP, at + 2 * STEP);
+    expect(xfsOf(b, inc)).toEqual([]);
+    run(pages, at + 3 * STEP, at + 3 * STEP);
+    expect(xfsOf(b, inc)).toHaveLength(1);
+    expect(xfsOf(b, inc)[0]).toMatchObject({ o: { nonce: good.nonce } });
   });
 });

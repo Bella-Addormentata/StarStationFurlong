@@ -772,6 +772,7 @@ function lookAtClock(now: number): void {
     endLookedAt = null;
     adoptTried.clear();
     adoptLookedAt = null;
+    offerVerdicts.clear();
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -5761,10 +5762,32 @@ const adoptTried = new Set<string>();
 /** When adoptDuty last looked (at most every TICK_MS). */
 let adoptLookedAt: number | null = null;
 
-/** Whether deed offer `o` carries its maker's signature. */
-function offerSigned(o: DeedOffer): boolean {
+/** How many offers one look may check the signature of (offerSigned). */
+export const ADOPT_CHECKS_PER_LOOK = 2;
+/** The most verdicts kept (a peer's flood of forged offers fills it: emptied then, and checked afresh). */
+const ADOPT_VERDICTS_MAX = 4_096;
+/** By an offer's bytes (maker, signed bytes' hash and signature): whether its maker signed it. */
+const offerVerdicts = new Map<string, boolean>();
+/** The checks the look under way has left. */
+let adoptChecksLeft = ADOPT_CHECKS_PER_LOOK;
+
+/** Whether deed offer `o` carries its maker's signature: checked once (a
+ *  forged one costs one check, not one a look), and at most
+ *  ADOPT_CHECKS_PER_LOOK new ones a look, so a peer's flood of offers its
+ *  maker never signed cannot hold this page's frames. Undefined for one the
+ *  look has no check left for: a later look's. */
+function offerSigned(o: DeedOffer): boolean | undefined {
+  const id = recHash(o);
+  if (id === null) return false;
+  const known = offerVerdicts.get(id);
+  if (known !== undefined) return known;
+  if (adoptChecksLeft <= 0) return undefined;
+  adoptChecksLeft--;
   const { sig, ...unsigned } = o;
-  return verifyIdentityStrict(o.makerPub, offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
+  const ok = verifyIdentityStrict(o.makerPub, offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
+  if (offerVerdicts.size >= ADOPT_VERDICTS_MAX) offerVerdicts.clear();
+  offerVerdicts.set(id, ok);
+  return ok;
 }
 
 /**
@@ -5794,9 +5817,12 @@ function offerSigned(o: DeedOffer): boolean {
  *
  * An offer moves a game only if its maker holds it, it was made after the
  * game opened (the resolver's skew, OFFER_SKEW_MS), its nonce is new to the
- * game's chain and its maker signed it. A game is left as it is while the doc
- * holds part of an update or its records are still being checked. Returns
- * how many games it moved.
+ * game's chain and its maker signed it. A game is left as it is, for a later
+ * look, wherever an end would be refused (switchGate: asleep, the room's
+ * state not in, part of an update, records being checked, a restore's wait),
+ * while a close of the open round is still to be checked, and while a
+ * decided round is short of a record it rests on (fairSound). Returns how
+ * many games it moved.
  */
 export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer): number {
   lookAtClock(now);
@@ -5808,16 +5834,32 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
   if (redeeming === undefined && !deedHeldBy(me)) return 0;
   const offers = (mine ? [mine] : redeeming === undefined ? deedOffersTo(me) : []).filter((o) => o.toPub === me);
   if (offers.length === 0) return 0;
+  adoptChecksLeft = ADOPT_CHECKS_PER_LOOK;
   let moved = 0;
   for (const { t, inc, holder } of theirs) {
+    // As an end is gated (switchGate): the transfer fixes the round the
+    // seller's house counts up to, for good. Not on a page asleep or whose
+    // room's state is not in (a cached doc may be rounds behind the room, and
+    // the rounds decided since would lose their house), nor on a doc that
+    // holds part of an update, nor while records are being checked or a
+    // peer's rewind stands in its restore's wait.
+    if (switchGate(t, now) !== null) continue;
     const resolved = computedResolutionOf(t, inc);
     const res = computedFoldOf(t, inc);
-    if (!resolved || resolved.pending || !resolved.base || !resolved.name || !res || res.pending || !casinoWhole(t) || !computedSettled(t)) continue;
+    if (!resolved || resolved.pending || !resolved.base || !resolved.name || !res || res.pending) continue;
+    // A close of the open round still to be checked: whether a round is in
+    // flight is not known yet.
+    if (res.tip === null && res.openCloses.some((c) => c.state !== 'invalid')) continue;
     const used = new Set(resolved.chain.map((h) => h.step?.xf.o.nonce));
     const name = resolved.name;
     const o = offers.find((c) => c.makerPub === holder && c.issuedAt >= name.ts - OFFER_SKEW_MS && !used.has(c.nonce)
-      && !adoptTried.has(`${t}:${inc}:${c.nonce}`) && (c === mine || offerSigned(c)));
+      && !adoptTried.has(`${t}:${inc}:${c.nonce}`) && (c === mine || offerSigned(c) === true));
     if (!o) continue;
+    // Nor while a decided round is short of a record it rests on (fairSound,
+    // as an end waits): a bettor who deletes a frozen slip takes the round
+    // off the chain this page reads, the transfer would be at an earlier
+    // round, and the slip put back could not give the round its house again.
+    if (!fairSound(t, inc, res, now)) continue;
     const ctx: FoldCtx = { room, t, inc };
     const B = resolved.base.ck;
     // The round the game changes hands at: the last this page reads decided,
@@ -5826,7 +5868,10 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
     // count on (a house counts for the rounds its delegator held, S2), the
     // seller's house may still trim them, and the round in flight is its to
     // reveal. At the base's own round they would all read undecided again.
-    const u = Math.max(B.u, lastDecided(res)?.r ?? 0) + (fairQuiet(res) ? 0 : 1);
+    // (Never under the round the seller took the game at: a page that has the
+    // transfer before the rounds under it would write one no page counts.)
+    const from = resolved.chain[resolved.chain.length - 1].from;
+    const u = Math.max(Math.max(B.u, lastDecided(res)?.r ?? 0) + (res.tip !== null ? 1 : 0), from);
     const xf = sealXf(ctx, { v: 1, o, u, k: me }, signIdentity);
     // (The base's content: all of it but who signed, who delegated the signer and the chain.)
     const { g: _g, dl: _dl, x: _x, k: _k, ...content } = B;
