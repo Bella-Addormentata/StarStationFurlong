@@ -13,7 +13,7 @@ import {
   CHIA_LANE_BUTTON_ID, LANE_ARMED_WARNING, LANE_DAMAGED_NOTE, LANE_ENV_DAMAGED_NOTE, LANE_ENV_NOTE, LANE_ENV_OLDER_NOTE,
   LANE_ENV_SAVED_NOTE, LANE_ENV_STUCK_NOTE, LANE_NO_NODE_COLOUR, LANE_OFF_COLOUR, LANE_OFF_UNKNOWN_NOTE, LANE_OLDER_NODE, LANE_ON_COLOUR,
   LANE_ON_NOTE, LANE_SAVING_NOTE, LANE_SETTING_OFF_NOTE, LANE_STUCK_NOTE, LANE_UNKNOWN_COLOUR, LANE_UNTIL_RESTART_NOTE, chiaBackOn,
-  chiaLaneRow, chiaOffWhy, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane, type ChiaLaneUi,
+  chiaLaneRow, chiaOffWhy, laneKeyRepeat, laneTurnOf, shareCardFeedback, turnChiaLane, type ChiaLaneUi,
 } from './chiaLane';
 import { TESTNET11 } from './chiaNetwork';
 import { isFlightKey } from './freeFlightStick';
@@ -207,38 +207,28 @@ describe('chiaOffWhy and chiaBackOn', () => {
   });
 });
 
-describe('the Chia Mesh and Share Card feedback', () => {
-  const MESH_ON = "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish).";
-  const MESH_OFF = 'Advanced Chia mesh mode OFF for this room.';
+describe('the Share Card feedback', () => {
   const CARD_ON = 'Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards).';
   const CARD_OFF = 'Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.';
   const OFF_LANES = [ENV, ENV_SAVED, SETTING_OFF, DAMAGED, STUCK, UNTIL_RESTART, { off: true } as ChiaLane];
 
-  it('say what they said before while Chia is on, or with no lane', () => {
+  it('says what it said before while Chia is on, or with no lane', () => {
     for (const lane of [undefined, null, ON, { off: false } as ChiaLane]) {
-      expect(meshFeedback(true, lane)).toBe(MESH_ON);
-      expect(meshFeedback(false, lane)).toBe(MESH_OFF);
       expect(shareCardFeedback(true, lane)).toBe(CARD_ON);
       expect(shareCardFeedback(false, lane)).toBe(CARD_OFF);
     }
   });
 
-  it('say Chia is off, and why, when ticked on while it is', () => {
+  it('says Chia is off, and why, when ticked on while it is', () => {
     for (const lane of OFF_LANES) {
-      const mesh = meshFeedback(true, lane);
       const card = shareCardFeedback(true, lane);
-      for (const words of [mesh, card]) {
-        expect(words).toContain(chiaOffWhy(lane));
-        expect(words).not.toContain('chain reads are on');
-        expect(words).not.toContain('knock when every live route fails');
-        const back = chiaBackOn(lane);
-        if (back) expect(words.endsWith(` ${back}`)).toBe(true);
-        else expect(words.endsWith('until Chia is back on.')).toBe(true);
-      }
-      expect(mesh).toBe(`Advanced Chia mesh mode ON for this room, but ${chiaOffWhy(lane)}, so your node reads and publishes nothing on the chain until Chia is back on.${chiaBackOn(lane) ? ` ${chiaBackOn(lane)}` : ''}`);
+      expect(card).toContain(chiaOffWhy(lane));
+      expect(card).not.toContain('knock when every live route fails');
+      const back = chiaBackOn(lane);
+      if (back) expect(card.endsWith(` ${back}`)).toBe(true);
+      else expect(card.endsWith('until Chia is back on.')).toBe(true);
       expect(card).toContain('reads no knocks');
       // Ticked off, the words are true either way.
-      expect(meshFeedback(false, lane)).toBe(MESH_OFF);
       expect(shareCardFeedback(false, lane)).toBe(CARD_OFF);
     }
     expect(shareCardFeedback(true, SETTING_OFF)).toBe(
@@ -371,13 +361,11 @@ describe('main.ts wires the CHIA row', () => {
     expect(body('async function refreshLocalFingerprint(')).toContain('bankWalletArmed = false;\n      chiaLaneArmed = false;');
   });
 
-  it('words the Chia Mesh and Share Card feedback with the lane', () => {
-    const at = main.indexOf('// ChiaHub Slice 3b: the "advanced Chia mesh mode" switch.');
+  it('words the Share Card feedback with the lane', () => {
+    const at = main.indexOf('// #231 P6b: the "share my card in this room" switch — writes the per-room');
     expect(at).toBeGreaterThan(0);
     const toggles = main.slice(at, main.indexOf('// ?seed= deep-link import', at));
-    expect(toggles).toContain('feedback.textContent = meshFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);');
     expect(toggles).toContain('feedback.textContent = shareCardFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);');
-    expect(toggles).not.toContain('chain reads are on for every node');
     expect(toggles).not.toContain('knock when every live route fails');
   });
 
@@ -525,7 +513,6 @@ describe('main.ts walks the Network view by keyboard', () => {
       retry: button('network-retry-node-btn'),
       chevron: button('network-details-toggle'),
       chia: button('chia-lane-switch'),
-      mesh: new StandInInput('INPUT', { type: 'checkbox', id: 'chia-mode-toggle' }),
       share: new StandInInput('INPUT', { type: 'checkbox', id: 'share-card-toggle' }),
       drawer: new StandIn('SUMMARY'),
       address: new StandInInput('INPUT', { type: 'text', id: 'network-bootstrap-address' }),
@@ -564,8 +551,7 @@ describe('main.ts walks the Network view by keyboard', () => {
     expect(press(view, view, 'ArrowDown')).toEqual({ to: c.retry, prevented: true });
     // Past the chevron, which the phone hides.
     expect(press(view, c.retry, 'ArrowDown').to).toBe(c.chia);
-    expect(press(view, c.chia, 'ArrowDown').to).toBe(c.mesh);
-    expect(press(view, c.mesh, 'ArrowDown').to).toBe(c.share);
+    expect(press(view, c.chia, 'ArrowDown').to).toBe(c.share);
     expect(press(view, c.share, 'ArrowDown').to).toBe(c.drawer);
     // The closed drawer's text box and buttons are laid out but not shown,
     // so they cannot take focus: round to the top.
@@ -579,12 +565,14 @@ describe('main.ts walks the Network view by keyboard', () => {
     expect(press(view, c.address, 'ArrowDown')).toEqual({ to: c.override, prevented: true });
     expect(press(view, c.address, 'ArrowUp')).toEqual({ to: c.drawer, prevented: true });
     expect(press(view, c.selfTest, 'ArrowDown').to).toBe(c.retry);
-    // The CHIA switch hidden (it offers nothing), and a room switch disabled
+    // The CHIA switch hidden (it offers nothing), and the room switch disabled
     // (no room yet), cannot take focus: neither is a stop.
     c.chia.laidOut = false;
+    expect(press(view, c.retry, 'ArrowDown').to).toBe(c.share);
+    expect(press(view, c.share, 'ArrowUp').to).toBe(c.retry);
     c.share.attrs.disabled = '';
-    expect(press(view, c.retry, 'ArrowDown').to).toBe(c.mesh);
-    expect(press(view, c.mesh, 'ArrowDown').to).toBe(c.drawer);
+    expect(press(view, c.retry, 'ArrowDown').to).toBe(c.drawer);
+    expect(press(view, c.drawer, 'ArrowUp').to).toBe(c.retry);
   });
 
   it('skips a closed drawer\'s controls in an engine without checkVisibility, which lays them out not at all', () => {
@@ -619,10 +607,10 @@ describe('main.ts walks the Network view by keyboard', () => {
     const { view, c } = networkView();
     // Enter and Space keep their own meaning: the click, the checkbox's toggle.
     expect(press(view, c.chia, 'Enter')).toEqual({ to: c.chia, prevented: false });
-    expect(press(view, c.mesh, ' ')).toEqual({ to: c.mesh, prevented: false });
+    expect(press(view, c.share, ' ')).toEqual({ to: c.share, prevented: false });
     expect(press(view, c.retry, 'ArrowLeft')).toEqual({ to: c.retry, prevented: false });
     for (const held of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }, { metaKey: true }]) {
-      expect(press(view, c.mesh, 'ArrowDown', held)).toEqual({ to: c.mesh, prevented: false });
+      expect(press(view, c.share, 'ArrowDown', held)).toEqual({ to: c.share, prevented: false });
     }
     const select = new StandInSelect('SELECT');
     expect(press(view, select, 'ArrowDown')).toEqual({ to: select, prevented: false });

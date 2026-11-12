@@ -417,7 +417,7 @@ describe('NetworkProvider — the room cap (#231 N8 / P6b)', () => {
     await prefetch.connect(PASS);
     await vi.waitFor(() => expect(caps(warming)).toHaveLength(1));
     expect(caps(warming)[0]).toEqual({
-      roomKeyB64: 'a2V5', chiaMode: false, publicRoom: null, seq: expect.any(Number), shareCard: true, prefetch: true, memberCards: [card], passPrivate: true,
+      roomKeyB64: 'a2V5', publicRoom: null, seq: expect.any(Number), shareCard: true, prefetch: true, memberCards: [card], passPrivate: true,
     });
     await vi.waitFor(() => expect(warming.opened[0].closed).toBe(true)); // one frame, then FIN
     await prefetch.disconnect();

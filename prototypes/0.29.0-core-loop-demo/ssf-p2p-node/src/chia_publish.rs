@@ -1,19 +1,23 @@
-//! ChiaHub C1 Slice 4: PUBLISH a room-key-sealed presence record as a
-//! spend-to-self carrying `[hint, ciphertext]` memos on testnet11.
+//! ChiaHub's writers: each record goes out as a spend-to-self carrying
+//! `[hint, ciphertext]` memos. It began as C1 Slice 4, the room-key-sealed v1
+//! presence record, whose writer is gone (stage 4 design §13 row 12): this
+//! node writes nothing under a room key. What it writes is its listing under
+//! its contact key, its knocks and, where turned on, its beacon.
 //!
 //! Two keys, two roles (this is the whole design):
-//!   - the IROH secret key SIGNS the presence record (identity + authorship — a
+//!   - the IROH secret key SIGNS the record (identity + authorship — a
 //!     resolver dials the `node_id` inside it), via the shipped `chia_lane` crypto;
-//!   - the CHIA BLS secret key PAYS for the publish (spends one of the wallet's
-//!     coins back to itself, carrying the sealed record as memos).
+//!   - a CHIA BLS secret key PAYS for the publish (spends one of its coins
+//!     back to itself, carrying the sealed record as memos).
 //!
 //! The principal returns to the wallet (spend-to-self, amount − fee), so only the
 //! fee leaves. Every SDK call is the source-verified 0.34 API (audit surfaces B/C/D).
 //! Behind the `chia-publish` feature; runtime-gated by the SSF wallet switch at the
 //! caller (chia_wallet_switch.rs: the Bank's TURN ON, or `SSF_CHIA_LANE=1`).
 //!
-//! N8 (#231): a room that is public space (bundled seed or PUBLIC passage) is
-//! never published under, armed or not — see [`publishable_rooms`].
+//! N8 (#231): nothing is published under a room's key, public space or not.
+//! The page's Chia Mesh switch, which armed a private room's v1 record on a
+//! test network, is gone with that record's writer.
 #![cfg(feature = "chia-publish")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -35,17 +39,13 @@ use serde::{Deserialize, Serialize};
 use crate::chia_contact::InboundVerified;
 use crate::chia_knock::{KnockBook, KnockRequest, SentKnock};
 use crate::chia_resolve::{LeaseWord, WriteCoins};
-use crate::chia_lane::{self, AddrEntry, BeaconV2, ChiaPresenceRecord, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
+use crate::chia_lane::{self, AddrEntry, BeaconV2, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
 
 /// Fee (mojos) for a publish. 0 confirms when the mempool is quiet (the usual
 /// testnet state); the spend-to-self recreates the coin at `amount − fee`, so at
 /// fee 0 the principal is fully preserved. Bump under sustained congestion.
 const PUBLISH_FEE: u64 = 0;
-
-/// How long a published record advertises itself as fresh (seconds). Advisory —
-/// the chain cannot delete; resolvers enforce freshness and writers heartbeat.
-const RECORD_TTL_SECS: u64 = 3600;
 
 /// The standard puzzle hash our coins are locked to (from the synthetic key).
 pub fn our_puzzle_hash(chia_sk: &SecretKey) -> Bytes32 {
@@ -64,7 +64,7 @@ pub const RECONCILE_GRACE: Duration = Duration::from_secs(20);
 pub const MAX_RECONCILE_PAGES: usize = 8;
 
 /// 🔒 Wallet spend lease (#245 review). Every spend from OUR wallet — the
-/// presence heartbeat (`publish_presence`, also the startup publish hook), the
+/// heartbeat's writers, the
 /// craps fairness hook's commit and reveal (`chia_craps_fair`), the faucet
 /// dish's GIVE (`chia_faucet`) — selects its coins, builds and pushes while
 /// holding `gate`, and parks the coin ids it consumes in `pending` BEFORE the
@@ -1209,7 +1209,7 @@ impl WalletLease {
     /// filed for it is `payer`, or its saved bundle spends a coin at
     /// `puzzle_hash`, which no lost payer record can hide
     /// ([`WalletLease::parks_spend_at`]). Every other spend counts, whoever
-    /// paid: another burner, the SSF wallet (a v1 room record, a GIVE, a
+    /// paid: another burner, the SSF wallet (a GIVE, a
     /// test hook), a claim into it (a TAKE, the `incoming` marker's coin
     /// among them, which lands on the chain like any spend), and a spend
     /// with no payer filed, which is the SSF wallet's or unknown, fail
@@ -2556,8 +2556,8 @@ impl std::error::Error for MoneyMemoRefused {}
 /// carries a memo and is paid by the SSF wallet's keys is built by
 /// [`build_publish_bundle`], which asks this first, so none leaves those
 /// keys off a test network: presence and knocks (the money key), the beacon
-/// the beacon wallet pays for (its key comes from the money key), v1 room
-/// records and both env test hooks. The second memo builder, a burner's
+/// the beacon wallet pays for (its key comes from the money key) and the env
+/// test hooks. The second memo builder, a burner's
 /// (`claim_write::build_burner_bundle`, stage 4 design §4.2), does not ask
 /// it: it signs with a `BurnerKey` alone and has no network check of its
 /// own. What reaches it is its callers' gate ([`burner_paths`]): on a test
@@ -2673,68 +2673,14 @@ pub fn sign_standard_spends(net: crate::chia_network::ChiaNet, chia_sk: &SecretK
     Ok(SpendBundle::new(coin_spends, aggregated))
 }
 
-// ── Slice 6: heartbeat publisher for ARMED rooms ─────────────────────────────
+// ── The heartbeat's pace ─────────────────────────────────────────────────────
 
-/// Publish cadence once a room's last publish SUCCEEDED (the ~30–60 min
-/// heartbeat from the ChiaHub plan §3.1; 30 min keeps records fresh well inside
-/// resolvers' freshness window).
-const HEARTBEAT_OK_SECS: u64 = 30 * 60;
-/// Retry cadence after a FAILED publish (e.g. wallet unfunded) — frequent enough
-/// to pick up a faucet funding within minutes, sparse enough not to spam logs.
+/// Retry cadence after a FAILED write (the chain unread, no mojo ready in the
+/// lobby dish) — frequent enough to pick the write up within minutes, sparse
+/// enough not to spam logs.
 const HEARTBEAT_RETRY_SECS: u64 = 5 * 60;
-/// Loop tick — how often armed rooms are checked for due publishes.
+/// Loop tick — how often the heartbeat's arms are checked for due writes.
 const HEARTBEAT_TICK_SECS: u64 = 60;
-
-/// Last publish attempt per room (loop-local; rebuilt on node restart, which just
-/// causes one early republish — harmless, spend-to-self is idempotent in effect).
-pub struct PublishMark {
-    pub room_key: [u8; 32],
-    pub addrs_sig: String,
-    pub at: Instant,
-    pub ok: bool,
-}
-
-/// N8 in one place: of the rooms the browser handed us, which may publish right
-/// now (armed AND known private) and which are armed but refused — their key is
-/// public space (bundled seed or PUBLIC passage), or the browser predates N8 and
-/// never said which, and silence fails closed.
-///
-/// Off a test network nothing at all (stage 4 design §4.5 (2)): a v1 record's
-/// hint is per room per day and its body carries every live address, so
-/// it is written on a test network only, and the page shows the Chia Mesh
-/// switch that arms it there only.
-pub fn publishable_rooms(net: crate::chia_network::ChiaNet, caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 32])>, Vec<String>) {
-    let mut armed = Vec::new();
-    let mut refused = Vec::new();
-    if !net.is_test() {
-        return (armed, refused);
-    }
-    for (room, cap) in caps {
-        if cap.restored {
-            continue; // read-only until the browser sends a live cap (posture may be stale)
-        }
-        if cap.may_publish() {
-            armed.push((room.clone(), cap.room_key));
-        } else if cap.chia_mode {
-            refused.push(room.clone());
-        }
-    }
-    (armed, refused)
-}
-
-/// Is a publish due? Always for a room never published; otherwise on a room-key
-/// change, an address change, or once the OK / retry cadence has elapsed.
-pub fn publish_due(mark: Option<&PublishMark>, room_key: &[u8; 32], addrs_sig: &str, now: Instant) -> bool {
-    match mark {
-        None => true,
-        Some(m) => {
-            m.room_key != *room_key
-                || m.addrs_sig != addrs_sig
-                || now.saturating_duration_since(m.at)
-                    >= Duration::from_secs(if m.ok { HEARTBEAT_OK_SECS } else { HEARTBEAT_RETRY_SECS })
-        }
-    }
-}
 
 // ── #231 P6a: the PER-NODE presence publisher ────────────────────────────────
 // One record per node per era, under the node's contact key, with the chain as
@@ -2749,8 +2695,8 @@ pub fn publish_due(mark: Option<&PublishMark>, room_key: &[u8; 32], addrs_sig: &
 // The mark of what was written persists in `publish_marks.json` and is set only
 // after the push succeeded, so a restart never doubles a write; a failed push
 // (an unfunded wallet, the peers down) retries on the heartbeat's retry
-// cadence. Presence has PRIORITY over the room-keyed v1 publishes in the same
-// tick (one spend per tick, see the heartbeat's doc comment).
+// cadence. Presence goes first in a tick, before the knocks and the beacon
+// (one spend per tick, see the heartbeat's doc comment).
 
 pub const NODE_MARK_FILE: &str = "publish_marks.json";
 /// Address-change republishes an era may carry (the once-per-era write excluded).
@@ -3960,8 +3906,8 @@ pub fn presence_status_with(
 }
 
 /// Publish this node's presence for `era` under its contact key: encode + sign
-/// (iroh key), seal (ck), then the same lease / coin / spend-to-self / push
-/// path as the room-keyed publish. Returns the hint written under and what
+/// (iroh key), seal (ck), then the lease / coin / spend-to-self / push
+/// path every money-paid memo takes ([`publish_memo_on`]). Returns the hint written under and what
 /// the write left behind ([`MemoWrite`]): an unanswered push is a write all
 /// the same — its input is parked and the bundle may be in a mempool — so the
 /// caller files it as pending and lets the chain's word settle it
@@ -4700,8 +4646,7 @@ fn knock_attempt_counts(burners: bool, e: &anyhow::Error) -> bool {
 ///
 /// So while one burner's write waits its turn, the arms after it get no
 /// tick: neither the knocks behind a waiting listing, nor the beacon and
-/// its mark's judging, nor the rooms' v1 records, which the SSF wallet
-/// writes and which lapse if the wait outlasts them. The wait is the
+/// its mark's judging. The wait is the
 /// other spend's time in flight, at most [`SPACING_IN_FLIGHT_HOLD`], and
 /// then 32 to 64 blocks, so about 40 minutes at the longest behind one
 /// spend, and each write queued behind it waits its own turn after it:
@@ -6804,18 +6749,21 @@ pub fn beacon_memo(net: crate::chia_network::ChiaNet, iroh_sk: &iroh::SecretKey,
     Ok((Bytes32::new(chia_lane::derive_beacon_hint(net, era)), plain.to_vec()))
 }
 
-/// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
-/// fixed-test-key SLICE 4 hook. Every armed room (its browser delivered the room
-/// key with chia_mode=true — the "advanced Chia mesh mode" toggle) gets a
-/// presence record sealed under its REAL room key published: within one tick of
-/// arming, every ~30 min thereafter, immediately on address change, and on a
-/// 5-min retry after failures (e.g. unfunded wallet — the log tells the operator
-/// to fund).
+/// The publisher's heartbeat: every tick ([`HEARTBEAT_TICK_SECS`]) it looks
+/// at this node's own writes in turn, the listing under its contact key
+/// (#231 P6a), the knocks queued for hosts no path reaches (P6b) and, where
+/// it is turned on, the beacon, and sends the first one that is due. A
+/// failed write is tried again after [`HEARTBEAT_RETRY_SECS`].
 ///
-/// At most ONE room publishes per tick: sequential spends inside one ~19 s block
-/// window would double-spend the same wallet coin (the recreated coin only
-/// becomes findable once its block confirms), so due rooms drain one per minute —
-/// far faster than the 30-min cadence needs. Every failure is log-and-continue;
+/// It began as Slice 6, the publisher of a v1 presence record under each
+/// armed room's key. That writer is gone (stage 4 design §13 row 12): no
+/// record is written under a room key. A room's cap is still read here,
+/// to ask whether the room uses cards before a knock on a host there, and
+/// whether this node serves the welcome room before a beacon.
+///
+/// At most ONE spend leaves per tick: sequential spends inside one ~19 s block
+/// window would double-spend the same coin (the recreated coin only becomes
+/// findable once its block confirms). Every failure is log-and-continue;
 /// the lane never affects the mesh.
 pub async fn heartbeat_loop(
     hub: crate::SharedHub,
@@ -6907,9 +6855,6 @@ pub async fn heartbeat_loop(
         Some(root) => ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE), &pause_keys(root, &hub.contact_key)),
         None => ForeignPause::in_memory(),
     };
-    let mut marks: HashMap<String, PublishMark> = HashMap::new();
-    // N8: public-space rooms that are armed, already told about once.
-    let mut refused_logged: HashSet<String> = HashSet::new();
     // #231 P6a: the per-node presence state. The mark is what was WRITTEN (on
     // disk, set on push success); the attempt instant paces retries after a
     // failure; the guard flag logs the end-of-era pause once.
@@ -7696,8 +7641,7 @@ pub async fn heartbeat_loop(
                 let took_the_tick = beacon_took_the_tick(&done);
                 match done {
                     // Nothing was pushed and the chain was asked nothing:
-                    // the try is paced as any other, and the tick goes on
-                    // to the rooms below.
+                    // the try is paced as any other.
                     Ok(BeaconDone::Guarded(_)) => {}
                     Ok(BeaconDone::Written { hint, write, from_burner }) => {
                         let mark = BeaconMark::written(era, now_unix, hint, &write, self_id.clone());
@@ -7719,122 +7663,12 @@ pub async fn heartbeat_loop(
                 }
             }
         }
-
-        if addrs.is_empty() {
-            continue; // nothing routable to advertise under a room key yet
-        }
-        let addrs_sig = addrs.join(",");
-        let caps: Vec<(String, ChiaRoomCap)> = hub
-            .chia_rooms
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(room, cap)| (room.clone(), cap.clone()))
-            .collect();
-        let (armed, refused) = publishable_rooms(net, &caps);
-        refused_logged.retain(|room| refused.contains(room));
-        for room in &refused {
-            if refused_logged.insert(room.clone()) {
-                println!(
-                    "⛓️ ChiaHub heartbeat: room {room} is armed but N8 refuses it — its key is public space (bundled seed or PUBLIC passage), or the browser predates N8 and never said; no address is published under its key until the browser says private"
-                );
-            }
-        }
-        // Forget rooms no longer armed (toggle flipped off / cap replaced).
-        marks.retain(|room, _| armed.iter().any(|(r, _)| r == room));
-        for (room, room_key) in armed {
-            let due = publish_due(marks.get(&room), &room_key, &addrs_sig, Instant::now());
-            if !due {
-                continue;
-            }
-            // The v1 room record is the SSF wallet's write, with its own
-            // key, which the keys hold on a test network only
-            // ([`PublisherKeys::money`]).
-            let published = match keys.money() {
-                Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,
-                Err(refused) => Err(refused.into()),
-            };
-            let ok = match published {
-                Ok(hint) => {
-                    println!(
-                        "⛓️ ChiaHub heartbeat: presence published for room {room} · hint {}",
-                        hex::encode(&hint.to_bytes()[..8])
-                    );
-                    true
-                }
-                Err(e) => {
-                    eprintln!(
-                        "⛓️ ChiaHub heartbeat: publish for room {room} failed: {e:#} (retry in {} min)",
-                        HEARTBEAT_RETRY_SECS / 60
-                    );
-                    false
-                }
-            };
-            marks.insert(
-                room,
-                PublishMark { room_key, addrs_sig: addrs_sig.clone(), at: Instant::now(), ok },
-            );
-            break; // one publish per tick — see doc comment (mempool double-spend)
-        }
     }
 }
 
 /// The first characters of a node id, for the log.
 fn short(node_id: &str) -> &str {
     &node_id[..node_id.len().min(16)]
-}
-
-/// Full publish: seal the presence record, find our coin, spend-to-self with the
-/// `[hint, ciphertext]` memos, and push to the node's network. Returns the published hint.
-///
-/// `iroh_sk` signs the record (identity); `chia_sk` pays (spends the coin).
-/// `live_addrs` are the node's current direct addresses (F3 rule: live data).
-pub async fn publish_presence(
-    iroh_sk: &iroh::SecretKey,
-    chia_sk: &SecretKey,
-    room_key: &[u8; 32],
-    live_addrs: &[String],
-) -> Result<Bytes32> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 1. Build + sign (iroh key) + seal (room key) the presence record — all the
-    //    shipped, unit-tested chia_lane crypto.
-    let record = ChiaPresenceRecord {
-            kx_pk: None,
-            addr_flags: vec![],
-        v: 1,
-        node_id: iroh_sk.public().to_string(),
-        addrs: live_addrs.to_vec(),
-        relay_urls: vec![],
-        issued_at: now,
-        expires_at: now + RECORD_TTL_SECS,
-    };
-    let blob = chia_lane::encode_signed(&record, iroh_sk)?;
-    let sealed = chia_lane::seal(room_key, &blob)?;
-    let hint = Bytes32::new(chia_lane::derive_hint(room_key, chia_lane::epoch_now(now)));
-    let ciphertext = Bytes::new(sealed);
-
-    // 2. Find our fundable coin (pays for the spend) — under the wallet lease,
-    //    so no other writer picks the same coin before this spend confirms.
-    let _lease = WALLET_LEASE.lock().await;
-    // A sealed lease refuses before any chain read (push_parked would refuse
-    // regardless; this spares the reads and names the reason at once).
-    WALLET_LEASE.ensure_open()?;
-    let client = crate::chia_chain::connect();
-    WALLET_LEASE.reconcile(&client).await;
-    let our_ph = our_puzzle_hash(chia_sk);
-    let coin = find_spendable_coin(&client, our_ph)
-        .await?
-        .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
-
-    // 3. Build + sign the spend-to-self, then push to the mempool with the coin
-    //    parked first (push_parked: a timed-out push may still have landed).
-    let bundle = build_publish_bundle(crate::chia_network::net(), chia_sk, coin.coin, hint, ciphertext)?;
-    push_parked(&client, Payer::of(chia_sk), bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
-    Ok(hint)
 }
 
 #[cfg(test)]
@@ -7860,8 +7694,8 @@ mod tests {
         Payer(Bytes32::new([0xc0; 32]))
     }
 
-    fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
-        ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false, prefetch: false }
+    fn cap(key: u8, public_room: Option<bool>) -> ChiaRoomCap {
+        ChiaRoomCap { room_key: [key; 32], share_card: true, public_room, seq: 0, restored: false, pass_private: false, prefetch: false }
     }
 
     #[test]
@@ -7870,7 +7704,7 @@ mod tests {
         // stale by the time the lease and coin lookups are done; the spend
         // asks again, and a withdrawn knock is not a failed one.
         let ck = [7u8; 32];
-        let private = cap(1, false, Some(false));
+        let private = cap(1, Some(false));
         assert_eq!(knock_leave(Some(&private), false, true, true, &ck), Ok(Some(ck)), "known private, sharing: the key rides");
         assert_eq!(knock_leave(Some(&private), false, false, true, &ck), Ok(None), "a key not kept across restarts: a bare knock");
         assert_eq!(knock_leave(Some(&private), false, true, false, &ck), Ok(None), "the node's own switch off: a bare knock");
@@ -13151,46 +12985,6 @@ mod tests {
         assert_ne!(asked(&chain), (0, 0, 0), "beacon: looked up");
     }
 
-    #[test]
-    fn n8_only_armed_known_private_rooms_publish() {
-        let caps = vec![
-            ("private-armed".to_string(), cap(1, true, Some(false))),
-            ("private-off".to_string(), cap(2, false, Some(false))),
-            ("public-armed".to_string(), cap(3, true, Some(true))),
-            ("public-off".to_string(), cap(4, false, Some(true))),
-            ("unknown-armed".to_string(), cap(5, true, None)),
-            ("unknown-off".to_string(), cap(6, false, None)),
-        ];
-        let (armed, refused) = publishable_rooms(crate::chia_network::ChiaNet::Testnet11, &caps);
-        assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])]);
-        assert_eq!(
-            refused,
-            vec!["public-armed".to_string(), "unknown-armed".to_string()],
-            "armed rooms that are public, or whose posture an old browser never sent, are named so the operator learns why nothing publishes"
-        );
-    }
-
-    /// 🛑 Stage 4 design §4.5 (2): off a test network no room publishes a v1
-    /// record, armed and known private or not; a test network keeps N8's
-    /// answer.
-    #[test]
-    fn off_a_test_network_no_room_publishes_a_v1_record() {
-        use crate::chia_network::ChiaNet;
-        let caps = vec![
-            ("private-armed".to_string(), cap(1, true, Some(false))),
-            ("public-armed".to_string(), cap(3, true, Some(true))),
-        ];
-        for net in ChiaNet::ALL {
-            let (armed, refused) = publishable_rooms(net, &caps);
-            if net.is_test() {
-                assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])], "{net:?}");
-                assert_eq!(refused, vec!["public-armed".to_string()], "{net:?}");
-            } else {
-                assert!(armed.is_empty() && refused.is_empty(), "{net:?}: {armed:?} {refused:?}");
-            }
-        }
-    }
-
     /// 🛑 Stage 4 design §4.5 (1): the builder of every memo spend the SSF
     /// wallet's keys pay for refuses off a test network, before it signs,
     /// whichever of them pays (the money key, or the beacon key made from
@@ -13263,21 +13057,6 @@ mod tests {
             assert_eq!(write_again_words(net, true), "writing it again", "{net:?}: the burner path writes again");
             assert_eq!(write_again_words(net, false) == "writing it again", money_memo_refusal(net).is_none(), "{net:?}");
         }
-    }
-
-    #[test]
-    fn publish_due_on_first_change_and_cadence() {
-        let key = [7u8; 32];
-        let t0 = Instant::now();
-        assert!(publish_due(None, &key, "a", t0), "never published -> due");
-        let ok = PublishMark { room_key: key, addrs_sig: "a".into(), at: t0, ok: true };
-        assert!(!publish_due(Some(&ok), &key, "a", t0 + Duration::from_secs(60)), "fresh OK publish is not due");
-        assert!(publish_due(Some(&ok), &key, "a,b", t0 + Duration::from_secs(1)), "address change republishes at once");
-        assert!(publish_due(Some(&ok), &[8u8; 32], "a", t0 + Duration::from_secs(1)), "room key change republishes at once");
-        assert!(publish_due(Some(&ok), &key, "a", t0 + Duration::from_secs(HEARTBEAT_OK_SECS)), "heartbeat cadence");
-        let failed = PublishMark { ok: false, ..PublishMark { room_key: key, addrs_sig: "a".into(), at: t0, ok: false } };
-        assert!(!publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
-        assert!(publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "retry cadence after a failure");
     }
 
     /// ⛓️ A spend signed for one network is signed over that network's

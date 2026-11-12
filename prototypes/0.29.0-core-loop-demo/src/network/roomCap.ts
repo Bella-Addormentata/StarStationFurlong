@@ -1,7 +1,6 @@
 import * as ed from '@noble/ed25519';
 import { blake3 } from '@noble/hashes/blake3';
 import { sha512 } from '@noble/hashes/sha512';
-import type { ChiaNetwork } from '../chiaNetwork.ts';
 import type { ContactCard, RoomBootstrap, RoomMemberHint } from './protocol.ts';
 
 // @noble's synchronous verify needs the hash wired once (keypair.ts does the
@@ -11,25 +10,24 @@ if (!ed.etc.sha512Sync) ed.etc.sha512Sync = (...m: Uint8Array[]) => sha512(ed.et
 /**
  * The `cap` envelope payload the browser hands its LOCAL node over loopback
  * (ChiaHub Slice 3; #231 N8 + D3). The node needs the room key to derive the
- * room's chain lookup hint and to seal presence records; the two flags say what
- * it may do with it.
+ * room's chain lookup hint and its knock lane; the flags say what it may do
+ * with it. Nothing is written under a room key: the Chia Mesh switch that
+ * armed a room's own record (`chiaMode`) is gone with that record's writer
+ * (stage 4 design §13 row 12), and the payload no longer carries the flag.
  *
- *  - `chiaMode`   the per-room "publish my presence here" toggle. Publishing
- *                 only; the node reads the chain for every room regardless (D3).
  *  - `publicRoom` N8: this room is PUBLIC SPACE — its seed ships inside every
  *                 build (the welcome room) or its passage policy lets anyone walk
- *                 in, so anyone can derive its hint. The node never publishes an
- *                 address under such a key, armed or not, and never reads under
+ *                 in, so anyone can derive its hint. The node uses and hands
+ *                 out no card under such a key and never reads under
  *                 it either (D6). The node also recognises the bundled key on its
  *                 own (`chia_rooms.rs`), so this flag is belt, that is braces.
  *                 `null`: not known YET — the first cap of a join goes out before
  *                 the room's door documents are bound (#272 review round 3); the
- *                 node then publishes nothing under the key, as for PUBLIC, but
+ *                 node then hands out no card of ours, as for PUBLIC, but
  *                 may use the cards a private pass brought (`passPrivate`).
  */
 export interface RoomCapPayload {
   roomKeyB64: string;
-  chiaMode: boolean;
   publicRoom: boolean | null;
   /** Monotonic within a browser session (the ms clock, bumped past the last
    *  one sent). Every cap rides its own stream and streams may land out of
@@ -54,11 +52,11 @@ export interface RoomCapPayload {
   /** #272 review round 9: sent by a background PASS PREFETCH (the room list
    *  warming a room the player holds a pass to, roomPasses.ts), not by the
    *  primary session. The prefetch cannot read the room's posture, so the cap
-   *  says unknown and arms nothing: the node may use the pass's cards — file
+   *  says unknown: the node may use the pass's cards — file
    *  them, knock on the host when every live route fails, which is what makes
    *  an unreachable room's prefetch ready at all — and knows the room's key
    *  (the bundled one, for the welcome room's beacon fall-through); it
-   *  publishes nothing and hands out no card of ours. The node never lets it
+   *  hands out no card of ours. The node never lets it
    *  replace a cap the primary session sent. */
   prefetch?: boolean;
 }
@@ -68,7 +66,6 @@ export const MAX_CAP_MEMBER_CARDS = 64;
 
 export function buildRoomCapPayload(
   roomKeyB64: string,
-  chiaMode: boolean,
   publicRoom: boolean | null | undefined,
   seq: number,
   shareCard: boolean = true,
@@ -77,7 +74,6 @@ export function buildRoomCapPayload(
 ): RoomCapPayload {
   const payload: RoomCapPayload = {
     roomKeyB64,
-    chiaMode: !prefetch && !!chiaMode,
     publicRoom: prefetch || publicRoom === undefined || publicRoom === null ? null : !!publicRoom,
     seq: Math.max(0, Math.floor(seq)) || 0,
     shareCard: shareCard !== false,
@@ -219,7 +215,6 @@ export function forgetSessionFlags(): void {
 }
 
 const shareCardKey = (roomId: string) => `ssf-chia-share-card-${roomId}`;
-const chiaModeKey = (roomId: string) => `ssf-chia-mode-${roomId}`;
 
 /** The per-room "share my card" flag (`ssf-chia-share-card-<roomId>`): on
  *  unless the player turned it off — this session (`setShareCard`) or in a
@@ -511,28 +506,4 @@ export function roomPostureProbe(src: PostureSources): (roomId: string) => boole
  *  cached card rides in no pass, whatever a room's own switch says. */
 export function nodeSharesCard(fp: { share_card?: boolean } | null | undefined): boolean {
   return fp?.share_card !== false;
-}
-
-/** The per-room chia-mode flag (`ssf-chia-mode-<roomId>`): this session's
- *  word (`setChiaMode`) before the stored one; tolerant of privacy mode where
- *  localStorage throws. */
-export function readChiaMode(roomId: string): boolean {
-  return readFlag(chiaModeKey(roomId), (stored) => stored === '1');
-}
-
-/** The Chia Mesh switch's word for `roomId`, effective at once for every
- *  reader, persisted when the browser allows. */
-export function setChiaMode(roomId: string, on: boolean): void {
-  writeFlag(chiaModeKey(roomId), on);
-}
-
-/** 🛑 Does the page show the Chia Mesh switch for the local node's network
- *  (the fingerprint's `chia_net`)? Only on a test network (stage 4 design
- *  §4.5 (2)): the switch arms the room's v1 record, whose hint is per room
- *  per day and whose body carries every live address, and the node writes
- *  none off a test network. Before any fingerprint is read (`undefined`) it
- *  shows as it always did; on a network this page does not know (`null`) it
- *  does not. */
-export function chiaMeshOffered(net: ChiaNetwork | null | undefined): boolean {
-  return net === undefined || net?.test === true;
 }

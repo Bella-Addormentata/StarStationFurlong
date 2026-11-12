@@ -23,7 +23,7 @@ import type {
   TransportMode,
 } from './protocol.ts';
 import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
-import { buildRoomCapPayload, memberCardsOf, nextCapSeq, readChiaMode, readShareCard } from './roomCap.ts';
+import { buildRoomCapPayload, memberCardsOf, nextCapSeq, readShareCard } from './roomCap.ts';
 import type { FaucetOp, FaucetRequestTicket } from '../faucetDish.ts';
 
 export interface NetworkDebugInfo {
@@ -153,14 +153,12 @@ export class NetworkProvider implements NetworkProviderPort {
       this.#startPingProbe(wt);
 
       // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + flags over a
-      // one-shot `cap` stream, so it can derive the room's chia lookup hint,
-      // read presence for it (on by default, #231 D3) and publish presence when
-      // armed. Loopback only. The chia-mode flag is the "advanced chia mesh
-      // mode" toggle — sourced from localStorage until the management-computer
-      // UI sets it; the public-room flag (N8) comes from the probe main.ts
-      // installs and is re-sent whenever the door policy changes.
+      // one-shot `cap` stream, so it can derive the room's chia lookup hint
+      // and read presence for it (on by default, #231 D3). Loopback only.
+      // The public-room flag (N8) comes from the probe main.ts installs and
+      // is re-sent whenever the door policy changes.
       if (boot.roomKeyB64) {
-        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
+        void this.sendRoomCap(boot.roomId, boot.roomKeyB64);
       }
 
     } catch (err: any) {
@@ -238,17 +236,17 @@ export class NetworkProvider implements NetworkProviderPort {
     this.#tickHandler = handler;
   }
 
-  /** ChiaHub Slice 3: deliver this room's key (+ per-room chia-mode flag) to the
+  /** ChiaHub Slice 3: deliver this room's key (+ its per-room flags) to the
    *  LOCAL node over a one-shot `cap` stream. The node needs the room key to
-   *  derive the room's chia lookup hint and seal presence records; it holds the
+   *  derive the room's chia lookup hint and its knock lane; it holds the
    *  room's plaintext doc already, so this is loopback-only and exposes nothing
    *  new. Fire-and-forget. The payload also carries N8's `publicRoom` flag from
    *  the installed probe (`null` while the probe cannot say yet, #272 review
    *  round 3); a provider with no probe sends no cap at all — see the guard
    *  below — except a pass prefetch's (`markPassPrefetch`, round 9), whose
-   *  cap says unknown and arms nothing. Same `[u32-LE len][JSON]`
+   *  cap says unknown. Same `[u32-LE len][JSON]`
    *  framing the node reads on every browser->node stream. */
-  async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
+  async sendRoomCap(roomId: string, roomKeyB64: string): Promise<void> {
     if (!this.#wt || this.#mode === 'offline') return;
     // N8: only a provider that can vouch for the room's posture speaks for
     // it. The background providers (far-door and departure writes, direct
@@ -261,7 +259,7 @@ export class NetworkProvider implements NetworkProviderPort {
     // the room here, in the background, and the primary session joins only
     // once that is READY — which, with every live route to the host failing,
     // takes the knock the pass's cards allow. Its cap says the posture is
-    // unknown, carries the pass's cards and arms nothing, and the node never
+    // unknown and carries the pass's cards, and the node never
     // lets it replace a cap the primary session sent.
     const prefetch = this.#passPrefetch;
     if (!this.#publicRoomProbe && !prefetch) return;
@@ -272,7 +270,7 @@ export class NetworkProvider implements NetworkProviderPort {
       // carries for its members (this session's boot, when it is this room's).
       const boot = this.#boot;
       const memberCards = boot?.roomId === roomId ? memberCardsOf(boot.memberHints) : [];
-      const payload = buildRoomCapPayload(roomKeyB64, chiaMode, publicRoom, this.#capSeq, readShareCard(roomId), memberCards, prefetch);
+      const payload = buildRoomCapPayload(roomKeyB64, publicRoom, this.#capSeq, readShareCard(roomId), memberCards, prefetch);
       const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
       // A few KB at most (member cards); chunked so the spread never trips an
       // argument limit. Node decodes with BASE64_STANDARD, which btoa produces.
@@ -297,26 +295,16 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
-  /** Re-send the current room's cap with a new chia-mode flag, reusing the boot
-   *  this session connected with (so the room key matches exactly). Called by the
-   *  management-computer toggle so the change takes effect without a reconnect. */
-  async resendRoomCap(chiaMode: boolean): Promise<void> {
-    const boot = this.#boot;
-    if (boot?.roomKeyB64) {
-      await this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
-    }
-  }
-
   /** N8: who decides whether a room is public space (bundled seed or PUBLIC
    *  passage). main.ts installs it on the primary provider at boot, before any
-   *  join; a provider without one never sends a cap, so a node never publishes
-   *  under a key the browser has not vouched for. */
+   *  join; a provider without one never sends a cap, so a node never hands a
+   *  card out under a key the browser has not vouched for. */
   setPublicRoomProbe(probe: (roomId: string) => boolean | undefined): void {
     this.#publicRoomProbe = probe;
   }
 
   /** #272 review round 9: this provider is a pass prefetch's (roomPasses.ts).
-   *  It sends the room's cap with no posture and nothing armed — the pass's
+   *  It sends the room's cap with no posture — the pass's
    *  cards, so the node can knock on a host every live route fails to reach,
    *  and the room's key, so the welcome room's beacon fall-through knows it. */
   markPassPrefetch(): void {
@@ -325,11 +313,13 @@ export class NetworkProvider implements NetworkProviderPort {
 
   /** Re-send the current room's cap with its CURRENT flags — called when the
    *  door policy changes, so a room flipping between public and private passage
-   *  reaches the node without a reconnect. */
+   *  reaches the node without a reconnect, and by the Share Card switch, so
+   *  its word does too. The boot this session connected with is reused, so
+   *  the room key matches exactly. */
   async refreshRoomCap(): Promise<void> {
     const boot = this.#boot;
     if (boot?.roomKeyB64) {
-      await this.sendRoomCap(boot.roomId, boot.roomKeyB64, readChiaMode(boot.roomId));
+      await this.sendRoomCap(boot.roomId, boot.roomKeyB64);
     }
   }
 

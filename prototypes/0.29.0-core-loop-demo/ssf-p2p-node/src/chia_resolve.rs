@@ -197,9 +197,11 @@ impl HintCursor {
 }
 
 /// 🕳️ Whether room-keyed (v1) records are read on `net`: on a test network
-/// only. No station writes one off a test network: a room's Chia mesh
-/// switch is not offered there, and the SSF wallet, which pays for a v1
-/// record, pays for no write there (`chia_publish::money_memo_refusal`). A
+/// only. This build writes none on any network (the writer went in stage 4
+/// PR 12), and an older build wrote one on a test network only: its Chia
+/// Mesh switch was not offered anywhere else, and the SSF wallet, which
+/// paid for a v1 record, pays for no write off a test network
+/// (`chia_publish::money_memo_refusal`). So off a test network a
 /// read could find nothing a station wrote, and would show the full node
 /// this station's private rooms as hints, in the very bytes it asks a test
 /// network's node for: a v1 hint is the room key's and the day's alone and

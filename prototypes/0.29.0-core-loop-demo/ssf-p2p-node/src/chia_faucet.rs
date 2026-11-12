@@ -1860,7 +1860,6 @@ mod tests {
         use crate::chia_chain::CLIENTS_BUILT;
         let cap = ChiaRoomCap {
             room_key: [3; 32],
-            chia_mode: true,
             share_card: true,
             public_room: Some(false),
             seq: 0,
