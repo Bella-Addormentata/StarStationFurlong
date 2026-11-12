@@ -61,7 +61,10 @@ new welcome room, paste the link, re-export the atlas from the devtools console)
 Keep the host node running: until an install has reached the welcome room once,
 every start docks there, and if nobody answers it stays docked in an empty copy
 of the room and keeps asking (the rules are in
-[`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). It no
+[`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). A link
+to the welcome room that another player hands a newcomer (`?seed=`) is used as
+given, with the bundled pass's routes beside its own, so the newcomer's computer
+also dials the node that link names. It no
 longer falls back to a module of its own, so today a new player's first room
 depends on that one node: the
 [External Infrastructure Register](docs/TDD/ExternalInfrastructureRegister.md)

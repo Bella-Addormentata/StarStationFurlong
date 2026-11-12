@@ -33,6 +33,7 @@ import {
   routeHint,
   setShareCard,
   type PostureSources,
+  withPassRoutes,
   writeNodeCard,
 } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
@@ -476,18 +477,17 @@ import {
   defaultStationAtlas,
 } from "./defaultStation";
 import {
-  WELCOME_FIRST_WAIT_MS,
   bootRoute,
   clearWelcomePending,
   markWelcomePending,
+  seekWelcome,
   seekingWelcome,
   welcomeArrivedLine,
   welcomeMarked,
+  welcomeNodeLostLine,
   welcomeRetryLine,
   welcomeSeekDelayMs,
   welcomeStateHere,
-  welcomeStillWaitingLine,
-  welcomeWaitingLine,
 } from "./welcomeOnly";
 import type { MarkStore } from "./welcomeOnly";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
@@ -844,15 +844,15 @@ const IS_FIRST_RUN_INSTALL = !hasStoredIdentity();
 /** 🛰️ Welcome only (welcomeOnly.ts): this page has seen the welcome room's
  *  shared state arrive. From then on the install is a returning one. */
 let welcomeReachedThisPage = false;
-/** 🛰️ The session (sessionEpoch) the seek's one loop runs for, so a boot
- *  that was superseded mid-join never starts a second (keepSeekingWelcome). */
+/** 🛰️ The session (sessionEpoch) the seek's one loop runs for, so no
+ *  session ever runs two (seekWelcomeIn). */
 let welcomeSeekEpoch: number | null = null;
 /** 🛰️ Dockings in a row that could not start: paces the retry
  *  (welcomeSeekDelayMs), and the line is said for the first only. */
 let welcomeDockFailures = 0;
 let welcomeRetryTimer: number | null = null;
 /** 🛰️ The dial-failure advice was said once while seeking: the node dials
- *  again at every ask, and the seek's own line says the rest. */
+ *  again at every ask (seekWelcome), and the seek's own line says the rest. */
 let welcomeDialFailureSaid = false;
 
 /** 🛰️ Where the welcome mark is kept; null where storage is closed. */
@@ -1515,6 +1515,16 @@ async function bootstrapNetworking() {
         "BASIC · join-only (no local node)",
         "#ffb300",
       );
+      // 🛰️ Welcome only: an install still on its way to the welcome room whose
+      // own node is not up yet (a slow start, a node started after the game)
+      // looks again by itself at the seek's pace, and docks once the node
+      // answers — it is not left offline until a manual Retry-node.
+      if (route === "dock") {
+        if (welcomeDockFailures === 0) {
+          logToPhoneSystem(welcomeRetryLine(DEFAULT_STATION.name));
+        }
+        scheduleWelcomeRetry();
+      }
       return;
     }
 
@@ -1525,19 +1535,25 @@ async function bootstrapNetworking() {
     // the imported-pass path exactly: the pass is merged with the LOCAL node
     // (resolveBridgeBootstrap), so the browser dials its own node and the node
     // bridges to the station's iroh hints, and it is a JOIN, never a claim. An
-    // override that is the welcome room itself (this docking's own, kept for
-    // Retry-node) docks afresh the same way. The install that HOSTS the
-    // welcome room is never seeking: its home IS that room. A welcome link no
-    // build should ship, one that names a room and does not decode here,
-    // leaves the boot as it was (defaultStation.test.ts parses the shipped
-    // one).
+    // override that is the welcome room itself — a pass to it the player
+    // supplied (?seed=, Use-link), or this docking's own, kept for Retry-node
+    // — is a docking too, and that pass STANDS: its routes may name a holder
+    // of the room the bundled pass does not, or fresher addresses, so they
+    // are kept and the bundled pass's routes ride beside them
+    // (withPassRoutes). The install that HOSTS the welcome room is never
+    // seeking: its home IS that room. A welcome link no build should ship,
+    // one that names a room and does not decode here, leaves the boot as it
+    // was (defaultStation.test.ts parses the shipped one).
     if (route === "dock") {
       const welcome = decodeBootstrapInput(DEFAULT_STATION.welcomeRoomLink);
       if (welcome) {
         // Set before the resolve: a failure from here on is the docking's,
         // and is tried again rather than left offline (the catch below).
         arrivingAtDefaultStation = true;
-        boot = await resolveBridgeBootstrap(welcome);
+        boot =
+          override && override.roomId === welcome.roomId
+            ? withPassRoutes(boot, welcome)
+            : await resolveBridgeBootstrap(welcome);
         // Persists like every override: a Retry-node stays classified as a
         // join and re-dials the station rather than claiming home.
         pendingBootstrapOverride = boot;
@@ -1555,33 +1571,20 @@ async function bootstrapNetworking() {
     // race this prevents. pendingBootstrapOverride intentionally persists
     // after use, so a Retry-node following a seed import stays classified as
     // a join.
-    const epochBeforeJoin = sessionEpoch;
     await joinRoom(
       boot,
       /* claimRoomDefaults */ !override && !arrivingAtDefaultStation,
     );
 
-    if (arrivingAtDefaultStation) {
-      // The join above only proves the LOCAL node answered. The station is
-      // reached when the room's own state lands over the bridge (roomInfo
-      // owner+name: welcomeStateHere). Nothing is held meanwhile: the exterior
-      // already shows the station (bundled atlas), and entering early lands in
-      // a replica that fills in as the sync arrives.
-      // joinRoom claims exactly one epoch: any other count means a newer
-      // session (a link, a Retry-node) owns the state, and its own boot waits.
-      const epochAtJoin = sessionEpoch;
-      const sync = yjsSync;
-      if (epochAtJoin !== epochBeforeJoin + 1 || !sync) return;
-      welcomeDockFailures = 0;
-      await awaitWelcomeState(sync, WELCOME_FIRST_WAIT_MS);
-      // (The join's own watch has usually said so already: joinRoomAtEpoch.)
-      if (noteWelcomeReached(sync)) return;
-      if (epochAtJoin !== sessionEpoch || yjsSync !== sync) return;
-      // 🛰️ No answer yet. The install stays docked, says so, and keeps asking
-      // for as long as it takes — it never boots a module of its own instead
-      // (owner direction 2026-11-12). Detached: the boot itself is done.
-      void keepSeekingWelcome(epochAtJoin, sync);
-    }
+    // 🛰️ The join above only proves the LOCAL node answered. The station is
+    // reached when the room's own state lands over the bridge (roomInfo
+    // owner+name: welcomeStateHere), and the session's own seek waits for
+    // that and keeps asking for as long as it takes (seekWelcomeIn, started
+    // by the join) — the install never boots a module of its own instead
+    // (owner direction 2026-11-12). Nothing is held meanwhile: the exterior
+    // already shows the station (bundled atlas), and entering early lands in
+    // a replica that fills in as the sync arrives.
+    if (arrivingAtDefaultStation) welcomeDockFailures = 0;
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -1592,8 +1595,8 @@ async function bootstrapNetworking() {
     await leaveRoom();
     // 🛰️ Welcome only (welcomeOnly.ts): the docking itself could not start —
     // the player's own node did not take the join. (A welcome room that does
-    // not answer is no failure: that boot stays docked and keeps asking,
-    // above.) It never falls back to the home module: said once, and tried
+    // not answer is no failure: that session stays docked and keeps asking,
+    // seekWelcomeIn.) It never falls back to the home module: said once, and tried
     // again by itself at the seek's pace, then on to the offline readouts
     // below. The override stays the welcome room's, so Retry-node docks too
     // and nothing can claim a local fork of it (review of #156, round 2).
@@ -2521,7 +2524,7 @@ async function joinRoomAtEpoch(
               "#ff1744",
             );
             // 🛰️ While this install waits at the welcome room its node dials
-            // again at every ask (keepSeekingWelcome): the advice is said for
+            // again at every ask (seekWelcome): the advice is said for
             // the first failure, and the seek's own line says the rest. The
             // NETWORK row above shows every one.
             const seekingHere =
@@ -3281,13 +3284,13 @@ async function joinRoomAtEpoch(
   }, 1_000);
   setActivePassRoom(boot.roomId);
   // 🛰️ Welcome only (welcomeOnly.ts): for an install still on its way here,
-  // this room's own state landing IS the arrival, by whichever path the join
-  // came (the docking at boot, Retry-node, GO TO, a pass) and however long
-  // after the join. After the pass manager is up: the arrival files the pass.
+  // this room's own state landing IS the arrival, and until it lands the
+  // session keeps asking — by whichever path the join came (the docking at a
+  // start, Retry-node, GO TO, a pass, a failed room swap falling back here)
+  // and however long after the join. After the pass manager is up: the
+  // arrival files the pass.
   if (boot.roomId === DEFAULT_STATION.welcomeRoomId && welcomeSeeking()) {
-    onWelcomeState(sync, () => {
-      noteWelcomeReached(sync);
-    });
+    seekWelcomeIn(epoch, sync);
   }
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
@@ -4088,34 +4091,45 @@ function onRoomStateReady(sync: YjsSync, fn: () => void): void {
  *  (welcomeStateHere: roomInfo owner+name): at once if it is, else when the
  *  write that brings it lands. Narrower than onRoomStateReady on purpose: a
  *  post-link sync with another install that is itself still waiting brings
- *  no state, and is no arrival. The watch ends with the doc. */
-function onWelcomeState(sync: YjsSync, fn: () => void): void {
+ *  no state, and is no arrival. Returns the way to stop watching; the watch
+ *  ends with the doc too. */
+function onWelcomeState(sync: YjsSync, fn: () => void): () => void {
   const roomMap = sync.doc.getMap("roomInfo");
   if (welcomeStateHere(roomMap)) {
     fn();
-    return;
+    return () => {};
   }
   let done = false;
-  const check = () => {
+  const check = (): void => {
     if (done || !welcomeStateHere(roomMap)) return;
+    stop();
+    fn();
+  };
+  const stop = (): void => {
+    if (done) return;
     done = true;
     try {
       roomMap.unobserve(check);
     } catch {
       /* doc may be destroyed */
     }
-    fn();
   };
   roomMap.observe(check);
+  return stop;
 }
 
 /** 🛰️ Resolve once the welcome room's own state is in `sync`'s doc
- *  (onWelcomeState), or after `timeoutMs`. Never rejects; a doc destroyed
- *  mid-wait resolves on the timer, and the caller checks its session. */
+ *  (onWelcomeState), or after `timeoutMs`, and stop watching either way: a
+ *  seek waits many times on one doc. Never rejects; a doc destroyed mid-wait
+ *  resolves on the timer, and the caller checks its session. */
 function awaitWelcomeState(sync: YjsSync, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve) => {
-    const timer = window.setTimeout(resolve, timeoutMs);
-    onWelcomeState(sync, () => {
+    let stop: () => void = () => {};
+    const timer = window.setTimeout(() => {
+      stop();
+      resolve();
+    }, timeoutMs);
+    stop = onWelcomeState(sync, () => {
       window.clearTimeout(timer);
       resolve();
     });
@@ -4151,37 +4165,68 @@ function noteWelcomeReached(sync: YjsSync | null): boolean {
 }
 
 /**
- * 🛰️ The welcome room has not answered the first wait: stay docked and keep
- * asking until it does (welcomeOnly.ts). One loop per session. Each round
- * re-issues the sync handshake — its envelope carries the pass's hints, and
- * the node dials every hint it is not already dialing or linked to, so an ask
- * while a dial runs costs nothing — then waits welcomeSeekDelayMs for the
- * room's state. It ends on arrival, or when the session is no longer this one
- * (the player followed a link, or Retry-node docked afresh and waits itself).
+ * 🛰️ The seek of this welcome-room session (welcomeOnly.ts seekWelcome), for
+ * an install still on its way here: wait for the room's state, say when it
+ * has not answered, and keep asking until it does. One per session, started
+ * by the join itself, so every way into the room has it. Each ask re-issues
+ * the sync handshake — its envelope carries the pass's hints, and the node
+ * dials every hint it is not already dialing or linked to, so an ask while a
+ * dial runs costs nothing. It ends on arrival, or when the session is no
+ * longer this one (the player followed a link, or Retry-node docked afresh
+ * and seeks itself).
+ *
+ * It also ends when the link to the player's own node closes under the
+ * session (the node restarted or stopped): nothing reconnects a session's
+ * transport, so asking on would reach nobody while the phone said it kept
+ * trying. The dead session is left and the docking starts again at the
+ * retry's pace, which finds the node when it is back.
  */
-async function keepSeekingWelcome(epoch: number, sync: YjsSync): Promise<void> {
+function seekWelcomeIn(epoch: number, sync: YjsSync): void {
   if (welcomeSeekEpoch === epoch) return;
   welcomeSeekEpoch = epoch;
-  logToPhoneSystem(welcomeWaitingLine(DEFAULT_STATION.name));
-  for (let round = 1; ; round++) {
-    sync.resync();
-    await awaitWelcomeState(sync, welcomeSeekDelayMs(round));
-    if (noteWelcomeReached(sync)) return;
-    if (epoch !== sessionEpoch || yjsSync !== sync) return;
-    logToPhoneSystem(welcomeStillWaitingLine(DEFAULT_STATION.name));
-  }
+  const live = (): boolean => epoch === sessionEpoch && yjsSync === sync;
+  void seekWelcome({
+    name: DEFAULT_STATION.name,
+    wait: (ms) => awaitWelcomeState(sync, ms),
+    linkLost: networkProvider.whenLinkLost(),
+    ask: () => sync.resync(),
+    arrived: () => noteWelcomeReached(sync),
+    current: live,
+    say: logToPhoneSystem,
+  }).then(async (end) => {
+    if (end !== "link-lost") return;
+    console.warn(`${DEFAULT_STATION.name}: the link to the local node closed while waiting — docking afresh.`);
+    logToPhoneSystem(welcomeNodeLostLine(DEFAULT_STATION.name));
+    // A room swap under way owns the session: its own join fails on the
+    // closed link and it restores or strands by itself. The retry looks
+    // again once it has ended.
+    try {
+      if (!transitInProgress && live()) {
+        await leaveRoom();
+        updateHUDNode("OFFLINE", "#ff1744");
+        updateHUDP2P("OFFLINE", "#ff1744");
+      }
+    } finally {
+      scheduleWelcomeRetry();
+    }
+  });
 }
 
-/** 🛰️ A docking that could not start is tried again by itself, one timer at
- *  a time, at the seek's pace (bootstrapNetworking's catch). Nothing is done
- *  when the install has arrived meanwhile, or a session is live or on its way
- *  (the player followed a link, or pressed Retry-node). */
+/** 🛰️ A docking that could not start, or whose link to the player's own node
+ *  closed, is tried again by itself, one timer at a time, at the seek's pace
+ *  (bootstrapNetworking, seekWelcomeIn). Nothing is done when the install has
+ *  arrived meanwhile or a session is live (the player followed a link, or
+ *  pressed Retry-node); a room swap under way is looked at again after it. */
 function scheduleWelcomeRetry(): void {
   if (welcomeRetryTimer !== null) return;
   const wait = welcomeSeekDelayMs(welcomeDockFailures++);
   welcomeRetryTimer = window.setTimeout(() => {
     welcomeRetryTimer = null;
-    if (!welcomeSeeking() || yjsSync || transitInProgress) return;
+    if (!welcomeSeeking() || yjsSync) return;
+    if (transitInProgress) {
+      scheduleWelcomeRetry();
+      return;
+    }
     void bootstrapNetworking();
   }, wait);
 }

@@ -24,7 +24,9 @@
  * was last in, and its own module is made when it asks for one (a door
  * keypad's PROVISION NEW MODULE) or when a later start has nowhere to resume.
  *
- * This file is the rules, pure; main.ts `bootstrapNetworking` applies them.
+ * This file is the rules, pure; main.ts applies them: `bootstrapNetworking`
+ * picks the room, and every welcome-room session of a seeking install runs
+ * the seek (`seekWelcome`), whichever way the player came into the room.
  */
 
 /** localStorage key of the mark: this install set out for the welcome room
@@ -145,6 +147,51 @@ export function welcomeSeekDelayMs(round: number): number {
   return Math.min(WELCOME_SEEK_CAP_MS, WELCOME_FIRST_WAIT_MS * 2 ** Math.min(n, 4));
 }
 
+/** What one welcome-room session of a seeking install needs for its seek
+ *  (main.ts hands these in; a test passes its own). */
+export interface WelcomeSeekDeps {
+  /** The welcome room's name, for the lines. */
+  name: string;
+  /** Wait up to `ms` for the room's state to land; resolves either way. */
+  wait(ms: number): Promise<void>;
+  /** Settles when this session's link to the player's own node is lost (the
+   *  node went away); pending for good otherwise. */
+  linkLost: Promise<void>;
+  /** Ask again: one sync handshake to the player's own node. */
+  ask(): void;
+  /** Whether the welcome room's state is here now; records the arrival. */
+  arrived(): boolean;
+  /** Whether this session is still the live one. */
+  current(): boolean;
+  say(line: string): void;
+}
+
+/** How a session's seek ended. It never ends while the room stays silent. */
+export type WelcomeSeekEnd = 'arrived' | 'superseded' | 'link-lost';
+
+/**
+ * The seek of ONE welcome-room session of an install still on its way there,
+ * by whichever path the session began (the docking at a start, Retry-node, a
+ * pass, a room swap that fell back here): wait the first wait, say the room
+ * has not answered, then ask again and wait at welcomeSeekDelayMs's pace for
+ * as long as it takes. It ends when the room's state arrives, when the
+ * session is no longer the live one, or when the link to the player's own
+ * node is lost under it — asking a closed link would reach nobody, so the
+ * caller docks afresh instead of saying it keeps trying.
+ */
+export async function seekWelcome(deps: WelcomeSeekDeps): Promise<WelcomeSeekEnd> {
+  const lost = deps.linkLost.then(() => true);
+  for (let round = 0; ; round++) {
+    // The join itself was the first ask.
+    if (round > 0) deps.ask();
+    const linkLost = await Promise.race([deps.wait(welcomeSeekDelayMs(round)).then(() => false), lost]);
+    if (deps.arrived()) return 'arrived';
+    if (!deps.current()) return 'superseded';
+    if (linkLost) return 'link-lost';
+    deps.say(round === 0 ? welcomeWaitingLine(deps.name) : welcomeStillWaitingLine(deps.name));
+  }
+}
+
 /** The line once the first wait ends with no answer. */
 export function welcomeWaitingLine(name: string): string {
   return `⏳ ${name} has not answered yet. Your computer keeps trying, and this room fills in by itself when it answers. Until then it is empty.`;
@@ -159,6 +206,12 @@ export function welcomeStillWaitingLine(name: string): string {
  *  did not take the join): the game tries again by itself. */
 export function welcomeRetryLine(name: string): string {
   return `⚠️ The link to ${name} could not start. Your computer tries again by itself.`;
+}
+
+/** The line when the player's own node stops answering while the install
+ *  waits in the welcome room: the docking starts again once it is back. */
+export function welcomeNodeLostLine(name: string): string {
+  return `⚠️ Your computer's own node stopped answering, so the link to ${name} is down. It starts again by itself when the node is back.`;
 }
 
 /** The line on arrival. */

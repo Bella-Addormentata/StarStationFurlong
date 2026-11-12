@@ -7,16 +7,18 @@ import {
   bootRoute,
   clearWelcomePending,
   markWelcomePending,
+  seekWelcome,
   seekingWelcome,
   welcomeArrivedLine,
   welcomeMarked,
+  welcomeNodeLostLine,
   welcomeRetryLine,
   welcomeSeekDelayMs,
   welcomeStateHere,
   welcomeStillWaitingLine,
   welcomeWaitingLine,
 } from './welcomeOnly';
-import type { MarkStore, WelcomeFacts } from './welcomeOnly';
+import type { MarkStore, WelcomeFacts, WelcomeSeekDeps } from './welcomeOnly';
 
 const WELCOME = 'home-aaaaaaaaaaaa';
 const HOME = 'home-bbbbbbbbbbbb';
@@ -187,16 +189,123 @@ describe('welcome only: what the player is told', () => {
     const waiting = welcomeWaitingLine('SSF-WELCOME');
     expect(waiting).toContain('SSF-WELCOME has not answered yet');
     expect(waiting).toContain('Your computer keeps trying');
-    for (const line of [waiting, welcomeStillWaitingLine('SSF-WELCOME'), welcomeRetryLine('SSF-WELCOME')]) {
+    for (const line of [waiting, welcomeStillWaitingLine('SSF-WELCOME'), welcomeRetryLine('SSF-WELCOME'), welcomeNodeLostLine('SSF-WELCOME')]) {
       expect(line).toContain('SSF-WELCOME');
       expect(line).not.toMatch(/your own module|booting|station node/i);
     }
     expect(welcomeRetryLine('SSF-WELCOME')).toContain('tries again by itself');
+    // A node that went away is the player's own, and is said so: no claim that anything keeps trying meanwhile.
+    expect(welcomeNodeLostLine('SSF-WELCOME')).toContain("Your computer's own node stopped answering");
+    expect(welcomeNodeLostLine('SSF-WELCOME')).not.toMatch(/keeps trying/);
   });
 
   it('on arrival says how a room of one’s own is made: by asking', () => {
     expect(welcomeArrivedLine('SSF-WELCOME')).toBe(
       "🛰️ Welcome aboard SSF-WELCOME. Any door's keypad can PROVISION NEW MODULE when you want a room of your own.",
     );
+  });
+});
+
+describe('welcome only: the seek of one welcome-room session (seekWelcome)', () => {
+  /** A session whose waits the test ends by hand: `tick()` lets the wait under way time out. */
+  function session() {
+    const waits: number[] = [];
+    const said: string[] = [];
+    let asks = 0;
+    let endWait: () => void = () => {};
+    let loseLink: () => void = () => {};
+    const state = { arrived: false, current: true };
+    const deps: WelcomeSeekDeps = {
+      name: 'SSF-WELCOME',
+      wait: (ms) => {
+        waits.push(ms);
+        return new Promise<void>((resolve) => (endWait = resolve));
+      },
+      linkLost: new Promise<void>((resolve) => (loseLink = resolve)),
+      ask: () => void asks++,
+      arrived: () => state.arrived,
+      current: () => state.current,
+      say: (line) => void said.push(line),
+    };
+    const flush = async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    };
+    return {
+      deps, waits, said, state,
+      asks: () => asks,
+      tick: async () => { endWait(); await flush(); },
+      loseLink: async () => { loseLink(); await flush(); },
+      flush,
+    };
+  }
+
+  it('waits the first wait without asking, says the room has not answered, then asks at the pace for as long as it takes', async () => {
+    const s = session();
+    const end = seekWelcome(s.deps);
+    await s.flush();
+    expect(s.waits).toEqual([30_000]);
+    expect(s.asks()).toBe(0); // the join was the first ask
+    expect(s.said).toEqual([]);
+    await s.tick();
+    expect(s.said).toEqual([welcomeWaitingLine('SSF-WELCOME')]);
+    expect(s.asks()).toBe(1);
+    for (let i = 0; i < 6; i++) await s.tick();
+    expect(s.waits).toEqual([30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000, 300_000]);
+    expect(s.asks()).toBe(7); // one ask before every wait but the first
+    expect(s.said.slice(1)).toEqual(Array(6).fill(welcomeStillWaitingLine('SSF-WELCOME')));
+    s.state.arrived = true;
+    await s.tick();
+    await expect(end).resolves.toBe('arrived');
+    expect(s.said).toHaveLength(7); // nothing more is said by the seek: the arrival has its own line
+  });
+
+  it('ends at once on arrival, whenever in a wait it comes', async () => {
+    const s = session();
+    const end = seekWelcome(s.deps);
+    await s.flush();
+    s.state.arrived = true;
+    await s.tick(); // the wait resolves on the state landing
+    await expect(end).resolves.toBe('arrived');
+    expect(s.asks()).toBe(0);
+    expect(s.said).toEqual([]);
+  });
+
+  it('ends silently when the session is no longer the live one', async () => {
+    const s = session();
+    const end = seekWelcome(s.deps);
+    await s.tick();
+    s.state.current = false; // the player followed a link, or Retry-node docked afresh
+    await s.tick();
+    await expect(end).resolves.toBe('superseded');
+    expect(s.asks()).toBe(1);
+    expect(s.said).toEqual([welcomeWaitingLine('SSF-WELCOME')]);
+  });
+
+  it('stops asking the moment the link to the player\'s own node is lost, mid-wait', async () => {
+    const s = session();
+    const end = seekWelcome(s.deps);
+    await s.tick();
+    await s.tick();
+    expect(s.asks()).toBe(2);
+    await s.loseLink(); // no wait has to time out first
+    await expect(end).resolves.toBe('link-lost');
+    expect(s.asks()).toBe(2); // a closed link is not asked again
+    expect(s.said).toEqual([welcomeWaitingLine('SSF-WELCOME'), welcomeStillWaitingLine('SSF-WELCOME')]);
+  });
+
+  it('an arrival or a newer session counts before a lost link', async () => {
+    const a = session();
+    const endA = seekWelcome(a.deps);
+    await a.flush();
+    a.state.arrived = true;
+    await a.loseLink();
+    await expect(endA).resolves.toBe('arrived');
+
+    const b = session();
+    const endB = seekWelcome(b.deps);
+    await b.flush();
+    b.state.current = false; // our own leave closed that link: nothing to dock afresh for
+    await b.loseLink();
+    await expect(endB).resolves.toBe('superseded');
   });
 });
