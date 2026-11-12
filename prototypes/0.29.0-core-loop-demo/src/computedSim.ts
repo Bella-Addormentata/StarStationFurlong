@@ -1580,7 +1580,7 @@ export class Sim {
    *  owner's node ticks on the house's page's. */
   private async houseTick2(): Promise<void> {
     const sp = this.buyer;
-    if (!sp || !this.node2 || !this.node2Up || sp.mode !== 'up' || !this.net.connected(sp)) return;
+    if (!sp || !this.node2 || !this.node2Up || !this.net.connected(sp)) return;
     await this.as(sp, (now) => {
       if (this.node2On !== sp.p) {
         sp.p.table.setLocalHouse(this.node2!.pub);

@@ -626,7 +626,7 @@ export class SimHouse {
       }
       const read = this.readTable(comp, ctx, { u: B.u, h: B.h, sid }, (k, r) => res.houseAt(k, r) === true);
       if (!read) continue;
-      this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true);
+      this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true, current);
       // (A house of a key the game has left writes no checkpoint, and is heard at the game no more.)
       if (!current) continue;
       if (now - mem.tables.get(`${t}|${inc}`)!.firstRead >= SETTLE_MS) settled += 1;
@@ -878,7 +878,7 @@ export class SimHouse {
   }
 
   /** One table's reveal, step-down and join (house.rs table_duties). */
-  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true): void {
+  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true, joins = true): void {
     const { ctx } = read;
     const own = read.reveals.filter((h) => h.k === this.pub);
     const doneKey = `${ctx.room}|${ctx.t}|${ctx.inc}`;
@@ -1008,7 +1008,7 @@ export class SimHouse {
     // Join the next round, when it asks for no commitment of this house (nor
     // will: the round before is not one of its own still to reveal).
     const r = nextRound();
-    if (settling || r <= done || revealedNow !== null || carried(r) || joined(r) || !mine(r)) return;
+    if (settling || r <= done || revealedNow !== null || carried(r) || joined(r) || !mine(r) || !joins) return;
     // Nor when another of the owner's houses has: it joined the round, or its
     // reveal of the round before carried a commitment no step-down has lifted
     // (one house to a round: two would let a bettor see both outcomes). Past a

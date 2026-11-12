@@ -1526,6 +1526,20 @@ describe("the simulations' houses at a FAIR ONLY game that changes hands (N1)", 
     expect(written(room.house)).toMatchObject({ joins: 1, reveals: 1, stepDowns: 0, cks: 0 });
   });
 
+  it('a house of a key the game has left joins nothing, not even an unjoined round of its own key\'s', () => {
+    const room = new HandRoom();
+    room.tick(0);
+    // (Still settling: it has not joined round 1, which the transfer leaves with the seller. No page
+    // writes such a transfer: its round is past the last decided only for a close in flight, which names a commitment.)
+    room.handOver(1);
+    room.run(2 * SETTLE_MS + 2_000);
+    expect(resolved(room).chain.map((h) => [h.k, h.from])).toEqual([[owner.pub, 0], [buyer.pub, 1]]);
+    // (Nor does the buyer's house join it: the round is not its own.)
+    expect(room.recs('o:1:')).toEqual([]);
+    expect(room.recs('o:2:')).toEqual([]);
+    for (const h of [room.house, room.house2]) expect(written(h)).toMatchObject({ joins: 0, reveals: 0, stepDowns: 0, cks: 0 });
+  });
+
   it('a game that has left its key does not hold the room\'s beat off the games the house still serves', () => {
     const room = new HandRoom().start();
     room.on2 = false;
