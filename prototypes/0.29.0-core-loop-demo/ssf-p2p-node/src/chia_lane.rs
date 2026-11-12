@@ -6,7 +6,8 @@
 //! epoch hints) is what #238 shipped and stays readable for two eras. v2
 //! (#231 P6a, the fixed-layout block below) is sealed under a per-NODE contact
 //! key and filed by the chain's own clock, the seven-day era; the node's
-//! presence moves there, and the room-keyed publish retires one release later.
+//! presence moved there, and the room-keyed publish is retired: since stage 4
+//! PR 12 nothing here writes a v1 record, on any network.
 //!
 //! The chain IO lives next door: `chia_resolve` (the generic hint reader, on by
 //! default since #231 D3), `chia_watch` (the P1 beat/hold watcher), `chia_rooms`

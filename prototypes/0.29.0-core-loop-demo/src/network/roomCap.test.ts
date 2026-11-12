@@ -9,7 +9,6 @@ import {
   bridgeMemberHints,
   buildRoomCapPayload,
   cardsForPass,
-  chiaMeshOffered,
   collectMemberHints,
   contactCardSignBytes,
   forgetSessionFlags,
@@ -23,19 +22,16 @@ import {
   normalizeContactCard,
   normalizeMemberHint,
   passageReading,
-  readChiaMode,
   readNodeCard,
   readShareCard,
   roomIsPublicSpace,
   roomPosture,
   roomPostureProbe,
   routeHint,
-  setChiaMode,
   setShareCard,
   type PostureSources,
   verifyContactCard,
 } from './roomCap';
-import { MAINNET, TESTNET11 } from '../chiaNetwork';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
 
@@ -54,27 +50,26 @@ const signed = (name: string, issuedAt = 100, ckByte = 7) => {
 };
 
 describe('room cap payload (N8 / D3)', () => {
-  it('carries the key, both flags coerced to booleans, and the sequence number', () => {
-    expect(buildRoomCapPayload('k', true, false, 7)).toEqual({ roomKeyB64: 'k', chiaMode: true, publicRoom: false, seq: 7, shareCard: true });
-    expect(buildRoomCapPayload('k', 0 as unknown as boolean, 1 as unknown as boolean, 2.9)).toEqual({
+  it('carries the key, the posture coerced to a boolean, and the sequence number', () => {
+    expect(buildRoomCapPayload('k', false, 7)).toEqual({ roomKeyB64: 'k', publicRoom: false, seq: 7, shareCard: true });
+    expect(buildRoomCapPayload('k', 1 as unknown as boolean, 2.9)).toEqual({
       roomKeyB64: 'k',
-      chiaMode: false,
       publicRoom: true,
       seq: 2,
       shareCard: true,
     });
-    expect(buildRoomCapPayload('k', true, true, Number.NaN).seq).toBe(0);
+    expect(buildRoomCapPayload('k', true, Number.NaN).seq).toBe(0);
   });
 
   it('P6b: carries the share toggle, and member cards only for a private room, capped', () => {
-    expect(buildRoomCapPayload('k', false, false, 1, false).shareCard).toBe(false);
-    expect(buildRoomCapPayload('k', false, false, 1, undefined as unknown as boolean).shareCard).toBe(true);
+    expect(buildRoomCapPayload('k', false, 1, false).shareCard).toBe(false);
+    expect(buildRoomCapPayload('k', false, 1, undefined as unknown as boolean).shareCard).toBe(true);
     const cards = [card('a'), card('b')];
-    expect(buildRoomCapPayload('k', false, false, 1, true, cards).memberCards).toEqual(cards);
-    expect(buildRoomCapPayload('k', false, true, 1, true, cards).memberCards).toBeUndefined();
-    expect(buildRoomCapPayload('k', false, false, 1, true, []).memberCards).toBeUndefined();
+    expect(buildRoomCapPayload('k', false, 1, true, cards).memberCards).toEqual(cards);
+    expect(buildRoomCapPayload('k', true, 1, true, cards).memberCards).toBeUndefined();
+    expect(buildRoomCapPayload('k', false, 1, true, []).memberCards).toBeUndefined();
     const many = Array.from({ length: MAX_CAP_MEMBER_CARDS + 5 }, (_, i) => card(`n${i}`));
-    expect(buildRoomCapPayload('k', false, false, 1, true, many).memberCards).toHaveLength(MAX_CAP_MEMBER_CARDS);
+    expect(buildRoomCapPayload('k', false, 1, true, many).memberCards).toHaveLength(MAX_CAP_MEMBER_CARDS);
   });
 
   it('P6b: a contact card needs every field with its type; the newer of two wins', () => {
@@ -110,7 +105,7 @@ describe('room cap payload (N8 / D3)', () => {
     expect(memberCardsOf(hints)).toEqual([card('a')]);
     // One malformed card leaves the roster, never the cap: the key, the
     // posture and the rest of the cards still go (round 13).
-    expect(buildRoomCapPayload('k', false, false, 1, true, memberCardsOf(hints))).toMatchObject({ roomKeyB64: 'k', memberCards: [card('a')], passPrivate: true });
+    expect(buildRoomCapPayload('k', false, 1, true, memberCardsOf(hints))).toMatchObject({ roomKeyB64: 'k', memberCards: [card('a')], passPrivate: true });
     expect(memberCardsOf(undefined)).toEqual([]);
   });
 
@@ -142,27 +137,27 @@ describe('room cap payload (N8 / D3)', () => {
     expect(roomPosture(false, false)).toBe(false);
     expect(roomPosture(false, undefined)).toBeUndefined();
     const cards = [card('host')];
-    const firstVisit = buildRoomCapPayload('k', false, undefined, 1, true, cards);
+    const firstVisit = buildRoomCapPayload('k', undefined, 1, true, cards);
     expect(firstVisit.publicRoom).toBeNull();
     expect(firstVisit.memberCards).toEqual(cards);
     expect(firstVisit.passPrivate).toBe(true);
-    expect(buildRoomCapPayload('k', false, null, 1, true, []).passPrivate).toBeUndefined();
-    expect(buildRoomCapPayload('k', false, true, 1, true, cards)).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: true, seq: 1, shareCard: true });
-    expect(buildRoomCapPayload('k', false, false, 1, true, cards).passPrivate).toBe(true);
+    expect(buildRoomCapPayload('k', null, 1, true, []).passPrivate).toBeUndefined();
+    expect(buildRoomCapPayload('k', true, 1, true, cards)).toEqual({ roomKeyB64: 'k', publicRoom: true, seq: 1, shareCard: true });
+    expect(buildRoomCapPayload('k', false, 1, true, cards).passPrivate).toBe(true);
   });
 
-  it("P6b: a pass prefetch's cap says UNKNOWN whatever it was told, arms nothing and carries the pass's cards", () => {
+  it("P6b: a pass prefetch's cap says UNKNOWN whatever it was told and carries the pass's cards", () => {
     // #272 review round 9: USE PASS warms a room on a provider with no posture
     // probe; its cap must let the node use the pass's cards (knock on a host
-    // every live route fails to reach) without claiming a posture, arming
-    // publishing or sharing our own card.
+    // every live route fails to reach) without claiming a posture or
+    // sharing our own card.
     const cards = [card('host')];
-    expect(buildRoomCapPayload('k', true, false, 3, true, cards, true)).toEqual({
-      roomKeyB64: 'k', chiaMode: false, publicRoom: null, seq: 3, shareCard: true, prefetch: true, memberCards: cards, passPrivate: true,
+    expect(buildRoomCapPayload('k', false, 3, true, cards, true)).toEqual({
+      roomKeyB64: 'k', publicRoom: null, seq: 3, shareCard: true, prefetch: true, memberCards: cards, passPrivate: true,
     });
-    expect(buildRoomCapPayload('k', true, true, 3, false, [], true)).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: null, seq: 3, shareCard: false, prefetch: true });
-    expect(buildRoomCapPayload('k', true, false, 3, true, cards)).toMatchObject({ chiaMode: true, publicRoom: false });
-    expect(buildRoomCapPayload('k', true, false, 3, true, cards).prefetch).toBeUndefined();
+    expect(buildRoomCapPayload('k', true, 3, false, [], true)).toEqual({ roomKeyB64: 'k', publicRoom: null, seq: 3, shareCard: false, prefetch: true });
+    expect(buildRoomCapPayload('k', false, 3, true, cards)).toMatchObject({ publicRoom: false });
+    expect(buildRoomCapPayload('k', false, 3, true, cards).prefetch).toBeUndefined();
   });
 
   it('P6b: a first visit\'s cap says UNKNOWN until the room\'s state is usable, then what its doors say', () => {
@@ -180,7 +175,7 @@ describe('room cap payload (N8 / D3)', () => {
     };
     const probe = roomPostureProbe(src);
     const cards = [card('host')];
-    const cap = () => buildRoomCapPayload('k', false, probe('r'), 1, true, cards);
+    const cap = () => buildRoomCapPayload('k', probe('r'), 1, true, cards);
     // 1. connect: no door documents are bound yet.
     expect(cap()).toMatchObject({ publicRoom: null, passPrivate: true, memberCards: cards });
     expect(roomIsPublicSpace(src.bundled('r'), passageReading(src, 'r'))).toBe(true); // a pass minted now carries no card
@@ -195,7 +190,7 @@ describe('room cap payload (N8 / D3)', () => {
     expect(cap()).toMatchObject({ publicRoom: false, passPrivate: true, memberCards: cards });
     expect(roomIsPublicSpace(src.bundled('r'), passageReading(src, 'r'))).toBe(false);
     state.passagePublic = true;
-    expect(cap()).toEqual({ roomKeyB64: 'k', chiaMode: false, publicRoom: true, seq: 1, shareCard: true });
+    expect(cap()).toEqual({ roomKeyB64: 'k', publicRoom: true, seq: 1, shareCard: true });
     // Another room's documents bound say nothing about this one; the bundled
     // room is public whatever is bound or synced.
     state.docsBoundFor = 'other';
@@ -228,20 +223,15 @@ describe('room cap payload (N8 / D3)', () => {
       expect(kept.get('ssf-chia-share-card-r')).toBe('1'); // the write was refused…
       expect(readShareCard('r')).toBe(false); // …and the choice holds all the same
       // The cap the node reads, and the pass a member is handed, both see OFF.
-      expect(buildRoomCapPayload('k', false, false, 1, readShareCard('r'), [card('host')]).shareCard).toBe(false);
+      expect(buildRoomCapPayload('k', false, 1, readShareCard('r'), [card('host')]).shareCard).toBe(false);
       const hints = [{ irohNodeId: 'me', nodeCard: card('me') }, { irohNodeId: 'host', nodeCard: card('host') }];
       const pass = cardsForPass(hints, false, readShareCard('r'), 'me');
       expect(pass[0].nodeCard).toBeUndefined();
       expect(pass[1].nodeCard).toEqual(card('host'));
       setShareCard('r', true);
       expect(readShareCard('r')).toBe(true);
-      // Another room is untouched; the Chia Mesh switch works the same way.
+      // Another room is untouched.
       expect(readShareCard('s')).toBe(true);
-      expect(readChiaMode('r')).toBe(false);
-      setChiaMode('r', true);
-      expect(readChiaMode('r')).toBe(true);
-      setChiaMode('r', false);
-      expect(readChiaMode('r')).toBe(false);
       // A browser that allows the write persists it too.
       refusing.setItem = (k: string, v: string) => void kept.set(k, v);
       setShareCard('t', false);
@@ -274,9 +264,6 @@ describe('room cap payload (N8 / D3)', () => {
       expect(kept.get('ssf-chia-share-card-r')).toBe('1');
       kept.set('ssf-chia-share-card-r', '0'); // another tab turned it off
       expect(readShareCard('r')).toBe(false);
-      setChiaMode('r', true);
-      kept.set('ssf-chia-mode-r', '0');
-      expect(readChiaMode('r')).toBe(false);
       // A refused write still holds for this tab…
       storage.setItem = () => {
         throw new Error('QuotaExceededError');
@@ -402,15 +389,15 @@ describe('room cap payload (N8 / D3)', () => {
     expect(bridged).toEqual([{ irohNodeId: host, irohRelayUrls: ['https://relay-b'] }, { irohNodeId: me, irohRelayUrls: ['https://relay-a'] }]);
     expect(memberCardsOf(bridged)).toEqual([]);
     // Neither the prefetch's cap nor the first cap of the join, posture unknown, calls B's pass private.
-    expect(buildRoomCapPayload('Yg==', false, null, 1, true, memberCardsOf(bridged), true))
-      .toEqual({ roomKeyB64: 'Yg==', chiaMode: false, publicRoom: null, seq: 1, shareCard: true, prefetch: true });
-    expect(buildRoomCapPayload('Yg==', false, null, 2, true, memberCardsOf(bridged))).not.toHaveProperty('passPrivate');
+    expect(buildRoomCapPayload('Yg==', null, 1, true, memberCardsOf(bridged), true))
+      .toEqual({ roomKeyB64: 'Yg==', publicRoom: null, seq: 1, shareCard: true, prefetch: true });
+    expect(buildRoomCapPayload('Yg==', null, 2, true, memberCardsOf(bridged))).not.toHaveProperty('passPrivate');
     // A private pass keeps every card it carries — one for our own node included, as its minter put it there.
     const privatePass = { ...publicPass, roomId: 'C', memberHints: [{ irohNodeId: host, nodeCard: signed('host') }, { irohNodeId: me, nodeCard: signed('me', 50) }] };
     const kept = bridgeMemberHints(privatePass, local);
     expect(memberCardsOf(kept)).toEqual([signed('host'), signed('me', 50)]);
     expect(kept.find((h) => h.irohNodeId === me)).toEqual({ irohNodeId: me, irohRelayUrls: ['https://relay-a'], nodeCard: signed('me', 50) });
-    expect(buildRoomCapPayload('Yw==', false, null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [signed('host'), signed('me', 50)], passPrivate: true });
+    expect(buildRoomCapPayload('Yw==', null, 3, true, memberCardsOf(kept), true)).toMatchObject({ memberCards: [signed('host'), signed('me', 50)], passPrivate: true });
   });
 
   it("P6b: a pass's card rides only verified, so a forged card for our node never displaces the genuine one in the passes minted here (review round 16)", () => {
@@ -508,26 +495,30 @@ describe('room cap payload (N8 / D3)', () => {
   });
 });
 
-describe('the Chia Mesh switch off a test network (stage 4 design §4.5 (2))', () => {
-  // The switch arms the room's v1 record, which the node writes on a test
-  // network only: the page shows it there, and before any fingerprint is
-  // read, as it always did.
-  it('shows on a test network and before the network is read, and nowhere else', () => {
-    expect(chiaMeshOffered(TESTNET11)).toBe(true);
-    expect(chiaMeshOffered(undefined)).toBe(true);
-    expect(chiaMeshOffered(MAINNET)).toBe(false);
-    expect(chiaMeshOffered(null)).toBe(false);
+describe('the Chia Mesh switch is gone (stage 4 PR 12)', () => {
+  // The switch armed the room's own v1 record. That record's writer is gone
+  // from the node, so the page keeps no switch, no stored flag and no cap
+  // field for it: a cap says nothing a node could take for "publish here".
+  it('no cap carries the old flag, whatever it is built from', () => {
+    for (const cap of [
+      buildRoomCapPayload('k', false, 1),
+      buildRoomCapPayload('k', true, 1),
+      buildRoomCapPayload('k', null, 1, true, [card('host')], true),
+    ]) {
+      expect(cap).not.toHaveProperty('chiaMode');
+    }
   });
 
-  it('is the row main.ts hides, by the fingerprint\'s network, and redrawn when that changes', () => {
-    const main = readFileSync(fileURLToPath(new URL('../main.ts', import.meta.url)), 'utf8');
-    const at = main.indexOf('function refreshChiaModeToggle()');
-    expect(at).toBeGreaterThan(0);
-    const body = main.slice(at, main.indexOf('\n}\n', at));
-    expect(body).toContain('getElementById("chia-mode-row")');
-    expect(body).toContain('chiaMeshOffered(localFingerprint?.chia_net)');
-    expect(main).toContain('if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();');
-    const html = readFileSync(fileURLToPath(new URL('../../index.html', import.meta.url)), 'utf8');
-    expect(html).toContain('id="chia-mode-row"');
+  it('is in neither the panel nor the page code', () => {
+    const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+    const html = read('../../index.html');
+    expect(html).not.toContain('chia-mode');
+    expect(html).toContain('id="share-card-toggle"');
+    for (const rel of ['../main.ts', './roomCap.ts', './NetworkProvider.ts', '../chiaLane.ts']) {
+      const src = read(rel);
+      for (const gone of ['chia-mode', 'ssf-chia-mode', 'readChiaMode', 'setChiaMode', 'chiaMeshOffered', 'meshFeedback', 'resendRoomCap']) {
+        expect(src, `${rel} still names ${gone}`).not.toContain(gone);
+      }
+    }
   });
 });

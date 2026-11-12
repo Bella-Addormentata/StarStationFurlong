@@ -110,7 +110,6 @@ describe('USE PASS prefetch (#231 P6b)', () => {
     expect(caps[0].room).toBe('far-room');
     expect(JSON.parse(atob(caps[0].payload as string))).toEqual({
       roomKeyB64: 'a2V5',
-      chiaMode: false,
       publicRoom: null,
       seq: expect.any(Number),
       shareCard: true,

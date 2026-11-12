@@ -138,15 +138,6 @@ const withBackOn = (text: string, lane: ChiaLane): string => {
   return back ? `${text} ${back}` : text;
 };
 
-/** The Network rows' feedback when the Chia Mesh row is ticked on or off,
- *  with the node's lane (`lane`): while Chia is off the node reads and
- *  publishes nothing on the chain, whatever the room asks. */
-export function meshFeedback(on: boolean, lane: ChiaLane | null | undefined): string {
-  if (!on) return 'Advanced Chia mesh mode OFF for this room.';
-  if (lane?.off) return withBackOn(`Advanced Chia mesh mode ON for this room, but ${chiaOffWhy(lane)}, so your node reads and publishes nothing on the chain until Chia is back on.`, lane);
-  return "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish).";
-}
-
 /** The Network rows' feedback when the Share Card row is ticked on or off,
  *  with the node's lane (`lane`): while Chia is off the node publishes
  *  nothing members can find it by on the chain, and reads no knocks. */

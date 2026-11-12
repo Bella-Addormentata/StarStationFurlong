@@ -20,20 +20,17 @@ import {
   acceptNodeCard,
   bridgeMemberHints,
   cardsForPass,
-  chiaMeshOffered,
   collectMemberHints,
   mergeMemberHints,
   nodeSharesCard,
   normalizeMemberHint,
   normalizeStringArray,
   passageReading,
-  readChiaMode,
   readNodeCard,
   readShareCard,
   roomIsPublicSpace,
   roomPostureProbe,
   routeHint,
-  setChiaMode,
   setShareCard,
   type PostureSources,
   writeNodeCard,
@@ -300,7 +297,7 @@ import {
 import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
-import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
+import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
@@ -1187,11 +1184,11 @@ const NETWORK_VIEW_STOPS =
  *  focus on it. Enter and Space keep their own meaning: a button's click
  *  (the CHIA switch's held-key guard stays on the switch), a checkbox's
  *  toggle, the drawer opening. A hidden control is skipped: the CHIA switch
- *  while it offers nothing, the collapse chevron, the Chia Mesh row off a
- *  test network, the override while its drawer is closed. Nothing moves on
- *  a phone that is put away (a control left focused inside it still
- *  receives keys), with a modifier held (Shift+↑ selects in the text box),
- *  or on a select or a slider, whose arrows turn their own values. */
+ *  while it offers nothing, the collapse chevron, the override while its
+ *  drawer is closed. Nothing moves on a phone that is put away (a control
+ *  left focused inside it still receives keys), with a modifier held
+ *  (Shift+↑ selects in the text box), or on a select or a slider, whose
+ *  arrows turn their own values. */
 function networkViewKeydown(view: HTMLElement, e: KeyboardEvent): void {
   if (!treasuryViewOnScreen(view)) return;
   if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -3497,8 +3494,8 @@ async function joinRoomAtEpoch(
     // app — the recipient watches their new deed appear in place.
     syncDeedsLedgerFromCurrentRoom();
     renderVenturesApp();
-    // Slice 3b: sync the advanced-chia-mesh toggle to this room's flag.
-    refreshChiaModeToggle();
+    // #231 P6b: sync the Share Card switch to this room's flag.
+    refreshShareCardToggle((window as unknown as { __ssfRoomId?: string }).__ssfRoomId);
   };
 
   roomMap.observe((_event) => {
@@ -9755,15 +9752,12 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // (a wallet turned on or off here, or by SSF_CHIA_LANE at the node's
   // restart; Chia turned off, or LIST ME turned, in the Network rows).
   const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null, localFingerprint?.chia_listing ?? null]);
-  const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
   // 📖 A LIST ME armed on another node, or on this one's other network (a
   // node restarted between two probes), is armed no longer: CONFIRM is for
   // the warning that was read.
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
-  // 🛑 The Chia Mesh switch follows the node's network (test networks only).
-  if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
@@ -10103,31 +10097,10 @@ async function resolveBridgeBootstrap(
   };
 }
 
-// ChiaHub Slice 3b: reflect the CURRENT room's advanced-chia-mesh flag on the
-// management-computer toggle (network-details panel). Called on room changes and
-// panel setup. The flag is per-room in localStorage (`ssf-chia-mode-<roomId>`),
-// matching how NetworkProvider reads it at connect and the node stores it per-room.
-function refreshChiaModeToggle() {
-  const toggle = document.getElementById(
-    "chia-mode-toggle",
-  ) as HTMLInputElement | null;
-  const state = document.getElementById("chia-mode-state");
-  // 🛑 Shown on a test network only (roomCap.ts chiaMeshOffered): off one
-  // the node writes no v1 room record, so the switch would arm nothing.
-  const row = document.getElementById("chia-mode-row");
-  if (row) row.style.display = chiaMeshOffered(localFingerprint?.chia_net) ? "" : "none";
-  if (!toggle) return;
-  const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-  const on = roomId ? readChiaMode(roomId) : false;
-  toggle.checked = on;
-  toggle.disabled = !roomId; // no room context yet -> nothing to toggle
-  if (state) state.textContent = on ? "ON" : "OFF";
-  refreshShareCardToggle(roomId);
-}
-
-// #231 P6b: the per-room "share my card in this room" switch beside it. On by
-// default; the flag is per-room in localStorage (`ssf-chia-share-card-<roomId>`)
-// and rides the room cap, where the node honours it for cards and its inbox.
+// #231 P6b: the per-room "share my card in this room" switch. Called on room
+// changes and panel setup. On by default; the flag is per-room in localStorage
+// (`ssf-chia-share-card-<roomId>`) and rides the room cap, where the node
+// honours it for cards and its inbox.
 function refreshShareCardToggle(roomId: string | undefined) {
   const toggle = document.getElementById(
     "share-card-toggle",
@@ -10317,35 +10290,6 @@ function setupNetworkDetailsPanel() {
   if (netView) {
     netView.addEventListener("keydown", (e) => networkViewKeydown(netView, e));
     wireNetworkViewStick(netView);
-  }
-
-  // ChiaHub Slice 3b: the "advanced Chia mesh mode" switch. Writes the per-room
-  // flag and re-sends the room cap so the node picks it up live (no reconnect).
-  const chiaToggle = document.getElementById(
-    "chia-mode-toggle",
-  ) as HTMLInputElement | null;
-  if (chiaToggle) {
-    chiaToggle.addEventListener("change", () => {
-      const roomId = (window as unknown as { __ssfRoomId?: string })
-        .__ssfRoomId;
-      const on = chiaToggle.checked;
-      const state = document.getElementById("chia-mode-state");
-      if (state) state.textContent = on ? "ON" : "OFF";
-      // Recorded for this session first, persisted on top (#272 review round
-      // 6): a refused write must not leave the switch saying one thing and
-      // every reader (the cap's refreshes) the other.
-      if (roomId) setChiaMode(roomId, on);
-      // Apply live — re-send this room's cap to the local node with the new flag.
-      void networkProvider.resendRoomCap(on);
-      if (feedback) {
-        // ⛓️ chiaLane.ts words it, and says so while Chia is off.
-        feedback.textContent = meshFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);
-        setTimeout(() => {
-          if (feedback) feedback.textContent = "";
-        }, 5000);
-      }
-    });
-    refreshChiaModeToggle();
   }
 
   // #231 P6b: the "share my card in this room" switch — writes the per-room

@@ -14,8 +14,8 @@
 //!   the writes that still take it there: with burner keys off, the listing
 //!   and the knocks, which the SSF wallet pays for, and the beacon, which
 //!   the beacon wallet pays for with the key made from it
-//!   ([`super::beacon_wallet_key`]); and the room records of Chia Mesh
-//!   (v1), until the money key leaves the publisher (PR 12).
+//!   ([`super::beacon_wallet_key`]). The room records of Chia Mesh (v1),
+//!   which took it with burner keys on too, are no longer written.
 //!
 //! Off a test network the wallet key is dropped here, so the heartbeat is
 //! handed none: [`PublisherKeys::money`] is the one way to it through the
@@ -36,13 +36,13 @@
 //! (`tests::the_publisher_reads_the_wallet_key_only_through_its_own_keys`).
 //! It is a reading of text, not a proof by types.
 //!
-//! Not typed here, and left to PR 12 with the v1 writer's removal: the
-//! money writers themselves (`build_publish_bundle`, `publish_memo_on`)
-//! still take a plain `SecretKey`, since on a test network they are the
-//! SSF wallet's writers and take its key ([`MoneyKey::secret_key`]). The
-//! test hooks of a test network (the publish test, the craps fairness test
-//! and the claim-and-write self-test) are started with the wallet key
-//! beside the heartbeat, as before.
+//! Not typed here, and left to the rest of PR 12 (the v1 writer is
+//! already gone): the money writers themselves (`build_publish_bundle`,
+//! `publish_memo_on`) still take a plain `SecretKey`, since on a test
+//! network they are the SSF wallet's writers and take its key
+//! ([`MoneyKey::secret_key`]). The test hooks of a test network (the craps
+//! fairness test and the claim-and-write self-test) are started with the
+//! wallet key beside the heartbeat, as before.
 
 use std::fmt;
 
@@ -309,10 +309,10 @@ mod tests {
     ///   only where the keys are made, and the wallet key is kept by the
     ///   money writers' own rule.
     /// - In `chia_publish.rs`, outside its tests, the wallet key is taken
-    ///   out of the keys (`secret_key`, under any spelling) on four lines
+    ///   out of the keys (`secret_key`, under any spelling) on three lines
     ///   and no other, each behind [`PublisherKeys::money`]: the knock and
     ///   the beacon off the burner path, in their seams, and the listing
-    ///   off the burner path and the v1 room record, in the heartbeat. In
+    ///   off the burner path, in the heartbeat. In
     ///   this file it is read once, for the wallet's payer. The other
     ///   files under `chia_publish` (the claim-and-write, the foreign
     ///   pause, the audit) never read it and never name the keys.
@@ -366,13 +366,11 @@ mod tests {
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
             "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix, listed).await,",
-            "Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,",
         ]);
         assert_eq!(code_lines(publish, ".money()"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
             "None => match keys.money() {",
-            "let published = match keys.money() {",
         ]);
         assert_eq!(code_lines(publish, "keys.money_payer()"), [
             "let money = keys.money_payer();",
@@ -598,5 +596,37 @@ mod tests {
         let steps: Vec<&str> = code_lines(forget, "(").into_iter().filter(|line| line.contains("date_beacon_push(") || line.contains("remove_file(")).collect();
         assert_eq!(steps, ["date_beacon_push(pushed, last_at)?;", "match std::fs::remove_file(mark) {"], "the date is carried before the mark goes");
         assert_eq!(code_lines(heartbeat, "remove_file(beacon_mark_path)"), [""; 0], "the heartbeat removes the mark through its forgetting only");
+    }
+
+    /// The v1 room record's writer is gone (stage 4 design §13 row 12), and
+    /// this keeps it gone: no code of the publisher, or of the files under
+    /// it, names what a v1 write was made of: the room key's seal, the
+    /// room's daily hint, the v1 record, or the flag that armed a room.
+    /// And `main.rs` starts no hook that wrote one. (`chia_resolve.rs` and
+    /// `chia_watch.rs` still read v1 on a test network, with the same hint
+    /// and the seal's opening: they are not the publisher's.) A reading of
+    /// text, like the pins above.
+    #[test]
+    fn the_publisher_writes_no_v1_room_record() {
+        let sources = [
+            ("chia_publish.rs", lf(include_str!("../chia_publish.rs"))),
+            ("keys.rs", lf(include_str!("keys.rs"))),
+            ("claim_write.rs", lf(include_str!("claim_write.rs"))),
+            ("foreign_pause.rs", lf(include_str!("foreign_pause.rs"))),
+            ("audit.rs", lf(include_str!("audit.rs"))),
+        ];
+        for (name, source) in &sources {
+            for v1 in ["chia_lane::seal(", "derive_hint(", "ChiaPresenceRecord", "may_publish", "chia_mode", "publish_presence"] {
+                assert_eq!(code_lines(code(source), v1), [""; 0], "{name} names {v1}");
+            }
+        }
+        let main = lf(include_str!("../main.rs"));
+        for hook in ["SSF_CHIA_PUBLISH_TEST", "publish_test_task", "publish_presence"] {
+            assert_eq!(code_lines(&main, hook), [""; 0], "main.rs names {hook}");
+        }
+        // The pin reads what it should: the lines it would catch are found
+        // where they still stand, in the readers.
+        let resolve = lf(include_str!("../chia_resolve.rs"));
+        assert!(!code_lines(code(&resolve), "derive_hint(").is_empty(), "the reader still derives a v1 hint");
     }
 }

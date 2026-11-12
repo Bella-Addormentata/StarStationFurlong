@@ -711,8 +711,8 @@ pub struct HubState {
     /// explicit SSF_EXTERNAL_ADDRS parser), read by the fingerprint API.
     pub reach: Arc<ReachState>,
     /// Per-room key + flags the LOCAL browser hands us over the `cap` lane
-    /// (chia-mode = publish toggle, public-room = N8 guard), so the node can
-    /// derive the room's chia lookup hint and seal presence records. Loopback +
+    /// (public-room = N8 guard, share-card = P6b), so the node can derive the
+    /// room's chia lookup hint and open the records read under it. Loopback +
     /// trust-safe (we already hold the plaintext room doc). Read side (#231 D3),
     /// so it is in the default build.
     #[cfg(feature = "chia-read")]
@@ -2311,9 +2311,9 @@ async fn node_main() -> Result<()> {
     // The identity persists beside the iroh key (bare CWD-relative path, same
     // convention). The Bank's TURN ON runs the same steps later
     // (`turn_wallet`) when the wallet did not start on.
-    // Slice 6 stash: the wallet key outlives this block so the heartbeat
-    // publisher (spawned after HubState exists — it reads hub.chia_rooms)
-    // can sign spends for ARMED rooms.
+    // The wallet key outlives this block so the publisher's heartbeat
+    // (spawned after HubState exists: it reads the hub) can be handed its
+    // keys (`start_publisher`).
     #[cfg(feature = "chia-publish")]
     let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-publish")]
@@ -2367,46 +2367,15 @@ async fn node_main() -> Result<()> {
                 // wallet's own (stage 4 design §4.4).
                 chia_publish::WALLET_LEASE.restore(&chia_net.path(chia_wallet_switch::LEASE_FILE), chia_publish::Payer::of(&chia_sk));
                 chia_heartbeat_sk = Some(chia_sk.clone());
-                // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
-                // a coin to publish a presence record under a FIXED test room key, so
-                // the publish->resolve loop can be validated without a browser having
-                // delivered a real room key. Spawned so it never blocks node startup;
-                // logs the hint on success or the reason on failure (e.g. unfunded).
-                // A test network only (`test_hook_on`).
-                let mut publish_test_task: Option<tokio::task::JoinHandle<()>> = None;
-                if test_hook_on(chia_net, "SSF_CHIA_PUBLISH_TEST") {
-                    let iroh_sk = secret_key.clone();
-                    let addrs = iroh_direct_addrs.clone();
-                    let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
-                    let chia_sk_pub = chia_sk.clone();
-                    publish_test_task = Some(tokio::spawn(async move {
-                        match chia_publish::publish_presence(&iroh_sk, &chia_sk_pub, &test_room_key, &addrs).await {
-                            Ok(hint) => println!(
-                                "⛓️ ChiaHub PUBLISH ok — {} presence record written at hint {}",
-                                chia_net.name(),
-                                hex::encode(&hint.to_bytes()[..8])
-                            ),
-                            Err(e) => eprintln!("⛓️ ChiaHub PUBLISH failed: {e:#}"),
-                        }
-                    }));
-                }
                 // 🎲⛓️ Craps fairness T1 hook (SSF_CHIA_CRAPS_FAIR_TEST=1, plan §12):
                 // publish a commit + reveal for a throwaway (table, round) on
-                // testnet11, then resolve + re-derive + verify the dice. Reuses the
-                // presence spend-to-self primitive with a PUBLIC (plaintext) payload.
+                // testnet11, then resolve + re-derive + verify the dice. A
+                // spend-to-self from the SSF wallet with a PUBLIC (plaintext) payload.
                 // Spawned so it never blocks startup; logs each step + PASS/FAIL.
                 // A test network only (`test_hook_on`).
                 if test_hook_on(chia_net, "SSF_CHIA_CRAPS_FAIR_TEST") {
                     let chia_sk_fair = chia_sk.clone();
                     tokio::spawn(async move {
-                        // Both test hooks spend from the SAME wallet — run
-                        // strictly after the publish test (when enabled) so the
-                        // two can't race coin selection into a mempool
-                        // double-spend and fail for non-fairness reasons
-                        // (#87 review).
-                        if let Some(t) = publish_test_task {
-                            let _ = t.await;
-                        }
                         if let Err(e) = chia_craps_fair::craps_fair_selftest(&chia_sk_fair).await {
                             eprintln!("🎲⛓️ craps-fair selftest FAILED: {e:#}");
                         }
@@ -2481,7 +2450,8 @@ async fn node_main() -> Result<()> {
     }
 
     // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
-    // testnet11 under the same fixed test room key the publish hook uses, and log
+    // testnet11 under the fixed test room key the publish hook of older builds
+    // wrote under (that hook is gone, stage 4 design §13 row 12), and log
     // the recovered node_id + addrs — the READ side of mesh introduction. Read-only
     // (no wallet needed); spawned so it never blocks startup. Never while
     // Chia is off (`chia_plan`), and on a test network only (`test_hook_on`):
@@ -2563,7 +2533,7 @@ async fn node_main() -> Result<()> {
             "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) {} · cards {}",
             book.peers.len(),
             caps.len(),
-            chia_rooms::restored_caps_words(chia_off, chia_net),
+            chia_rooms::restored_caps_words(chia_off),
             if !durable {
                 "not shared (no durable contact key)"
             } else if chia_contact::share_card_enabled() {
@@ -2787,12 +2757,10 @@ async fn node_main() -> Result<()> {
         });
     }
 
-    // ⛓️ ChiaHub C1 SLICE 6 (chia-publish): the REAL-room heartbeat publisher.
-    // Every armed room (browser delivered its room key with chia_mode=true via
-    // the Slice 3/3b toggle) that is not public space (N8) gets presence
-    // published under its REAL room key — within a minute of arming, every
-    // ~30 min after, and on address change. Started here when the wallet
-    // loaded at startup; the Bank's TURN ON starts it later (`turn_wallet`).
+    // ⛓️ ChiaHub (chia-publish): the publisher's heartbeat, this node's
+    // listing, knocks and beacon (`chia_publish::heartbeat_loop`). Started
+    // here when the wallet loaded at startup; the Bank's TURN ON starts it
+    // later (`turn_wallet`).
     #[cfg(feature = "chia-publish")]
     if let Some(chia_sk) = chia_heartbeat_sk.clone() {
         start_publisher(&hub, &iroh_endpoint, chia_sk);
@@ -3055,9 +3023,9 @@ async fn handle_wt_connection_inner(
                         }
 
                         // ChiaHub C1 Slice 3: a `cap` envelope from the LOCAL browser
-                        // carries this room's key + flags (chia-mode = publish toggle,
-                        // public-room = N8 guard) so the node can derive the room's chia
-                        // lookup hint and seal presence records. Consumed locally and
+                        // carries this room's key + flags (public-room = N8 guard,
+                        // share-card = P6b) so the node can derive the room's chia
+                        // lookup hint and open the records read under it. Consumed locally and
                         // NEVER relayed to remote peers (the room key must not leave this
                         // machine) — hence the early `continue`. Read side, so the
                         // default build ingests it with no runtime switch (#231 D3).
@@ -6609,13 +6577,14 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
 
 /// 🛑 Whether an env test hook whose variable `var` holds `raw` runs on
 /// `net`, and the line said when it is set and refused. The hooks run on a
-/// test network only (stage 4 design §4.5 (3)): the publish hook writes this
-/// node's addresses under a room key anyone can compute from a constant in
-/// the source, the craps hook writes plaintext, and the claim-and-write hook
-/// spends a lobby dish coin under a hint computed the same way. The resolve
-/// hook writes nothing, but asks a full node for the hint of that same room
-/// key, which no player's station asks for. Like the hooks, `1` alone sets
-/// one.
+/// test network only (stage 4 design §4.5 (3)): the craps hook writes
+/// plaintext, and the claim-and-write hook spends a lobby dish coin under a
+/// hint anyone can compute from a constant in the source. The resolve hook
+/// writes nothing, but asks a full node for the hint of a room key computed
+/// the same way, which no player's station asks for. (The publish hook that
+/// wrote under that key, `SSF_CHIA_PUBLISH_TEST`, went with the v1 room
+/// record's writer, §13 row 12: only an older build writes there.) Like the
+/// hooks, `1` alone sets one.
 #[cfg(feature = "chia-read")]
 fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool, Option<String>) {
     match raw {
@@ -6646,7 +6615,7 @@ mod test_hook_tests {
     /// value runs nothing anywhere and says nothing. No environment is read.
     #[test]
     fn the_env_test_hooks_run_on_a_test_network_only() {
-        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST", "SSF_CHIA_RESOLVE_TEST"] {
+        for var in ["SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST", "SSF_CHIA_RESOLVE_TEST"] {
             for net in ChiaNet::ALL {
                 for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
                     assert_eq!(test_hook(net, var, raw), (false, None), "{var}={raw:?} on {net:?}");
@@ -6665,7 +6634,7 @@ mod test_hook_tests {
         }
     }
 
-    /// The read-only hook starts through the same rule as the three that
+    /// The read-only hook starts through the same rule as the two that
     /// write (docs/TDD/ChiaLanePrivacy.md §7): this file's one place that
     /// starts it asks `test_hook_on` first. Read from the source, since the
     /// start is in `main` itself.

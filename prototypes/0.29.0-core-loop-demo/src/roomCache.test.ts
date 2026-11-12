@@ -39,13 +39,13 @@ describe('room cache snapshots and the posture probe', () => {
     };
     const probe = roomPostureProbe(src);
     expect(probe('r')).toBeUndefined();
-    expect(buildRoomCapPayload('k', false, probe('r'), 1, true, [card])).toMatchObject({ publicRoom: null, passPrivate: true, memberCards: [card] });
+    expect(buildRoomCapPayload('k', probe('r'), 1, true, [card])).toMatchObject({ publicRoom: null, passPrivate: true, memberCards: [card] });
     // A visit where the host's state arrived is kept as usable: its doors speak.
     const syncedRow = cacheRowOf(Y.encodeStateAsUpdate(retry), false, true, 2000);
     expect(snapshotUsable(syncedRow)).toBe(true);
     state.stateUsable = snapshotUsable(syncedRow);
     state.passagePublic = false;
     expect(probe('r')).toBe(false);
-    expect(buildRoomCapPayload('k', false, probe('r'), 2, true, [card])).toMatchObject({ publicRoom: false, passPrivate: true });
+    expect(buildRoomCapPayload('k', probe('r'), 2, true, [card])).toMatchObject({ publicRoom: false, passPrivate: true });
   });
 });
