@@ -216,6 +216,37 @@ mod tests {
         &source[..source.find("\nmod tests {").expect("the file's tests")]
     }
 
+    /// The lines of `source` that start at the left margin once its own
+    /// `mod tests` has opened: the tests' end, a raw string's line inside
+    /// them, and whatever the file holds after them, which [`code`] does
+    /// not read.
+    fn after_tests(source: &str) -> Vec<&str> {
+        let tests = source.find("\nmod tests {").expect("the file's tests");
+        source[tests..].lines().skip(2).filter(|line| line.starts_with(|c: char| !c.is_whitespace())).collect()
+    }
+
+    /// Every `.rs` file under the crate's `src`, by its path from there
+    /// with `/` between its parts, with its text ([`lf`]), in the order of
+    /// the paths. Read from the source tree the test was built from.
+    fn sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the crate's sources").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let parts: Vec<String> = path.strip_prefix(root).unwrap().components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+                    out.push((parts.join("/"), lf(&std::fs::read_to_string(&path).expect("a source file"))));
+                }
+            }
+        }
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
     /// The item of `source` that opens with `header`, up to the `}` that
     /// closes it at the start of a line.
     fn item<'a>(source: &'a str, header: &str) -> &'a str {
@@ -247,16 +278,21 @@ mod tests {
     ///   claim-and-write, the foreign pause, the audit) never read one and
     ///   never name the keys.
     /// - None of those files reads the hub's wallet key (`.chia_wallet`),
-    ///   which the node holds on every network for the Bank and the dish.
+    ///   which the node holds on every network for the Bank and the dish,
+    ///   and the hub's field has that name.
+    /// - After its tests `chia_publish.rs` holds its sub-modules and what
+    ///   it takes from them, and no item of its own, so reading it up to
+    ///   its tests reads all of its code.
     /// - The wallet's payer, the beacon's key and the root are read out of
     ///   the keys on the lines below and no other.
     /// - The memo builder that signs with a wallet key
     ///   ([`super::super::build_publish_bundle`]) is called from no code of
     ///   the publisher but the test-only [`super::super::memo_bundle`]; the
-    ///   craps fairness hook is its one caller in the node.
+    ///   craps fairness hook is its one caller in the node, by a reading
+    ///   of every source file up to its own tests.
     ///
     /// What it does not see: the wallet key reached from a file outside
-    /// `chia_publish`, or the hub's field under another name.
+    /// `chia_publish` by another way than that builder.
     #[test]
     fn the_publisher_holds_no_wallet_key() {
         // A CRLF checkout reads as an LF one.
@@ -266,6 +302,16 @@ mod tests {
 
         let (main, publish, this) = (lf(include_str!("../main.rs")), lf(include_str!("../chia_publish.rs")), lf(include_str!("keys.rs")));
         let (claim, pause, audit) = (lf(include_str!("claim_write.rs")), lf(include_str!("foreign_pause.rs")), lf(include_str!("audit.rs")));
+        // What `code` leaves unread in chia_publish.rs is no item of its
+        // own: the tests' end, two lines of a raw string in them, and the
+        // sub-modules with what is taken from them.
+        for line in after_tests(&publish) {
+            let known = ["}", "}}\"#"].contains(&line) || ["mod ", "use ", "pub use ", "pub(crate) use ", "#[cfg(test)]", "//"].iter().any(|open| line.starts_with(open));
+            assert!(known, "chia_publish.rs holds code after its tests: {line}");
+        }
+        for (name, source) in [("keys.rs", &this), ("claim_write.rs", &claim), ("foreign_pause.rs", &pause), ("audit.rs", &audit)] {
+            assert_eq!(after_tests(source), ["}"], "{name} ends with its tests");
+        }
         let (main, publish, this) = (main.as_str(), code(&publish), code(&this));
         let others = [("claim_write.rs", code(&claim)), ("foreign_pause.rs", code(&pause)), ("audit.rs", code(&audit))];
 
@@ -331,13 +377,25 @@ mod tests {
         assert_eq!(code_lines(publish, "build_publish_bundle("), ["pub fn build_publish_bundle(", "let bundle = build_publish_bundle(net, chia_sk, coin, hint, Bytes::new(body))?;"]);
         assert!(publish.contains("#[cfg(test)]\npub fn memo_bundle("), "memo_bundle is the tests' own");
         assert_eq!(code_lines(item(publish, "\npub fn memo_bundle("), "build_publish_bundle(").len(), 1, "and it is the caller");
+        // In the rest of the node it has one caller, the craps fairness
+        // hook: every other source file is read up to its own tests, but
+        // for the one that is tests throughout.
+        let mut callers: Vec<(String, String)> = Vec::new();
+        for (name, text) in sources() {
+            if name == "chia_publish.rs" || name == "chia_publish/chain_tests.rs" {
+                continue;
+            }
+            let code = text.find("\nmod tests {").map_or(text.as_str(), |tests| &text[..tests]);
+            callers.extend(code_lines(code, "build_publish_bundle(").into_iter().map(|line| (name.clone(), line.to_string())));
+        }
+        assert_eq!(callers, [("chia_craps_fair.rs".to_string(), "let bundle = build_publish_bundle(net, chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;".to_string())]);
 
         // The hub's wallet key is read by none of them.
         for (name, source) in [("chia_publish.rs", publish), ("keys.rs", this)].into_iter().chain(others) {
             assert_eq!(code_lines(source, ".chia_wallet"), [""; 0], "{name} reads the hub's wallet key");
         }
-        // The scan sees the field where it is: main.rs sets it.
-        assert!(!code_lines(main, ".chia_wallet").is_empty());
+        // The scan names the field the hub keeps the key in.
+        assert_eq!(code_lines(main, "chia_wallet: Mutex<"), ["pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,"]);
     }
 
     /// What the heartbeat's source says of its writers (stage 4 design §13
@@ -354,6 +412,10 @@ mod tests {
     ///   shared.
     /// - The money refusal is asked once in the heartbeat, for its line
     ///   off a test network, and its answer holds no arm.
+    /// - What an older version's wallet paid for is still looked for: the
+    ///   heartbeat files a lost listing mark again from the lease, with the
+    ///   wallet's payer, and hands that payer to the listing's step for
+    ///   the hint rule.
     /// - LIST ME is asked once a tick, and its word is read on eight lines:
     ///   where it is asked, where a turn to off drops the queued knocks,
     ///   the tick's findable, the listing's arm and its writer, and the
@@ -389,12 +451,18 @@ mod tests {
         assert_eq!(code_lines(publish, "pub const BURNERS_ENV"), ["pub const BURNERS_ENV: &str = \"SSF_CHIA_BURNERS\";"]);
         assert_eq!(code_lines(&main, "BURNERS"), ["if let Some(note) = chia_publish::burners_env_note(std::env::var_os(chia_publish::BURNERS_ENV).as_deref()) {"]);
         // The writers of the wallet's own path are gone.
-        for gone in ["publish_memo_on", "publish_knock_on", "publish_beacon_on", "publish_node_presence(", "money_listing_step", "money_path_burner_payer", "MemoWait"] {
+        for gone in ["publish_memo_on", "publish_knock_on", "publish_beacon_on", "publish_node_presence(", "publish_node_presence_on", "money_listing_step", "money_path_burner_payer", "MemoWait"] {
             assert_eq!(code_lines(publish, gone), [""; 0], "chia_publish.rs: {gone}");
         }
         // The money refusal: its line, once, and nothing held by it.
         assert_eq!(code_lines(heartbeat, "refuse_money_memo"), ["let _ = refuse_money_memo(net);"]);
         assert_eq!(code_lines(heartbeat, "money_memo_refusal"), [""; 0]);
+        // A write an older version's wallet paid for: its lost mark is
+        // filed again, and the listing's step is told the wallet's payer.
+        assert_eq!(code_lines(heartbeat, "lost_listing_mark("), [
+            "lost_listing_mark(&WALLET_LEASE, node_mark.as_ref(), net, &hub.contact_key, era, &money_payer, |m| listing_clock.burner_payer(root, &hub.contact_key, era, &m.hint)).await;",
+        ]);
+        assert_eq!(code_lines(heartbeat, "money: "), ["money: &money_payer,"]);
 
         // 📖 LIST ME (stage 4 design §4.5 (6)): asked of the hub's switch
         // once a tick, and every read of its word. The listing's arm opens

@@ -603,6 +603,8 @@ impl Setup {
     /// the test's lease and chain, at the next instant ([`Self::later`]):
     /// the beacon a station that moved to burner keys in the middle of an
     /// era may still have in flight. No writer of this version makes one.
+    /// That version's arm also dated the push in `beacon_pushed.json`; this
+    /// dates none.
     async fn money_beacon(&mut self, wallet: u8, node: &iroh::SecretKey, era: u64, now_unix: u64) -> Result<(Bytes32, MemoWrite)> {
         let at = self.later();
         let (hint, plain) = beacon_memo(NET, node, era, now_unix)?;
@@ -1288,7 +1290,10 @@ async fn beacons_of(s: &Setup, era: u64, peak: u32, now: u64) -> Vec<(iroh::Publ
 /// It is kept here, on the test's network, because a station that moved to
 /// burner keys in the middle of an era still has such a write on its lease,
 /// in its marks and on the chain, and the hint rule (§8.3), the steps that
-/// file a lost mark or entry again and T4 are shown against it.
+/// file a lost mark or entry again and T4 are shown against it. One step of
+/// that version's writer is left out: it wrote nothing while any spend on
+/// the lease was parked, and this writes beside one, so a test can lay down
+/// more than that version could have had in flight at once.
 #[allow(clippy::too_many_arguments)]
 async fn older_build_write(
     lease: &WalletLease,
@@ -1318,6 +1323,35 @@ async fn older_build_write(
         Err(e) => return Err(e.into()),
     };
     Ok(MemoWrite { coins, acked, spend: lease.spend_of(&coins.parked), memo, payer: paid_by })
+}
+
+/// The picker of the SSF wallet's own spends ([`find_spendable_coin_on`],
+/// which a test network's craps fairness hook still takes its coin with)
+/// gives the wallet's largest free coin, with the height it was confirmed
+/// at, and passes over every coin the lease holds: with the largest parked
+/// it gives the next largest, and with every coin parked it gives none. No
+/// writer of the Phone Book takes a coin this way any more (stage 4 design
+/// §13 row 12), so the choice is shown here on its own.
+#[tokio::test]
+async fn the_wallets_coin_picker_gives_the_largest_free_coin_and_passes_over_those_the_lease_holds() {
+    let mut s = setup().await;
+    let payer = wallet(19);
+    let ours = our_puzzle_hash(&payer);
+    let (small, large, middle) = (s.chain.fund(ours, 1, None), s.chain.fund(ours, 1000, None), s.chain.fund(ours, 30, None));
+    let funded = s.chain.farm().await;
+    let hint = Bytes32::new([0x19; 32]);
+
+    for (free, what) in [(large, "the largest"), (middle, "the next, the largest parked"), (small, "the last, the two above it parked")] {
+        let found = find_spendable_coin_on(&s.lease, &s.money, ours).await.unwrap().expect("a free coin");
+        assert_eq!((found.coin, found.confirmed_height), (free, funded), "{what}");
+        let at = s.later();
+        let write = older_build_write(&s.lease, &s.money, at, &payer, hint, None, |_| Ok(b"a memo".to_vec()), Resend::Always).await.unwrap();
+        assert_eq!(write.coins, WriteCoins::one(free.coin_id()), "{what}: the writer takes the coin the picker gives");
+        assert!(s.lease.is_taken(&free.coin_id()), "{what}: parked");
+    }
+    assert!(find_spendable_coin_on(&s.lease, &s.money, ours).await.unwrap().is_none(), "every coin parked: none is free");
+    assert!(find_spendable_coin_on(&WalletLease::new(), &s.money, ours).await.unwrap().is_some_and(|c| c.coin == large), "another lease holds none of them");
+    assert!(find_spendable_coin_on(&s.lease, &s.money, our_puzzle_hash(&wallet(20))).await.unwrap().is_none(), "an unfunded wallet has none");
 }
 
 /// A presence write lands, the resolver's reader opens it under the

@@ -12576,7 +12576,11 @@ mod tests {
             assert_eq!(line.matches("burner").count(), 1, "{line}");
             assert!(!line.contains(&hint[16..]), "the hint is cut to 16 digits: {line}");
         }
-        assert!(beacon_sent_line(true, 7, "abcd").contains("· hint abcd — "), "a short hint is not cut past its end");
+        assert_eq!(
+            beacon_sent_line(true, 7, "abcd"),
+            "⛓️ ChiaHub beacon: published for era 7 · hint abcd — pending until its own coin is read back · from its own burner key",
+            "a short hint is not cut past its end"
+        );
     }
 
     /// The facts of a beacon try with everything the arm's rule asks for in
