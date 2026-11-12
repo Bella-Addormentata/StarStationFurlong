@@ -513,7 +513,8 @@ describe('what a page takes for a FAIR ONLY game, and what is junk to it', () =>
     expect(res().holder).toBe(buyer.pub);
     put(a, { key: xf.key, value: { junk: 1 } });
     expect(res().holder).toBe(buyer.pub);
-    const fin = sealFin(P, owner.pub, owner.sign);
+    // (the buyer's: an end order stands from the game's holder now, S5)
+    const fin = sealFin(P, buyer.pub, buyer.sign);
     put(a, fin);
     expect(res().fin).toEqual(fin.value);
     a.doc.transact(() => casinoComputed(a).delete(fin.key));

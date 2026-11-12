@@ -16,8 +16,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { definedOffer, FAIR_ONLY_RV, faironlyInc, OFFER_SKEW_MS, readCk, sealCk } from './computedFairOnly';
-import type { CkRec, XferRec } from './computedFairOnly';
+import { definedOffer, FAIR_ONLY_RV, faironlyInc, MAX_TRANSFERS, OFFER_SKEW_MS, readCk, sealCk, sealXf } from './computedFairOnly';
+import type { CkRec, DeedOffer, XferRec } from './computedFairOnly';
 import { asClose, nextSid3 } from './computedFold';
 import type { CloseRec, FoldCtx } from './computedFold';
 import { houseSign } from './computedHouse';
@@ -678,6 +678,164 @@ describe('a flood of offers nobody signed', () => {
     run(pages, at + 5 * STEP, at + 5 * STEP);
     expect(xfsOf(b, inc)).toHaveLength(1);
     expect(xfsOf(b, inc)[0]).toMatchObject({ o: { nonce: good.nonce } });
+    b.table.setAdoptVerdictsMaxForTests();
+  });
+});
+
+describe('an end order and a hand-over', () => {
+  /** A round in flight at the game: A and C bet, the round closes on the house's commitment. The time it closed at. */
+  function inFlight(pages: Page[], kit: ComputedKit, at: number): number {
+    const [a, , c] = pages;
+    house(a, kit.houseJoin(H, 1));
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], at)).toBe('ok');
+    clockOf(c, at);
+    expect(c.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    sync(at, ...pages);
+    const closedAt = run(pages, at + STEP, at + 30_000, { until: () => keysIn(a, 'c', 1).length > 0 });
+    sync(closedAt, ...pages);
+    return closedAt;
+  }
+  /** The house reveals round 1 (laid in by C). The time the seeds were in at, and the round. */
+  function reveal(pages: Page[], kit: ComputedKit, from: number) {
+    const [a, , c] = pages;
+    const [close] = closesOf(a, 1);
+    const seedsAt = run(pages, from, from + 12_000, { until: () => pages.every((p) => keysIn(p, 'x', 1).length === 2) });
+    house(c, kit.houseReveal(H, 1, [hashIn(keysIn(a, 'c', 1)[0])], frozenOf(close)));
+    sync(seedsAt, ...pages);
+    const v = foldOf(a).rounds.find((x) => x.r === 1)!;
+    expect(v).toMatchObject({ decided: 'house' });
+    return { seedsAt, v };
+  }
+
+  it('the seller ordered the end with a round in flight: the buyer\'s page takes the order on with the game, its own in the same update, and writes the end once the round is decided', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    const closedAt = inFlight(pages, kit, at);
+    expect(off(a, closedAt + STEP)).toBe('ending');
+    sync(closedAt + STEP, ...pages);
+    for (const p of pages) expect(res(p, inc)).toMatchObject({ live: true, holder: a.pub, fin: { k: a.pub } });
+    const T = closedAt + 2 * STEP;
+    const o = offerAt(a, b, T);
+    const sent = updatesOf(b, () => { expect(redeem(b, o, T)).toEqual({ ok: true }); });
+    expect(sent).toHaveLength(1);
+    expect(xfsOf(b, inc)).toMatchObject([{ u: 1, k: b.pub }]);
+    sync(T, ...pages);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: true, holder: b.pub, fin: { k: b.pub }, invalid: [] });
+      expect(p.casino.computedGamesEnding(b.pub)).toEqual([{ t: TABLE, inc }]);
+      expect(p.casino.computedGamesEnding(a.pub)).toEqual([]);
+    }
+    const { seedsAt, v } = reveal(pages, kit, T + STEP);
+    run(pages, seedsAt + STEP, seedsAt + b.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(b, inc)).toMatchObject({ e: 1, u: 1, k: b.pub, f: { k: b.pub }, x: xfsOf(b, inc) });
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: false, pending: false, invalid: [], base: { ck: { e: 1, u: 1 } } });
+      for (const q of [a, c]) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(v.deltas.get(q.pid)));
+    }
+  });
+
+  it('the seller pressed as the buyer redeemed, neither page having heard the other: the game is the buyer\'s and the seller\'s order stands no more; no page ends it for that order, and the buyer\'s own press does', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    const closedAt = inFlight(pages, kit, at);
+    const T = closedAt + STEP;
+    const o = offerAt(a, b, T);
+    expect(off(a, T)).toBe('ending');
+    expect(res(a, inc)).toMatchObject({ fin: { k: a.pub } });
+    expect(redeem(b, o, T)).toEqual({ ok: true });
+    expect(res(b, inc)).toMatchObject({ holder: b.pub, fin: null });
+    sync(T, ...pages);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: true, holder: b.pub, fin: null, invalid: [] });
+      expect(p.casino.computedGamesEnding(a.pub)).toEqual([]);
+      expect(p.casino.computedGamesEnding(b.pub)).toEqual([]);
+    }
+    const { seedsAt, v } = reveal(pages, kit, T + STEP);
+    const quiet = seedsAt + 10_000 + 2 * b.table.FAIR_END_WAIT_MS;
+    run(pages, seedsAt + STEP, quiet);
+    for (const p of pages) expect(endOf(p, inc)).toBeUndefined();
+    expect(off(a, quiet + STEP)).toBe('theirs');
+    expect(off(b, quiet + STEP)).toBe('ok');
+    expect(endOf(b, inc)).toMatchObject({ e: 1, u: 1, k: b.pub, f: { k: b.pub } });
+    sync(quiet + STEP, ...pages);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: false, pending: false, invalid: [], fin: { k: b.pub } });
+      for (const q of [a, c]) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(v.deltas.get(q.pid)));
+    }
+  });
+});
+
+describe('a game handed over as often as a chain can be long', () => {
+  it('stays its holder\'s: the next buyer\'s page takes the deed and writes no transfer, then or on a later look', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    let T = at;
+    for (let i = 0; i < MAX_TRANSFERS; i++) {
+      const [from, to] = i % 2 === 0 ? [a, b] : [b, a];
+      expect(redeem(to, offerAt(from, to, T), T)).toEqual({ ok: true });
+      sync(T, ...pages);
+      run(pages, T + STEP, T + 2 * STEP);
+      T += 3 * STEP;
+    }
+    expect(MAX_TRANSFERS % 2).toBe(0);
+    for (const p of pages) {
+      expect(res(p, inc)).toMatchObject({ live: true, holder: a.pub, invalid: [] });
+      expect(res(p, inc).chain).toHaveLength(MAX_TRANSFERS + 1);
+    }
+    expect(redeem(b, offerAt(a, b, T), T)).toEqual({ ok: true });
+    expect(b.casino.deedHeldBy(b.pub)).toBe(true);
+    expect(xfsOf(b, inc)).toHaveLength(MAX_TRANSFERS);
+    sync(T, ...pages);
+    const sent = updatesOf(b, () => { run(pages, T + STEP, T + 3_000, { each: undefined }); });
+    expect(sent).toEqual([]);
+    for (const p of pages) {
+      expect(xfsOf(p, inc)).toHaveLength(MAX_TRANSFERS);
+      expect(res(p, inc)).toMatchObject({ live: true, holder: a.pub, invalid: [] });
+    }
+  });
+});
+
+describe('a flood of offers nobody signed, for one game of two', () => {
+  it('more forged offers for the first game than verdicts are kept: each look begins with the next game, so the good offer for the other is asked and moves it', async () => {
+    const { pages, at: t1 } = await houseRoom(['A', 'B']);
+    const [a, b] = pages;
+    const a2 = await loadPage('A2', 3, { reloadOf: a });
+    a2.table.setLocalHouse(H.pub);
+    a2.table.setLocalHouseFold(FOLD);
+    const all = [a, a2, b];
+    sync(t1, ...all);
+    const T = run(all, t1 + STEP, t1 + 30_000, { until: () => a2.casino.houseOnline() && a2.table.fairOnlyOfferRefusal() === null });
+    expect(press(a, T)).toBe('ok');
+    expect(press(a2, T, { j: 'fedcba9876543210' })).toBe('ok');
+    sync(T, ...all);
+    const [g1, g2] = [nameOf(a, T), nameOf(a, T, 'p', TABLE, 'fedcba9876543210')].sort();
+    run(all, T + STEP, T + 3 * STEP);
+    const at = T + 4 * STEP;
+    // The first game goes to a key no page here has (the house's own, which signs as a page's does).
+    clockOf(a, at);
+    const out = definedOffer(a.offers.makeOffer(ASSET, a.name, { toPub: H.pub })) as unknown as DeedOffer;
+    const away = sealXf({ room: PAGE_ROOM, t: TABLE, inc: g1 }, { v: 1, o: out, u: 0, k: H.pub }, (bytes) => houseSign(H.secret, bytes));
+    a.doc.transact(() => top(a).set(away.key, away.value));
+    sync(at, ...all);
+    run(all, at + STEP, at + 2 * STEP);
+    expect(b.casino.computedFairOnlyGames()).toEqual([{ t: TABLE, inc: g1, holder: H.pub }, { t: TABLE, inc: g2, holder: a.pub }]);
+    // Eight offers "from" the first game's holder that it never signed, and A's good one, which moves the second.
+    b.table.setAdoptVerdictsMaxForTests(4);
+    const T2 = at + 3 * STEP;
+    const forged = Array.from({ length: 8 }, () => ({ ...offerAt(a, b, T2), makerPub: H.pub }));
+    const good = offerAt(a, b, T2);
+    b.doc.transact(() => {
+      b.doc.getMap('roomInfo').set('owner', b.pid);
+      for (const o of [...forged, good]) top(b).set(`do:${o.nonce}`, definedOffer(o));
+    });
+    sync(T2, ...all);
+    expect(b.casino.deedOffersTo(b.pub)).toHaveLength(9);
+    run(all, T2 + STEP, T2 + 6 * STEP);
+    const moved = keysUnder(b, `xf:${TABLE}:${g2}:`).map((k) => top(b).get(k) as XferRec);
+    expect(moved).toMatchObject([{ k: b.pub, o: { nonce: good.nonce } }]);
+    expect(keysUnder(b, `xf:${TABLE}:${g1}:`)).toEqual([away.key]);
+    for (const p of all) expect(p.casino.computedResolutionOf(TABLE, g2)).toMatchObject({ live: true, holder: b.pub, invalid: [] });
     b.table.setAdoptVerdictsMaxForTests();
   });
 });

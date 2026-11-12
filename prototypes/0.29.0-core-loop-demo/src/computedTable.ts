@@ -245,7 +245,7 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
-import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, OFFER_SKEW_MS, sealCk, sealFin, sealXf } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, MAX_TRANSFERS, OFFER_SKEW_MS, sealCk, sealFin, sealXf } from './computedFairOnly';
 import type { CkRec, DeedOffer, FinRec, XferRec } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
@@ -773,7 +773,8 @@ function lookAtClock(now: number): void {
     adoptTried.clear();
     adoptLookedAt = null;
     offerVerdicts.clear();
-    adoptCursor = '';
+    adoptCursors.clear();
+    adoptLooks = 0;
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -5806,26 +5807,30 @@ function offerSigned(o: DeedOffer): boolean | undefined {
   return ok;
 }
 
-/** The nonce of the offer a look last asked the signature of (signedAmong). */
-let adoptCursor = '';
+/** By `<tableId>:<inc>`: the nonce of the offer a look last asked the
+ *  signature of for that game (signedAmong). */
+const adoptCursors = new Map<string, string>();
+/** How many looks have had a game to ask for (the game a look begins with). */
+let adoptLooks = 0;
 
 /** Of offers `could` (sorted by nonce), one its maker signed, or null: the
  *  one being redeemed (`mine`, checked by the redemption), else one already
  *  found signed, else the first found so of those asked now. The asking goes
- *  round from where the last look stopped (adoptCursor), not from the first
+ *  round from where the last look stopped for the game (adoptCursors), not from the first
  *  each time: the verdicts kept are bounded, and a flood of forged offers
  *  larger than the bound would otherwise have every look spend its checks on
  *  the same first few again, never reaching a good offer behind them. */
-function signedAmong(could: DeedOffer[], mine: DeedOffer | null): DeedOffer | null {
+function signedAmong(game: string, could: DeedOffer[], mine: DeedOffer | null): DeedOffer | null {
   if (mine && could.includes(mine)) return mine;
   const known = could.find((c) => { const id = recHash(c); return id !== null && offerVerdicts.get(id) === true; });
   if (known) return known;
-  const at = could.findIndex((c) => c.nonce > adoptCursor);
+  const cursor = adoptCursors.get(game) ?? '';
+  const at = could.findIndex((c) => c.nonce > cursor);
   const round = at < 0 ? could : [...could.slice(at), ...could.slice(0, at)];
   for (const c of round) {
     const v = offerSigned(c);
     if (v === undefined) return null;
-    adoptCursor = c.nonce;
+    adoptCursors.set(game, c.nonce);
     if (v) return c;
   }
   return null;
@@ -5862,8 +5867,13 @@ function signedAmong(could: DeedOffer[], mine: DeedOffer | null): DeedOffer | nu
  * look, wherever an end would be refused (switchGate: asleep, the room's
  * state not in, part of an update, records being checked, a restore's wait),
  * while a close of the open round is still to be checked, and while a
- * decided round is short of a record it rests on (fairSound). Returns how
- * many games it moved.
+ * decided round is short of a record it rests on (fairSound). A game
+ * handed over as often as a chain can be long (MAX_TRANSFERS) stays its
+ * holder's: nothing is written. Where the seller's end order stands, this
+ * key's own goes in with the transfer (an order stands only from the game's
+ * holder, S5), so the end goes on and this page writes it (fairEndDuty).
+ * Each look begins with the next game, and asks each game's offers round
+ * from where it stopped for that game. Returns how many games it moved.
  */
 export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer): number {
   lookAtClock(now);
@@ -5876,8 +5886,13 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
   const offers = (mine ? [mine] : redeeming === undefined ? deedOffersTo(me) : []).filter((o) => o.toPub === me);
   if (offers.length === 0) return 0;
   adoptChecksLeft = ADOPT_CHECKS_PER_LOOK;
+  for (const key of [...adoptCursors.keys()]) if (!theirs.some((g) => `${g.t}:${g.inc}` === key)) adoptCursors.delete(key);
+  // (Each look begins with the next game: the checks are the look's, and a
+  // flood of forged offers for one game, larger than the verdicts kept, would
+  // otherwise have every look spend them there and never ask for the next.)
+  const first = adoptLooks++ % theirs.length;
   let moved = 0;
-  for (const { t, inc, holder } of theirs) {
+  for (const { t, inc, holder } of [...theirs.slice(first), ...theirs.slice(0, first)]) {
     // As an end is gated (switchGate): the transfer fixes the round the
     // seller's house counts up to, for good. Not on a page asleep or whose
     // room's state is not in (a cached doc may be rounds behind the room, and
@@ -5888,6 +5903,10 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
     const resolved = computedResolutionOf(t, inc);
     const res = computedFoldOf(t, inc);
     if (!resolved || resolved.pending || !resolved.base || !resolved.name || !res || res.pending) continue;
+    // A game handed over as often as a chain can be long (MAX_TRANSFERS): no
+    // page follows a transfer more, and an adoption with one more would read
+    // as no checkpoint. Nothing is written: the game stays its holder's.
+    if (resolved.chain.length > MAX_TRANSFERS) continue;
     // A close of the open round still to be checked: whether a round is in
     // flight is not known yet.
     if (res.tip === null && res.openCloses.some((c) => c.state !== 'invalid')) continue;
@@ -5895,7 +5914,7 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
     const name = resolved.name;
     const could = offers.filter((c) => c.makerPub === holder && c.issuedAt >= name.ts - OFFER_SKEW_MS && !used.has(c.nonce)
       && !adoptTried.has(`${t}:${inc}:${c.nonce}`));
-    const o = signedAmong(could, mine);
+    const o = signedAmong(`${t}:${inc}`, could, mine);
     if (!o) continue;
     // Nor while a decided round is short of a record it rests on (fairSound,
     // as an end waits): a bettor who deletes a frozen slip takes the round
@@ -5921,8 +5940,12 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
     // (a root is its opener's alone to sign, S0): this key holds the game from
     // round `u` on, and can sign nothing under it.
     const adoption = B.b === 'g' || B.u !== u ? null : sealCk(ctx, { ...content, x: [...transfersOf(resolved), xf.value], k: me }, signIdentity);
+    // An end order standing is the seller's, and stands no more once the game
+    // is this key's (S5): the end it ordered goes on under this key's own
+    // order, in the same write, and this page writes the end (fairEndDuty).
+    const fin = resolved.fin !== null ? sealFin(ctx, me, signIdentity).value : null;
     adoptTried.add(`${t}:${inc}:${o.nonce}`);
-    if (writeFairOnlyAdoption(t, inc, xf, adoption)) moved++;
+    if (writeFairOnlyAdoption(t, inc, xf, adoption, fin)) moved++;
     else adoptTried.delete(`${t}:${inc}:${o.nonce}`);
   }
   return moved;

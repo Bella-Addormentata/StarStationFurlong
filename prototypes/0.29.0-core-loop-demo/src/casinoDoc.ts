@@ -3295,7 +3295,10 @@ export function writeFairOnlyEnd(tableId: string, inc: string, fin: FinRec | nul
  *  (null) where the buyer can sign none: the base is the opening root (its
  *  opener's alone, S0), or stands under the transfer's round. The base then
  *  stays the seller's, whose range ends at the transfer's round, and the
- *  transfer under its key is what moves the game. Refused
+ *  transfer under its key is what moves the game. With `fin`, the buyer's
+ *  own end order under the game's one key, where the seller's stood: an order
+ *  stands only from the game's holder (S5), so the end the seller ordered
+ *  goes on under the buyer's. Refused
  *  (false, nothing written) while the doc holds part of an update, for a game
  *  this page doesn't track, and for records that are not that: a transfer
  *  whose key is not its id, an adoption that isn't a live checkpoint of the
@@ -3304,12 +3307,14 @@ export function writeFairOnlyEnd(tableId: string, inc: string, fin: FinRec | nul
  *  the caller's to have read, and every page's resolver's to judge. */
 export function writeFairOnlyAdoption(
   tableId: string, inc: string, xf: { key: string; value: XferRec }, adoption: { key: string; value: CkRec } | null,
+  fin: FinRec | null = null,
 ): boolean {
   const map = computedMap;
   if (!map || !computedIncs.get(`${tableId}:${inc}`)?.fo || !casinoWhole(tableId)) return false;
   const at = parseFairOnlyKey(xf.key);
   if (!at || at.kind !== 'xf' || at.t !== tableId || at.inc !== inc) return false;
   if (asXf(xf.value, boundRoomId) === null || xfId(xf.value) !== at.id) return false;
+  if (fin !== null && asFin(fin)?.k !== xf.value.k) return false;
   if (adoption !== null) {
     const read = readCk(boundRoomId, adoption.key, adoption.value);
     if (read.kind !== 'ok' || read.t !== tableId || read.inc !== inc || read.ck.e === 1 || read.ck.dl !== undefined) return false;
@@ -3319,6 +3324,7 @@ export function writeFairOnlyAdoption(
   boundDoc!.transact(() => {
     map.set(xf.key, xf.value);
     if (adoption !== null) map.set(adoption.key, adoption.value);
+    if (fin !== null) map.set(finKey(tableId, inc), fin);
   });
   return true;
 }
@@ -4197,7 +4203,7 @@ export function computedGamesHeldBy(tableId: string, pub: string): string[] {
 }
 
 /** 🔒 The live FAIR ONLY games key `pub` holds over which an end order
- *  stands (S5: a fin an owner-level key holding the game signed), by table and
+ *  stands (S5: a fin the game's holder signed), by table and
  *  name, sorted: the games whose holder's page writes the end once no round
  *  is in flight, if their house has not (computedTable fairEndDuty). Read-only,
  *  of the games this page counts as live. */
@@ -4800,8 +4806,10 @@ function readCkMemo(key: string, value: unknown): CkRead {
  *  table is not whole (countComputed): the base it names is one the page does
  *  not hold then, and with that base deleted before the page counts from it
  *  the game is at the base the page holds again, on what that one stood on:
- *  the seller's end order, say, which stands no more at the buyer's
- *  checkpoint and stands at the seller's. What an answer does not stand on is
+ *  the end order an end checkpoint carried, say, with that checkpoint gone
+ *  and the game live again. (A seller's order is not such a case: the
+ *  transfer is held from the answer that followed it, and an order stands
+ *  only from the game's holder, S5.) What an answer does not stand on is
  *  let go of where the page counts from it (settleStanding). */
 function keepStanding(fo: FairOnlyState, xfs: ReadonlyMap<string, unknown>): void {
   const res = fo.res!;

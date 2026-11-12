@@ -338,12 +338,16 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     if (waiting.some(beats) || plausible.slice(cut).some(beats)) pending = true;
   }
 
-  // S5: an end order standing at the base: one an owner-level key holding the game there signed,
-  // or the game's holder now. (After a hand-over the base can stand under the round the holder
-  // took the game at: a root, or a trim with rounds decided since, which the buyer's key cannot
-  // sign over. The holder's order must stand all the same, or no page would stop closing for it
-  // and the holder could not end its game with a round in flight. The end itself is at a round
-  // the holder holds, S1.)
+  // S5: the end order that stands: one the game's holder now signed, or, of a game that has
+  // ended, one a key that held it at the round it ended signed (the order its end carries).
+  // The holder's stands wherever the base is: after a hand-over the base can stand under the
+  // round the holder took the game at (a root, or a trim with rounds decided since, which the
+  // buyer's key cannot sign over), and without its order no page would stop closing for it,
+  // nor could it end its game with a round in flight (the end itself is at a round it holds,
+  // S1). A key the game has left orders nothing more of a live game: its order, older than
+  // the hand-over or newer, would stop every page closing for an end only the holder's page
+  // writes, and that page writes its own. (The buyer's page takes a standing order on as it
+  // takes the game: computedTable adoptFairOnlyGames.)
   let fin: FinRec | null = null;
   if (base) {
     const finCandidates: FinRec[] = [];
@@ -353,7 +357,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       if (own) finCandidates.push(own);
     }
     for (const f of finCandidates) {
-      if (f.k !== chain[chain.length - 1].k && !holds(f.k, base.ck.u)) continue;
+      if (f.k !== chain[chain.length - 1].k && !(base.ck.e === 1 && holds(f.k, base.ck.u))) continue;
       const fh = recHash(f);
       if (fh === null) continue;
       const v = env.sig(sigId('fin', t, inc, fh), f.k, () => signBytes('fin', ctx, f), f.g);
