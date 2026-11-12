@@ -2530,8 +2530,16 @@ export class Sim {
       const d = delegations.find((x) => x.h === pub
         && chain.some((h, i) => h.k === x.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(x));
       if (d === undefined) return false;
+      // (With the one that answered, every delegation of that house by a
+      // holder: a buyer who delegates the seller's node again writes its own
+      // under the same key, and a page holds that one on for the house it
+      // used, casinoDoc keepHouses.)
       const e = baseKey === null || partial ? undefined : dlsOf.get(name);
-      if (e && e.base === baseKey && !e.dls.some((x) => x.h === d.h && x.k === d.k && x.g === d.g)) e.dls.push(d);
+      if (e && e.base === baseKey) {
+        for (const y of delegations) {
+          if (y.h === pub && !e.dls.some((x) => x.h === y.h && x.k === y.k && x.g === y.g) && chain.some((h) => h.k === y.k) && signed(y)) e.dls.push(y);
+        }
+      }
       return true;
     };
     let best: { key: string; id: string; ck: CkRec } | null = null;
