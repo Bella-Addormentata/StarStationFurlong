@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { sealCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
-import { houseSign } from './computedHouse';
+import { delegationKey, houseSign } from './computedHouse';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
@@ -318,6 +318,38 @@ describe('the checkpoint oracle and an end', () => {
 });
 
 describe("the oracle's own base rule", () => {
+  it("holds the buyer's house's delegation its count uses while the doc has lost the record (as a page does, casinoDoc keepHouses): the rounds that house revealed stay counted", async () => {
+    const sim = await Sim.open({ name: 'fair-only-buyer-house-key', seed: seed(1231), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    await sim.run(30_000);
+    const [, buyer, , D] = sim.pages;
+    expect(await sim.handOver(buyer), sim.label).toEqual({ ok: true });
+    while (sim.elapsed < RUN_MS && sim.node2!.wrote.reveals === 0) await sim.run(200);
+    expect(sim.node2!.wrote.reveals, sim.label).toBeGreaterThan(0);
+    // (Its house has signed no checkpoint yet: the record under its key is the only copy of its delegation.)
+    expect(sim.node2!.trims + sim.node2!.sweeps + sim.node2!.ends, sim.label).toBe(0);
+    await sim.run(1_000);
+    const key = delegationKey(sim.node2!.pub);
+    const top = D.p.doc.getMap<unknown>('casinoComputed');
+    expect(top.has(key), sim.label).toBe(true);
+    // (The buyer's page asleep: its node cannot put the record back.)
+    sim.sleep(buyer, false);
+    await sim.run(1_000);
+    // The record goes from page D's doc (by its own hand, so the moment is exact: a page that holds it
+    // puts it back within the second): the oracle's count of that doc, read at once, stands as it stood.
+    sim.enter(D);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    D.cheats = true;
+    D.p.doc.transact(() => top.delete(key));
+    expect(top.has(key), sim.label).toBe(false);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(sim.cageProblems(D), sim.label).toEqual([]);
+    sim.wake(buyer);
+    await sim.run(10_000);
+    await sim.syncAll();
+    expect(top.has(key), sim.label).toBe(true);
+    expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
+
   it("holds no checkpoint that came and went while the page's doc held part of an update (the page never counted from it), and holds one that was there when the rest came", async () => {
     const sim = await Sim.open({ name: 'fair-only-parked-ck', seed: seed(1219), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
     const T = 'roulette-1';

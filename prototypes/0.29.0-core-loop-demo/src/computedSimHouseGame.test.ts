@@ -1526,6 +1526,27 @@ describe("the simulations' houses at a FAIR ONLY game that changes hands (N1)", 
     expect(written(room.house)).toMatchObject({ joins: 1, reveals: 1, stepDowns: 0, cks: 0 });
   });
 
+  it('a game that has left its key does not hold the room\'s beat off the games the house still serves', () => {
+    const room = new HandRoom().start();
+    room.on2 = false;
+    const second = rootOf(Q, 'q');
+    const ses = `ses:${T}:${Q.inc}:${nextSid3(Q, second.value)}`;
+    room.doc.transact(() => {
+      room.top().set(second.key, second.value);
+      room.top().set(ses, new Y.Map());
+    });
+    room.run(SETTLE_MS + HEARTBEAT_MS);
+    room.played(1, SID);
+    room.handOver(1);
+    room.tick(TICK);
+    expect(resolved(room).holder).toBe(buyer.pub);
+    const beats = room.house.wrote.beats;
+    room.run(3 * HEARTBEAT_MS);
+    expect(room.house.wrote.beats).toBeGreaterThanOrEqual(beats + 2);
+    // (The base is still under the transfer's round: the game is one it reveals for no more, and counts for nothing.)
+    expect(room.cks().map((x) => x.key)).toEqual([ROOT.key]);
+  });
+
   it('neither house signs a checkpoint at the hand-over round the seller\'s house decided: the seller\'s speaks for the game no more (nor under the seller\'s end order), the buyer\'s did not reveal it', () => {
     const { room } = midRound();
     room.junk(HOUSE_SWEEP_BYTES);

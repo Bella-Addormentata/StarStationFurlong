@@ -604,7 +604,11 @@ export class SimHouse {
       for (let i = last - 1; !by && now_ === null && i >= 0; i--) by = res.houseBy(this.pub, Math.max(B.u, res.chain[i].from) + 1);
       if (!by) continue;
       const current = now_ !== null && now_ !== undefined;
-      serving += 1;
+      // (Only a game it serves counts for the room's beat: a game that has
+      // left its key never settles here, and would hold the beat off the
+      // games this house still serves for as long as its base stays under
+      // the transfer's round.)
+      if (current) serving += 1;
       const ctx: FoldCtx = { room, t, inc };
       const sid = nextSid3(ctx, B);
       const sesKey = `ses:${t}:${inc}:${sid}`;

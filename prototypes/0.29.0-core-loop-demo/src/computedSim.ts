@@ -793,9 +793,12 @@ export class Sim {
   /** …and the games whose best checkpoint in the doc it has not held yet,
    *  the doc holding part of an update when it was read (foBase, foCatchUp). */
   private readonly foBehind = new WeakMap<Page, Map<string, FoldCtx>>();
-  /** 🤝 Per load of a page, by game: every transfer its doc has held (a page
-   *  holds the transfers its game's chain stands on, design §8.4 P2). */
+  /** 🤝 Per load of a page, by game: the transfers of the chain foBase last
+   *  read there (a page holds the transfers its game's chain stands on,
+   *  design §8.4 P2; not one that never made the chain). */
   private readonly foXfs = new WeakMap<Page, Map<string, Map<string, XferRec>>>();
+  /** The delegations the chain's holders signed, as foBase last read them for each load of a page, by `<t>|<inc>`. */
+  private readonly foDls = new WeakMap<Page, Map<string, DelegationRec[]>>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
@@ -2430,10 +2433,16 @@ export class Sim {
     const name = `${ctx.t}|${ctx.inc}`;
     const whole: { key: string; id: string; ck: CkRec }[] = [];
     const delegations: DelegationRec[] = [];
+    // The transfers to choose from: the doc's, and the steps of the chain
+    // this rule last read for this load of the page (a page holds the steps
+    // its count stands on while the doc has lost them: casinoDoc
+    // keepStanding). Not every transfer it ever saw: one that never made
+    // the chain and is gone from the doc is gone.
     const xfsOf = this.foXfs.get(sp.p) ?? new Map<string, Map<string, XferRec>>();
     this.foXfs.set(sp.p, xfsOf);
-    const xfs = xfsOf.get(name) ?? new Map<string, XferRec>();
-    xfsOf.set(name, xfs);
+    const xfs = new Map<string, XferRec>(xfsOf.get(name) ?? []);
+    const dlsOf = this.foDls.get(sp.p) ?? new Map<string, DelegationRec[]>();
+    this.foDls.set(sp.p, dlsOf);
     const takeXf = (v: unknown, under?: string): void => {
       const xf = asXf(v, PAGE_ROOM);
       const id = xf && xfId(xf);
@@ -2450,8 +2459,15 @@ export class Sim {
       if (r.kind !== 'ok') continue;
       whole.push({ key, id: r.id, ck: r.ck });
       if (r.ck.dl !== undefined) delegations.push(r.ck.dl);
-      for (const xf of r.ck.x ?? []) takeXf(xf);
+      // (Its transfers only where it speaks for the buyer of the last: the
+      // only records whose `x` the pages read, computedFairOnlyAuth claimed.)
+      const lastX = r.ck.x?.[r.ck.x.length - 1];
+      if (lastX !== undefined && lastX.k === (r.ck.dl?.k ?? r.ck.k)) for (const xf of r.ck.x!) takeXf(xf);
     }
+    // (The delegations the chain's holders signed, as this rule last read
+    // them: a page holds those its count uses while the doc has lost one,
+    // casinoDoc keepHouses.)
+    for (const d of dlsOf.get(name) ?? []) delegations.push(d);
     // (The base the page holds while the doc has lost it, below: the game is
     // still its opener's, and its house still the one that base names.)
     const kept = this.foHeld.get(sp.p)?.get(name)?.ck;
@@ -2480,14 +2496,18 @@ export class Sim {
     }
     const holdsAt = (i: number, u: number): boolean => chain[i].from <= u && (i + 1 === chain.length || u <= chain[i + 1].from);
     const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
+    xfsOf.set(name, new Map(chain.flatMap((h) => (h.id === null ? [] : [[h.id, xfs.get(h.id)!] as [string, XferRec]]))));
+    const usedDls = new Map<string, DelegationRec>();
+    for (const d of delegations) if (chain.some((h) => h.k === d.k) && signed(d)) usedDls.set(`${d.h}|${d.g}`, d);
+    dlsOf.set(name, [...usedDls.values()]);
     const houseAt = (pub: string, r: number): boolean => delegations.some((d) => d.h === pub
       && chain.some((h, i) => h.k === d.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(d));
     let best: { key: string; id: string; ck: CkRec } | null = null;
-    for (const { key, id, ck } of whole) {
+    const accepts = (id: string, ck: CkRec): boolean => {
       // Whose it speaks for: the holder its transfers lead to, at a round that holder holds.
       const i = ck.x?.length ?? 0;
-      if (i >= chain.length || !holdsAt(i, ck.u)) continue;
-      if ((ck.x ?? []).some((xf, j) => xfId(xf) !== chain[j + 1].id)) continue;
+      if (i >= chain.length || !holdsAt(i, ck.u)) return false;
+      if ((ck.x ?? []).some((xf, j) => xfId(xf) !== chain[j + 1].id)) return false;
       const holder = chain[i].k;
       const { g, ...body } = ck;
       const dl = ck.dl;
@@ -2496,12 +2516,14 @@ export class Sim {
       // (An end is its house's too, or the holder's own, with no delegation;
       // an adoption is the buyer's own, of a game that came to it: no root.)
       const own = dl === undefined && ck.k === holder && (ck.e === 1 || (i > 0 && !root));
-      if (!(root ? i === 0 && ck.k === ck.ok && dlOk : own || (dlOk && dl!.h === ck.k))) continue;
+      if (!(root ? i === 0 && ck.k === ck.ok && dlOk : own || (dlOk && dl!.h === ck.k))) return false;
       // (An end order: a key's that holds the game at the round it ends, S1.)
       const fin = ck.f;
-      if (fin !== undefined && !(chain.some((h, j) => h.k === fin.k && holdsAt(j, ck.u)) && ok(`fin|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) continue;
-      if (!ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g)) continue;
-      if (best === null || outranks(ck, id, best.ck, best.id)) best = { key, id, ck };
+      if (fin !== undefined && !(chain.some((h, j) => h.k === fin.k && holdsAt(j, ck.u)) && ok(`fin|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
+      return ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g);
+    };
+    for (const { key, id, ck } of whole) {
+      if (accepts(id, ck) && (best === null || outranks(ck, id, best.ck, best.id))) best = { key, id, ck };
     }
     // A page holds the base it counts from (casinoDoc's held records, design
     // §8.4 P2): while the doc has lost it (a peer's delete or junk over its
@@ -2522,7 +2544,14 @@ export class Sim {
     this.foBehind.set(sp.p, behind);
     // (Which keys are houses is read afresh each time: a transfer or a
     // delegation comes without the base changing.)
-    const was = held.get(name);
+    // (And the base it holds only while the chain still gives it: a
+    // transfer under its round takes it from the key it spoke for, and the
+    // page that held it counts from it no more.)
+    let was = held.get(name);
+    if (was && !accepts(was.key.slice(prefix.length), was.ck)) {
+      held.delete(name);
+      was = undefined;
+    }
     if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) {
       behind.delete(name);
       return { ...was, houseAt };
