@@ -591,6 +591,15 @@ describe('the round the game changes hands at is one every page will read', () =
     expect(redeem(c2, o, closedAt + STEP)).toEqual({ ok: true });
     expect(xfsOf(c2, inc).find((x) => x.k === c2.pub)).toMatchObject({ u: 1 });
     expect(res(c2, inc)).toMatchObject({ holder: c2.pub, invalid: [] });
+    // An end from this page now would be at round 0, under the round it holds the game from, and count
+    // nowhere: the order alone goes in, and the end waits for the round.
+    expect(off(c2, closedAt + 2 * STEP)).toBe('ending');
+    expect(endOf(c2, inc)).toBeUndefined();
+    expect(res(c2, inc)).toMatchObject({ live: true, holder: c2.pub, fin: { k: c2.pub } });
+    expect(c2.casino.computedGamesEnding(c2.pub)).toEqual([{ t: TABLE, inc }]);
+    run([c2], closedAt + 3 * STEP, closedAt + 3 * STEP + 2 * c2.table.FAIR_END_WAIT_MS);
+    expect(endOf(c2, inc)).toBeUndefined();
+    expect(res(c2, inc)).toMatchObject({ live: true, invalid: [] });
   });
 });
 
@@ -649,5 +658,26 @@ describe('a flood of offers nobody signed', () => {
     run(pages, at + 3 * STEP, at + 3 * STEP);
     expect(xfsOf(b, inc)).toHaveLength(1);
     expect(xfsOf(b, inc)[0]).toMatchObject({ o: { nonce: good.nonce } });
+  });
+
+  it('more forged offers than verdicts are kept: the asking goes round from where the last look stopped, so the good offer behind them is still reached', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    b.table.setAdoptVerdictsMaxForTests(4);
+    const made = Array.from({ length: 9 }, () => offerAt(a, b, at)).sort((x, y) => (x.nonce < y.nonce ? -1 : 1));
+    const good = made[8];
+    const forged = made.slice(0, 8).map((o) => ({ ...o, sig: good.sig }));
+    b.doc.transact(() => {
+      b.doc.getMap('roomInfo').set('owner', b.pid);
+      for (const o of [...forged, good]) top(b).set(`do:${o.nonce}`, definedOffer(o));
+    });
+    sync(at, ...pages);
+    // (Two a look: the ninth offer is asked on the fifth look, whatever was forgotten meanwhile.)
+    run(pages, at + STEP, at + 4 * STEP);
+    expect(xfsOf(b, inc)).toEqual([]);
+    run(pages, at + 5 * STEP, at + 5 * STEP);
+    expect(xfsOf(b, inc)).toHaveLength(1);
+    expect(xfsOf(b, inc)[0]).toMatchObject({ o: { nonce: good.nonce } });
+    b.table.setAdoptVerdictsMaxForTests();
   });
 });

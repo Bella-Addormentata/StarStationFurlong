@@ -773,6 +773,7 @@ function lookAtClock(now: number): void {
     adoptTried.clear();
     adoptLookedAt = null;
     offerVerdicts.clear();
+    adoptCursor = '';
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -5641,6 +5642,17 @@ function transfersOf(resolved: Resolution): XferRec[] {
   return resolved.chain.slice(1).map((h) => h.step!.xf);
 }
 
+/** Whether an end this page's key signs for the game folded as `res` over
+ *  base `B` would be at a round its holder holds (S1): the round of the last
+ *  decided round, or the base's, is not under the round the holder took the
+ *  game at. After a hand-over it can be: the game taken at a round in flight
+ *  that is not decided yet, or on a page that has the transfer and not yet
+ *  the rounds under it. An end there would count on no page, so none is
+ *  written: the end order stands and the end waits for the round. */
+function fairEndReaches(resolved: Resolution, B: CkRec, res: FoldResult): boolean {
+  return Math.max(B.u, lastDecided(res)?.r ?? 0) >= resolved.chain[resolved.chain.length - 1].from;
+}
+
 /** The ended checkpoint of a game at base `B` folded as `res`, quiet, under
  *  end order `fin`, as the page that holds the game signs it (design §8.6, and
  *  §8.5 N6 for the form): at the last round its fold decided past the base, or
@@ -5703,12 +5715,12 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
     const played = computedIncOf(t);
     return played !== null && isFairOnlyInc(played) && gameOfInc(played) === game && isComputedTable(t) ? 'theirs' : 'ok';
   }
-  const games: { inc: string; fin: FinRec | null; base: CkRec; res: FoldResult; x: XferRec[] }[] = [];
+  const games: { inc: string; fin: FinRec | null; base: CkRec; res: FoldResult; x: XferRec[]; reaches: boolean }[] = [];
   for (const inc of held) {
     const resolved = computedResolutionOf(t, inc);
     const res = computedFoldOf(t, inc);
     if (!resolved || resolved.pending || !resolved.base || !res || res.pending) return 'reconnecting';
-    games.push({ inc, fin: resolved.fin, base: resolved.base.ck, res, x: transfersOf(resolved) });
+    games.push({ inc, fin: resolved.fin, base: resolved.base.ck, res, x: transfersOf(resolved), reaches: fairEndReaches(resolved, resolved.base.ck, res) });
   }
   if (game === 'craps' && !again && games.some((g) => contractRides(g.res.carry as CrapsCarry))) return 'contract';
   const writes = games.map((g) => {
@@ -5717,7 +5729,7 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
     // (Sound first: what it notes is noted with a round in flight too, so a
     // wait that began for one loss does not stand in for the next.)
     const sound = fairSound(t, g.inc, g.res, now);
-    const end = fairQuiet(g.res) && sound ? fairEndOf(ctx, g.base, g.res, fin, g.x) : null;
+    const end = fairQuiet(g.res) && sound && g.reaches ? fairEndOf(ctx, g.base, g.res, fin, g.x) : null;
     return { inc: g.inc, fin: g.fin === null ? fin : null, end };
   });
   // (A game whose order stands and whose end waits has nothing to write.)
@@ -5765,7 +5777,11 @@ let adoptLookedAt: number | null = null;
 /** How many offers one look may check the signature of (offerSigned). */
 export const ADOPT_CHECKS_PER_LOOK = 2;
 /** The most verdicts kept (a peer's flood of forged offers fills it: emptied then, and checked afresh). */
-const ADOPT_VERDICTS_MAX = 4_096;
+let adoptVerdictsMax = 4_096;
+/** 🧪 Set the most verdicts kept (a spec's flood need not be thousands). */
+export function setAdoptVerdictsMaxForTests(n = 4_096): void {
+  adoptVerdictsMax = n;
+}
 /** By an offer's bytes (maker, signed bytes' hash and signature): whether its maker signed it. */
 const offerVerdicts = new Map<string, boolean>();
 /** The checks the look under way has left. */
@@ -5785,9 +5801,34 @@ function offerSigned(o: DeedOffer): boolean | undefined {
   adoptChecksLeft--;
   const { sig, ...unsigned } = o;
   const ok = verifyIdentityStrict(o.makerPub, offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
-  if (offerVerdicts.size >= ADOPT_VERDICTS_MAX) offerVerdicts.clear();
+  if (offerVerdicts.size >= adoptVerdictsMax) offerVerdicts.clear();
   offerVerdicts.set(id, ok);
   return ok;
+}
+
+/** The nonce of the offer a look last asked the signature of (signedAmong). */
+let adoptCursor = '';
+
+/** Of offers `could` (sorted by nonce), one its maker signed, or null: the
+ *  one being redeemed (`mine`, checked by the redemption), else one already
+ *  found signed, else the first found so of those asked now. The asking goes
+ *  round from where the last look stopped (adoptCursor), not from the first
+ *  each time: the verdicts kept are bounded, and a flood of forged offers
+ *  larger than the bound would otherwise have every look spend its checks on
+ *  the same first few again, never reaching a good offer behind them. */
+function signedAmong(could: DeedOffer[], mine: DeedOffer | null): DeedOffer | null {
+  if (mine && could.includes(mine)) return mine;
+  const known = could.find((c) => { const id = recHash(c); return id !== null && offerVerdicts.get(id) === true; });
+  if (known) return known;
+  const at = could.findIndex((c) => c.nonce > adoptCursor);
+  const round = at < 0 ? could : [...could.slice(at), ...could.slice(0, at)];
+  for (const c of round) {
+    const v = offerSigned(c);
+    if (v === undefined) return null;
+    adoptCursor = c.nonce;
+    if (v) return c;
+  }
+  return null;
 }
 
 /**
@@ -5852,8 +5893,9 @@ export function adoptFairOnlyGames(now = Date.now(), redeeming?: TransferOffer):
     if (res.tip === null && res.openCloses.some((c) => c.state !== 'invalid')) continue;
     const used = new Set(resolved.chain.map((h) => h.step?.xf.o.nonce));
     const name = resolved.name;
-    const o = offers.find((c) => c.makerPub === holder && c.issuedAt >= name.ts - OFFER_SKEW_MS && !used.has(c.nonce)
-      && !adoptTried.has(`${t}:${inc}:${c.nonce}`) && (c === mine || offerSigned(c) === true));
+    const could = offers.filter((c) => c.makerPub === holder && c.issuedAt >= name.ts - OFFER_SKEW_MS && !used.has(c.nonce)
+      && !adoptTried.has(`${t}:${inc}:${c.nonce}`));
+    const o = signedAmong(could, mine);
     if (!o) continue;
     // Nor while a decided round is short of a record it rests on (fairSound,
     // as an end waits): a bettor who deletes a frozen slip takes the round
@@ -5930,7 +5972,7 @@ function fairEndDuty(pub: string, now: number): void {
     // (Sound before quiet, as the press: noted with a round in flight too.)
     if (checked) looked.add(key);
     const sound = checked && fairSound(t, inc, res!, now);
-    const ready = sound && fairQuiet(res!);
+    const ready = sound && fairQuiet(res!) && fairEndReaches(resolved!, resolved!.base!.ck, res!);
     if (!ready) {
       endingSince.delete(key);
       continue;
