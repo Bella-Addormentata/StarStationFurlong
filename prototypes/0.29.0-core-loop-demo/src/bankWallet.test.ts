@@ -3,7 +3,7 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { BANK_LISTING_LINE, UNKNOWN_NETWORK_TEXT, bankWalletView, chiaOffBankText, createInAppText, listsWhen, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { BANK_LISTING_LINE, BANK_LISTING_LINE_TEST, UNKNOWN_NETWORK_TEXT, bankWalletView, chiaOffBankText, createInAppText, listsWhen, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
 import { chiaOffWhy } from './chiaLane';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import type { ChiaLane, ChiaListing, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
@@ -218,11 +218,28 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       expect(listsWhen(net, listMeOn, 'the wallet', true)).toBe('Once the wallet holds a coin (one mojo from the faucet dish is enough) it lists itself in the Phone Book on the test chain.');
       // LIST ME off: no listing is promised, and no mojo is asked for.
       expect(listsWhen(net, listMeOff, 'the wallet', true)).toBe(`LIST ME is off for testnet11 (${where}), so your node writes no Phone Book listing there until you turn it on.`);
+      // A node that says the lobby dish pays (`dish`, its default on a test
+      // network): no listing for a coin, no mojo asked for, and nothing said
+      // of "never", since an older version paid from this wallet there.
+      const dishPays = `On testnet11 the wallet pays for no Phone Book write: your station is listed there while LIST ME is on (${where}), paid by the lobby dish.`;
+      expect(listsWhen(net, { ...listMeOn, dish: true })).toBe(dishPays);
+      expect(listsWhen(net, { ...listMeOn, dish: true }, 'the wallet', true)).toBe(dishPays);
+      expect(listsWhen(net, { ...listMeOn, dish: true }, 'the new wallet')).toBe(dishPays.replace('the wallet', 'the new wallet'));
+      expect(listsWhen(net, { ...listMeOff, dish: true }, 'the wallet', true)).toBe(listsWhen(net, listMeOff, 'the wallet', true));
+      for (const [w] of cases) {
+        const warning = armed(w, { ...listMeOn, dish: true });
+        expect(warning).toContain('pays for no Phone Book write');
+        expect(warning).not.toContain('holds a coin');
+        expect(warning).not.toContain('faucet');
+        expect(warning).not.toContain('never');
+      }
     } else {
       // Off a test network the wallet never pays, whatever LIST ME says, and
       // no faucet dish is promised.
       expect(listsWhen(net, undefined, 'the wallet', true)).toBe('On Chia mainnet the wallet pays for no Phone Book write.');
-      for (const listing of [listMeOn, listMeOff]) {
+      // The same whether or not the node says `dish`: off a test network
+      // the lobby dish pays either way.
+      for (const listing of [listMeOn, listMeOff, { ...listMeOn, dish: true as const }, { ...listMeOff, dish: true as const }]) {
         expect(listsWhen(net, listing, 'the wallet', true)).toBe(
           `On Chia mainnet the wallet pays for no Phone Book write, and its address is never in the book: your station is listed there only while LIST ME is on (${where}), paid by the lobby dish.`,
         );
@@ -236,12 +253,22 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       expect(notice(listing)).toContain('at a new address');
       expect(notice(listing).includes('not listed in the Phone Book')).toBe(net.test && (!listing || listing.on));
     }
+    // Where the node says the lobby dish pays, an empty new wallet holds no
+    // listing back, on any network.
+    for (const listing of [{ ...listMeOn, dish: true as const }, { ...listMeOff, dish: true as const }]) {
+      expect(notice(listing)).toContain('at a new address');
+      expect(notice(listing)).not.toContain('not listed in the Phone Book');
+    }
   });
 
-  it('says who pays for the listing only off a test network, for a node with a LIST ME and a wallet to speak of', () => {
+  it('says the lobby dish pays for the listing off a test network, and on one only when the node says so, for a node with a LIST ME and a wallet to speak of', () => {
     expect(BANK_LISTING_LINE).toBe("Your Phone Book listing is paid by the lobby dish, never by this wallet. This wallet's address is never in the book.");
+    // A test network's line promises no "never": an older version paid for
+    // its listings from this wallet there.
+    expect(BANK_LISTING_LINE_TEST).toBe('Your Phone Book listing is paid by the lobby dish, not by this wallet: it needs no coin to be listed.');
     const withListMe = (fp: LocalFingerprint, chia_listing: ChiaListing = { on: false, chosen: false }): LocalFingerprint => ({ ...fp, chia_listing });
     const shown = net.test ? null : BANK_LISTING_LINE;
+    const shownDish = net.test ? BANK_LISTING_LINE_TEST : BANK_LISTING_LINE;
     const wallets: LocalFingerprint[] = [
       on({ state: 'ready', mnemonic: true, backup: 'native' }),
       on({ state: 'ready', seed: true, mnemonic: true }),
@@ -255,6 +282,9 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       for (const listing of [{ on: false, chosen: false }, { on: true, chosen: true }, { on: true, chosen: true, held: true as const }] as ChiaListing[]) {
         for (const ui of [IDLE, { ...IDLE, armed: true }, { ...IDLE, turning: true }]) {
           expect(bankWalletView(withListMe(fp, listing), ui).listing).toBe(shown);
+          // The node says the lobby dish pays: the line shows on a test
+          // network too, in that network's words.
+          expect(bankWalletView(withListMe(fp, { ...listing, dish: true }), ui).listing).toBe(shownDish);
         }
       }
       // A node older than LIST ME writes no listing off a test network: no line.
@@ -271,6 +301,9 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       null,
     ];
     for (const fp of none) expect(bankWalletView(fp, IDLE).listing).toBeNull();
+    for (const fp of none) {
+      if (fp?.chia_listing) expect(bankWalletView({ ...fp, chia_listing: { ...fp.chia_listing, dish: true } }, IDLE).listing).toBeNull();
+    }
     const noCreate = bankWalletView(withListMe(on({ state: 'ready', mnemonic: true, backup: 'none' })), IDLE);
     expect(noCreate.listing).toBeNull();
     if (!net.test) expect(noCreate.text).toBe(createInAppText(net));
@@ -314,11 +347,22 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
   it('writes the note under the address for this network, with no em-dash', () => {
     const note = receiveNote(net);
     expect(`${note.lead} ${note.text}`).not.toContain('—');
+    const dish = receiveNote(net, true);
+    expect(`${dish.lead} ${dish.text}`).not.toContain('—');
+    expect(dish.lead).toBe(note.lead);
     if (net.test) {
       expect(note.lead).toBe('testnet11 only.');
       expect(note.text).toContain('a testnet faucet gives TXCH for free');
       expect(note.text).toContain('for good');
+      // A node that says the lobby dish pays for its listing and knocks:
+      // the wallet's coin is for GIVE at the faucet dish, and the note
+      // promises no chain write of the node's for it.
+      expect(dish.text).toBe('Scan the code or paste the address in a testnet11 wallet (a testnet faucet gives TXCH for free). The lobby dish pays for this node\'s Phone Book listing and its knocks, so this wallet needs a coin only to GIVE at the faucet dish. A mainnet wallet refuses a txch address, so real XCH cannot land here by mistake.');
+      expect(dish.text).not.toContain('presence');
+      expect(dish.text).not.toContain('for good');
     } else {
+      // Off a test network the note is the same whatever the node says.
+      expect(dish).toEqual(note);
       expect(note.lead).toBe('Real XCH.');
       expect(note.text).toContain('real XCH');
       // The lobby dish pays for the listing and the knocks there, so the

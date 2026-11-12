@@ -423,7 +423,9 @@ pub struct Fingerprint {
     /// publisher may write the Phone Book listing and the knocks (`on`),
     /// whether the player turned the switch or the network's default stands
     /// (`chosen`), `held` when `SSF_CHIA_FINDABLE=0` holds the listing off
-    /// beside it, and `damaged` when its file cannot be read. Read live per
+    /// beside it, `damaged` when its file cannot be read, and `dish` when
+    /// the lobby dish pays for those writes and the SSF wallet for none
+    /// (burner keys are on, `chia_publish::burners`). Read live per
     /// request; absent from a read-only build, which writes nothing, and
     /// from an older node. Loopback only, like the address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2383,7 +2385,7 @@ async fn node_main() -> Result<()> {
                 }
                 // ⛓️🧪 Claim-and-write self-test hook
                 // (SSF_CHIA_CLAIM_WRITE_TEST=1, stage 4 design §13 row 9):
-                // once at startup, with burner keys on (SSF_CHIA_BURNERS=1), a
+                // once at startup, with burner keys on (not SSF_CHIA_BURNERS=0), a
                 // burner claims a lobby dish coin and writes 64 random bytes in
                 // the same bundle, waits for the chain's verdict and reads the
                 // record back through its ephemeral parent. A test network only
@@ -2400,7 +2402,7 @@ async fn node_main() -> Result<()> {
                             }
                         });
                     } else {
-                        eprintln!("⛓️ ChiaHub: SSF_CHIA_CLAIM_WRITE_TEST=1 needs SSF_CHIA_BURNERS=1; nothing is written.");
+                        eprintln!("⛓️ ChiaHub: SSF_CHIA_CLAIM_WRITE_TEST=1 needs burner keys, which SSF_CHIA_BURNERS=0 turned off; nothing is written.");
                     }
                 }
             }
@@ -2436,7 +2438,8 @@ async fn node_main() -> Result<()> {
     // nothing is written whatever the switch says and the lane's line says
     // so. A build that only reads the chain has no switch.
     #[cfg(feature = "chia-publish")]
-    let list_me = chia_listing::ListMe::read(chia_net, chia_net.path(chia_listing::LISTING_FILE), chia_publish::findable_enabled());
+    let list_me = chia_listing::ListMe::read(chia_net, chia_net.path(chia_listing::LISTING_FILE), chia_publish::findable_enabled())
+        .paid_by_dish(chia_publish::burners_enabled());
     #[cfg(feature = "chia-publish")]
     let listed = list_me.on();
     #[cfg(not(feature = "chia-publish"))]
@@ -6652,13 +6655,13 @@ mod test_hook_tests {
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address, with the
 /// beacon on the beacon's line (which names its address only where the
-/// operator funds it, [`beacon_lines`]), with SSF_CHIA_BURNERS set to
-/// `1`, what that does on this network, and with SSF_CHIA_AUDIT set
+/// operator funds it, [`beacon_lines`]), what burner keys do on this
+/// network or that SSF_CHIA_BURNERS turned them off, and with SSF_CHIA_AUDIT set
 /// to `1`, the audit's notice and the beacon key's address
 /// (`chia_publish::audit_wallet_lines`). Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
-    chia_wallet::log_receive_address(net, id);
+    chia_wallet::log_receive_address(net, id, chia_publish::burners_enabled());
     // #231 P6b/D7: the beacon role pays from a key of its own, derived from
     // the wallet key (so it changes with a re-mint). With burner keys off,
     // which only a test network can have, it is funded separately, at the
@@ -6672,11 +6675,12 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
             eprintln!("{warning}");
         }
     }
-    // Stage 4 design §8 (2): with the variable set to `1`, burner keys on
-    // for a test network's run, or the word that it changes nothing off
-    // one, where they are on without it; nothing is said when the variable
-    // is not `1`. The second arm is kept for a line said with them off,
-    // which no network gives now.
+    // Stage 4 design §8 (2), §13 row 12: on a test network, what burner
+    // keys do there, where they are on by default, or, with the variable
+    // at `0`, that the SSF wallet pays at its own address (the second arm:
+    // said on stderr, since that path shows the wallet's address beside
+    // the listing). Off a test network, the word that the variable changes
+    // nothing where it is `0` or `1`, and nothing otherwise.
     match chia_publish::burners() {
         (true, Some(line)) => println!("{line}"),
         (false, Some(line)) => eprintln!("{line}"),
@@ -6694,8 +6698,8 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
 /// (stage 2, question 6): the node id it writes in the clear comes from
 /// `iroh_node_id.key`, which every network shares, so a node that beacons on
 /// testnet11 too writes the same id on both chains and can be linked across
-/// them. With burner keys on for the run (`burners`: with the flag on a
-/// test network, and always off one, `chia_publish::burners_of`) the lobby
+/// them. With burner keys on for the run (`burners`: on a test network
+/// unless the flag turns them off, and always off one, `chia_publish::burners_of`) the lobby
 /// dish funds the beacon's key, so the line names no address and asks for
 /// no funding, on every network (stage 4 design §4.5 (8)). With them off on
 /// a test network it names `addr`, the beacon wallet's address, to be
@@ -6761,8 +6765,8 @@ mod beacon_line_tests {
     }
 
     /// Stage 4 design §4.5 (8): the beacon's line over every network and
-    /// path. With burner keys on, which a test network has with its flag
-    /// and mainnet has always (`chia_publish::burners_of`, walked here over
+    /// path. With burner keys on, which a test network has unless its flag
+    /// says `0` and mainnet has always (`chia_publish::burners_of`, walked here over
     /// every value of the flag), the lobby dish funds the beacon's key, so
     /// the line names no address and asks for no funding. With them off on
     /// a test network it is the line it always was, with the address to
@@ -6793,7 +6797,7 @@ mod beacon_line_tests {
         for raw in [None, Some("0"), Some("1")] {
             let burners = |net| crate::chia_publish::burners_of(net, raw.map(std::ffi::OsStr::new)).0;
             assert_eq!(beacon_lines(ChiaNet::Mainnet, burners(ChiaNet::Mainnet), "ADDR").0, DISH, "mainnet with the flag {raw:?}");
-            let testnet = if raw == Some("1") { DISH } else { FUNDED };
+            let testnet = if raw == Some("0") { FUNDED } else { DISH };
             assert_eq!(beacon_lines(ChiaNet::Testnet11, burners(ChiaNet::Testnet11), "ADDR").0, testnet, "testnet11 with the flag {raw:?}");
         }
     }

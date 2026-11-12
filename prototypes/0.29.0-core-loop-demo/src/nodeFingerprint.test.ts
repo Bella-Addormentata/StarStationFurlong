@@ -174,9 +174,14 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ on: true, chosen: true, damaged: true })).toEqual({ on: false, chosen: true, damaged: true });
     // An older node sends no switch at all.
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_listing).toBeUndefined();
-    // `held` and `damaged` only as true.
+    // A node whose listing the lobby dish pays for says so (`dish`), beside
+    // whatever else the switch says.
+    expect(fp({ on: true, chosen: false, dish: true })).toEqual({ on: true, chosen: false, dish: true });
+    expect(fp({ on: false, chosen: true, held: true, dish: true })).toEqual({ on: false, chosen: true, held: true, dish: true });
+    expect(fp({ on: true, chosen: true, damaged: true, dish: true })).toEqual({ on: false, chosen: true, damaged: true, dish: true });
+    // `held`, `damaged` and `dish` only as true: a payer is never guessed.
     for (const junk of [false, 'true', 1, null, 0]) {
-      expect(fp({ on: true, chosen: true, held: junk, damaged: junk })).toEqual({ on: true, chosen: true });
+      expect(fp({ on: true, chosen: true, held: junk, damaged: junk, dish: junk })).toEqual({ on: true, chosen: true });
     }
     // An `on` or a `chosen` that is not a boolean, or no object at all: no
     // switch, never one guessed as on.

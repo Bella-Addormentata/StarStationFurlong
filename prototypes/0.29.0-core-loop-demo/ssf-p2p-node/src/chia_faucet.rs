@@ -496,7 +496,7 @@ impl Unspent {
 /// error for the page that failed, under the words the listing's callers
 /// have always logged ("coin lookup: ..."). It is typed so that a caller
 /// can tell a failed read, which a later try may get past, from a refusal:
-/// with burner keys on (SSF_CHIA_BURNERS=1 on a test network), a knock that
+/// with burner keys on (a test network's default, and always off one), a knock that
 /// could not read the chain waits and uses no attempt (stage 4 design §5.2,
 /// `chia_publish::is_typed_wait`); with them off it uses one, as on main.
 #[derive(Debug)]

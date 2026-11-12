@@ -170,7 +170,8 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
 }
 
 /** The listed title names the edition the listing is in. With burner keys
- *  on (SSF_CHIA_BURNERS=1 on a test network, stage 4 design §4.3), a node
+ *  on (always off a test network, and on one unless the node was started
+ *  with SSF_CHIA_BURNERS=0; stage 4 design §4.3), a node
  *  keeps last week's listing listed while this week's waits for its slot or
  *  its late start: readers scan this edition and the one before, so last
  *  week's is the listing they find. The node then sends `listed_era` as the

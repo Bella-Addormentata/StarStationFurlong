@@ -17,8 +17,8 @@
 //! signs with the SSF wallet's keys. It signs with a [`BurnerKey`] alone,
 //! never a money key, and has no network check of its own: the rules hold
 //! on every network, and which callers reach it, on which network, is their
-//! gate (`super::burner_paths`: SSF_CHIA_BURNERS on a test network, §13
-//! rows 9 and 10, and always off one; the beacon's writer where the
+//! gate (`super::burner_paths`: on a test network unless SSF_CHIA_BURNERS=0,
+//! §13 rows 9, 10 and 12, and always off one; the beacon's writer where the
 //! operator turned the beacon on, and the listing's and the knocks' while
 //! the player's LIST ME is on, §4.5 (6)). Its tests run on each network
 //! for that reason.
@@ -45,7 +45,7 @@
 //! beacon's writer from its key B (`publish_beacon_with`, PR 10d), and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
-//! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
+//! (SSF_CHIA_CLAIM_WRITE_TEST=1, with burner keys on).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1294,7 +1294,7 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
 /// burner as its payer, and the mark's reader judges it by both coins
 /// ([`WriteCoins::filed`]). Like the builder it has no network check of its
 /// own: its one caller, the claim-and-write self-test hook
-/// ([`claim_write_selftest`]), runs only with SSF_CHIA_BURNERS=1 on a test
+/// ([`claim_write_selftest`]), runs only with burner keys on, on a test
 /// network (§13 row 9), and keeps no mark. The listing does not come
 /// through here: it reaches [`burner_write_with`] through its own wrapper
 /// (`chia_publish::publish_burner_presence`, §13 row 10), and the heartbeat
@@ -1364,7 +1364,7 @@ async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
 }
 
 /// The claim-and-write self-test (SSF_CHIA_CLAIM_WRITE_TEST=1 with
-/// SSF_CHIA_BURNERS=1, on a test network: main.rs). It makes one real
+/// burner keys on, on a test network: main.rs). It makes one real
 /// claim-and-write from a burner on the network's lobby dish ([`burner_write`],
 /// stage 4 design §4.1), waits for the chain's verdict on it, and reads the
 /// record back through its ephemeral parent g on the carrier lane: the
@@ -1402,9 +1402,9 @@ async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
 ///
 /// A bundle it parked outlives the run: like any spend in flight, it is
 /// pushed again and settled on any later start on a test network, with
-/// SSF_CHIA_BURNERS set or not, and until it settles the money writers'
+/// burner keys on or off, and until it settles the money writers'
 /// settling check, which asks about every payer, holds them. Nothing new is
-/// built without the flag.
+/// built with burner keys off.
 pub async fn claim_write_selftest(net: ChiaNet, wallet: chia_bls::SecretKey) -> Result<()> {
     use crate::chia_burner::{BurnerRoot, MoneyKey};
     use crate::chia_resolve::{read_hint_items, spent_heights, HintCursor, WriteStanding};
