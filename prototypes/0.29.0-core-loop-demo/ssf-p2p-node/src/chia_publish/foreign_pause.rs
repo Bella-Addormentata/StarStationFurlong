@@ -35,8 +35,7 @@
 //!
 //! This file is the clock alone ([`ForeignPause`]): it reads no chain and
 //! no lease, and its time and era are its caller's. The heartbeat owns the
-//! one the node runs by, loaded from [`FOREIGN_PAUSE_FILE`] with burner
-//! keys on and kept in memory, never noted, with them off. A pause is for
+//! one the node runs by, loaded from [`FOREIGN_PAUSE_FILE`]. A pause is for
 //! the listing keys it was counted under ([`ForeignPause::load`]): new
 //! words or a new contact key make new listing keys, which no copy shares,
 //! and a pause on record for the old ones holds nothing. Nor is one
@@ -61,7 +60,7 @@
 //! learned lost after the clock was set right and the two hours ended, is
 //! counted a second time: its stamp is past the end brought in, and no
 //! stamp of the old clock can be told from one of the new. And a station
-//! that was stopped, or had burner keys off, when the two hours ended
+//! that was stopped when the two hours ended
 //! starts the watch afresh when it next runs: what the other copy wrote
 //! until then, in a later era too, is adopted and not told of.
 
@@ -195,8 +194,7 @@ impl std::fmt::Debug for ForeignPause {
 
 impl ForeignPause {
     /// No pause, kept in memory alone and saved nowhere, and bound to no
-    /// keys: the heartbeat's with burner keys off, where nothing is ever
-    /// counted, and the tests' own.
+    /// keys: what [`ForeignPause::load`] starts from, and the tests' own.
     pub fn in_memory() -> ForeignPause {
         ForeignPause { era: 0, times: 0, until: 0, renewed: false, keys: None, seen: Vec::new(), said: None, path: None }
     }

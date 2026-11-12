@@ -439,17 +439,18 @@ impl InboundVerified {
 
 /// What the log says a first unsolicited inbound of an era is for. While
 /// Chia is off on this computer (`chia_off`) no presence record is written,
-/// on every network, so the line states the reachability fact alone. Off a
-/// test network (`net`) the SSF wallet pays for no presence record either
-/// (stage 4 design §4.5 (1), `chia_publish::money_memo_refusal`), so the
-/// line promises none there.
-pub fn inbound_verified_words(chia_off: bool, net: crate::chia_network::ChiaNet) -> &'static str {
+/// on every network, so the line states the reachability fact alone.
+/// Otherwise the words are one for every network: the listing is written
+/// the same way on each, from a key of its own (stage 4 design §13 row 12),
+/// and whether one is written is the player's LIST ME and the SSF wallet's
+/// switch to say, so the line promises none. (Off a test network it said
+/// that no presence record is written there, which was true only while the
+/// SSF wallet was the one payer.)
+pub fn inbound_verified_words(chia_off: bool) -> &'static str {
     if chia_off {
         "Chia is off on this computer, so no presence record is written"
-    } else if !net.is_test() {
-        "no presence record is written on this network yet"
     } else {
-        "this era's presence record will say so"
+        "this era's presence record, where one is written, will say so"
     }
 }
 
@@ -803,20 +804,17 @@ mod tests {
     }
 
     /// ⛓️ While Chia is off on this computer the inbound line never promises
-    /// a presence record, on any network: no publisher runs. With Chia on,
-    /// testnet11's words are as before, and off a test network, where the
-    /// SSF wallet pays for no presence record, the line promises none.
+    /// a presence record: no publisher runs. With Chia on its words are one
+    /// for every network, since the listing is written the same way on
+    /// each, and they promise no record where none is written (LIST ME off,
+    /// no SSF wallet on).
     #[test]
     fn while_chia_is_off_an_inbound_mark_promises_no_presence_record() {
-        use crate::chia_network::ChiaNet;
-        for net in ChiaNet::ALL {
-            let off = inbound_verified_words(true, net);
-            assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
-            assert!(!off.contains("will say so"), "{off}");
-        }
-        assert_eq!(inbound_verified_words(false, ChiaNet::Testnet11), "this era's presence record will say so");
-        let mainnet = inbound_verified_words(false, ChiaNet::Mainnet);
-        assert_eq!(mainnet, "no presence record is written on this network yet");
-        assert!(!mainnet.contains("will say so"), "{mainnet}");
+        let off = inbound_verified_words(true);
+        assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
+        assert!(!off.contains("will say so"), "{off}");
+        let on = inbound_verified_words(false);
+        assert_eq!(on, "this era's presence record, where one is written, will say so");
+        assert!(!on.contains("network"), "it names no network: {on}");
     }
 }

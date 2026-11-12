@@ -106,7 +106,7 @@ const where = (net: ChiaNetwork | null): string => net?.name ?? 'the Chia networ
 /** What a station writes while LIST ME is on, and who can read it. Off a
  *  test network it also says who pays: a key of its own for each write,
  *  funded by the lobby dish, never the SSF wallet. On a test network it
- *  names no payer, since there the SSF wallet may be the one. */
+ *  names no payer, since there an older node's SSF wallet may be the one. */
 const whatIsWritten = (net: ChiaNetwork | null): string =>
   net && !net.test
     ? 'its Phone Book listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach, each from a key of its own that the lobby dish pays for, never from your SSF wallet. Only holders of your contact card, and a host your node knocks on, can read your addresses.'
@@ -144,12 +144,21 @@ export const listMeChiaOffNote = (net: ChiaNetwork | null): string =>
 
 /** What a LIST ME shows the world, before CONFIRM. `held`: the node's
  *  environment holds the listing off (`SSF_CHIA_FINDABLE=0`), so a turn on
- *  writes only the knocks, and the warning says so. */
-export function listMeWarning(net: ChiaNetwork | null, held = false): string {
-  const pays = net && !net.test
-    ? ' Each is written from a key of its own that the lobby dish pays for, never from your SSF wallet.'
-    : '';
-  const wallet = !net || net.test ? ' (on a test network your SSF wallet may pay for a write, which shows its address)' : '';
+ *  writes only the knocks, and the warning says so. `dish`: the node says
+ *  the lobby dish pays for what the switch allows (`ChiaListing.dish`), as
+ *  every node does since stage 4 PR 12. On a test network the warning then
+ *  names that payer, without the "never" of a network of real coins, since
+ *  an older version paid from the wallet there. A test-network node that
+ *  does not say it is an older one, whose SSF wallet may be the payer. */
+export function listMeWarning(net: ChiaNetwork | null, held = false, dish = false): string {
+  const pays = !net
+    ? ''
+    : !net.test
+      ? ' Each is written from a key of its own that the lobby dish pays for, never from your SSF wallet.'
+      : dish
+        ? ' Each is written from a key of its own that the lobby dish pays for, not from your SSF wallet.'
+        : '';
+  const wallet = !net || (net.test && !dish) ? ' (on a test network your SSF wallet may pay for a write, which shows its address)' : '';
   const heldOff = held ? " While SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, only the knocks are written." : '';
   return `List this station in the Phone Book on ${where(net)}? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach.${pays} Only holders of your contact card, and a host your node knocks on, can read your addresses. Anyone can see that some Star Station node wrote, and when${wallet}; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain.${heldOff} Tap CONFIRM.`;
 }
@@ -199,7 +208,7 @@ export function listMeRow(fp: LocalFingerprint | null | undefined, ui: ListMeUi)
   // A LIST ME names its network to the node, and this page has no name for
   // one it does not know: none is offered there.
   if (!net) return row(`${note} ${LIST_ME_UNKNOWN_NETWORK}`, null);
-  if (ui.armed && !busy) return row(note, { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false }, listMeWarning(net, listing.held === true));
+  if (ui.armed && !busy) return row(note, { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false }, listMeWarning(net, listing.held === true, listing.dish === true));
   return row(note, { act: 'arm', label: 'LIST ME', danger: false, busy: false });
 }
 

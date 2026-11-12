@@ -213,8 +213,8 @@ fn strict_status(source: crate::chia_strict::OffSource) -> String {
 /// there: it names the switch, and what is not written while it is off, the
 /// listing and the knocks (stage 4 design §4.5 (6)). It does not say the
 /// lane only reads then: a beacon the operator turned on is written from a
-/// key of its own. Who pays is not this line's: on a test network the SSF
-/// wallet may, and off one the lobby dish does (`chia_publish::burner_paths`).
+/// key of its own. Who pays is not this line's: the lobby dish does, on
+/// every network (stage 4 design §13 row 12).
 pub fn publish_status(built: bool, listed: bool, wallet_on: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
     if !built {
         "not built"

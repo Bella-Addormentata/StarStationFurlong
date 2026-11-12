@@ -123,8 +123,8 @@ pub struct KnockRequest {
     /// The host's contact-card key the knock is sealed to.
     pub kx_host: [u8; 32],
     /// Failed attempts to send it so far (the publisher drops it after
-    /// `chia_publish::MAX_KNOCK_ATTEMPTS`). With burner keys on
-    /// (everywhere but a test network run with SSF_CHIA_BURNERS=0), the knock is written from its own burner key
+    /// `chia_publish::MAX_KNOCK_ATTEMPTS`). The knock is written from its
+    /// own burner key
     /// K(h), and a try that only waited, for a mojo ready in the lobby dish,
     /// for the fuse on the edition's gifts, for a spend still settling or for
     /// a chain that did not answer, is none (stage 4 design §5.2,
@@ -159,10 +159,11 @@ pub struct SentKnock {
     /// coin carrying the knock under the hint, which is how the knock is found
     /// again and judged ([`crate::chia_resolve::write_standing`]) — its spent
     /// flag alone proves nothing, since a dropped knock's coin goes to the next
-    /// write. For a knock the SSF wallet pays for, it is also the input the
-    /// spend consumed; for a burner's knock, always the first write of its
-    /// key, it is the gift g, and `parked` names the dish coin F the spend
-    /// consumed (stage 4 design §4.1, §4.4). With `hint` it names the entry in the book.
+    /// write. For a burner's knock, always the first write of its key, it is
+    /// the gift g, and `parked` names the dish coin F the spend consumed
+    /// (stage 4 design §4.1, §4.4); for a knock an older version had the SSF
+    /// wallet pay for, it is also the input the spend consumed. With `hint`
+    /// it names the entry in the book.
     pub coin_id: String,
     /// The digest of the memo the knock carried, hex
     /// ([`crate::chia_resolve::memo_digest`] of its sealed knock): the coin
@@ -312,8 +313,8 @@ pub struct KnockBook {
 impl KnockBook {
     /// A missing file is an empty book; an unreadable one is logged and starts
     /// empty (one early knock at worst: the era budget is the host's to read).
-    /// With burner keys on (stage 4 design §4.1, the knock row; §9) a lost
-    /// book gives no second knock for the same host and room in an era, since
+    /// A lost book (stage 4 design §4.1, the knock row; §9) gives no second
+    /// knock for the same host and room in an era, since
     /// that knock's key answers: it wrote, and a knock's key writes once. The
     /// key is the host's own, bound to its node id, so a knock to another
     /// host whose card names the same contact key does not answer for it. A
