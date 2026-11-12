@@ -2,11 +2,12 @@
 //! one Chia network (stage 4 of the mainnet transition, design §4.5 (6)).
 //!
 //! A station writes two things into the Phone Book: its listing, once an
-//! edition, and a knock on a host it holds a card for and cannot reach. On a
-//! network whose coins are real money neither is paid by the SSF wallet and
-//! neither names it (chia_publish.rs `burner_paths`). Even so a write shows
+//! edition, and a knock on a host it holds a card for and cannot reach.
+//! Neither is paid by the SSF wallet and neither names it, on any network
+//! (stage 4 design §13 row 12). Even so a write shows
 //! that some Star Station node wrote, and when, and the Chia full nodes the
-//! station talks to see its IP address. So there the station writes neither
+//! station talks to see its IP address. So on a network whose coins are real
+//! money the station writes neither
 //! until its player says so, with LIST ME. On a test network the switch
 //! starts on, as it always was (#231 D4: a publishing node is findable
 //! unless told otherwise), and the player can turn it off.
@@ -43,9 +44,8 @@
 //! written, and an on is refused until Chia is back.
 //!
 //! The switch says whether the listing's and the knocks' arms may write.
-//! Whose key pays is another question (`burner_paths`), and whether a
-//! publisher runs at all a third: with no SSF wallet on there is none, and
-//! the switch waits for it.
+//! Whether a publisher runs at all is another question: with no SSF wallet
+//! on there is none, and the switch waits for it.
 //!
 //! The listing's and the knocks' writers are handed the switch's word as a
 //! value ([`Listed`]) that only a switch that is on gives out, so no call
@@ -170,12 +170,12 @@ impl Listed {
 ///     follow `on`);
 ///   - `damaged`, only when true: the switch's file is there but cannot be
 ///     read, so it counts as off until it is turned again;
-///   - `dish`, only when true: what the switch allows is written from keys
-///     of their own that the lobby dish pays for (burner keys,
-///     `chia_publish::burners`), so the SSF wallet pays for no listing and
-///     no knock, and a coin in it lists nothing. A node from before this
-///     field never says it, and on a test network the page then takes the
-///     wallet to pay, as it did there.
+///   - `dish`, always true: what the switch allows is written from keys of
+///     their own that the lobby dish pays for (burner keys), so the SSF
+///     wallet pays for no listing and no knock, and a coin in it lists
+///     nothing. A node from before this field never says it, and one from
+///     before stage 4 PR 12 could be started to leave it out; on a test
+///     network the page then takes the wallet to pay, as it did there.
 ///
 /// It says what the switch says, never whether anything was written: the
 /// listing's own readout is `chia_presence`, and with no SSF wallet on no
@@ -194,10 +194,10 @@ pub struct ListingView {
 
 /// The view of the file as it reads now (`saved`) on `net`, with whether
 /// the environment leaves the listing on (`findable`: `SSF_CHIA_FINDABLE`
-/// is not `0`). Who pays is not the file's to say: `dish` is the process's
-/// ([`ListMe::paid_by_dish`]).
+/// is not `0`). The lobby dish pays for what the switch allows, on every
+/// network, so every view says `dish`.
 pub fn view_of(net: ChiaNet, saved: &Saved, findable: bool) -> ListingView {
-    ListingView { on: saved.on(net), chosen: saved.chosen(), held: !findable, damaged: matches!(saved, Saved::Damaged(_)), dish: false }
+    ListingView { on: saved.on(net), chosen: saved.chosen(), held: !findable, damaged: matches!(saved, Saved::Damaged(_)), dish: true }
 }
 
 /// What the page asks of the route: the turn, and for which network and
@@ -374,9 +374,6 @@ pub struct ListMe {
     path: PathBuf,
     /// `SSF_CHIA_FINDABLE` is not `0`, as the process read it.
     findable: bool,
-    /// Burner keys are on for this run, so the lobby dish pays for what the
-    /// switch allows ([`ListMe::paid_by_dish`]).
-    dish: bool,
     /// The file as it reads now: the start's, then each turn's. An off whose
     /// save failed is kept here as off for the rest of the run.
     saved: Mutex<Saved>,
@@ -390,23 +387,12 @@ impl ListMe {
     /// from it.
     pub fn read(net: ChiaNet, path: PathBuf, findable: bool) -> Self {
         let saved = Mutex::new(saved_of(&path));
-        Self { net, path, findable, dish: false, saved }
+        Self { net, path, findable, saved }
     }
 
-    /// The switch, with who pays for the listing and the knocks it allows:
-    /// `dish` when this run writes them from burner keys the lobby dish
-    /// funds (the process's is `chia_publish::burners_enabled()`). Every
-    /// view says it then ([`ListingView`]'s `dish`), the fingerprint's and
-    /// a turn's answer alike, so the Bank never promises a listing for a
-    /// coin in a wallet that pays for none.
-    pub fn paid_by_dish(mut self, dish: bool) -> Self {
-        self.dish = dish;
-        self
-    }
-
-    /// The view over the file as `saved` reads it, with this run's `dish`.
+    /// The view over the file as `saved` reads it.
     fn view_over(&self, saved: &Saved) -> ListingView {
-        ListingView { dish: self.dish, ..view_of(self.net, saved, self.findable) }
+        view_of(self.net, saved, self.findable)
     }
 
     /// The switch's word for the writers, when it is on ([`Listed`]): asked
@@ -577,18 +563,19 @@ mod tests {
     fn the_view_says_what_the_switch_says_on_each_network() {
         for net in ChiaNet::ALL {
             let test = net.is_test();
-            assert_eq!(view_of(net, &Saved::Unset, true), ListingView { on: test, chosen: false, held: false, damaged: false, dish: false }, "{net:?}");
-            assert_eq!(view_of(net, &Saved::On, true), ListingView { on: true, chosen: true, held: false, damaged: false, dish: false }, "{net:?}");
-            assert_eq!(view_of(net, &Saved::Off, true), ListingView { on: false, chosen: true, held: false, damaged: false, dish: false }, "{net:?}");
-            assert_eq!(view_of(net, &Saved::Damaged("x".into()), true), ListingView { on: false, chosen: false, held: false, damaged: true, dish: false }, "{net:?}");
+            assert_eq!(view_of(net, &Saved::Unset, true), ListingView { on: test, chosen: false, held: false, damaged: false, dish: true }, "{net:?}");
+            assert_eq!(view_of(net, &Saved::On, true), ListingView { on: true, chosen: true, held: false, damaged: false, dish: true }, "{net:?}");
+            assert_eq!(view_of(net, &Saved::Off, true), ListingView { on: false, chosen: true, held: false, damaged: false, dish: true }, "{net:?}");
+            assert_eq!(view_of(net, &Saved::Damaged("x".into()), true), ListingView { on: false, chosen: false, held: false, damaged: true, dish: true }, "{net:?}");
             // SSF_CHIA_FINDABLE=0 does not turn the switch: it is said beside it.
-            assert_eq!(view_of(net, &Saved::On, false), ListingView { on: true, chosen: true, held: true, damaged: false, dish: false }, "{net:?}");
+            assert_eq!(view_of(net, &Saved::On, false), ListingView { on: true, chosen: true, held: true, damaged: false, dish: true }, "{net:?}");
         }
-        // The flags are sent only when true, and an answer without them reads back.
-        assert_eq!(serde_json::to_value(view_of(ChiaNet::Mainnet, &Saved::Unset, true)).unwrap(), serde_json::json!({ "on": false, "chosen": false }));
+        // `held` and `damaged` are sent only when true, `dish` in every view, and
+        // an answer without them (an older node's) reads back with each false.
+        assert_eq!(serde_json::to_value(view_of(ChiaNet::Mainnet, &Saved::Unset, true)).unwrap(), serde_json::json!({ "on": false, "chosen": false, "dish": true }));
         assert_eq!(
             serde_json::to_value(view_of(ChiaNet::Mainnet, &Saved::Damaged("x".into()), false)).unwrap(),
-            serde_json::json!({ "on": false, "chosen": false, "held": true, "damaged": true })
+            serde_json::json!({ "on": false, "chosen": false, "held": true, "damaged": true, "dish": true })
         );
         assert_eq!(
             serde_json::from_value::<ListingView>(serde_json::json!({ "on": true, "chosen": true })).unwrap(),
@@ -597,30 +584,29 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_whose_writes_the_lobby_dish_pays_for_says_so_in_every_view() {
-        // Who pays is the run's, not the file's: no view made from the file
-        // alone says `dish`, and the switch says it in the fingerprint's view
-        // and in a turn's answer alike, taken or refused, on or off.
+    fn every_view_says_the_lobby_dish_pays_for_what_the_switch_allows() {
+        // The SSF wallet pays for no listing and no knock on any network
+        // (stage 4 design §13 row 12), so no view is without `dish`: the
+        // file's own, the fingerprint's, and a turn's answer, taken or
+        // refused, on or off, with the listing held or not.
         let dir = temp_dir("dish");
         for net in ChiaNet::ALL {
             for saved in [Saved::Unset, Saved::On, Saved::Off, Saved::Damaged("x".into())] {
-                assert!(!view_of(net, &saved, true).dish && !view_of(net, &saved, false).dish, "{net:?} {saved:?}");
+                assert!(view_of(net, &saved, true).dish && view_of(net, &saved, false).dish, "{net:?} {saved:?}");
             }
-            let path = dir.join(format!("{}-{LISTING_FILE}", net.id()));
-            let wallet = ListMe::read(net, path.clone(), true);
-            assert!(!wallet.view().dish, "{net:?}: a switch not told who pays says nothing");
-            assert!(serde_json::to_value(wallet.view()).unwrap().get("dish").is_none(), "{net:?}: and the flag is not sent");
-            let dish = ListMe::read(net, path.clone(), true).paid_by_dish(true);
-            assert_eq!(dish.view(), ListingView { dish: true, ..wallet.view() }, "{net:?}: it changes nothing else");
-            assert_eq!(serde_json::to_value(dish.view()).unwrap()["dish"], serde_json::json!(true), "{net:?}");
-            let on = dish.turn(true, 1, false);
-            assert_eq!(on.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true, "dish": true } }), "{net:?}");
-            let off = dish.turn(false, 2, false);
-            assert_eq!(off.body, serde_json::json!({ "ok": true, "listing": { "on": false, "chosen": true, "dish": true } }), "{net:?}");
-            let refused = dish.turn(true, 3, true);
-            assert_eq!(refused.status, "409 Conflict", "{net:?}");
-            assert_eq!(refused.body["listing"], serde_json::json!({ "on": false, "chosen": true, "dish": true }), "{net:?}");
-            assert!(!ListMe::read(net, path.clone(), true).paid_by_dish(false).view().dish, "{net:?}: and with burner keys off it is not said");
+            for findable in [true, false] {
+                let path = dir.join(format!("{}-{findable}-{LISTING_FILE}", net.id()));
+                let switch = ListMe::read(net, path, findable);
+                assert!(switch.view().dish, "{net:?}");
+                assert_eq!(serde_json::to_value(switch.view()).unwrap()["dish"], serde_json::json!(true), "{net:?}: and the flag is sent");
+                let on = switch.turn(true, 1, false);
+                assert_eq!(on.body["listing"]["dish"], serde_json::json!(true), "{net:?}: turned on");
+                let off = switch.turn(false, 2, false);
+                assert_eq!(off.body["listing"]["dish"], serde_json::json!(true), "{net:?}: turned off");
+                let refused = switch.turn(true, 3, true);
+                assert_eq!(refused.status, "409 Conflict", "{net:?}");
+                assert_eq!(refused.body["listing"]["dish"], serde_json::json!(true), "{net:?}: refused");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -713,7 +699,7 @@ mod tests {
             };
             let on = switch.turn_with(true, 2, false, late);
             assert_eq!(on.status, "200 OK", "{net:?}: {}", on.body);
-            assert_eq!(on.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true } }));
+            assert_eq!(on.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true, "dish": true } }));
             assert!(switch.on() && switch.listed().is_some(), "{net:?}: on now, as at the next start");
             assert!(ListMe::read(net, path.clone(), true).on(), "{net:?}: the next start reads on");
             let line = on.line.unwrap();
@@ -747,7 +733,7 @@ mod tests {
 
         let turned = main.turn(true, 100, false);
         assert_eq!(turned.status, "200 OK");
-        assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true } }));
+        assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true, "dish": true } }));
         assert_eq!(turned.line.as_deref(), Some(turned_line(ChiaNet::Mainnet, true, false).as_str()));
         assert!(!turned.failed);
         assert!(main.on() && main.listed().is_some(), "on from this call");
@@ -757,7 +743,7 @@ mod tests {
         assert!(ListMe::read(ChiaNet::Mainnet, file(ChiaNet::Mainnet), true).on());
 
         let turned = test.turn(false, 200, false);
-        assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": false, "chosen": true } }));
+        assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": false, "chosen": true, "dish": true } }));
         assert_eq!(turned.line.as_deref(), Some(turned_line(ChiaNet::Testnet11, false, false).as_str()));
         assert!(!test.on() && test.listed().is_none(), "off from this call");
         assert!(!ListMe::read(ChiaNet::Testnet11, file(ChiaNet::Testnet11), true).on(), "and at the next start");
@@ -800,13 +786,13 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
             let switch = ListMe::read(net, path.clone(), true);
             assert!(!switch.on(), "{net:?}: a folder there counts as off");
-            assert_eq!(switch.view(), ListingView { on: false, chosen: false, held: false, damaged: true, dish: false });
+            assert_eq!(switch.view(), ListingView { on: false, chosen: false, held: false, damaged: true, dish: true });
             let on = switch.turn(true, 1, false);
             assert_eq!(on.status, "409 Conflict");
             assert!(on.body["error"].as_str().unwrap().starts_with("LIST ME was not turned on: its switch could not be saved ("), "{}", on.body);
             assert!(on.failed && on.line.as_deref().unwrap().contains("so it was not turned on"));
             assert!(!switch.on() && switch.listed().is_none(), "{net:?}: not on");
-            assert_eq!(on.body["listing"], serde_json::json!({ "on": false, "chosen": false, "damaged": true }));
+            assert_eq!(on.body["listing"], serde_json::json!({ "on": false, "chosen": false, "damaged": true, "dish": true }));
         }
         // An off over a switch that is on, whose save fails: off for the run.
         for net in ChiaNet::ALL {
@@ -826,7 +812,7 @@ mod tests {
             assert!(error.starts_with("LIST ME is off until your station node stops, but its switch could not be saved ("), "{error}");
             assert!(error.ends_with("at the node's next start it reads off"), "{error}: a folder reads as off");
             assert!(!switch.on() && switch.listed().is_none(), "{net:?}: off from this call all the same");
-            assert_eq!(off.body["listing"], serde_json::json!({ "on": false, "chosen": true }));
+            assert_eq!(off.body["listing"], serde_json::json!({ "on": false, "chosen": true, "dish": true }));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -877,7 +863,7 @@ mod tests {
             assert_eq!(switch.on(), net.is_test(), "{net:?}: the switch is the file's and the default's");
             assert!(switch.view().held);
             let turned = switch.turn(true, 1, false);
-            assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true, "held": true } }));
+            assert_eq!(turned.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true, "held": true, "dish": true } }));
             assert_eq!(turned.line.as_deref(), Some(turned_line(net, true, true).as_str()));
             assert!(turned.line.unwrap().contains("SSF_CHIA_FINDABLE=0 in its environment still holds its listing off"));
             assert!(switch.listed().is_some(), "{net:?}: the knocks follow the switch");

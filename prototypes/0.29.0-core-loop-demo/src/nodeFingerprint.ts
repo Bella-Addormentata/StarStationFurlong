@@ -141,7 +141,7 @@ export function parseHouseFold(v: unknown): HouseFold | undefined {
 }
 
 /** 📖 The four looks of the phone book: this edition's listing confirmed
- *  with the current addresses (`listed`; with burner keys on, last edition's
+ *  with the current addresses (`listed`; last edition's
  *  too, while this edition's waits for its slot), out but not yet read back
  *  (`sent`), a listing of ours that is stale (`outdated`: an older edition,
  *  other addresses, no chain peak to judge by), none of ours (`unlisted`). */
@@ -154,7 +154,7 @@ export type ChiaPresenceState = 'listed' | 'sent' | 'outdated' | 'unlisted';
  *  listing in force with these addresses, `public_addrs` how many the node
  *  would list now, and `error` is the last failed attempt's text, or the
  *  node's words for what the listing waits for, when there is one. A `listed`
- *  listing names this edition, or, with burner keys on (stage 4 design §4.3),
+ *  listing names this edition, or (stage 4 design §4.3)
  *  the edition before, while this edition's waits for its slot or its late
  *  start: `listed_era` is then `era - 1`, and readers still find it.
  *  `unlanded`, sent only when true, says an `outdated` listing of this
@@ -348,10 +348,11 @@ export interface ChiaListing {
   damaged?: true;
   /** The node writes what the switch allows from keys of their own that the
    *  lobby dish pays for, so its SSF wallet pays for no listing and no knock
-   *  and a coin in it lists nothing. On a test network the node says so
-   *  unless it was started with `SSF_CHIA_BURNERS=0`; a node from before
-   *  this field never says it, and its wallet may be the payer there. Off a
-   *  test network the lobby dish pays whether the node says so or not. */
+   *  and a coin in it lists nothing. A node says so on every network since
+   *  stage 4 PR 12. One from before this field never says it, and one from
+   *  just before that PR could be started not to: on a test network the
+   *  wallet of such a node may be the payer. Off a test network the lobby
+   *  dish pays whether the node says so or not. */
   dish?: true;
 }
 

@@ -34,12 +34,12 @@
 // are real money it pays for no chain write: the listing and the knocks are
 // written from keys of their own that the lobby dish pays for, only while
 // LIST ME is on, so the wallet's address is never in the book, and RECEIVE
-// says so (`listing`). On a test network the node does the same by default
-// (stage 4 PR 12) and says so in its LIST ME readout (`dish`); the Bank
-// then promises no listing for a coin, and asks for one only to GIVE at the
-// faucet dish. A test-network node that does not say it (an older one, or
-// one started with SSF_CHIA_BURNERS=0) pays for the listing from its
-// wallet while LIST ME is on, and the Bank words that as it did.
+// says so (`listing`). On a test network the node does the same (stage 4
+// PR 12) and says so in its LIST ME readout (`dish`); the Bank then
+// promises no listing for a coin, and asks for one only to GIVE at the
+// faucet dish. A test-network node that does not say it is an older one,
+// which pays for the listing from its wallet while LIST ME is on, and the
+// Bank words that as it did.
 
 import { chiaBackOn, chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';

@@ -72,6 +72,11 @@ describe.each([TESTNET11, MAINNET])('listMeRow on $name', (net) => {
     expect(held.warning).toBe(listMeWarning(net, true));
     expect(held.warning).toContain("While SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, only the knocks are written. Tap CONFIRM.");
     expect(listMeWarning(net)).not.toContain('SSF_CHIA_FINDABLE');
+    // A node that says the lobby dish pays (every node since stage 4 PR 12): CONFIRM is over the warning that names that payer.
+    for (const held of [false, true]) {
+      const listing: ChiaListing = held ? { ...OFF, dish: true, held: true } : { ...OFF, dish: true };
+      expect(listMeRow(fp(listing), { ...IDLE, armed: true }).warning).toBe(listMeWarning(net, held, true));
+    }
   });
 
   it('offers UNLIST ME where it is on, with no CONFIRM, and says what still waits', () => {
@@ -140,8 +145,20 @@ describe.each([TESTNET11, MAINNET])('listMeRow on $name', (net) => {
       expect(text).toContain('once an edition (about a week)');
       expect(text).toContain('a knock on a host it holds a card for and cannot reach');
     }
-    // On a test network the SSF wallet may be the payer, and the warning says what that shows.
+    // On a test network the SSF wallet of an older node may be the payer, and the warning says what that shows.
     expect(listMeWarning(net).includes('(on a test network your SSF wallet may pay for a write, which shows its address)')).toBe(net.test);
+    // A node that says the lobby dish pays: the warning names that payer on every network, and no wallet beside it.
+    for (const held of [false, true]) {
+      const dish = listMeWarning(net, held, true);
+      expect(dish).toContain(' Each is written from a key of its own that the lobby dish pays for, ');
+      expect(dish.includes('never from your SSF wallet.')).toBe(!net.test);
+      expect(dish.includes('not from your SSF wallet.')).toBe(net.test);
+      expect(dish).not.toContain('may pay');
+      expect(dish).toContain('Anyone can see that some Star Station node wrote, and when; the Chia full nodes');
+      expect(dish.endsWith(' Tap CONFIRM.')).toBe(true);
+    }
+    // Off a test network the lobby dish pays whether the node says so or not.
+    if (!net.test) expect(listMeWarning(net, false, true)).toBe(listMeWarning(net));
     expect(listMeWarning(net)).toContain('Anyone can see that some Star Station node wrote, and when');
     expect(listMeWarning(net)).toContain('the Chia full nodes your node talks to see its IP address');
     expect(listMeWarning(net)).toContain('what is written stays on the chain');
@@ -169,6 +186,12 @@ describe('the LIST ME texts, whole', () => {
     expect(listMeOffNote(TESTNET11)).toBe(
       'LIST ME is off for testnet11: your station writes no Phone Book listing and no knock there. What it wrote before stays on the chain; readers stop finding a listing once its edition and the next have passed.',
     );
+    expect(listMeWarning(TESTNET11, false, true)).toBe(
+      'List this station in the Phone Book on testnet11? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Each is written from a key of its own that the lobby dish pays for, not from your SSF wallet. Only holders of your contact card, and a host your node knocks on, can read your addresses. Anyone can see that some Star Station node wrote, and when; the Chia full nodes your node talks to see its IP address; and what is written stays on the chain. Tap CONFIRM.',
+    );
+    expect(listMeWarning(TESTNET11)).toBe(
+      'List this station in the Phone Book on testnet11? Your node then writes its listing there once an edition (about a week), and a knock on a host it holds a card for and cannot reach. Only holders of your contact card, and a host your node knocks on, can read your addresses. Anyone can see that some Star Station node wrote, and when (on a test network your SSF wallet may pay for a write, which shows its address); the Chia full nodes your node talks to see its IP address; and what is written stays on the chain. Tap CONFIRM.',
+    );
     expect(listMeHeldNote(TESTNET11)).toBe("LIST ME is on for testnet11, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. Its knocks are still written.");
     expect(listMeHeldNote(TESTNET11, true)).toBe(
       "LIST ME is on for testnet11, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. Its knocks are written once the SSF wallet is on (the SpacePhone's 🏦 BANK).",
@@ -186,8 +209,9 @@ describe('the LIST ME texts, whole', () => {
       expect(text).toContain('the Chia network your node runs on');
       expect(text).not.toContain('lobby dish');
     }
-    // An unknown network may be a test one: the wallet may pay there.
+    // An unknown network may be a test one: the wallet may pay there. No payer is promised, whatever the node says.
     expect(listMeWarning(null)).toContain('your SSF wallet may pay for a write');
+    expect(listMeWarning(null, false, true)).toBe(listMeWarning(null));
     // A LIST ME names its network to the node, and this page has no name
     // for that one: no on is offered there, armed or not. An off still is.
     const unknown: LocalFingerprint = { ...BASE, chia_net: null, chia_listing: { on: false, chosen: false } };

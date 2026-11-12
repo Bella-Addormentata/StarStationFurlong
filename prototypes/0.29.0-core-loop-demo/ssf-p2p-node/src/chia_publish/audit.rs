@@ -14,7 +14,7 @@
 //!
 //! What is named, and when:
 //! - the listing's key P(e), once the heartbeat knows the era, and again
-//!   at each new era, for a station that is findable with burner keys on.
+//!   at each new era, for a station that is findable.
 //!   The first time in a run it names the keys of the
 //!   [`AUDIT_ERAS_BACK`] eras before as well, under the words and the
 //!   contact key of now, so one run at the end of a drill of up to five
@@ -34,10 +34,10 @@
 //!   (`chia_knock::KnockBook::prune`). So the knock keys of a drill need
 //!   the switch on in the runs that write them;
 //! - the beacon's key B, when the wallet loads with the beacon on
-//!   (`SSF_CHIA_BEACON=1`), on either path: B is one key and one address
-//!   with burner keys on or off ([`wallet_lines`]). It is named wherever
-//!   the beacon is on, on every network: on the burner path, the only one
-//!   off a test network, the beacon's own startup line names no address;
+//!   (`SSF_CHIA_BEACON=1`): B is one key and one address, whichever
+//!   version wrote from it ([`wallet_lines`]). It is named wherever the
+//!   beacon is on, on every network, since the beacon's own startup line
+//!   names no address;
 //! - the claim-and-write self-test's key, when that hook runs
 //!   (`claim_write::claim_write_selftest`).
 //!
@@ -93,15 +93,14 @@ pub fn audit_of(raw: Option<&OsStr>) -> (bool, Option<String>) {
         return (false, None);
     }
     let notice = format!(
-        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, unless SSF_CHIA_BURNERS=0), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written, and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
     );
     (true, Some(notice))
 }
 
-/// The process's [`AUDIT_ENV`] ([`audit_of`]), read once, as
-/// [`super::burners`] reads its variable: the wallet's lines, the
-/// heartbeat's book and the self-test hook see the same value. No test
-/// calls it.
+/// The process's [`AUDIT_ENV`] ([`audit_of`]), read once, so the wallet's
+/// lines, the heartbeat's book and the self-test hook see the same value.
+/// No test calls it.
 pub fn audit() -> &'static (bool, Option<String>) {
     static AUDIT: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
     AUDIT.get_or_init(|| audit_of(std::env::var_os(AUDIT_ENV).as_deref()))
@@ -152,9 +151,9 @@ pub(crate) fn audit_line(net: ChiaNet, key: AuditKey, payer: Payer) -> String {
 /// turns it on: nothing with the audit off; with it on (`audit`, as
 /// [`audit_of`] gives it) its notice, and with the beacon on (`beacon_on`)
 /// the line of the beacon's key B, derived from the wallet key `wallet`
-/// ([`super::beacon_wallet_key`]). B pays for the beacon on either path,
-/// as the beacon wallet's key or as a burner key, at one address, so its
-/// line is the same with burner keys on or off. It is said wherever the
+/// ([`super::beacon_wallet_key`]). B pays for the beacon at one address,
+/// as a burner key or, in an older version, as the beacon wallet's key, so
+/// its line is the same whichever wrote. It is said wherever the
 /// beacon is on, on every network, whether or not a coin sits at the
 /// address yet.
 pub fn wallet_lines(net: ChiaNet, audit: &(bool, Option<String>), beacon_on: bool, wallet: &SecretKey) -> Vec<String> {
@@ -284,7 +283,7 @@ mod tests {
             (
                 true,
                 Some(
-                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, unless SSF_CHIA_BURNERS=0), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written, and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
                         .to_string()
                 )
             )
@@ -443,9 +442,9 @@ mod tests {
 
     /// When a wallet loads: nothing with the audit off, beacon or not; the
     /// notice with it on; and with the beacon on as well, the line of the
-    /// beacon's key B, whose address is the one the beacon's own startup
-    /// line names with burner keys off (the beacon wallet's) and whose
-    /// puzzle hash is the payer B has as a burner key.
+    /// beacon's key B, whose address is the one an older version's startup
+    /// line named as the beacon wallet's and whose puzzle hash is the payer
+    /// B has as a burner key.
     #[test]
     fn a_loaded_wallet_says_the_notice_and_the_beacons_key_only_with_the_audit_on() {
         let w = wallet(41);
@@ -505,7 +504,7 @@ mod tests {
         assert_eq!(code_lines(publish, "audit.listing("), ["for line in audit.listing(root, &hub.contact_key, era) {"]);
         assert_eq!(code_lines(publish, "audit_knock("), [
             "fn audit_knock(",
-            "let audit_line = audit_knock(&mut audit, listing_root, net, &req, &room_key, era, &done);",
+            "let audit_line = audit_knock(&mut audit, root, net, &req, &room_key, era, &done);",
         ]);
         assert_eq!(code_lines(publish, "audit_line("), Vec::<&str>::new(), "no line is made in chia_publish.rs itself");
         assert_eq!(code_lines(publish, "audit_of("), Vec::<&str>::new());

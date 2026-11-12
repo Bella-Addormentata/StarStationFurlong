@@ -17,11 +17,10 @@
 //! signs with the SSF wallet's keys. It signs with a [`BurnerKey`] alone,
 //! never a money key, and has no network check of its own: the rules hold
 //! on every network, and which callers reach it, on which network, is their
-//! gate (`super::burner_paths`: on a test network unless SSF_CHIA_BURNERS=0,
-//! §13 rows 9, 10 and 12, and always off one; the beacon's writer where the
-//! operator turned the beacon on, and the listing's and the knocks' while
-//! the player's LIST ME is on, §4.5 (6)). Its tests run on each network
-//! for that reason.
+//! gate (§13 rows 9, 10 and 12: the beacon's writer where the operator
+//! turned the beacon on, and the listing's and the knocks' while the
+//! player's LIST ME is on, §4.5 (6)). Its tests run on each network for
+//! that reason.
 //!
 //! The writer ([`burner_write_with`], and [`burner_write`] on the node's own
 //! lease and chain) picks what a write spends under the gift rules of §5.2:
@@ -45,7 +44,7 @@
 //! beacon's writer from its key B (`publish_beacon_with`, PR 10d), and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
-//! (SSF_CHIA_CLAIM_WRITE_TEST=1, with burner keys on).
+//! (SSF_CHIA_CLAIM_WRITE_TEST=1).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -851,13 +850,13 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// `body` gets the id of the coin the write's own coin will name as its
 /// parent, g for a first write and the burner's coin for a rewrite, so a
 /// knock seals to it. With a `gate`, `body` runs and the bundle is pushed
-/// under it, as `chia_publish::publish_memo_on` does. The bundle is built and checked
+/// under it. The bundle is built and checked
 /// against R1 to R7 ([`build_burner_bundle`]; a broken rule is the
 /// [`BurnerRule`] inside the error) and pushed with its on-chain input parked
 /// under the burner as its payer ([`Payer::of_burner`]): F for a first
 /// write, never g. The [`MemoWrite`] names that payer, for a first write and
 /// a rewrite alike. An acknowledged or an unanswered push is a write, `acked`
-/// true or false, as in `chia_publish::publish_memo_on`, and a first write's gift is
+/// true or false, and a first write's gift is
 /// counted in the fuse; a refused one, or one the lease would not park, is
 /// the [`PushError`] inside the error, and counts nothing.
 ///
@@ -1294,8 +1293,8 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
 /// burner as its payer, and the mark's reader judges it by both coins
 /// ([`WriteCoins::filed`]). Like the builder it has no network check of its
 /// own: its one caller, the claim-and-write self-test hook
-/// ([`claim_write_selftest`]), runs only with burner keys on, on a test
-/// network (§13 row 9), and keeps no mark. The listing does not come
+/// ([`claim_write_selftest`]), runs only on a test network (§13 row 9),
+/// and keeps no mark. The listing does not come
 /// through here: it reaches [`burner_write_with`] through its own wrapper
 /// (`chia_publish::publish_burner_presence`, §13 row 10), and the heartbeat
 /// files its write in the presence mark. Neither does a knock: its key
@@ -1363,8 +1362,8 @@ async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
     Ok(crate::chia_lane::era_of(peak))
 }
 
-/// The claim-and-write self-test (SSF_CHIA_CLAIM_WRITE_TEST=1 with
-/// burner keys on, on a test network: main.rs). It makes one real
+/// The claim-and-write self-test (SSF_CHIA_CLAIM_WRITE_TEST=1 on a test
+/// network: main.rs). It makes one real
 /// claim-and-write from a burner on the network's lobby dish ([`burner_write`],
 /// stage 4 design §4.1), waits for the chain's verdict on it, and reads the
 /// record back through its ephemeral parent g on the carrier lane: the
@@ -1401,10 +1400,7 @@ async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
 /// the peers do not serve g, and the FAIL says the §10 fallback is needed.
 ///
 /// A bundle it parked outlives the run: like any spend in flight, it is
-/// pushed again and settled on any later start on a test network, with
-/// burner keys on or off, and until it settles the money writers'
-/// settling check, which asks about every payer, holds them. Nothing new is
-/// built with burner keys off.
+/// pushed again and settled on any later start on a test network.
 pub async fn claim_write_selftest(net: ChiaNet, wallet: chia_bls::SecretKey) -> Result<()> {
     use crate::chia_burner::{BurnerRoot, MoneyKey};
     use crate::chia_resolve::{read_hint_items, spent_heights, HintCursor, WriteStanding};
@@ -2027,7 +2023,7 @@ mod tests {
         let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test", None).await;
         let e = write.err().expect("the write waits");
         assert!(e.downcast_ref::<CoinLookupFailed>().is_some(), "a failed read: {e:#}");
-        assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "a failed read is no knock attempt (§5.2)");
+        assert!(!crate::chia_publish::knock_attempt_counts(&e), "a failed read is no knock attempt (§5.2)");
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "the burner's listing, then the refund's, unanswered");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "the gift kept counted");
         assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
@@ -2219,7 +2215,7 @@ mod tests {
             let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
             assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::KnockKeyUnread), "{what}: {e:#}");
             assert!(crate::chia_publish::is_typed_wait(&e), "{what}: a wait");
-            assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "{what}: no knock attempt (§5.2)");
+            assert!(!crate::chia_publish::knock_attempt_counts(&e), "{what}: no knock attempt (§5.2)");
             assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "{what}: the one listing");
             assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}: no parent asked");
             assert_eq!(sent(&chain), 0, "{what}: nothing sent");
@@ -2304,7 +2300,7 @@ mod tests {
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::KnockKeyUnread), "{e:#}");
         assert!(crate::chia_publish::already_knocked(&e).is_none(), "not read as knocked, so the host is not noted: {e:#}");
         assert!(crate::chia_publish::is_typed_wait(&e), "a wait");
-        assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "no knock attempt (§5.2)");
+        assert!(!crate::chia_publish::knock_attempt_counts(&e), "no knock attempt (§5.2)");
         assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![f.coin_id()]], "its parent, by id, once");
         assert_eq!(sent(&chain), 0, "nothing sent");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
@@ -2624,7 +2620,7 @@ mod tests {
             assert!(e.downcast_ref::<CoinLookupFailed>().is_some(), "{what}: a failed read: {e:#}");
             assert!(e.downcast_ref::<AlreadyKnocked>().is_none(), "{what}: not read as knocked");
             assert!(crate::chia_publish::is_typed_wait(&e), "{what}: a wait");
-            assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "{what}: no knock attempt (§5.2)");
+            assert!(!crate::chia_publish::knock_attempt_counts(&e), "{what}: no knock attempt (§5.2)");
             assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{what}: the key's listing, then the unanswered read");
             assert_eq!(*chain.asked_names.lock().unwrap(), names, "{what}");
             assert_eq!(sent(&chain), 0, "{what}: nothing sent");

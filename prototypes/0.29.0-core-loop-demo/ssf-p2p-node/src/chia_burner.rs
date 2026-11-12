@@ -99,13 +99,10 @@ impl MoneyKey {
         MoneyKey(wallet)
     }
 
-    /// The wallet key, for the money spends, which take it as a plain
-    /// `SecretKey` today. The publisher's keys read it once where they are
-    /// made, on every network, for the wallet's payer, which is a puzzle
-    /// hash (`chia_publish::PublisherKeys::of`). After that the publisher
-    /// reaches it only through them (`PublisherKeys::money`), and they hold
-    /// a `MoneyKey` on a test network alone, for the writes that still
-    /// take the wallet key there. Never for a burner's write: those take a
+    /// The wallet key itself. The publisher's keys read it once where they
+    /// are made, on every network, for the wallet's payer, which is a
+    /// puzzle hash (`chia_publish::PublisherKeys::of`), and keep no
+    /// `MoneyKey` after that. Never for a burner's write: those take a
     /// [`BurnerKey`], and no `SecretKey` makes one.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
@@ -117,8 +114,8 @@ impl MoneyKey {
     /// the address the beacon always paid from. It is the one [`BurnerKey`]
     /// no root makes: R is one-way from the wallet key, and B needs the
     /// wallet key itself, so it is a named derivation from the `MoneyKey`,
-    /// never a trait. On the burner path the beacon is written from it
-    /// (§4.1, the two beacon rows).
+    /// never a trait. The beacon is written from it (§4.1, the two beacon
+    /// rows).
     pub(crate) fn beacon(&self) -> BurnerKey {
         BurnerKey(chia_publish::beacon_wallet_key(&self.0))
     }
@@ -924,10 +921,9 @@ mod tests {
         // The publisher's keys (`chia_publish::PublisherKeys`, §3.4): what
         // the heartbeat is started with. They are made by their one
         // constructor, from the wallet key and the network, are never
-        // copied, and give the wallet key up through no trait, so the
-        // heartbeat reaches it by `PublisherKeys::money` alone, which
-        // answers with a refusal off a test network
-        // (`chia_publish::keys`' own tests).
+        // copied, and give a wallet key up through no trait. They hold
+        // none to give, by their fields (`chia_publish::keys`' own tests);
+        // these lines keep a later field from leaking one this way.
         refuted!(PublisherKeys: Clone);
         refuted!(PublisherKeys: Copy);
         refuted!(PublisherKeys: Default);
