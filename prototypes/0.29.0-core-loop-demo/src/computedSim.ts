@@ -146,9 +146,10 @@ export const between = (r: Rng, lo: number, hi: number): number => lo + Math.flo
 export class Device {
   readonly store = new Map<string, string>();
 
-  constructor(readonly name: string, seed: number) {
-    // The identity seed keypair.ts would mint, fixed by name and run seed.
-    this.store.set('ssf-identity-seed', b64url(sha256(utf8ToBytes(`ssf-sim-identity|${seed}|${name}`))));
+  constructor(readonly name: string, seed: number, identity: string = name) {
+    // The identity seed keypair.ts would mint, fixed by name and run seed
+    // (`identity`: another profile's, a player's key brought to a second machine).
+    this.store.set('ssf-identity-seed', b64url(sha256(utf8ToBytes(`ssf-sim-identity|${seed}|${identity}`))));
   }
 }
 
@@ -234,6 +235,14 @@ export interface PageSpec {
   pid?: string;
   /** Its browser profile (default its own, by name): a second tab names the first's. */
   device?: string;
+  /** 🏠🏠 Its identity key is that of the page named (its own profile, the
+   *  same key: a player's second machine; with that page's `pid`, the same
+   *  player). */
+  identity?: string;
+  /** 🏠🏠 Its machine runs a node of its own (with houseNode), which its page
+   *  tells its key to as the house's page does: a second house of the room's
+   *  deed holder, on a page with the holder's `identity` and `pid`. */
+  node?: boolean;
   /** False for a page the spec plays a cheat on: it counts for no stall. */
   honest?: boolean;
   /** Its bot (null: none), and the tables it plays (default every one). */
@@ -764,6 +773,10 @@ export class Sim {
   node2: SimHouse | null = null;
   node2Up = true;
   private node2On: Page | null = null;
+  /** 🏠🏠 The other machines of the deed holder's that run a node (PageSpec
+   *  node): each one's page, its node, whether that runs, and the load of
+   *  the page it last told its key to. */
+  readonly also: { sp: SimPage; node: SimHouse; up: boolean; on: Page | null }[] = [];
   /** 🔒 fairOnly: when the house's page opened each table's game (ms into the
    *  run), and what its press answered before. */
   readonly opened = new Map<string, number>();
@@ -903,6 +916,11 @@ export class Sim {
     });
     vi.setSystemTime(sim.T);
     for (const spec of opts.pages) await sim.add(spec, { connect: false });
+    if (sim.node) {
+      for (const sp of sim.pages) {
+        if (sp.spec.node) sim.also.push({ sp, node: new SimHouse(sha256(utf8ToBytes(`sim-house-node-also|${opts.seed}|${sp.name}`))), up: true, on: null });
+      }
+    }
     const house = sim.house = sim.pages.find((sp) => sp.spec.house) ?? sim.pages[0];
     // 🏠 With a node, the house's page holds the room's deed.
     if (sim.node) await sim.as(house, () => house.p.doc.getMap('roomInfo').set('owner', house.pid));
@@ -975,7 +993,7 @@ export class Sim {
   private deviceOf(spec: PageSpec): Device {
     const name = spec.device ?? spec.name;
     let d = this.devices.get(name);
-    if (!d) this.devices.set(name, d = new Device(name, this.opts.seed));
+    if (!d) this.devices.set(name, d = new Device(name, this.opts.seed, spec.identity ?? name));
     return d;
   }
 
@@ -1553,6 +1571,7 @@ export class Sim {
     if (beat) this.net.resync();
     if (this.node) await this.houseTick();
     await this.houseTick2();
+    for (const m of this.also) await this.houseTickAlso(m);
     if (this.opts.fairOnly) await this.openGames();
     for (const sp of this.pages) {
       if (sp.mode !== 'up' || this.T < sp.pauseUntil) continue;
@@ -1605,13 +1624,46 @@ export class Sim {
     });
   }
 
+  /** 🏠🏠 The tick of a node on another machine of the deed holder's, on the
+   *  doc of that machine's page. */
+  private async houseTickAlso(m: { sp: SimPage; node: SimHouse; up: boolean; on: Page | null }): Promise<void> {
+    const { sp } = m;
+    if (!m.up || sp.mode !== 'up' || !this.net.connected(sp)) return;
+    await this.as(sp, (now) => {
+      if (m.on !== sp.p) {
+        sp.p.table.setLocalHouse(m.node.pub);
+        if (this.opts.fairOnly) sp.p.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+        m.on = sp.p;
+      }
+      m.node.tick(PAGE_ROOM, sp.p.doc, this.T, now);
+    });
+  }
+
+  /** 🏠 Every simulated house of the run, each once: the owner's node, the
+   *  buyer's after a hand-over, and those of the holder's other machines. */
+  get nodes(): SimHouse[] {
+    return [...new Set([this.node, this.node2, ...this.also.map((m) => m.node)].filter((n): n is SimHouse => n !== null))];
+  }
+
+  /** 🏠 House `node` stops (`up` false: its machine, or its process), or
+   *  starts again with what a restart keeps (SimHouse restart). */
+  runs(node: SimHouse, up: boolean): void {
+    if (up) node.restart();
+    if (node === this.node) this.nodeUp = up;
+    if (node === this.node2) this.node2Up = up;
+    for (const m of this.also) if (m.node === node) m.up = up;
+  }
+
   /** 🤝 The room's deed goes to page `buyer` by an offer made out to its key
    *  (design §8.7): the page that holds the deed makes the offer (offers
    *  makeOffer), the buyer's page redeems it (redeemDeedOffer, which moves
    *  the FAIR ONLY games too: computedTable adoptFairOnlyGames). With `node`
-   *  (the default), the buyer's own node becomes its house (node2). What the
-   *  redemption answered. */
-  async handOver(buyer: SimPage, opts: { node?: boolean } = {}): Promise<{ ok: boolean }> {
+   *  (the default), the buyer's own node becomes its house (node2); with
+   *  'same', the seller's node does (the machine goes with the room: one
+   *  house key, delegated by the seller and then by the buyer, and the node
+   *  runs on the buyer's page's doc from here on). What the redemption
+   *  answered. */
+  async handOver(buyer: SimPage, opts: { node?: boolean | 'same' } = {}): Promise<{ ok: boolean }> {
     const seller = this.holder;
     const offer = await this.as(seller, () => seller.p.offers.makeOffer({ kind: 'deed', roomId: PAGE_ROOM, roomName: 'The Room' }, seller.name, { toPub: buyer.p.pub }));
     // (Told first, so the oracle knows whose the checkpoint the redemption writes is.)
@@ -1622,7 +1674,10 @@ export class Sim {
       this.buyer = before;
       return out;
     }
-    if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
+    if (opts.node === 'same') {
+      this.node2 = this.node;
+      this.nodeUp = false;
+    } else if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
     return out;
   }
 

@@ -38,7 +38,7 @@ afterAll(() => {
 });
 
 /** The deed goes to page B once, from `from` ms into the run, at the first tick where `when()`. When it went. */
-function handOverAt(sim: Sim, from: number, when: () => boolean, opts: { node?: boolean } = {}): { at: number | null; said: { ok: boolean } | null } {
+function handOverAt(sim: Sim, from: number, when: () => boolean, opts: { node?: boolean | 'same' } = {}): { at: number | null; said: { ok: boolean } | null } {
   const out: { at: number | null; said: { ok: boolean } | null } = { at: null, said: null };
   sim.every(async () => {
     if (out.at !== null || sim.elapsed < from || !when()) return;
@@ -116,6 +116,30 @@ describe('FAIR ONLY roulette: the game moves with the deed, and the buyer\'s hou
     expect(s.voids, sim.label).toBe(1);
     expect(sim.node2!.wrote.reveals, sim.label).toBeGreaterThanOrEqual(2);
   }, TIMEOUT);
+});
+
+describe('FAIR ONLY roulette: the seller\'s node goes with the room', () => {
+  for (const mid of [false, true]) {
+    it(`handed over ${mid ? 'with a round in flight' : 'on a quiet table'} to a buyer who runs the seller's node (one house key, delegated by each in turn): no round is lost, and the node plays on for the buyer`, async () => {
+      const sim = await Sim.open({ name: `fair-only-hand-over-same-${mid ? 'mid' : 'quiet'}`, seed: seed(mid ? 1413 : 1411), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+      const went = handOverAt(sim, 60_000, () => flightOnBuyer(sim, ROULETTE) === (mid ? 'tip' : 'quiet'), { node: 'same' });
+      let before: { joins: number; reveals: number; cks: number } | null = null;
+      sim.every(() => { if (went.at === null) before = { joins: sim.node!.wrote.joins, reveals: sim.node!.wrote.reveals, cks: sim.node!.trims + sim.node!.sweeps }; });
+      await sim.run(RUN_MS);
+      const s = await rouletteFinish(sim);
+      fairOnlyFinish(sim, s);
+      expect(went.said, sim.label).toEqual({ ok: true });
+      const buyer = sim.pages[1];
+      expect(holders(sim, ROULETTE), sim.label).toEqual(sim.pages.filter((sp) => sp.mode === 'up').map(() => buyer.p.pub));
+      expect(sim.node2, sim.label).toBe(sim.node);
+      // The commitment its last reveal for the seller carried is its own, and the buyer delegates it: the round on it is played.
+      expect(s.voids, sim.label).toBe(0);
+      if (!mid) expect(sim.node!.wrote.joins, sim.label).toBe(before!.joins);
+      expect(sim.node!.wrote.reveals, sim.label).toBeGreaterThanOrEqual(before!.reveals + 2);
+      expect(sim.node!.trims + sim.node!.sweeps, sim.label).toBeGreaterThan(before!.cks);
+      expect(sim.adoptionsWritten + sim.node!.trims, sim.label).toBeGreaterThan(0);
+    }, TIMEOUT);
+  }
 });
 
 describe('FAIR ONLY roulette: the buyer ends the game it took', () => {
