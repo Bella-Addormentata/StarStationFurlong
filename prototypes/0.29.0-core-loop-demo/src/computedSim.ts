@@ -1078,6 +1078,20 @@ export class Sim {
       for (const k of top ?? []) if (k?.startsWith('sum:')) this.sumsSeen.add(canon(computed.get(k)) ?? '');
       // 🔒 A FAIR ONLY game's checkpoints are its house's (design §8.4 P1): a
       // page writes its own opening root, and puts back one the house wrote.
+      // 🤝 (And as its transfers and delegations change: the chain and the
+      // houses the oracle holds for this load are the last the doc gave it,
+      // so one that comes and goes between two looks is read as it comes.)
+      for (const k of top ?? []) {
+        if (k?.startsWith('xf:')) {
+          const at = parseFairOnlyKey(k);
+          if (at?.kind === 'xf') this.foBase(sp, computed, { room: PAGE_ROOM, t: at.t, inc: at.inc });
+        } else if (k?.startsWith('hk:')) {
+          for (const name of [...(this.foHeld.get(sp.p)?.keys() ?? [])]) {
+            const [t, inc] = name.split('|');
+            this.foBase(sp, computed, { room: PAGE_ROOM, t, inc });
+          }
+        }
+      }
       for (const k of top ?? []) {
         if (!k?.startsWith('ck:')) continue;
         // (The oracle's own base for this page, kept as its doc's checkpoints
@@ -2495,7 +2509,7 @@ export class Sim {
       }
     }
     const holdsAt = (i: number, u: number): boolean => chain[i].from <= u && (i + 1 === chain.length || u <= chain[i + 1].from);
-    const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
+    const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.k}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
     xfsOf.set(name, new Map(chain.flatMap((h) => (h.id === null ? [] : [[h.id, xfs.get(h.id)!] as [string, XferRec]]))));
     const usedDls = new Map<string, DelegationRec>();
     for (const d of delegations) if (chain.some((h) => h.k === d.k) && signed(d)) usedDls.set(`${d.h}|${d.g}`, d);
@@ -2519,7 +2533,7 @@ export class Sim {
       if (!(root ? i === 0 && ck.k === ck.ok && dlOk : own || (dlOk && dl!.h === ck.k))) return false;
       // (An end order: a key's that holds the game at the round it ends, S1.)
       const fin = ck.f;
-      if (fin !== undefined && !(chain.some((h, j) => h.k === fin.k && holdsAt(j, ck.u)) && ok(`fin|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
+      if (fin !== undefined && !(chain.some((h, j) => h.k === fin.k && holdsAt(j, ck.u)) && ok(`fin|${fin.k}|${fin.g}`, fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
       return ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g);
     };
     for (const { key, id, ck } of whole) {
