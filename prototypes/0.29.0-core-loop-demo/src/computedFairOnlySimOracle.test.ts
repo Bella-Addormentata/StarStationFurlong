@@ -327,21 +327,34 @@ describe("the oracle's own base rule", () => {
     const owner = sim.house;
     const top = D.p.doc.getMap<unknown>('casinoComputed');
     const inc = D.p.casino.computedIncOf(T)!;
-    const base = (): { houseAt(pub: string, r: number): boolean } | null => (sim as unknown as {
-      foBase(sp: typeof D, map: Y.Map<unknown>, ctx: { room: string; t: string; inc: string }): { houseAt(pub: string, r: number): boolean } | null;
-    }).foBase(D, top, { room: PAGE_ROOM, t: T, inc });
-    // (A key the holder delegates and that writes nothing: page D's own, as good a key as any.)
+    // (What the oracle holds on for this load of the page: its own notes, read as they are.)
+    const heldKeys = (): string[] => ((sim as unknown as { foDls: WeakMap<object, Map<string, { dls: { h: string }[] }>> }).foDls
+      .get(D.p)?.get(`${T}|${inc}`)?.dls ?? []).map((d) => d.h);
+    // (A key the holder delegates and that writes nothing a fold takes: page D's own, as good a key as any.)
     const h = D.p.pub;
     const body = { v: 1, h, k: owner.p.pub };
     const dl = { ...body, g: owner.p.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) };
-    expect(base()?.houseAt(sim.node!.pub, 1), sim.label).toBe(true);
-    expect(base()?.houseAt(h, 1), sim.label).toBe(false);
+    sim.enter(D);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).toEqual([sim.node!.pub]);
     D.cheats = true;
-    D.p.doc.transact(() => top.set(delegationKey(h), dl));
-    expect(base()?.houseAt(h, 1), sim.label).toBe(true);
+    const ses = D.p.casino.computedSessionForWrite(T)!;
+    D.p.doc.transact(() => {
+      top.set(delegationKey(h), dl);
+      // (And a record under a house's key prefix that names it, which no fold reads as a record.)
+      ses.set('o:garbage', { k: h });
+    });
+    await sim.run(2_000);
+    sim.enter(D);
+    expect(top.has(delegationKey(h)), sim.label).toBe(true);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).not.toContain(h);
     D.p.doc.transact(() => top.delete(delegationKey(h)));
-    expect(base()?.houseAt(h, 1), sim.label).toBe(false);
-    expect(base()?.houseAt(sim.node!.pub, 1), sim.label).toBe(true);
+    await sim.run(1_000);
+    sim.enter(D);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).not.toContain(h);
+    expect(heldKeys(), sim.label).toContain(sim.node!.pub);
   }, TIMEOUT);
 
   for (const what of ['delegation', 'transfer'] as const) {
@@ -368,8 +381,7 @@ describe("the oracle's own base rule", () => {
       await sim.run(1_000);
       // The record goes from page D's doc (by its own hand, so the moment is exact: a page that holds it
       // puts it back within the second): the oracle's count of that doc, read at once, stands as it stood.
-      sim.enter(D);
-      expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+      // (No look of the spec's own before it goes: what the oracle holds is what its looks of the run gave it.)
       D.cheats = true;
       D.p.doc.transact(() => top.delete(key));
       expect(top.has(key), sim.label).toBe(false);

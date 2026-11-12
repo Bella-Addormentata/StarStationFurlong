@@ -2511,28 +2511,29 @@ export class Sim {
     const holdsAt = (i: number, u: number): boolean => chain[i].from <= u && (i + 1 === chain.length || u <= chain[i + 1].from);
     const signed = (d: DelegationRec): boolean => ok(`dl|${d.h}|${d.k}|${d.g}`, d.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: d.v, h: d.h, k: d.k }), d.g);
     xfsOf.set(name, new Map(chain.flatMap((h) => (h.id === null ? [] : [[h.id, xfs.get(h.id)!] as [string, XferRec]]))));
-    // Which delegations it holds on for this load (retain, below): those of
-    // a house with a record of its own in the session the base opens (a
-    // join or a reveal: what a count can rest on), read on a whole doc, and
-    // those it held already for this base. Not one that came and went
-    // unused, nor one read while the doc held part of an update.
+    // Which delegations it holds on for this load: those a count used.
+    // A lookup of its own cold fold (houseAt, below) that a signed
+    // delegation of a holder answered, on a whole doc, holds that
+    // delegation on for as long as the base stands (a new base starts
+    // afresh, and the records its session carries earn theirs again). Not
+    // one that came and went unused, one a malformed record names (the fold
+    // refuses the record before it asks), nor one read while the doc held
+    // part of an update.
+    const partial = (sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
+    let baseKey: string | null = null;
     const retain = (fb: FoBase): FoBase => {
-      if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) return fb;
-      const ses = map.get(`ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, fb.ck)}`);
-      const wrote = new Set<unknown>();
-      if (ses instanceof Y.Map) {
-        for (const [k, v] of ses.entries()) if ((k.startsWith('h:') || k.startsWith('o:')) && typeof v === 'object' && v !== null) wrote.add((v as { k?: unknown }).k);
-      }
-      const keep = new Map<string, DelegationRec>();
-      const prev = dlsOf.get(name);
-      const mine = (d: DelegationRec): boolean => chain.some((h) => h.k === d.k) && signed(d);
-      if (prev?.base === fb.key) for (const d of prev.dls) if (mine(d)) keep.set(`${d.h}|${d.k}|${d.g}`, d);
-      for (const d of delegations) if (wrote.has(d.h) && mine(d)) keep.set(`${d.h}|${d.k}|${d.g}`, d);
-      dlsOf.set(name, { base: fb.key, dls: [...keep.values()] });
+      baseKey = fb.key;
+      if (!partial && dlsOf.get(name)?.base !== fb.key) dlsOf.set(name, { base: fb.key, dls: [] });
       return fb;
     };
-    const houseAt = (pub: string, r: number): boolean => delegations.some((d) => d.h === pub
-      && chain.some((h, i) => h.k === d.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(d));
+    const houseAt = (pub: string, r: number): boolean => {
+      const d = delegations.find((x) => x.h === pub
+        && chain.some((h, i) => h.k === x.k && h.from < r && (i + 1 === chain.length || r <= chain[i + 1].from)) && signed(x));
+      if (d === undefined) return false;
+      const e = baseKey === null || partial ? undefined : dlsOf.get(name);
+      if (e && e.base === baseKey && !e.dls.some((x) => x.h === d.h && x.k === d.k && x.g === d.g)) e.dls.push(d);
+      return true;
+    };
     let best: { key: string; id: string; ck: CkRec } | null = null;
     const accepts = (id: string, ck: CkRec): boolean => {
       // Whose it speaks for: the holder its transfers lead to, at a round that holder holds.
