@@ -8611,7 +8611,7 @@ function renderRoomHoldersSection(): void {
 
   const toggle = `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px;">
       <span style="color:rgba(212,168,75,0.55);">List my computer in the rooms it holds</span>
-      <button type="button" data-holder-action="toggle" aria-pressed="${listed}" style="${pill}${listed ? " background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;" : ""}">${listed ? "ON" : "OFF"}</button>
+      <button type="button" data-holder-action="toggle" aria-label="List my computer in the rooms it holds" aria-pressed="${listed}" style="${pill}${listed ? " background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;" : ""}">${listed ? "ON" : "OFF"}</button>
     </div>`;
 
   section.innerHTML = header + rows + more + statusLine + toggle;

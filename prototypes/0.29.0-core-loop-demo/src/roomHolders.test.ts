@@ -11,9 +11,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   ADDRS_REFRESH_MS,
+  HELD_ROOMS_KEY,
   HOLDER_NODES_MAP,
   LIST_COMPUTER_KEY,
   MAX_AGE_MS,
+  MAX_HELD_ROOMS,
   MAX_HOLDERS,
   MAX_HOLDER_HINTS,
   MAX_PRUNE,
@@ -23,16 +25,20 @@ import {
   fileMyHolderNode,
   holderHintsHere,
   holderNodeFromWire,
+  holderNodeOk,
   holderNodeSignBytes,
   holdersHere,
   listsThisComputer,
   needsRefile,
+  noteRoomHeld,
   ownerPubIn,
   readHolderHints,
   readHolders,
   resetRoomHoldersForTest,
+  roomHeldBy,
   roomStateIn,
   setListsThisComputer,
+  setLocalHolderNode,
   signHolderNode,
   staleHolderKeys,
   subscribeHolderNodes,
@@ -305,6 +311,104 @@ describe('the switch', () => {
   });
 });
 
+/** A Storage stand-in that counts its writes. */
+const memStore = () => {
+  const m = new Map<string, string>();
+  const s = {
+    m,
+    writes: 0,
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => { s.writes++; m.set(k, v); },
+    removeItem: (k: string) => void m.delete(k),
+  };
+  return s;
+};
+const closedStore = { getItem: (): string | null => { throw new Error('closed'); }, setItem: () => { throw new Error('closed'); }, removeItem: () => { throw new Error('closed'); } };
+
+describe('what this install has loaded (its own note)', () => {
+  beforeEach(() => resetRoomHoldersForTest());
+  afterEach(() => resetRoomHoldersForTest());
+  /** A later page of the same install: the page's memory is gone, storage is not. */
+  const nextPage = () => resetRoomHoldersForTest();
+
+  it('reads back the node that held a room, on a later page too, and nothing for a room never loaded', () => {
+    const s = memStore();
+    expect(roomHeldBy(s, ROOM)).toBeNull();
+    noteRoomHeld(s, ROOM, node('a'));
+    expect(roomHeldBy(s, ROOM)).toBe(node('a'));
+    expect(roomHeldBy(s, 'room-b')).toBeNull();
+    nextPage();
+    expect(roomHeldBy(s, ROOM)).toBe(node('a'));
+    expect(JSON.parse(s.m.get(HELD_ROOMS_KEY)!)).toEqual([[ROOM, node('a')]]);
+  });
+
+  it('writes once per room and node: a second note of the same pair touches nothing', () => {
+    const s = memStore();
+    noteRoomHeld(s, ROOM, node('a'));
+    noteRoomHeld(s, ROOM, node('a'));
+    expect(s.writes).toBe(1);
+    nextPage(); // the page forgot; storage says so already
+    noteRoomHeld(s, ROOM, node('a'));
+    expect(s.writes).toBe(1);
+  });
+
+  it('keeps one node per room, the latest, and the most recently noted room last', () => {
+    const s = memStore();
+    noteRoomHeld(s, ROOM, node('a'));
+    noteRoomHeld(s, 'room-b', node('a'));
+    noteRoomHeld(s, ROOM, node('b')); // this computer's node changed
+    expect(roomHeldBy(s, ROOM)).toBe(node('b'));
+    expect(JSON.parse(s.m.get(HELD_ROOMS_KEY)!)).toEqual([['room-b', node('a')], [ROOM, node('b')]]);
+  });
+
+  it('keeps the most recent 256 rooms and lets the oldest go', () => {
+    const s = memStore();
+    for (let i = 0; i < MAX_HELD_ROOMS + 4; i++) noteRoomHeld(s, `room-${i}`, node('a'));
+    expect(JSON.parse(s.m.get(HELD_ROOMS_KEY)!)).toHaveLength(MAX_HELD_ROOMS);
+    // The page's own memory is bounded the same way.
+    expect(roomHeldBy(null, 'room-3')).toBeNull();
+    expect(roomHeldBy(null, 'room-4')).toBe(node('a'));
+    nextPage();
+    expect(roomHeldBy(s, 'room-3')).toBeNull();
+    expect(roomHeldBy(s, 'room-4')).toBe(node('a'));
+    expect(roomHeldBy(s, `room-${MAX_HELD_ROOMS + 3}`)).toBe(node('a'));
+  });
+
+  it('reads junk in storage as no note, and keeps the well-formed pairs among it', () => {
+    const s = memStore();
+    for (const junk of ['not json', '{}', '"x"', '7', 'null', '[[1,2]]', `[["${ROOM}","not-a-node"]]`, `[["${ROOM}"]]`, `[["","${node('a')}"]]`,
+      `[["${'r'.repeat(129)}","${node('a')}"]]`, `[["${ROOM}","${node('a')}","more"]]`]) {
+      s.m.set(HELD_ROOMS_KEY, junk);
+      expect(roomHeldBy(s, ROOM)).toBeNull();
+      expect(roomHeldBy(s, 'r'.repeat(129))).toBeNull();
+    }
+    s.m.set(HELD_ROOMS_KEY, JSON.stringify([null, ['room-b', node('b')], 'x', [ROOM, node('a')]]));
+    expect(roomHeldBy(s, ROOM)).toBe(node('a'));
+    // A note written over junk keeps what was well-formed.
+    noteRoomHeld(s, 'room-c', node('c'));
+    expect(JSON.parse(s.m.get(HELD_ROOMS_KEY)!)).toEqual([['room-b', node('b')], [ROOM, node('a')], ['room-c', node('c')]]);
+  });
+
+  it('notes nothing for a room id or a node id that is not one', () => {
+    const s = memStore();
+    noteRoomHeld(s, '', node('a'));
+    noteRoomHeld(s, 'r'.repeat(129), node('a'));
+    noteRoomHeld(s, ROOM, 'not-a-node');
+    expect(s.writes).toBe(0);
+    expect(roomHeldBy(s, ROOM)).toBeNull();
+  });
+
+  it('lasts the page where storage is closed or absent, and does not throw there', () => {
+    expect(() => noteRoomHeld(closedStore, ROOM, node('a'))).not.toThrow();
+    expect(roomHeldBy(closedStore, ROOM)).toBe(node('a'));
+    expect(() => noteRoomHeld(null, 'room-b', node('b'))).not.toThrow();
+    expect(roomHeldBy(undefined, 'room-b')).toBe(node('b'));
+    nextPage();
+    expect(roomHeldBy(closedStore, ROOM)).toBeNull();
+    expect(roomHeldBy(null, 'room-b')).toBeNull();
+  });
+});
+
 describe('the bound store', () => {
   let doc: Y.Doc;
   const holder: FilingFacts = { listed: true, holds: true, owner: false };
@@ -370,6 +474,125 @@ describe('the bound store', () => {
     expect(records().has(ann.pub)).toBe(false);
     bindHolderNodes(doc); // the next visit
     expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 2000, ann)).toBe('filed');
+  });
+
+  it('does not file again either when the cleared record was one it found standing from an earlier visit', () => {
+    // An earlier visit filed it, and it is still fresh: this visit keeps it as it is.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW - 1000, ann, false));
+    bindHolderNodes(doc); // this visit
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann)).toBe('kept');
+    expect(records().has(ann.pub)).toBe(true);
+    records().delete(ann.pub); // a full list's clearing arrived
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 1000, ann)).toBe('kept');
+    expect(records().has(ann.pub)).toBe(false);
+    bindHolderNodes(doc); // the next visit
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 2000, ann)).toBe('filed');
+  });
+
+  it('files over a record standing under its key that is not its own, and still files once per visit', () => {
+    // Somebody else wrote under the holder's key: not a record of theirs to keep.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW - 1000, ben, false));
+    bindHolderNodes(doc);
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann)).toBe('filed');
+    records().delete(ann.pub);
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 1000, ann)).toBe('kept');
+  });
+
+  it('notes on its own computer that it holds the room, listed or not, and only once it does', () => {
+    const s = memStore();
+    expect(fileMyHolderNode(ROOM, { ...holder, holds: false }, hint(node('a')), NOW, ann, s)).toBe('kept');
+    expect(fileMyHolderNode(ROOM, holder, null, NOW, ann, s)).toBe('kept');
+    expect(roomHeldBy(s, ROOM)).toBeNull();
+    expect(s.writes).toBe(0);
+    // Listing off: nothing goes in the room, the note is made all the same.
+    expect(fileMyHolderNode(ROOM, { ...holder, listed: false }, hint(node('a')), NOW, ann, s)).toBe('kept');
+    expect(records().size).toBe(0);
+    expect(roomHeldBy(s, ROOM)).toBe(node('a'));
+    // Listed: the record is filed, and the note is not written twice.
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann, s)).toBe('filed');
+    expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 1000, ann, s)).toBe('kept');
+    expect(s.writes).toBe(1);
+    // The note names nobody and no key: room and node only.
+    expect(s.m.get(HELD_ROOMS_KEY)).toBe(JSON.stringify([[ROOM, node('a')]]));
+  });
+
+  describe('a holder reopening a room with only their own computer online', () => {
+    /** The room as this computer's node hands it back: state, and `who`'s records. */
+    const roomWith = (...who: [HolderSigner, string][]): Y.Doc => {
+      const d = new Y.Doc();
+      d.getMap('roomInfo').set('owner', 'player-1');
+      d.getMap('roomInfo').set('name', 'Lobby');
+      d.getMap('players').set('player-1', { keyB64: cat.pub }); // cat owns it; cat is away
+      for (const [s, n] of who) d.getMap(HOLDER_NODES_MAP).set(s.pub, signHolderNode(ROOM, hint(n), NOW - 1000, s, false));
+      return d;
+    };
+    /** One visit: bind, and file as the game does once the room has arrived. */
+    const visit = (d: Y.Doc, facts: FilingFacts, s: ReturnType<typeof memStore>, at = NOW) => {
+      bindHolderNodes(d);
+      return fileMyHolderNode(ROOM, facts, hint(node('a')), at, ann, s);
+    };
+    /** A later start of the game: the page is new, storage and this computer's node are not. */
+    const restart = () => {
+      resetRoomHoldersForTest();
+      setLocalHolderNode(node('a'));
+    };
+
+    it('gets in after switching listing off took their record down', () => {
+      const s = memStore();
+      setLocalHolderNode(node('a'));
+      const first = roomWith([cat, node('c')]);
+      expect(visit(first, holder, s)).toBe('filed');
+      expect(visit(first, { ...holder, listed: false }, s)).toBe('removed');
+      restart();
+      // Their node's copy: the room, the owner's record, none of theirs.
+      const alone = roomWith([cat, node('c')]);
+      expect(alone.getMap(HOLDER_NODES_MAP).has(ann.pub)).toBe(false);
+      expect(holderNodeOk(node('a'), alone, ROOM, NOW + DAY, ann.pub, s)).toBe(true);
+      // And stays off the list: the visit that follows files nothing.
+      expect(visit(alone, { ...holder, listed: false }, s, NOW + DAY)).toBe('kept');
+      expect(alone.getMap(HOLDER_NODES_MAP).has(ann.pub)).toBe(false);
+    });
+
+    it('gets in after a full list cleared their record, and is listed again by that visit', () => {
+      const s = memStore();
+      setLocalHolderNode(node('a'));
+      const first = roomWith([cat, node('c')]);
+      expect(visit(first, holder, s)).toBe('filed');
+      first.getMap(HOLDER_NODES_MAP).delete(ann.pub); // cleared by another filer
+      restart();
+      const alone = roomWith([cat, node('c')]);
+      expect(holderNodeOk(node('a'), alone, ROOM, NOW + DAY, ann.pub, s)).toBe(true);
+      expect(visit(alone, holder, s, NOW + DAY)).toBe('filed');
+    });
+
+    it('gets in with listing off from the first visit on: no record of theirs ever stood', () => {
+      const s = memStore();
+      setLocalHolderNode(node('a'));
+      expect(visit(roomWith([cat, node('c')]), { ...holder, listed: false }, s)).toBe('kept');
+      restart();
+      expect(holderNodeOk(node('a'), roomWith(), ROOM, NOW + DAY, ann.pub, s)).toBe(true);
+    });
+
+    it('does not for a first visit, an empty copy, another room, another node, or a computer whose node changed', () => {
+      const s = memStore();
+      setLocalHolderNode(node('a'));
+      const room = roomWith([cat, node('c')]);
+      // A first visit: nothing noted yet, and no record of theirs to show.
+      expect(holderNodeOk(node('a'), room, ROOM, NOW, ann.pub, s)).toBe(false);
+      expect(visit(room, { ...holder, listed: false }, s)).toBe('kept');
+      restart();
+      // A node that only registered the room brings nothing, noted or not.
+      expect(holderNodeOk(node('a'), new Y.Doc(), ROOM, NOW, ann.pub, s)).toBe(false);
+      // The note is for that room alone.
+      expect(holderNodeOk(node('a'), room, 'room-b', NOW, ann.pub, s)).toBe(false);
+      // Only this computer's node, never one that merely matches a note.
+      expect(holderNodeOk(node('b'), room, ROOM, NOW, ann.pub, s)).toBe(false);
+      setLocalHolderNode(node('b')); // a new node on this computer never held the room
+      expect(holderNodeOk(node('b'), room, ROOM, NOW, ann.pub, s)).toBe(false);
+      expect(holderNodeOk(node('a'), room, ROOM, NOW, ann.pub, s)).toBe(false);
+      setLocalHolderNode(null);
+      expect(holderNodeOk(node('a'), room, ROOM, NOW, ann.pub, s)).toBe(false);
+    });
   });
 
   it('clears stale records as it files, never the owner’s', () => {

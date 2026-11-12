@@ -102,7 +102,10 @@ Switching it off takes the record down at once in the room you are in, and in
 any other room at your next visit there; a record not refreshed for 30 days
 stops counting by itself. Off, the computer still keeps and hands on its
 copies; other players' games just no longer count a copy that came from it
-alone as the whole room.
+alone as the whole room. Your own game still does: it keeps a note on this
+computer of the rooms it has loaded (which room, on which node; never sent to
+anyone), so a room your computer holds still opens for you with nobody else
+online, listed or not.
 
 What it does not promise: a holder's copy may be old, and nothing yet proves a
 copy is complete or unaltered. Copies merge, so an old one is brought up to

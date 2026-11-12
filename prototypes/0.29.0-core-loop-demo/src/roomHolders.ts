@@ -33,6 +33,13 @@
  * addresses under its id by default (the Mainline DHT). That is the price of
  * the direction above, and what the switch is for.
  *
+ * What stays on this computer: a note of the rooms whose state has reached
+ * this install, each with the node that held the copy then (`noteRoomHeld`).
+ * It is not the list and is never sent. It lets a player's own game count
+ * their own computer's copy of a room once their record is gone from the
+ * room (the switch turned off, or cleared from a full list), so such a
+ * player can still open, alone, a room their computer holds.
+ *
  * What a record is not: authority, or proof that a copy is complete or honest.
  * A hint is a route (iroh connects by key, so only the node a hint names can
  * answer), and what a holder serves merges into state every member's node
@@ -266,17 +273,29 @@ export function setLocalHolderNode(node: string | null): void {
  *  - a node a holder filed as theirs (holderNodesIn). A game files only once
  *    the room's state has reached it, so on a first visit the record that
  *    names the node arrives in the very frame it proves;
- *  - or this machine's own node, for the room's owner, and for a player whose
- *    own signed record names it however old that record is. That is the way
- *    in for a holder back after MAX_AGE_MS, reopening a room nobody else has
- *    online: their game files a fresh record only once the room's state has
- *    arrived, so without it they could never file one. A visitor's own node
- *    gains nothing: it has no record of theirs to show.
+ *  - or this machine's own node, for the room's owner, for a player whose
+ *    own signed record names it however old that record is, and for an
+ *    install that has loaded the room on that node before (its own private
+ *    note, roomHeldBy). That is the way in for a holder reopening a room
+ *    nobody else has online, back after MAX_AGE_MS or with their record gone
+ *    from the room (the switch turned off, cleared from a full list): their
+ *    game files a record only once the room's state has arrived, so without
+ *    it they could never file one again. A first-time visitor's own node
+ *    gains nothing: there is no record of theirs and no note to show.
  */
-export function holderNodeOk(node: string, doc: Y.Doc, roomId: string, now = Date.now(), me = getIdentityPub()): boolean {
+export function holderNodeOk(
+  node: string,
+  doc: Y.Doc,
+  roomId: string,
+  now = Date.now(),
+  me = getIdentityPub(),
+  held: SwitchStore | null = ownStore(),
+): boolean {
   if (!roomStateIn(doc)) return false;
   if (holderNodesIn(doc, roomId, now).has(node)) return true;
-  if (localNode === null || node !== localNode || me.length === 0) return false;
+  if (localNode === null || node !== localNode) return false;
+  if (roomHeldBy(held, roomId) === node) return true;
+  if (me.length === 0) return false;
   if (ownerPubIn(doc) === me) return true;
   const mine = holderNodeFromWire(doc.getMap(HOLDER_NODES_MAP).get(me));
   return !!mine && mine.node === node && cachedVerify(me, holderNodeSignBytes(roomId, me, mine), mine.sig);
@@ -365,13 +384,82 @@ export function setListsThisComputer(store: SwitchStore | null | undefined, on: 
   }
 }
 
+// ── What this install has loaded (private) ───────────────────────────────────
+
+/** localStorage key of this install's own note of the rooms whose state has
+ *  reached it, each with the node that held the copy then: pairs of room id
+ *  and node id, the most recently noted last. Never sent anywhere. */
+export const HELD_ROOMS_KEY = 'ssf-rooms-held';
+/** Rooms the note keeps, at most; past it the least recently noted go. */
+export const MAX_HELD_ROOMS = 256;
+const MAX_ROOM_ID = 128;
+
+/** This page's own storage, or none where it is closed (or in a test). */
+function ownStore(): SwitchStore | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** The note as this page made it, for where storage is closed. */
+const heldThisPage = new Map<string, string>();
+
+function readHeldRooms(store: SwitchStore | null | undefined): Array<[string, string]> {
+  let raw: unknown = null;
+  try {
+    raw = JSON.parse(store?.getItem(HELD_ROOMS_KEY) ?? 'null');
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(raw)) return [];
+  const out: Array<[string, string]> = [];
+  for (const pair of raw.slice(-MAX_HELD_ROOMS)) {
+    if (!Array.isArray(pair) || pair.length !== 2) continue;
+    const [roomId, node] = pair as unknown[];
+    if (typeof roomId !== 'string' || roomId.length === 0 || roomId.length > MAX_ROOM_ID) continue;
+    if (typeof node !== 'string' || !NODE_RE.test(node)) continue;
+    out.push([roomId, node]);
+  }
+  return out;
+}
+
+/** The node that held `roomId` when its state last reached this install, by
+ *  the install's own note; null when it never did. */
+export function roomHeldBy(store: SwitchStore | null | undefined, roomId: string): string | null {
+  const here = heldThisPage.get(roomId);
+  if (here !== undefined) return here;
+  for (const [room, node] of readHeldRooms(store)) if (room === roomId) return node;
+  return null;
+}
+
+/** Note that `roomId`'s own state has reached this install while `node` was
+ *  its computer's node (best effort where storage is closed: the page keeps
+ *  it). Nothing is written when the note says so already. */
+export function noteRoomHeld(store: SwitchStore | null | undefined, roomId: string, node: string): void {
+  if (!roomId || roomId.length > MAX_ROOM_ID || !NODE_RE.test(node)) return;
+  if (heldThisPage.get(roomId) === node) return;
+  heldThisPage.delete(roomId);
+  heldThisPage.set(roomId, node);
+  if (heldThisPage.size > MAX_HELD_ROOMS) heldThisPage.delete(heldThisPage.keys().next().value as string);
+  const rooms = readHeldRooms(store);
+  if (rooms.some(([room, held]) => room === roomId && held === node)) return;
+  const next = [...rooms.filter(([room]) => room !== roomId), [roomId, node] as [string, string]].slice(-MAX_HELD_ROOMS);
+  try {
+    store?.setItem(HELD_ROOMS_KEY, JSON.stringify(next));
+  } catch {
+    /* privacy mode: the note lasts this page only */
+  }
+}
+
 // ── The bound store ──────────────────────────────────────────────────────────
 
 let boundDoc: Y.Doc | null = null;
 let nodesMap: Y.Map<unknown> | null = null;
-/** The key this binding filed a record under: a record since cleared from a
- *  full list is not filed again in the same visit (two full rooms' worth of
- *  players would otherwise clear each other for ever). */
+/** The key whose record this binding filed, or found standing: a record
+ *  since cleared from a full list is not filed again in the same visit (two
+ *  full rooms' worth of players would otherwise clear each other for ever). */
 let filedAs: string | null = null;
 /** Verdicts by key, signature and signed bytes (never key and signature
  *  alone: an altered record re-filed with an old signature must not borrow a
@@ -439,7 +527,8 @@ export interface FilingFacts {
  * A game files (or refreshes) its computer's node in the bound room once it
  * holds the room, and takes its record down when the player has switched
  * listing off. A filing also clears a few stale records (staleHolderKeys).
- * Returns what it did to this player's own record.
+ * Returns what it did to this player's own record. Listed or not, a game
+ * that holds the room notes so on its own computer (noteRoomHeld, `held`).
  */
 export function fileMyHolderNode(
   roomId: string,
@@ -447,8 +536,10 @@ export function fileMyHolderNode(
   hint: RoomMemberHint | null,
   now = Date.now(),
   signer: HolderSigner = localHolderSigner(),
+  held: SwitchStore | null = ownStore(),
 ): 'filed' | 'removed' | 'kept' {
   if (!docAlive() || !roomId || !signer.pub) return 'kept';
+  if (me.holds && hint) noteRoomHeld(held, roomId, hint.irohNodeId);
   const storedRaw = nodesMap!.get(signer.pub);
   if (!me.listed) {
     filedAs = null; // switched on again, it files afresh
@@ -463,7 +554,12 @@ export function fileMyHolderNode(
   if (storedRaw === undefined && filedAs === signer.pub) return 'kept';
   const stored = holderNodeFromWire(storedRaw);
   const genuine = stored && verifyIdentityStrict(signer.pub, holderNodeSignBytes(roomId, signer.pub, stored), stored.sig) ? stored : null;
-  if (!needsRefile(genuine, next, now)) return 'kept';
+  if (!needsRefile(genuine, next, now)) {
+    // A record of this player's stands in this visit, filed in an earlier
+    // one: cleared from a full list later, it is not filed again either.
+    filedAs = signer.pub;
+    return 'kept';
+  }
   const keep = new Set([signer.pub, ...(me.ownerPub ? [me.ownerPub] : [])]);
   boundDoc!.transact(() => {
     nodesMap!.set(signer.pub, next);
@@ -480,4 +576,5 @@ export function resetRoomHoldersForTest(): void {
   nodesMap = null;
   filedAs = null;
   localNode = null;
+  heldThisPage.clear();
 }
