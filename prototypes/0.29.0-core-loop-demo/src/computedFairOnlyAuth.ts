@@ -59,6 +59,12 @@ import type { TransferOffer } from './offerBytes';
  *  under their own claimed key are not counted: they cost one check, once, and
  *  are deleted). */
 export const MAX_CK_CANDIDATES = 8;
+/** How many transfers found forged one resolution walks past (PR 6c-4b-3a): with
+ *  more in the holder's way the answer waits (`pending`) for the pages to delete
+ *  the ones listed (`invalid`; design §8.4 P7), and the next resolution goes on
+ *  from there. So a flood of forged transfers costs a resolution this many
+ *  verdicts, and never more than the verdicts a page keeps. */
+export const MAX_FORGED_XFS = 64;
 
 // ── What the caller gives ────────────────────────────────────────────────────
 
@@ -92,6 +98,21 @@ export interface AuthEnv {
   liveSid?: string;
   /** readCk with the caller's memory (a record is read once, not each pass). */
   read?: (key: string, value: unknown) => CkRead;
+  /** readXf with the caller's memory (PR 6c-4b-3a: a flood of transfers is
+   *  read once, not at each pass). */
+  xf?: (value: unknown, whole?: boolean) => XfRead | null;
+}
+
+/** A transfer as the resolver reads it, with its id. */
+export interface XfRead { xf: XferRec; id: string }
+
+/** Read `value` as a transfer of `room` (asXf) and name it (xfId); null for
+ *  none. `whole`: the value is one a checkpoint that was read carries (readCk
+ *  took it as a transfer already), so only its id is worked out. */
+export function readXf(room: string, value: unknown, whole = false): XfRead | null {
+  const xf = whole ? (value as XferRec) : asXf(value, room);
+  const id = xf && xfId(xf);
+  return xf && id ? { xf, id } : null;
 }
 
 /** The records of ONE game, as the doc holds them (the caller picks them out
@@ -114,8 +135,9 @@ export interface AuthRecords {
 export interface Counted { key: string; id: string; ck: CkRec }
 
 /** A transfer that counts. `key` is where the doc holds it, absent for one
- *  found only inside a checkpoint's `x`. */
-export interface Step { id: string; xf: XferRec; key?: string }
+ *  found only inside a checkpoint's `x`; `carriers` are the doc keys of the
+ *  checkpoints that carry it in their `x`. */
+export interface Step { id: string; xf: XferRec; key?: string; carriers: string[] }
 
 /** One holder of the game, and the round it holds it from. */
 export interface Holder {
@@ -148,7 +170,10 @@ export interface Resolution {
    *  junk and is never listed: readers pass it over, and authority can depend on
    *  a record that is still being put back. */
   invalid: readonly string[];
-  /** A check was put off, and its answer could still change this one. */
+  /** A check was put off, and its answer could still change this one; or (PR
+   *  6c-4b-3a) more forged transfers stand in the holder's way than a resolution
+   *  walks past (MAX_FORGED_XFS): then no check waits, and the answer changes
+   *  when the records listed in `invalid` are deleted. */
   pending: boolean;
   /** Whether `pub` is a house that decides round `round` of this game: it was
    *  delegated by the key that holds the game for that round. `undefined`
@@ -216,18 +241,23 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   // S2: the transfers that can move this game: those it was written with (`xf:`),
   // and those a checkpoint whose signer could hold the game carries.
   const found = new Map<string, Step>();
-  const take = (xf: XferRec, key?: string): void => {
+  const readX = env.xf ?? ((value: unknown, whole?: boolean) => readXf(env.room, value, whole));
+  const take = (r: XfRead | null, key?: string, carrier?: string): void => {
+    // (No id only for a value canon refuses, which asXf has already refused.)
+    if (r === null) return;
+    const { xf, id } = r;
     if (xf.o.issuedAt < name.ts - OFFER_SKEW_MS) return; // made before the game opened: a replay
-    const id = xfId(xf); // (null only for a value canon refuses, which asXf has already refused)
     // (The ones under their keys come first, so a copy that has a key keeps it.)
-    if (id !== null && !found.has(id)) found.set(id, { id, xf, key });
+    let step = found.get(id);
+    if (!step) found.set(id, step = { id, xf, key, carriers: [] });
+    if (carrier !== undefined) step.carriers.push(carrier);
   };
   for (const [key, value] of rec.xfs) {
     const pk = parseFairOnlyKey(key);
-    const xf = pk && pk.kind === 'xf' && pk.t === t && pk.inc === inc ? asXf(value, env.room) : null;
-    if (xf && xfId(xf) === (pk as { id: string }).id) take(xf, key);
+    const r = pk && pk.kind === 'xf' && pk.t === t && pk.inc === inc ? readX(value) : null;
+    if (r && r.id === (pk as { id: string }).id) take(r, key);
   }
-  for (const c of readable) if (claimed(c.ck)) for (const xf of c.ck.x ?? []) take(xf);
+  for (const c of readable) if (claimed(c.ck)) for (const xf of c.ck.x ?? []) take(readX(xf, true), undefined, c.key);
 
   // The chain: from the opener, the next holder is the lowest-round transfer made by the
   // holder, at or after the round it took the game, with an offer not used before.
@@ -245,7 +275,8 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     return env.sig(sigId('xf', t, inc, xh), s.xf.k, () => signBytes('xf', ctx, s.xf), s.xf.g);
   };
   let chainPending = false;
-  while (chain.length <= MAX_TRANSFERS) {
+  let forged = 0;
+  while (chain.length <= MAX_TRANSFERS && !chainPending) {
     const last = chain[chain.length - 1];
     const next = [...found.values()]
       .filter((s) => s.xf.o.makerPub === last.k && s.xf.u >= last.from && !used.has(s.xf.o.nonce))
@@ -255,7 +286,11 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       const v = checkedXf(s);
       if (v === true) { taken = s; break; }
       if (v === undefined) { chainPending = true; break; }
+      // (Forged: its key goes, and every checkpoint that carries it, which no chain can ever bear out.)
       if (s.key !== undefined) invalid.add(s.key);
+      for (const key of s.carriers) invalid.add(key);
+      // (One more forged than the resolution walks past: the holder is not known until they are gone.)
+      if (++forged > MAX_FORGED_XFS) { chainPending = true; break; }
     }
     if (!taken) break;
     chain.push({ k: taken.xf.k, from: taken.xf.u, step: taken });
@@ -275,7 +310,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   const plausible = readable.filter(({ ck: c }) => {
     const i = c.x?.length ?? 0;
     if (chain[i]?.k !== authority(c) || !inRange(i, c.u)) return false;
-    for (let j = 0; j < i; j++) if (xfId((c.x as XferRec[])[j]) !== chain[j + 1].step?.id) return false;
+    for (let j = 0; j < i; j++) if (readX((c.x as XferRec[])[j], true)?.id !== chain[j + 1].step?.id) return false;
     // An end order must be an owner-level key's, holding the game at the round it ends.
     return c.f === undefined || holds(c.f.k, c.u);
   });

@@ -11,10 +11,10 @@ import { describe, expect, it } from 'vitest';
 import { recHash } from './computedFold';
 import { ckId, ckKey, finKey, MAX_SMALL_RECORD_BYTES, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, sealFin, sealXf, weightOf, xfId, xfKey } from './computedFairOnly';
 import type { CkRec, FairOnlyLetter, XferRec } from './computedFairOnly';
-import { MAX_CK_CANDIDATES, resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
+import { MAX_CK_CANDIDATES, MAX_FORGED_XFS, resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Resolution } from './computedFairOnlyAuth';
 import {
-  authEnv, buyer, changed, ctxOf, delegation, DL_HOUSE, fourth, hex, house, house2, houseSigner, NAME, owner, P, Q, recordsOf, rootOf,
+  authEnv, buyer, changed, ctxOf, delegation, DL_HOUSE, fourth, hex, house, house2, houseSigner, NAME, offerOf, owner, P, Q, recordsOf, rootOf,
   stranger, T, third, trimOf, xferOf,
 } from './computedFairOnlyKit';
 import type { FoldCtx } from './computedFold';
@@ -362,14 +362,62 @@ describe('transfers (S2)', () => {
     expect(other.invalid, 'and none of its records is this game\'s to report').toEqual([]);
   });
 
-  it('a transfer that fails inside a checkpoint is nobody\'s, and has no key to report', () => {
+  it('a transfer that fails inside a checkpoint is nobody\'s, and the checkpoint that carries it is reported: no chain can bear it out', () => {
     const { ctx, root, trim, xf } = setup('p');
     const forged = { ...xf.value, g: BAD_SIG };
     const carrier = trimOf(ctx, 'p', { u: 5, l: hex('e', 32), k: buyer.pub, dl: undefined, x: [forged] });
     const { res } = resolve('p', [root, trim, carrier]);
     expect(res.holder).toBe(owner.pub);
     expect(res.base?.key).toBe(trim.key);
-    expect(res.invalid).toEqual([]);
+    expect(res.invalid).toEqual([carrier.key]);
+    // under its own key too, and in a second checkpoint: all three go
+    const keyed: Entry = { key: xfKey(ctx.t, ctx.inc, xfId(forged) as string), value: forged };
+    const carrier2 = trimOf(ctx, 'p', { u: 6, l: hex('e', 32), k: buyer.pub, dl: undefined, x: [forged] });
+    expect(resolve('p', [root, trim, carrier, carrier2, keyed]).res.invalid).toEqual([carrier.key, carrier2.key, keyed.key].sort());
+    // a checkpoint that carries the good transfer is none
+    const good = trimOf(ctx, 'p', { u: 5, l: hex('e', 32), k: buyer.pub, dl: undefined, x: [xf.value] });
+    expect(resolve('p', [root, trim, good]).res).toMatchObject({ invalid: [], holder: buyer.pub });
+  });
+
+  it('walks past MAX_FORGED_XFS forged transfers in the holder\'s way and no more: with one more the answer waits, lists them, and goes on once they are gone (PR 6c-4b-3a)', () => {
+    const { ctx, root, trim, xf } = setup('p');
+    /** A transfer by the holder at round `u` that nobody signed: it sorts before the good one (round 3). */
+    const forgedAt = (u: number, i: number): Entry => {
+      const o = { ...offerOf(owner, buyer, { nonce: i.toString(16).padStart(24, '0') }), sig: BAD_SIG };
+      const value = { v: 1, o, u, k: buyer.pub, g: BAD_SIG };
+      return { key: xfKey(ctx.t, ctx.inc, xfId(value as XferRec) as string), value };
+    };
+    const forged = Array.from({ length: MAX_FORGED_XFS + 40 }, (_, i) => forgedAt(i % 3, i + 1));
+    const at = (n: number) => resolve('p', [root, trim, ...forged.slice(0, n), xf]);
+    const within = at(MAX_FORGED_XFS);
+    expect(within.res).toMatchObject({ holder: buyer.pub, pending: false });
+    expect(within.res.invalid).toHaveLength(MAX_FORGED_XFS);
+    const over = at(MAX_FORGED_XFS + 1);
+    expect(over.res).toMatchObject({ holder: owner.pub, pending: true });
+    expect(over.res.invalid).toHaveLength(MAX_FORGED_XFS + 1);
+    // a flood: the same number looked at, however many there are
+    const flood = at(forged.length);
+    expect(flood.res).toMatchObject({ holder: owner.pub, pending: true });
+    expect(flood.res.invalid).toHaveLength(MAX_FORGED_XFS + 1);
+    expect(flood.verified.length).toBeLessThanOrEqual(over.verified.length);
+    // the pages delete what a resolution lists (design P7), and the next goes on from there: three passes for these
+    let left: Entry[] = [root, trim, ...forged, xf];
+    let passes = 0;
+    for (;;) {
+      const { res } = resolve('p', left);
+      passes++;
+      if (!res.pending) {
+        expect(res.holder).toBe(buyer.pub);
+        break;
+      }
+      expect(res.invalid.length).toBeGreaterThan(0);
+      left = left.filter((e) => !res.invalid.includes(e.key));
+    }
+    expect(passes).toBe(Math.ceil((forged.length + 1) / (MAX_FORGED_XFS + 1)));
+    expect(left.map((e) => e.key)).toContain(xf.key);
+    // a transfer of a key that does not hold the game is not walked at all, in any number
+    const strangers = Array.from({ length: MAX_FORGED_XFS + 5 }, (_, i) => xferOf(ctx, stranger, buyer, 1, { nonce: (i + 1).toString(16).padStart(24, 'a') }));
+    expect(resolve('p', [root, trim, ...strangers, xf]).res).toMatchObject({ holder: buyer.pub, pending: false, invalid: [] });
   });
 
   it('does not count what was not signed by the seller, or by the buyer', () => {

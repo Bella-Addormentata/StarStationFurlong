@@ -24,6 +24,9 @@ export interface Finish {
   /** The house is away for a while (the scenario's own doing): the table
    *  waits for it, so the roulette sims' stall budget is not held. */
   houseAway?: boolean;
+  /** The warm transactions' p95 this scenario may reach instead of WARM_MS: one whose cheat makes every page check
+   *  signatures by the hundred (a check is the cost of a forged record, and a recount's budget of them is past WARM_MS). */
+  warmMs?: number;
   /** Bytes of junk a cheat lays into a session at a time: the session's bound
    *  is the house's, on what the fold used, and junk lies there until its
    *  next trim or sweep. */
@@ -59,7 +62,7 @@ export async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSu
   // With its house there, a game stalls no longer than a house table does.
   if (!opts.houseAway) expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(table.ABANDON_MS + 2 * table.GRACE_MAX_MS);
   expect(s.coldFoldMs, sim.label).toBeLessThan(COLD_FOLD_MS);
-  expect(s.warmP95Ms, sim.label).toBeLessThan(WARM_MS);
+  expect(s.warmP95Ms, sim.label).toBeLessThan(opts.warmMs ?? WARM_MS);
   const allowed = new Set([...(opts.flips ?? []), ...(opts.awayFlips ?? [])]);
   const unexpected = sim.pages.flatMap((sp) => (Object.entries(sp.flipKinds) as [FlipKind, number][])
     .filter(([k]) => !allowed.has(k)).map(([k, n]) => `${sp.name}: ${n} × ${k}`));

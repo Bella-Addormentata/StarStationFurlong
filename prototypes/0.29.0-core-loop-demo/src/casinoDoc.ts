@@ -229,8 +229,8 @@ import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDig
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
 import { asDo, asFin, asXf, finKey, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId, xfKey } from './computedFairOnly';
 import type { CkRead, CkRec, DeedOffer, FinRec, XferRec } from './computedFairOnly';
-import { resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
-import type { Resolution } from './computedFairOnlyAuth';
+import { readXf, resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
+import type { Resolution, XfRead } from './computedFairOnlyAuth';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, commitHouses, committingHouse, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts,
   houseOfCommit, roomSignBytes,
@@ -2488,6 +2488,10 @@ let staleGames = new Set<ComputedInc>();
  *  leaves when the doc holds all the page holds of it, so a tick looks at no
  *  game nothing happened to. */
 let foCheck = new Set<ComputedInc>();
+/** 🔒 The FAIR ONLY games whose last resolution found a record forged (PR
+ *  6c-4b-3a; Resolution invalid): the ones the tidy duty looks at
+ *  (computedFairOnlyForged). A game leaves at the resolution that finds none. */
+let foForged = new Set<ComputedInc>();
 /** 🔒 How many FAIR ONLY games this page tracks: with none, the game a table
  *  plays is its switch's, as it always was (computedIncOf), at no cost. */
 let foGames = 0;
@@ -4806,6 +4810,19 @@ function readCkMemo(key: string, value: unknown): CkRead {
   return read;
 }
 
+/** 🔒 readXf with a memory (PR 6c-4b-3a): a transfer is read and named once for
+ *  as long as the doc holds it, not at every resolution of its game (a flood of
+ *  them is thousands, and a resolution reads every one). */
+const xfReads = new WeakMap<object, { room: string; read: XfRead | null }>();
+function readXfMemo(value: unknown, whole?: boolean): XfRead | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const hit = xfReads.get(value);
+  if (hit && hit.room === boundRoomId) return hit.read;
+  const read = readXf(boundRoomId, value, whole);
+  xfReads.set(value, { room: boundRoomId, read });
+  return read;
+}
+
 /** 🔒 Keep what the resolution just made stands on, of the records it was given
  *  (FairOnlyState heldXfs, heldFin): the transfers of its chain, and the end
  *  order standing, each wherever the resolution found it. A transfer that has
@@ -5044,7 +5061,7 @@ function resolveFairOnly(c: ComputedInc): void {
   const lostHks: unknown[] = [];
   for (const [key, list] of fo.heldHks) for (const h of list) if (hkRaw.get(key) !== h.value) lostHks.push(h.value);
   fo.res = resolveGame(
-    { room: boundRoomId, sig: authCheck, liveSid: c.sid === '' ? undefined : c.sid, read: readCkMemo },
+    { room: boundRoomId, sig: authCheck, liveSid: c.sid === '' ? undefined : c.sid, read: readCkMemo, xf: readXfMemo },
     c.t, c.inc, {
       cks, xfs, fin: fo.fin,
       ...(fo.heldFin !== undefined && fo.heldFin !== fo.fin ? { fins: [fo.heldFin] } : {}),
@@ -5053,6 +5070,8 @@ function resolveFairOnly(c: ComputedInc): void {
   );
   keepStanding(fo, xfs);
   foCheck.add(c);
+  if (fo.res.invalid.length > 0) foForged.add(c);
+  else foForged.delete(c);
   let live = foLive.get(c.t);
   if (fo.res.live) {
     if (!live) foLive.set(c.t, live = new Map());
@@ -5305,6 +5324,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   authVerdicts = new Map();
   staleGames = new Set();
   foCheck = new Set();
+  foForged = new Set();
   foGames = 0;
   foPlayed = new Map();
   foMoved = new Map();
@@ -6216,6 +6236,81 @@ function fairOnlyRecoveries(map: Y.Map<unknown>): FairOnlyRecovery[] {
     });
   }
   return out;
+}
+
+/** One FAIR ONLY game with forged records in the doc, as the tidy duty reads it
+ *  (computedTable fairTidyDuty). */
+export interface FairOnlyForged {
+  t: string;
+  inc: string;
+  ctx: FoldCtx;
+  /** The round of the base this page counts the game from (0: none). */
+  u: number;
+  /** How many forged records of the game the doc holds (deleteFairOnlyForged
+   *  deletes them, FORGED_DELETE_MAX at a time). */
+  forged: number;
+  /** The keys that signed the game's staked felts, sorted: the pages whose turn
+   *  comes first. */
+  pubs: string[];
+}
+
+/** How many forged records one write deletes: a write is one update, and a flood
+ *  is thousands. */
+export const FORGED_DELETE_MAX = 256;
+
+/** The doc keys of game `c` its resolution found forged (a `ck:` or an `xf:` that
+ *  is whole, under the key its id names, with a signature that fails under the key
+ *  it claims: Resolution invalid) and the doc still holds as the resolution read
+ *  them. Not a record this page holds and the doc has lost (it is not in the doc),
+ *  nor a key that holds another value now: the next resolution speaks for that. */
+function fairOnlyForged(c: ComputedInc, map: Y.Map<unknown>): string[] {
+  const fo = c.fo!;
+  const out: string[] = [];
+  for (const key of fo.res?.invalid ?? []) {
+    const value = map.get(key);
+    if (value !== undefined && (fo.cks.get(key) === value || fo.xfs.get(key) === value)) out.push(key);
+  }
+  return out;
+}
+
+/** 🔒 The FAIR ONLY games the doc holds forged records of (design §8.4 P7): a
+ *  checkpoint or a transfer whose signature fails under the key it claims. Such a
+ *  record can never count, whatever else comes (nothing it depends on is still on
+ *  its way), and every one costs each page that resolves the game a check: a
+ *  flood of them holds the game's answer off, and the room's spending with it.
+ *  Only the games whose last resolution found one are looked at. Read-only. */
+export function computedFairOnlyForged(): FairOnlyForged[] {
+  const map = computedMap;
+  if (!map || foForged.size === 0) return [];
+  const out: FairOnlyForged[] = [];
+  for (const c of foForged) {
+    const forged = fairOnlyForged(c, map).length;
+    if (forged === 0) continue;
+    const pubs = new Set<string>();
+    for (const s of c.last?.felts.values() ?? []) if (s.rec.b.length > 0) pubs.add(s.rec.k);
+    out.push({ t: c.t, inc: c.inc, ctx: c.ctx, u: c.fo!.res?.base?.ck.u ?? 0, forged, pubs: [...pubs].sort() });
+  }
+  return out;
+}
+
+/**
+ * 🔒 Delete the forged records of FAIR ONLY game `inc` of table `tableId` from
+ * the doc (design §8.4 P7; fairOnlyForged says which), FORGED_DELETE_MAX at the
+ * most, in one transaction. Returns how many it deleted (0: none, or the doc
+ * holds part of an update). Nothing but a record whose own signature fails is
+ * ever deleted: one whose signer has no authority (yet) may gain it from a
+ * record still being put back, and stays.
+ */
+export function deleteFairOnlyForged(tableId: string, inc: string): number {
+  const map = computedMap;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!map || !c?.fo || !docAlive() || docHoldsPart()) return 0;
+  const keys = fairOnlyForged(c, map).slice(0, FORGED_DELETE_MAX);
+  if (keys.length === 0) return 0;
+  boundDoc!.transact(() => {
+    for (const key of keys) map.delete(key);
+  });
+  return keys.length;
 }
 
 /** 🔒 How many times, since the doc was bound, the records this page holds of
