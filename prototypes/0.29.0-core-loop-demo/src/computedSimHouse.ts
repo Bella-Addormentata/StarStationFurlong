@@ -810,7 +810,10 @@ export class SimHouse {
     const eligible = new Set(read.closes.map((c) => c.hash));
     for (const [x, r, k, v] of abandons) {
       if (!eligible.has(x) || read.abandoned.has(x)) continue;
-      if (fo && !this.frozenKey(read, read.closes.find((c) => c.hash === x)!, k)) continue;
+      const of = read.closes.find((c) => c.hash === x)!;
+      // (Of its close's round: the fold counts no other, computedFold decide.)
+      if (of.r !== r) continue;
+      if (fo && !this.frozenKey(read, of, k)) continue;
       if (this.abandonOk(ctx, r, k, v)) read.abandoned.add(x);
     }
     return read;
@@ -1049,11 +1052,15 @@ export class SimHouse {
     // (Nor once any close of that round is abandoned: the pages abandon the
     // close their fold chose, which voids the round, and a rival of it that
     // nobody abandons would hold this house off for good.)
-    const theirs = fo && r - 1 > read.baseU && !read.reveals.some((h) => h.r === r - 1)
+    // (And the wait for a close ends with a reveal of the commitment it
+    // names, that house's reveal or its step-down: not with another house's
+    // step-down from a join of the same round.)
+    const theirs = fo && r - 1 > read.baseU
       && !closesAt(r - 1).some((c) => read.abandoned.has(c.hash))
       && closesAt(r - 1).some((c) => {
-        if (c.h === undefined) return false;
-        const k = whose(c.h);
+        const h = c.h;
+        if (h === undefined || read.reveals.some((v) => v.r === r - 1 && v.commit === h)) return false;
+        const k = whose(h);
         return k !== undefined && k !== this.pub && read.houseAt(k, r - 1);
       });
     if (theirs) return;

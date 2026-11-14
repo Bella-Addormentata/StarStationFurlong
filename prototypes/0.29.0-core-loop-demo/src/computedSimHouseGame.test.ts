@@ -1756,6 +1756,31 @@ describe("the simulations' houses at a FAIR ONLY game with two houses of its hol
     expect(by2(room, 'o:2:')).toHaveLength(1);
   });
 
+  it('an abandon of that close signed for another round voids nothing, and ends no wait', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c } = room.closed(2, r1.c.hash);
+    room.put(kit.abandon(alice, 3, c.hash));
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    expect(room.recs('o:3:')).toEqual([]);
+  });
+
+  it('both joined the first round, and the house whose join the close does not name steps down from it and starts again: the round still waits on the other, and it joins nothing', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    room.on = false;
+    room.closed(1, SID);
+    room.house2.steppingDown = true;
+    room.tick(TICK);
+    expect(by2(room, 'h:1:').map((v) => v.x)).toEqual([[]]);
+    room.house2.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 1 });
+    expect(room.recs('o:2:')).toEqual([]);
+  });
+
   it('past a trim by the other house, a round that waits on the commitment its checkpoint carries: no join of the round after', () => {
     const room = new TwoRoom().start();
     room.played(1, SID);
