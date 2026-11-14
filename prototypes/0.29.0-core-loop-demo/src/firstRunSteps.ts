@@ -109,7 +109,10 @@ export function firstRunSteps(f: FirstRunFacts, roomName: string): StepLine[] {
         lines.push({
           key: 'wallet',
           mark: 'off',
-          text: 'No SSF wallet yet: your computer can read the Phone Book but not write in it. The Bank app makes one.',
+          // `ready` is "can be turned on", with a saved wallet or with none
+          // (the Bank offers TURN ON or CREATE, or says where one is made):
+          // the line promises neither.
+          text: 'The SSF wallet is not on: your computer can read the Phone Book but not write in it. The Bank app shows how to turn it on.',
         });
       } else if (f.wallet === 'off') {
         lines.push({
@@ -161,7 +164,8 @@ export function firstRunSteps(f: FirstRunFacts, roomName: string): StepLine[] {
 }
 
 /** How long the title holds the reveal for the room after NEW PLAYER, before
- *  it lights ENTER and says nobody answered yet. ENTER is there throughout. */
+ *  it lights ENTER and says the room is not here yet. ENTER is there
+ *  throughout. */
 export const ENTER_PATIENCE_MS = 45_000;
 
 /**
@@ -177,14 +181,31 @@ export function enterMode(arrived: boolean, waitedMs: number): EnterMode {
   return waitedMs >= ENTER_PATIENCE_MS ? 'lit' : 'quiet';
 }
 
-/** The line under the ENTER button. */
+/** The line under the ENTER button. It speaks of the room, never of who
+ *  answered: a computer may have answered that does not hold the room yet
+ *  (another install still waiting for it), and the steps above say so. */
 export function enterNote(mode: EnterMode, roomName: string): string {
   if (mode === 'reveal') return `${roomName} is here.`;
   if (mode === 'lit') {
-    return `Nobody has answered yet. Enter now: ${roomName} fills in by itself when a computer answers.`;
+    return `${roomName} is not here yet. Enter now: it fills in by itself when a computer that holds it answers.`;
   }
-  return `Finding ${roomName}. You can enter at any time; the room fills in by itself when a computer answers.`;
+  return `Finding ${roomName}. You can enter at any time; the room fills in by itself when a computer that holds it answers.`;
 }
+
+/** The title's background behind the lines (`index-inline.css`
+ *  `#welcome`: opaque from the first paint), as red, green, blue. */
+export const TITLE_BACKGROUND: readonly [number, number, number] = [2, 5, 16];
+
+/** The colour of a line, by its mark. Opaque, and each at least 4.5 to 1
+ *  against [`TITLE_BACKGROUND`] (the lines are 12 px text): a line that says
+ *  why Chia or the wallet is not available must read as well as the others.
+ *  `off` is the dimmest, and has its own glyph besides. */
+export const STEP_COLOR: Readonly<Record<StepMark, string>> = {
+  done: '#9fe0a0',
+  busy: '#f0d090',
+  wait: '#aa873f',
+  off: '#957739',
+};
 
 /** The mark drawn before a line. */
 export function stepGlyph(mark: StepMark): string {

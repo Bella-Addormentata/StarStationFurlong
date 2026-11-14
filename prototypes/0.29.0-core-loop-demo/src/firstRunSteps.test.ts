@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   ENTER_PATIENCE_MS,
+  STEP_COLOR,
+  TITLE_BACKGROUND,
   enterMode,
   enterNote,
   firstRunSteps,
@@ -70,11 +72,19 @@ describe('firstRunSteps: the Phone Book and its wallet', () => {
     expect(line(lines, 'wallet')).toMatchObject({ mark: 'done' });
   });
 
-  it('says where a wallet is made when there is none yet', () => {
+  it('says a wallet that can be turned on is not on, and where to turn it on', () => {
     const l = line(firstRunSteps(up({ chiaOff: false, wallet: 'ready' }), ROOM), 'wallet');
     expect(l?.mark).toBe('off');
     expect(l?.text).toContain('Bank');
     expect(l?.text).toContain('read the Phone Book but not write');
+  });
+
+  it('promises no new wallet: `ready` is also a saved wallet that is off', () => {
+    // The node says `ready` with a wallet on disk too (the Bank then offers
+    // TURN ON, not CREATE), and the title is not told which.
+    const text = line(firstRunSteps(up({ chiaOff: false, wallet: 'ready' }), ROOM), 'wallet')?.text ?? '';
+    expect(text).not.toMatch(/No SSF wallet|makes one|\bnew\b|creat/i);
+    expect(text).toContain('not on');
   });
 
   it('says a wallet held off is held off, with no way offered that is not there', () => {
@@ -151,9 +161,23 @@ describe('enterMode: ENTER is always there', () => {
 
   it('says in each mode what entering now means', () => {
     expect(enterNote('quiet', ROOM)).toContain('You can enter at any time');
-    expect(enterNote('lit', ROOM)).toContain('Nobody has answered yet');
+    expect(enterNote('lit', ROOM)).toContain('SSF-WELCOME is not here yet');
     expect(enterNote('lit', ROOM)).toContain('fills in by itself');
     expect(enterNote('reveal', ROOM)).toBe('SSF-WELCOME is here.');
+  });
+
+  it('never says nobody answered: a computer that answered may not hold the room yet', () => {
+    // Two installs that both wait for the room link to each other: the steps
+    // then say "A computer answered." and the note under ENTER must not say
+    // the opposite once the patience is over.
+    const lines = firstRunSteps(up({ linked: true }), ROOM);
+    expect(line(lines, 'dial')?.text).toBe('A computer answered.');
+    expect(line(lines, 'room')).toMatchObject({ mark: 'busy' });
+    for (const mode of ['quiet', 'lit'] as const) {
+      const note = enterNote(mode, ROOM);
+      expect(note).not.toMatch(/nobody|no one|has answered/i);
+      expect(note).toContain('a computer that holds it answers');
+    }
   });
 });
 
@@ -199,6 +223,42 @@ describe('stepGlyph', () => {
   it('has a mark of its own for each state', () => {
     const glyphs = (['done', 'busy', 'wait', 'off'] as const).map(stepGlyph);
     expect(new Set(glyphs).size).toBe(4);
+  });
+});
+
+describe('STEP_COLOR: every line reads against the title', () => {
+  // WCAG 2 relative luminance and contrast ratio.
+  const channel = (v: number): number => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = ([r, g, b]: readonly [number, number, number]): number =>
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+  const rgbOf = (hex: string): [number, number, number] => {
+    expect(hex).toMatch(/^#[0-9a-f]{6}$/);
+    return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number];
+  };
+  const contrast = (hex: string): number => {
+    const [hi, lo] = [luminance(rgbOf(hex)), luminance(TITLE_BACKGROUND)].sort((a, b) => b - a);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+
+  it('gives each mark an opaque colour at 4.5 to 1 or better, the off lines too', () => {
+    for (const mark of ['done', 'busy', 'wait', 'off'] as const) {
+      expect(contrast(STEP_COLOR[mark]), `${mark} ${STEP_COLOR[mark]}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it('keeps the off lines the dimmest', () => {
+    expect(contrast(STEP_COLOR.off)).toBeLessThan(contrast(STEP_COLOR.wait));
+  });
+
+  it('measures against the background the title really has', () => {
+    const css = readFileSync(fileURLToPath(new URL('./index-inline.css', import.meta.url)), 'utf8');
+    const a = css.indexOf('#welcome {');
+    expect(a).toBeGreaterThan(-1);
+    const rule = css.slice(a, css.indexOf('}', a));
+    expect(rule).toContain(`background: rgb(${TITLE_BACKGROUND.join(', ')});`);
   });
 });
 

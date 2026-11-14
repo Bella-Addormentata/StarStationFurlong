@@ -496,6 +496,7 @@ import {
 } from "./welcomeOnly";
 import type { MarkStore } from "./welcomeOnly";
 import {
+  STEP_COLOR,
   enterMode,
   enterNote,
   firstRunSteps,
@@ -503,7 +504,7 @@ import {
   noteDial,
   stepGlyph,
 } from "./firstRunSteps";
-import type { FirstRunFacts, StepMark } from "./firstRunSteps";
+import type { FirstRunFacts } from "./firstRunSteps";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -12401,12 +12402,6 @@ function setupClickToEnter() {
       steps.style.cssText =
         "display:none; flex-direction:column; gap:4px; margin-top:6px; width:380px; " +
         "max-width:86vw; text-align:left; font:400 12px/1.45 inherit;";
-      const markColor: Record<StepMark, string> = {
-        done: "#9fe0a0",
-        busy: "#f0d090",
-        wait: "rgba(212,168,75,0.8)",
-        off: "rgba(212,168,75,0.55)",
-      };
       const btnEnter = document.createElement("button");
       btnEnter.type = "button";
       btnEnter.id = "first-run-enter";
@@ -12448,7 +12443,7 @@ function setupClickToEnter() {
               const row = document.createElement("div");
               row.dataset.step = l.key;
               row.dataset.mark = l.mark;
-              row.style.color = markColor[l.mark];
+              row.style.color = STEP_COLOR[l.mark];
               row.textContent = `${stepGlyph(l.mark)}  ${l.text}`;
               return row;
             }),
