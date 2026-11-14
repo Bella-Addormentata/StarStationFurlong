@@ -232,7 +232,7 @@ describe('main.ts: the title is wired to the search', () => {
   });
 
   it('only the welcome room\'s dial reports are counted', () => {
-    const counted = between('if (env.room === DEFAULT_STATION.welcomeRoomId) {\n            noteDial(', '}');
+    const counted = between('if (env.room === DEFAULT_STATION.welcomeRoomId) {\n      noteDial(', '}');
     expect(counted).toContain('firstRunDial');
   });
 
@@ -242,11 +242,56 @@ describe('main.ts: the title is wired to the search', () => {
     expect(seeded).toContain('noteDial(firstRunDial, hint.irohNodeId, "dialing");');
   });
 
-  it('the title is told of the node, of a silent node, and of the arrival', () => {
-    const told = between('if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;', 'localNodeOrigin = nodeOrigin;');
+  it('the record is counted before the first handshake leaves, so no report is overwritten by a late "dialing"', () => {
+    const join = between('const sync = new YjsSync({\n    roomId: boot.roomId,\n    channel,', 'networkProvider.onEnvelope(');
+    const seeded = join.indexOf('noteDial(firstRunDial, hint.irohNodeId, "dialing");');
+    const started = join.indexOf('await sync.start();');
+    expect(seeded).toBeGreaterThan(-1);
+    expect(started).toBeGreaterThan(seeded);
+    // And nowhere after it.
+    expect(join.indexOf('noteDial(firstRunDial', started)).toBe(-1);
+  });
+
+  it('the dial reports of the session\'s own stream reach the same handler as the node\'s other reports', () => {
+    // The node answers the handshake's dial (the record's first computer) on
+    // the handshake's stream: YjsSync hands them over, and only `bridge`
+    // ones, and only while that session is the page's.
+    const made = between('const sync = new YjsSync({\n    roomId: boot.roomId,\n    channel,', '});');
+    expect(made).toContain('onOtherEnvelope: (env) => {');
+    expect(made).toContain('if (env.kind === "bridge" && yjsSync === sync) noteBridgeEnvelope(env);');
+    // The node-opened streams end in that handler too, and it is the one
+    // place that counts for the title.
+    expect(between('networkProvider.onEnvelope(\n', '// Bind shared players map')).toContain('if (env.kind === "bridge") noteBridgeEnvelope(env);');
+    expect(main.split('noteDial(firstRunDial, status.target, status.status);').length).toBe(2);
+    const handler = between('function noteBridgeEnvelope(', '\n}\n');
+    expect(handler).toContain('if (env.kind !== "bridge" || typeof env.payload !== "string") return;');
+    expect(handler).toContain('noteDial(firstRunDial, status.target, status.status);');
+  });
+
+  it('the title reads only a node that answers now, and is told of one that stopped', () => {
+    const facts = between('function firstRunFactsNow(): FirstRunFacts {', '\n}\n');
+    expect(facts).toContain('const fp = localNodeLive ? localFingerprint : null;');
+    expect(facts).not.toContain('const fp = localFingerprint;');
+    // A probe the node did not answer: live no longer, then the title is told.
+    const silent = between('if (!fingerprint) {', 'return localFingerprint;');
+    const off = silent.indexOf('localNodeLive = false;');
+    expect(off).toBeGreaterThan(-1);
+    expect(silent.indexOf('firstRunNodeSilent = true;')).toBeGreaterThan(off);
+    expect(silent.indexOf('firstRunRepaint?.();')).toBeGreaterThan(silent.indexOf('firstRunNodeSilent = true;'));
+  });
+
+  it('the title is told of the node once it counts as live, of a silent node, and of the arrival', () => {
+    const told = between('localNodeOrigin = nodeOrigin;\n  localNodeLive = true;', 'const backupMoved');
     expect(told).toContain('firstRunNodeSilent = false;');
     expect(told).toContain('firstRunRepaint?.();');
     expect(between('No running Rust node found', 'updateHUDNode')).toContain('firstRunNodeSilent = true;');
     expect(between('welcomeReachedThisPage = true;\n', 'clearWelcomePending(welcomeStore());')).toContain('firstRunRepaint?.();');
+  });
+
+  it('ENTER NOW takes the focus when it replaces the two choices (Tab is the phone\'s key)', () => {
+    const handler = between('btnNew.addEventListener("click"', 'btnEnter.addEventListener("click"');
+    const shown = handler.indexOf('btnEnter.style.display = "";');
+    expect(shown).toBeGreaterThan(handler.indexOf('btnNew.style.display = "none";'));
+    expect(handler.indexOf('btnEnter.focus({ preventScroll: true });')).toBeGreaterThan(shown);
   });
 });

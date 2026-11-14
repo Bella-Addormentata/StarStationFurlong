@@ -874,15 +874,19 @@ let welcomeRetryTimer: number | null = null;
 let welcomeDialFailureSaid = false;
 /** 🛰️ First run (firstRunSteps.ts): what the title screen shows of the search
  *  for the welcome room. The dial reports of the welcome room's session, by
- *  computer; whether a boot found this computer's node silent; and the
- *  title's own repaint, set only while the title shows the steps. */
+ *  computer; whether a boot or the latest probe found this computer's node
+ *  silent; and the title's own repaint, set only while the title shows the
+ *  steps. */
 const firstRunDial = newDialTally();
 let firstRunNodeSilent = false;
 let firstRunRepaint: (() => void) | null = null;
 
 /** 🛰️ The facts the title's steps are drawn from, as they stand now. */
 function firstRunFactsNow(): FirstRunFacts {
-  const fp = localFingerprint;
+  // Only a node that answered the latest probe: the last-known fingerprint
+  // outlives a node that stopped (refreshLocalFingerprint keeps it for the
+  // live sessions), and the title must not call that node running.
+  const fp = localNodeLive ? localFingerprint : null;
   return {
     node: fp ? "up" : firstRunNodeSilent ? "down" : "unknown",
     chiaOff: fp?.chia_lane ? fp.chia_lane.off : undefined,
@@ -892,6 +896,75 @@ function firstRunFactsNow(): FirstRunFacts {
     linked: firstRunDial.linked,
     arrived: welcomeReachedThisPage,
   };
+}
+
+/** 🌉 One `bridge` report from this computer's node: where its dial of
+ *  another computer stands (dialing / connected / failed). The node sends it
+ *  two ways: on the stream of the handshake that asked for the dial (the
+ *  record's first computer; YjsSync hands those over, `onOtherEnvelope`), and
+ *  on a stream of its own to every page in the room (the record's other
+ *  computers, and the dials the node starts by itself). Both end here. */
+function noteBridgeEnvelope(env: { kind?: string; payload?: string; room?: string }): void {
+  if (env.kind !== "bridge" || typeof env.payload !== "string") return;
+  try {
+    const status = JSON.parse(atob(env.payload)) as {
+      target?: string;
+      status?: string;
+      detail?: string;
+    };
+    const shortTarget = (status.target ?? "").slice(0, 8);
+    // 🛰️ The title's steps count the welcome room's dials by computer
+    // (firstRunSteps.ts); another room's dials are not its business.
+    if (env.room === DEFAULT_STATION.welcomeRoomId) {
+      noteDial(firstRunDial, status.target, status.status);
+      firstRunRepaint?.();
+    }
+    if (status.status === "dialing") {
+      setNetworkRow(
+        "network-bridge-status",
+        `DIALING → ${shortTarget}…`,
+        "#d4a84b",
+      );
+    } else if (status.status === "connected") {
+      setNetworkRow(
+        "network-bridge-status",
+        `LINKED ↔ ${shortTarget}`,
+        "#00e676",
+      );
+      logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
+      // The peer JUST linked — but our opening SyncStep1 fired before the
+      // dial finished and was relayed to an empty neighbor set, so the host
+      // never sent its (static) room state. Re-issue SyncStep1 now that the
+      // host is a live neighbor to pull the roster / room name / furniture.
+      // Mark the link first so the SyncStep2 this resync pulls is the one
+      // that opens the post-link readiness gate (whenLinkedSynced) — the
+      // arrival curtain + birth-door healing wait on THAT, not the empty
+      // pre-link handshake.
+      yjsSync?.markPeerLinked();
+      yjsSync?.resync();
+    } else if (status.status === "failed") {
+      setNetworkRow(
+        "network-bridge-status",
+        `FAILED → ${shortTarget} (see node log)`,
+        "#ff1744",
+      );
+      // 🛰️ While this install waits at the welcome room its node dials
+      // again at every ask (seekWelcome): the advice is said for
+      // the first failure, and the seek's own line says the rest. The
+      // NETWORK row above shows every one.
+      const seekingHere =
+        activeBootstrap?.roomId === DEFAULT_STATION.welcomeRoomId &&
+        welcomeSeeking();
+      if (!seekingHere || !welcomeDialFailureSaid) {
+        if (seekingHere) welcomeDialFailureSaid = true;
+        logToPhoneSystem(
+          `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
+        );
+      }
+    }
+  } catch (e) {
+    console.warn("Unparseable bridge status envelope:", e);
+  }
 }
 
 /** 🛰️ Where the welcome mark is kept; null where storage is closed. */
@@ -2468,6 +2541,12 @@ async function joinRoomAtEpoch(
     // names (MY ROOMS): a pass added while the session waits is asked at
     // the next handshake.
     bootRecord: () => withHeldWelcomeRoutes(withCoHostHints(networkProvider.getBootRecord(), boot.roomId)),
+    // 🌉 The node reports the dial of the record's first computer on this
+    // very stream: handed to the same handler as its other reports, for as
+    // long as this is the page's session.
+    onOtherEnvelope: (env) => {
+      if (env.kind === "bridge" && yjsSync === sync) noteBridgeEnvelope(env);
+    },
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
@@ -2510,6 +2589,24 @@ async function joinRoomAtEpoch(
     console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
     roomReplicaSeeded = true;
   }
+  // 🛰️ First run (firstRunSteps.ts): the handshake below asks the node to
+  // dial every computer this welcome session's record names. The title
+  // counts those computers from the record itself, BEFORE the handshake
+  // leaves, so a report that comes back at once (a failure, an answer) is
+  // never overwritten by a late "dialing"; the node's reports move each one
+  // on from there (noteBridgeEnvelope).
+  if (boot.roomId === DEFAULT_STATION.welcomeRoomId) {
+    const own = localFingerprint?.iroh_node_id;
+    const record = withHeldWelcomeRoutes(
+      withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
+    );
+    for (const hint of collectMemberHints(record)) {
+      if (hint.irohNodeId && hint.irohNodeId !== own) {
+        noteDial(firstRunDial, hint.irohNodeId, "dialing");
+      }
+    }
+    firstRunRepaint?.();
+  }
   await sync.start();
   if (epoch !== sessionEpoch) {
     // Superseded while the sync spun up. A concurrent leaveRoom may already
@@ -2533,24 +2630,6 @@ async function joinRoomAtEpoch(
   }
   // No awaits below this line — the epoch can no longer go stale mid-bind,
   // so every observer/handler below attaches to the CURRENT session's doc.
-
-  // 🛰️ First run (firstRunSteps.ts): the handshake above asked the node to
-  // dial every computer this welcome session's record names, and the node's
-  // report of that first dial can come before the handler below listens (a
-  // page's first join has none yet). The title counts those computers from
-  // the record itself; the node's later reports move each one on.
-  if (boot.roomId === DEFAULT_STATION.welcomeRoomId) {
-    const own = localFingerprint?.iroh_node_id;
-    const record = withHeldWelcomeRoutes(
-      withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
-    );
-    for (const hint of collectMemberHints(record)) {
-      if (hint.irohNodeId && hint.irohNodeId !== own) {
-        noteDial(firstRunDial, hint.irohNodeId, "dialing");
-      }
-    }
-    firstRunRepaint?.();
-  }
 
   // 🚪🔥 A warm session (open, dialling, or already hung up) may have linked
   // this node to the room's host, and the node keeps that peer and does not
@@ -2636,67 +2715,7 @@ async function joinRoomAtEpoch(
         }
         return;
       }
-      if (env.kind === "bridge" && typeof env.payload === "string") {
-        try {
-          const status = JSON.parse(atob(env.payload)) as {
-            target?: string;
-            status?: string;
-            detail?: string;
-          };
-          const shortTarget = (status.target ?? "").slice(0, 8);
-          // 🛰️ The title's steps count the welcome room's dials by computer
-          // (firstRunSteps.ts); another room's dials are not its business.
-          if (env.room === DEFAULT_STATION.welcomeRoomId) {
-            noteDial(firstRunDial, status.target, status.status);
-            firstRunRepaint?.();
-          }
-          if (status.status === "dialing") {
-            setNetworkRow(
-              "network-bridge-status",
-              `DIALING → ${shortTarget}…`,
-              "#d4a84b",
-            );
-          } else if (status.status === "connected") {
-            setNetworkRow(
-              "network-bridge-status",
-              `LINKED ↔ ${shortTarget}`,
-              "#00e676",
-            );
-            logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
-            // The peer JUST linked — but our opening SyncStep1 fired before the
-            // dial finished and was relayed to an empty neighbor set, so the host
-            // never sent its (static) room state. Re-issue SyncStep1 now that the
-            // host is a live neighbor to pull the roster / room name / furniture.
-            // Mark the link first so the SyncStep2 this resync pulls is the one
-            // that opens the post-link readiness gate (whenLinkedSynced) — the
-            // arrival curtain + birth-door healing wait on THAT, not the empty
-            // pre-link handshake.
-            yjsSync?.markPeerLinked();
-            yjsSync?.resync();
-          } else if (status.status === "failed") {
-            setNetworkRow(
-              "network-bridge-status",
-              `FAILED → ${shortTarget} (see node log)`,
-              "#ff1744",
-            );
-            // 🛰️ While this install waits at the welcome room its node dials
-            // again at every ask (seekWelcome): the advice is said for
-            // the first failure, and the seek's own line says the rest. The
-            // NETWORK row above shows every one.
-            const seekingHere =
-              activeBootstrap?.roomId === DEFAULT_STATION.welcomeRoomId &&
-              welcomeSeeking();
-            if (!seekingHere || !welcomeDialFailureSaid) {
-              if (seekingHere) welcomeDialFailureSaid = true;
-              logToPhoneSystem(
-                `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
-              );
-            }
-          }
-        } catch (e) {
-          console.warn("Unparseable bridge status envelope:", e);
-        }
-      }
+      if (env.kind === "bridge") noteBridgeEnvelope(env);
     },
   );
 
@@ -10162,6 +10181,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       listMeArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
+    // 🛰️ The title's steps say so too (firstRunSteps.ts): a node that stopped
+    // while the title waits is not answering, whatever it said before.
+    firstRunNodeSilent = true;
+    firstRunRepaint?.();
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
@@ -10185,12 +10208,13 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // node restarted between two probes), is armed no longer: CONFIRM is for
   // the warning that was read.
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
-  // 🛰️ The title's steps read the node, the Phone Book and the wallet from
-  // the fingerprint (firstRunSteps.ts).
-  firstRunNodeSilent = false;
-  firstRunRepaint?.();
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
+  // 🛰️ The title's steps read the node, the Phone Book and the wallet from
+  // the fingerprint of a node that answers (firstRunSteps.ts): told once the
+  // node counts as live.
+  firstRunNodeSilent = false;
+  firstRunRepaint?.();
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
   // words, or words marked saved (bankBackup.ts reconcileBackupUi).
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
@@ -12454,6 +12478,9 @@ function setupClickToEnter() {
         btnLoad.style.display = "none";
         restoreBox?.remove();
         btnEnter.style.display = "";
+        // The button that was pressed is gone, and Tab is the phone's key
+        // here: the way in takes the focus, so a keyboard can still enter.
+        btnEnter.focus({ preventScroll: true });
         paintSteps();
         // The patience runs on a clock no event reports: look twice a second.
         holdTimer = window.setInterval(paintSteps, 500);
