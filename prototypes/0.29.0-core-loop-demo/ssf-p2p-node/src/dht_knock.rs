@@ -23,8 +23,9 @@
 //!   router. The knocker's own dial, still running, then lands, and the holder
 //!   learns who it was from the handshake, as with any inbound link. The DHT
 //!   goes on listing a knock for a long while after: no hold begins toward an
-//!   address a connection that came in from it still stands to
-//!   ([`OpeningBook::begin`] has the other limits).
+//!   address a connection that came in from it still stands to, nor toward
+//!   one a link in any room has a direct path to, whichever side dialed it
+//!   ([`linked_addrs`]; [`OpeningBook::begin`] has the other limits).
 //!
 //! What it does not do: it does not find a holder's address (the dial does
 //! that, from the pass and the DHT's address record), and it reads and writes
@@ -47,7 +48,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, SecretKey};
+use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, SecretKey, TransportAddr};
 use n0_future::StreamExt;
 use n0_mainline::{Dht, DhtBuilder, Id};
 
@@ -478,6 +479,38 @@ async fn noted_opening_dial(book: &Mutex<OpeningBook>, endpoint: &IrohEndpoint, 
     book.lock().unwrap().note_opening(*addr.ip(), Instant::now());
 }
 
+/// The IPv4 addresses a connection that still stands has a direct path to:
+/// where its packets go now, whichever side dialed, and whatever the link
+/// began on (one that began through a relay finds its direct path after).
+/// Nothing for a connection that has closed.
+pub(crate) fn direct_paths_of(conn: &iroh::endpoint::Connection) -> Vec<SocketAddrV4> {
+    if conn.close_reason().is_some() {
+        return Vec::new();
+    }
+    let paths = conn.paths();
+    let direct: Vec<SocketAddrV4> = paths
+        .iter()
+        .filter_map(|path| match path.remote_addr() {
+            TransportAddr::Ip(SocketAddr::V4(v4)) => Some(*v4),
+            TransportAddr::Ip(SocketAddr::V6(v6)) => v6.ip().to_ipv4_mapped().map(|ip| SocketAddrV4::new(ip, v6.port())),
+            _ => None,
+        })
+        .collect();
+    direct
+}
+
+/// Every address a link of ours, in any room, has a direct path to. No hold
+/// begins toward one: the router is open that way already. The book's own
+/// rule ([`OpeningBook::begin`], `live`) knows only the connections that came
+/// in, and only by the address they came in from; a knocker this computer
+/// reached by a dial of its own, or one whose link began through a relay, is
+/// linked all the same, and the DHT goes on listing its knock.
+fn linked_addrs(hub: &SharedHub) -> HashSet<SocketAddrV4> {
+    let links: Vec<iroh::endpoint::Connection> =
+        hub.rooms.lock().unwrap().values().flat_map(|room| room.remote_peers.values().map(|member| member.conn.clone())).collect();
+    links.iter().flat_map(direct_paths_of).collect()
+}
+
 /// The rooms the holder looks its knock points up for: the rooms this node is
 /// in whose key it holds, SSF-WELCOME first, [`MAX_ROOMS`] at most.
 fn rooms_to_poll(hub: &SharedHub) -> Vec<(String, [u8; 32])> {
@@ -542,13 +575,16 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         let looked =
             n0_future::join_all(points.into_iter().map(|(room_id, point)| async move { (room_id, knock.lookup(point, LOOKUP_TIMEOUT).await) })).await;
         let own = own_ips(&endpoint, knock).await;
+        // Asked only in a round that found somebody.
+        let anybody = looked.iter().any(|(_, found)| found.as_ref().is_some_and(|found| !found.is_empty()));
+        let linked = if anybody { linked_addrs(&hub) } else { HashSet::new() };
         for (room_id, found) in looked {
             let Some(found) = found else {
                 eprintln!("🚪 DHT knock: the DHT client stopped; no knock is seen or sent in this run");
                 return;
             };
             for addr in found {
-                if !knock_admitted(addr, &own, crate::ipv4_is_public) {
+                if !knock_admitted(addr, &own, crate::ipv4_is_public) || linked.contains(&addr) {
                     continue;
                 }
                 let begun = Instant::now();
@@ -1167,6 +1203,57 @@ mod tests {
         // And the mark runs out a grace after the dial was let go.
         assert!(!book.lock().unwrap().opened_lately(ip, let_go + OPENED_GRACE + Duration::from_secs(1)));
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_standing_link_is_known_by_where_its_packets_go_whichever_side_dialed() {
+        async fn loopback() -> (IrohEndpoint, SocketAddrV4) {
+            let endpoint = IrohEndpoint::builder(iroh::endpoint::presets::Minimal)
+                .alpns(vec![b"ssf".to_vec()])
+                .bind_addr("127.0.0.1:0")
+                .expect("a loopback address")
+                .bind()
+                .await
+                .expect("an endpoint on loopback");
+            let bound = endpoint.bound_sockets().iter().find_map(|s| match s {
+                SocketAddr::V4(v4) => Some(*v4),
+                SocketAddr::V6(_) => None,
+            });
+            (endpoint, bound.expect("an IPv4 socket"))
+        }
+        /// The snapshot of a link's paths may come a moment after the handshake.
+        async fn has_path(conn: &iroh::endpoint::Connection, to: SocketAddrV4) -> bool {
+            for _ in 0..30 {
+                if direct_paths_of(conn).contains(&to) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+        let (dialer, dialer_addr) = loopback().await;
+        let (dialed, dialed_addr) = loopback().await;
+        let accepting = tokio::spawn({
+            let dialed = dialed.clone();
+            async move { dialed.accept().await.expect("an incoming dial").accept().expect("accepted").await.expect("a handshake") }
+        });
+        let out = dialer
+            .connect(EndpointAddr::new(dialed.id()).with_ip_addr(SocketAddr::V4(dialed_addr)), b"ssf")
+            .await
+            .expect("the dial lands");
+        let inbound = accepting.await.expect("the accepting task");
+        // The side that dialed knows the link by the address it reached: the
+        // case the book's own rule, which hears only of inbound links, misses.
+        assert!(has_path(&out, dialed_addr).await, "{:?}", direct_paths_of(&out));
+        // The side that was dialed knows it by the address the dial came from.
+        assert!(has_path(&inbound, dialer_addr).await, "{:?}", direct_paths_of(&inbound));
+        // Neither is known by the other's address.
+        assert!(!direct_paths_of(&out).contains(&dialer_addr));
+        // A link that has closed stands to nothing.
+        out.close(0u32.into(), b"done");
+        assert!(direct_paths_of(&out).is_empty());
+        dialer.close().await;
+        dialed.close().await;
     }
 
     #[tokio::test]
