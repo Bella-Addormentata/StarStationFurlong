@@ -1,0 +1,786 @@
+//! 🚪 The DHT knock: a way in to a computer whose router answers nobody.
+//!
+//! Two computers behind home routers cannot reach each other by dialing: each
+//! router drops what nobody inside asked for. A router does let an answer
+//! through once the computer behind it has sent something to that address, so
+//! a link forms when BOTH sides send. The side that dials sends by dialing.
+//! The side that is dialed has to learn that it is wanted, and by whom. This
+//! module is how it learns it, with no server and no coin:
+//!
+//! - **The knocker** (a dial that is not answered at once, `knock_while_dialing`)
+//!   announces the game's UDP port at a **knock point** on the BitTorrent
+//!   Mainline DHT: twenty bytes worked out from the room's key, the node id of
+//!   the computer it dials and the hour ([`knock_point`]). The DHT's nodes
+//!   store the announcer's address as they saw it (BEP 5), so a knocker can
+//!   only ever name its own.
+//! - **The holder** (`run_holder`) looks its own knock points up every
+//!   [`POLL_PERIOD`], for every room it is in and holds the key of. The DHT
+//!   hands back addresses and ports, never a node id. For each new one it runs
+//!   an **opening hold**: a dial under a made-up node id to that address every
+//!   [`OPENING_PERIOD`] for [`OPENING_WINDOW`] ([`opening_dial`]). Such a dial
+//!   can never finish, and it does not need to: its first packets leave from
+//!   the game's port toward the knocker, which is what opens the holder's
+//!   router. The knocker's own dial, still running, then lands, and the holder
+//!   learns who it was from the handshake, as with any inbound link.
+//!
+//! What it does not do: it does not find a holder's address (the dial does
+//! that, from the pass and the DHT's address record), it does not help where a
+//! router gives every destination a different port (the knocker's announced
+//! port is then not the one its packets leave from), and it reads and writes
+//! nothing of Chia.
+//!
+//! Who can see what: a knocker's address and port are stored by the DHT nodes
+//! nearest the knock point, and handed to anyone who asks at that point. The
+//! point cannot be worked out without the room's key, so for a private room
+//! that is the room's members; SSF-WELCOME's key ships in the game, so there
+//! it is anyone. The address is the one the knocker's dial shows the holder
+//! anyway. Off with `SSF_NO_DHT=1` (the whole DHT) or `SSF_DHT_KNOCK=0`.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, SecretKey};
+use n0_future::StreamExt;
+use n0_mainline::{Dht, DhtBuilder, Id};
+
+use crate::SharedHub;
+
+/// A knock point lives for one hour of the clock: the knocker announces at the
+/// hour it reads, and the holder looks at that hour and, near a boundary, at
+/// the one beside it ([`poll_buckets`]). Points therefore change by
+/// themselves, and what the DHT still lists of an hour gone is not looked at.
+pub(crate) const BUCKET_SECS: u64 = 3600;
+
+/// How near an hour's boundary the holder also looks at the neighbouring
+/// hour: a knock announced just before the boundary, and a knocker whose clock
+/// runs this far off the holder's, are still found.
+pub(crate) const BUCKET_OVERLAP_SECS: u64 = 600;
+
+/// The holder's first look comes this long after the node started (the DHT
+/// has to be joined first), and then one every [`POLL_PERIOD`].
+const FIRST_POLL_DELAY: Duration = Duration::from_secs(10);
+
+/// How often the holder looks its knock points up. A lookup on the real DHT
+/// took 1 to 4 s when measured (2026-11-14), so a knock is seen within about
+/// half a minute of its announce.
+pub(crate) const POLL_PERIOD: Duration = Duration::from_secs(30);
+
+/// A lookup that has not ended in this long is given up for this round.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// At most this many rooms are looked up per round, SSF-WELCOME first.
+pub(crate) const MAX_ROOMS: usize = 4;
+
+/// One opening dial every this long, for this long: the chain hold's rhythm
+/// (`chia_watch::HOLD_PERIOD` / `HOLD_WINDOW`). A router keeps the opening a
+/// packet made for at least two minutes when it follows RFC 4787, and many
+/// keep it for only thirty seconds, so the hold sends again well inside that.
+pub(crate) const OPENING_PERIOD: Duration = Duration::from_secs(15);
+pub(crate) const OPENING_WINDOW: Duration = Duration::from_secs(180);
+
+/// An opening dial is let go after this long: its packets left at once, and
+/// nothing more is wanted of it.
+const OPENING_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// At most this many opening holds at once, whoever knocks.
+pub(crate) const MAX_OPENINGS: usize = 8;
+
+/// One address gets at most this many holds per hour of the clock, and after
+/// a hold toward it began the next waits [`OPENING_REST`]. The DHT goes on
+/// listing a knock long after the knocker linked or left, and this is what
+/// keeps the holder from opening toward it for ever.
+pub(crate) const MAX_HOLDS_PER_ADDR: u32 = 3;
+pub(crate) const OPENING_REST: Duration = Duration::from_secs(600);
+
+/// How long an address an opening dial went to counts as one we sent to
+/// first: main.rs `DIAL_PINHOLE_GRACE`, for the same reason (a connection
+/// that comes back through an opening our own packets made is not
+/// unsolicited, and proves nothing about being reachable).
+pub(crate) const OPENED_GRACE: Duration = Duration::from_secs(120);
+
+/// A dial that is answered at once needs no knock: the knocker waits this
+/// long before it announces. A reachable computer answers well inside it.
+const KNOCK_GRACE: Duration = Duration::from_secs(3);
+
+/// While its dial runs the knocker announces again every this long (a new
+/// hour may have begun, and a DHT node that held the announce may be gone),
+/// at most [`MAX_KNOCKS_PER_DIAL`] times. The dial ladder itself lasts about
+/// four and a half minutes when nothing answers (2026-11-14, measured).
+const KNOCK_PERIOD: Duration = Duration::from_secs(120);
+const MAX_KNOCKS_PER_DIAL: u32 = 3;
+
+/// An announce that has not ended in this long is given up (measured: 0.3 to
+/// 7 s on the real DHT).
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A knocker's port below this is not opened toward: the game never binds
+/// one, and nothing is sent to another service's port on a knocker's word.
+const MIN_KNOCK_PORT: u16 = 1024;
+
+/// The hour of the clock `unix_secs` falls in.
+pub(crate) fn bucket_of(unix_secs: u64) -> u64 {
+    unix_secs / BUCKET_SECS
+}
+
+/// The hours the holder looks at now: this one, and the neighbour while the
+/// clock is within [`BUCKET_OVERLAP_SECS`] of the boundary to it.
+pub(crate) fn poll_buckets(unix_secs: u64) -> Vec<u64> {
+    let bucket = bucket_of(unix_secs);
+    let into = unix_secs % BUCKET_SECS;
+    let mut out = vec![bucket];
+    if into < BUCKET_OVERLAP_SECS && bucket > 0 {
+        out.push(bucket - 1);
+    } else if into >= BUCKET_SECS - BUCKET_OVERLAP_SECS {
+        out.push(bucket + 1);
+    }
+    out
+}
+
+/// Where a knock on `holder` for the room of `room_key` is left during the
+/// hour `bucket`: the first twenty bytes of a keyed hash, so the point says
+/// nothing of the room or the holder to someone without the room's key, and
+/// two rooms' knocks on one holder never share a point.
+pub(crate) fn knock_point(room_key: &[u8; 32], holder: &PublicKey, bucket: u64) -> [u8; 20] {
+    let mut hasher = blake3::Hasher::new_derive_key("StarStationFurlong 2026-11-14 DHT knock point v1");
+    hasher.update(room_key);
+    hasher.update(holder.as_bytes());
+    hasher.update(&bucket.to_le_bytes());
+    let mut point = [0u8; 20];
+    point.copy_from_slice(&hasher.finalize().as_bytes()[..20]);
+    point
+}
+
+/// Whether `SSF_DHT_KNOCK` holds the knock off: exactly `0`. Unset or
+/// anything else leaves it on, as the DHT itself is on unless told otherwise.
+pub(crate) fn knock_off(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("0")
+}
+
+/// May the holder open toward `addr`, as far as the address itself goes: a
+/// public IPv4 address that is not one of our own (a computer behind our own
+/// router is found on the LAN, and our router would not turn the packets
+/// round), at a port the game could have bound.
+pub(crate) fn knock_admitted(addr: SocketAddrV4, own: &HashSet<Ipv4Addr>, is_public: impl Fn(Ipv4Addr) -> bool) -> bool {
+    addr.port() >= MIN_KNOCK_PORT && is_public(*addr.ip()) && !own.contains(addr.ip())
+}
+
+/// What the holder remembers of its opening holds: which run now, how many
+/// each address had this hour, where opening dials went lately, and where a
+/// connection has come in from. Pure: the clock is handed in.
+#[derive(Default)]
+pub(crate) struct OpeningBook {
+    /// Holds running now, by the knocker's address.
+    running: HashSet<SocketAddrV4>,
+    /// Per address: the hour its holds were counted in, how many began in it,
+    /// and when the last one began.
+    begun: HashMap<SocketAddrV4, (u64, u32, Instant)>,
+    /// Addresses an opening dial went to, and when the last one left.
+    opened: HashMap<Ipv4Addr, Instant>,
+    /// Addresses a connection came in from, and when.
+    landed: HashMap<SocketAddrV4, Instant>,
+}
+
+impl OpeningBook {
+    /// Claim a hold toward `addr` in the hour `bucket`: `true` when it may
+    /// begin (and is now counted as running), `false` when one runs already,
+    /// [`MAX_OPENINGS`] run, the address had its [`MAX_HOLDS_PER_ADDR`] this
+    /// hour, or its last hold began less than [`OPENING_REST`] ago.
+    pub(crate) fn begin(&mut self, addr: SocketAddrV4, bucket: u64, now: Instant) -> bool {
+        if self.running.contains(&addr) || self.running.len() >= MAX_OPENINGS {
+            return false;
+        }
+        // What is kept of other hours is of no use to anyone.
+        self.begun.retain(|_, (hour, _, _)| *hour == bucket);
+        match self.begun.get_mut(&addr) {
+            Some((_, count, last)) => {
+                if *count >= MAX_HOLDS_PER_ADDR || now.duration_since(*last) < OPENING_REST {
+                    return false;
+                }
+                *count += 1;
+                *last = now;
+            }
+            None => {
+                self.begun.insert(addr, (bucket, 1, now));
+            }
+        }
+        self.running.insert(addr);
+        true
+    }
+
+    /// The hold toward `addr` ended.
+    pub(crate) fn end(&mut self, addr: &SocketAddrV4) {
+        self.running.remove(addr);
+    }
+
+    /// An opening dial is leaving for `ip`.
+    pub(crate) fn note_opening(&mut self, ip: Ipv4Addr, now: Instant) {
+        self.opened.retain(|_, at| now.duration_since(*at) < OPENED_GRACE);
+        self.opened.insert(ip, now);
+    }
+
+    /// Did an opening dial go to `ip` within [`OPENED_GRACE`]?
+    pub(crate) fn opened_lately(&mut self, ip: Ipv4Addr, now: Instant) -> bool {
+        self.opened.retain(|_, at| now.duration_since(*at) < OPENED_GRACE);
+        self.opened.contains_key(&ip)
+    }
+
+    /// A connection came in from `addr`. Kept only while a hold toward that
+    /// address runs: nobody else asks.
+    pub(crate) fn note_landed(&mut self, addr: SocketAddrV4, now: Instant) {
+        if self.running.contains(&addr) {
+            self.landed.insert(addr, now);
+        }
+    }
+
+    /// Did a connection come in from `addr` since `since`? The hold toward it
+    /// stops asking for one then. Forgets the mark once read as true.
+    pub(crate) fn landed_since(&mut self, addr: &SocketAddrV4, since: Instant) -> bool {
+        match self.landed.get(addr) {
+            Some(at) if *at >= since => {
+                self.landed.remove(addr);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.running.len()
+    }
+}
+
+/// The node's own client on the Mainline DHT for knocks, with the holder's
+/// book. The address lookup keeps the client it publishes and resolves with
+/// to itself, so this is a second one, on a socket of its own.
+pub struct KnockDht {
+    dht: Dht,
+    book: Mutex<OpeningBook>,
+    /// Knocks of ours that are out now: dials whose knock was stored and that
+    /// still run. While any is, a handshake that fails on the way in is most
+    /// likely the opening dial we asked for (main.rs `run_iroh_listener`).
+    knocks_out: AtomicUsize,
+}
+
+impl KnockDht {
+    /// Join the DHT with `builder` (the library's bootstrap hosts, or the
+    /// operator's). The join itself goes on in the background.
+    pub(crate) fn start(builder: &DhtBuilder) -> std::io::Result<Self> {
+        Ok(Self { dht: builder.build()?, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0) })
+    }
+
+    /// Is a knock of ours out now?
+    pub(crate) fn knock_out(&self) -> bool {
+        self.knocks_out.load(Ordering::SeqCst) > 0
+    }
+
+    /// Did an opening dial of ours go to `ip` lately (main.rs
+    /// `note_inbound_verified`: a connection from there is not unsolicited)?
+    pub(crate) fn opened_lately(&self, ip: std::net::IpAddr, now: Instant) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => self.book.lock().unwrap().opened_lately(v4, now),
+            std::net::IpAddr::V6(_) => false,
+        }
+    }
+
+    /// A connection was accepted from `addr` (main.rs `run_iroh_listener`).
+    pub(crate) fn note_landed(&self, addr: SocketAddr) {
+        if let SocketAddr::V4(v4) = addr {
+            self.book.lock().unwrap().note_landed(v4, Instant::now());
+        }
+    }
+
+    /// Everything the DHT lists at `point` now.
+    async fn lookup(&self, point: [u8; 20]) -> Option<BTreeSet<SocketAddrV4>> {
+        let id = Id::from_bytes(point).ok()?;
+        let mut found = BTreeSet::new();
+        let mut stream = self.dht.get_peers(id).await.ok()?;
+        while let Some(batch) = stream.next().await {
+            found.extend(batch);
+        }
+        Some(found)
+    }
+
+    /// Announce `port` at `point`: "the computer at the address you see this
+    /// from, at this port, knocks".
+    async fn announce(&self, point: [u8; 20], port: u16) -> Result<(), String> {
+        let id = Id::from_bytes(point).map_err(|e| e.to_string())?;
+        self.dht.announce_peer(id, Some(port)).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// One opening dial: a dial under a node id nobody holds, to `addr`. It cannot
+/// finish (whoever answers there proves another id, or nobody answers), and
+/// what it is for has happened by the time it fails: its first packets left
+/// the game's socket toward `addr`. Should it ever connect, the link is
+/// closed at once: nothing was meant to be said on it.
+pub(crate) async fn opening_dial(endpoint: &IrohEndpoint, addr: SocketAddrV4) {
+    let nobody = SecretKey::generate().public();
+    let target = EndpointAddr::new(nobody).with_ip_addr(SocketAddr::V4(addr));
+    if let Ok(Ok(conn)) = tokio::time::timeout(OPENING_DIAL_TIMEOUT, endpoint.connect(target, b"ssf")).await {
+        conn.close(0u32.into(), b"opening dial");
+    }
+}
+
+/// The rooms the holder looks its knock points up for: the rooms this node is
+/// in whose key it holds, SSF-WELCOME first, [`MAX_ROOMS`] at most.
+fn rooms_to_poll(hub: &SharedHub) -> Vec<(String, [u8; 32])> {
+    let live: Vec<String> = hub.rooms.lock().unwrap().keys().cloned().collect();
+    let caps = hub.chia_rooms.lock().unwrap();
+    let mut rooms: Vec<(String, [u8; 32])> =
+        live.into_iter().filter_map(|id| caps.get(&id).map(|cap| (id, cap.room_key))).collect();
+    drop(caps);
+    order_rooms(&mut rooms, crate::chia_rooms::is_bundled_room_key);
+    rooms
+}
+
+/// SSF-WELCOME (the bundled key) first, then by room id so a round is the same
+/// rooms as the last, [`MAX_ROOMS`] at most.
+pub(crate) fn order_rooms(rooms: &mut Vec<(String, [u8; 32])>, is_welcome: impl Fn(&[u8; 32]) -> bool) {
+    rooms.sort_by(|a, b| is_welcome(&b.1).cmp(&is_welcome(&a.1)).then_with(|| a.0.cmp(&b.0)));
+    rooms.truncate(MAX_ROOMS);
+}
+
+/// Our own public IPv4 addresses, as far as the node advertised any.
+fn own_public_ips(hub: &SharedHub) -> HashSet<Ipv4Addr> {
+    hub.reach
+        .self_advertised
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// The holder's side, for as long as the node runs: every [`POLL_PERIOD`] look
+/// up this node's knock points and begin an opening hold toward each address
+/// found there that may have one.
+pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
+    let Some(knock) = hub.dht_knock.as_ref() else { return };
+    let me = endpoint.id();
+    tokio::time::sleep(FIRST_POLL_DELAY).await;
+    match knock.dht.bootstrapped().await {
+        Ok(true) => println!("🚪 DHT knock: joined the DHT; looking for knocks every {} s", POLL_PERIOD.as_secs()),
+        Ok(false) => println!("🚪 DHT knock: the DHT is not joined yet (no bootstrap host answered); it keeps trying, and so does the look for knocks"),
+        Err(_) => {
+            eprintln!("🚪 DHT knock: the DHT client stopped; no knock is seen or sent in this run");
+            return;
+        }
+    }
+    loop {
+        let now_unix = crate::chia_resolve::unix_now();
+        let bucket = bucket_of(now_unix);
+        for (room_id, room_key) in rooms_to_poll(&hub) {
+            for hour in poll_buckets(now_unix) {
+                let point = knock_point(&room_key, &me, hour);
+                let found = match tokio::time::timeout(LOOKUP_TIMEOUT, knock.lookup(point)).await {
+                    Ok(Some(found)) => found,
+                    Ok(None) => {
+                        eprintln!("🚪 DHT knock: the DHT client stopped; no knock is seen or sent in this run");
+                        return;
+                    }
+                    Err(_) => continue,
+                };
+                let own = own_public_ips(&hub);
+                for addr in found {
+                    if !knock_admitted(addr, &own, crate::ipv4_is_public) {
+                        continue;
+                    }
+                    let begun = Instant::now();
+                    if !knock.book.lock().unwrap().begin(addr, bucket, begun) {
+                        continue;
+                    }
+                    println!(
+                        "🚪 DHT knock: {addr} knocked for room {room_id}; opening toward it every {} s for {} s",
+                        OPENING_PERIOD.as_secs(),
+                        OPENING_WINDOW.as_secs()
+                    );
+                    tokio::spawn(opening_hold(hub.clone(), endpoint.clone(), addr, begun));
+                }
+            }
+        }
+        tokio::time::sleep(POLL_PERIOD).await;
+    }
+}
+
+/// One opening hold: an opening dial toward `addr` every [`OPENING_PERIOD`]
+/// until a connection comes in from it or [`OPENING_WINDOW`] has passed.
+async fn opening_hold(hub: SharedHub, endpoint: IrohEndpoint, addr: SocketAddrV4, begun: Instant) {
+    let Some(knock) = hub.dht_knock.as_ref() else { return };
+    let mut landed = false;
+    while begun.elapsed() < OPENING_WINDOW {
+        let round = Instant::now();
+        knock.book.lock().unwrap().note_opening(*addr.ip(), round);
+        opening_dial(&endpoint, addr).await;
+        // Look twice a second for the knocker's dial to land, up to the next
+        // opening dial: a hold that got what it was for sends nothing more.
+        while round.elapsed() < OPENING_PERIOD {
+            if knock.book.lock().unwrap().landed_since(&addr, begun) {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if landed {
+            break;
+        }
+    }
+    knock.book.lock().unwrap().end(&addr);
+    if landed {
+        println!("🚪 DHT knock: a connection came in from {addr} {} s after the opening began", begun.elapsed().as_secs());
+    } else {
+        println!("🚪 DHT knock: nothing came in from {addr} in {} s; the opening is over", OPENING_WINDOW.as_secs());
+    }
+}
+
+/// A dial's knock has not been stored (yet).
+const KNOCK_NOT_OUT: u8 = 0;
+/// A dial's knock was stored and is counted in `KnockDht::knocks_out`.
+const KNOCK_OUT: u8 = 1;
+/// The dial ended: nothing more is counted for it.
+const KNOCK_ENDED: u8 = 2;
+
+/// The knocker's side of one dial. Dropped when the dial ends, however it
+/// ends, which stops the knocking and takes the knock out of the count of
+/// those that are out.
+pub(crate) struct Knocking {
+    task: tokio::task::AbortHandle,
+    hub: SharedHub,
+    /// One of `KNOCK_NOT_OUT`, `KNOCK_OUT`, `KNOCK_ENDED`: the task and the
+    /// guard run on different threads, so the count moves only on the change
+    /// each of them wins.
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for Knocking {
+    fn drop(&mut self) {
+        self.task.abort();
+        if self.state.swap(KNOCK_ENDED, Ordering::SeqCst) == KNOCK_OUT {
+            if let Some(knock) = self.hub.dht_knock.as_ref() {
+                knock.knocks_out.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Count a dial's stored knock as out, once per dial, and only while the dial
+/// still runs: a guard dropped meanwhile leaves the count as it was.
+fn count_knock_out(knocks_out: &AtomicUsize, state: &AtomicU8) {
+    if state.load(Ordering::SeqCst) != KNOCK_NOT_OUT {
+        return;
+    }
+    knocks_out.fetch_add(1, Ordering::SeqCst);
+    if state.compare_exchange(KNOCK_NOT_OUT, KNOCK_OUT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        knocks_out.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Knock on `target` for `room_id` while a dial to it runs: after
+/// [`KNOCK_GRACE`] (a reachable computer has answered by then, and the caller
+/// has dropped the guard), announce the game's IPv4 port at the knock point,
+/// and again every [`KNOCK_PERIOD`]. `None`, and nothing sent, when the knock
+/// is off, the room's key is not held, or the game has no IPv4 socket.
+pub(crate) fn knock_while_dialing(hub: &SharedHub, endpoint: &IrohEndpoint, room_id: &str, target: PublicKey) -> Option<Knocking> {
+    hub.dht_knock.as_ref()?;
+    let room_key = hub.chia_rooms.lock().unwrap().get(room_id)?.room_key;
+    let port = endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port())?;
+    let shown: String = target.to_string().chars().take(8).collect();
+    let state = Arc::new(AtomicU8::new(KNOCK_NOT_OUT));
+    let task = tokio::spawn(knock_rounds(hub.clone(), state.clone(), room_key, target, port, shown));
+    Some(Knocking { task: task.abort_handle(), hub: hub.clone(), state })
+}
+
+/// The knocking itself, for as long as its dial runs ([`Knocking`] aborts it).
+async fn knock_rounds(hub: SharedHub, state: Arc<AtomicU8>, room_key: [u8; 32], target: PublicKey, port: u16, shown: String) {
+    let Some(knock) = hub.dht_knock.as_ref() else { return };
+    tokio::time::sleep(KNOCK_GRACE).await;
+    // A node that has only just started (a first run) may still be joining the
+    // DHT: an announce before that is stored by nobody.
+    if knock.dht.bootstrapped().await.is_err() {
+        return;
+    }
+    for round in 0..MAX_KNOCKS_PER_DIAL {
+        if round > 0 {
+            tokio::time::sleep(KNOCK_PERIOD).await;
+        }
+        let point = knock_point(&room_key, &target, bucket_of(crate::chia_resolve::unix_now()));
+        let began = Instant::now();
+        match tokio::time::timeout(ANNOUNCE_TIMEOUT, knock.announce(point, port)).await {
+            Ok(Ok(())) => {
+                count_knock_out(&knock.knocks_out, &state);
+                println!(
+                    "🚪 DHT knock: knocked on {shown}… through the DHT (port {port}, {:.1} s); it opens toward this computer when it sees the knock",
+                    began.elapsed().as_secs_f32()
+                );
+            }
+            Ok(Err(e)) => eprintln!("🚪 DHT knock: the knock on {shown}… was not stored ({e}); the dial goes on without it"),
+            Err(_) => eprintln!("🚪 DHT knock: the knock on {shown}… was not stored in {} s; the dial goes on without it", ANNOUNCE_TIMEOUT.as_secs()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> PublicKey {
+        SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port)
+    }
+
+    #[test]
+    fn a_knock_is_counted_out_once_and_never_after_its_dial_ended() {
+        let count = AtomicUsize::new(0);
+        // Stored twice in one dial (the second round): counted once.
+        let running = AtomicU8::new(KNOCK_NOT_OUT);
+        count_knock_out(&count, &running);
+        count_knock_out(&count, &running);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(running.load(Ordering::SeqCst), KNOCK_OUT);
+        // A dial that ended before its knock was stored: never counted, so the
+        // count cannot stay raised with nobody left to lower it.
+        let ended = AtomicU8::new(KNOCK_ENDED);
+        count_knock_out(&count, &ended);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(ended.load(Ordering::SeqCst), KNOCK_ENDED);
+    }
+
+    #[test]
+    fn a_point_is_the_rooms_the_holders_and_the_hours() {
+        let room = [7u8; 32];
+        let other_room = [8u8; 32];
+        let holder = key(1);
+        let other_holder = key(2);
+        let point = knock_point(&room, &holder, 500_000);
+        // The same three give the same point, on either computer.
+        assert_eq!(point, knock_point(&room, &holder, 500_000));
+        // Another room, another holder or another hour is another point.
+        assert_ne!(point, knock_point(&other_room, &holder, 500_000));
+        assert_ne!(point, knock_point(&room, &other_holder, 500_000));
+        assert_ne!(point, knock_point(&room, &holder, 500_001));
+        // And it is a DHT id.
+        assert!(Id::from_bytes(point).is_ok());
+    }
+
+    #[test]
+    fn the_holder_looks_at_this_hour_and_near_a_boundary_at_the_neighbour() {
+        let hour = 500_000u64;
+        let start = hour * BUCKET_SECS;
+        assert_eq!(bucket_of(start), hour);
+        assert_eq!(bucket_of(start + BUCKET_SECS - 1), hour);
+        // Just after the hour began: the hour before as well.
+        assert_eq!(poll_buckets(start), vec![hour, hour - 1]);
+        assert_eq!(poll_buckets(start + BUCKET_OVERLAP_SECS - 1), vec![hour, hour - 1]);
+        // In the middle: this hour alone.
+        assert_eq!(poll_buckets(start + BUCKET_OVERLAP_SECS), vec![hour]);
+        assert_eq!(poll_buckets(start + BUCKET_SECS - BUCKET_OVERLAP_SECS - 1), vec![hour]);
+        // Just before the next: the next as well.
+        assert_eq!(poll_buckets(start + BUCKET_SECS - BUCKET_OVERLAP_SECS), vec![hour, hour + 1]);
+        assert_eq!(poll_buckets(start + BUCKET_SECS - 1), vec![hour, hour + 1]);
+        // A knocker and a holder whose clocks differ by less than the overlap
+        // always share an hour: whatever hour the knocker reads, the holder
+        // looks at it.
+        for knocker in [start + 5, start + BUCKET_SECS / 2, start + BUCKET_SECS - 5] {
+            for skew in [-(BUCKET_OVERLAP_SECS as i64) + 1, 0, BUCKET_OVERLAP_SECS as i64 - 1] {
+                let holder = (knocker as i64 + skew) as u64;
+                assert!(poll_buckets(holder).contains(&bucket_of(knocker)), "knocker at {knocker}, holder at {holder}");
+            }
+        }
+        // The first hour of the clock has none before it.
+        assert_eq!(poll_buckets(5), vec![0]);
+    }
+
+    #[test]
+    fn only_a_plain_zero_holds_the_knock_off() {
+        assert!(knock_off(Some("0")));
+        assert!(knock_off(Some(" 0 ")));
+        assert!(!knock_off(None));
+        assert!(!knock_off(Some("")));
+        assert!(!knock_off(Some("1")));
+        assert!(!knock_off(Some("off")));
+    }
+
+    #[test]
+    fn a_knock_is_opened_toward_only_at_a_public_address_that_is_not_ours() {
+        let public = |ip: Ipv4Addr| !ip.is_private() && !ip.is_loopback();
+        let own: HashSet<Ipv4Addr> = [Ipv4Addr::new(198, 51, 100, 7)].into_iter().collect();
+        assert!(knock_admitted(v4(203, 0, 113, 9, 44442), &own, public));
+        // A private or loopback address: never.
+        assert!(!knock_admitted(v4(192, 168, 1, 20, 44442), &own, public));
+        assert!(!knock_admitted(v4(127, 0, 0, 1, 44442), &own, public));
+        // Our own public address (another computer behind our router).
+        assert!(!knock_admitted(v4(198, 51, 100, 7, 44442), &own, public));
+        // A port the game never binds.
+        assert!(!knock_admitted(v4(203, 0, 113, 9, 53), &own, public));
+        assert!(!knock_admitted(v4(203, 0, 113, 9, 0), &own, public));
+        assert!(knock_admitted(v4(203, 0, 113, 9, MIN_KNOCK_PORT), &own, public));
+    }
+
+    #[test]
+    fn the_welcome_room_is_looked_up_first_and_four_rooms_at_most() {
+        let welcome = [9u8; 32];
+        let mut rooms: Vec<(String, [u8; 32])> =
+            ["e", "c", "w", "a", "d", "b"].iter().map(|id| (id.to_string(), if *id == "w" { welcome } else { [1u8; 32] })).collect();
+        order_rooms(&mut rooms, |k| *k == welcome);
+        let ids: Vec<&str> = rooms.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["w", "a", "b", "c"]);
+        assert_eq!(rooms.len(), MAX_ROOMS);
+    }
+
+    #[test]
+    fn one_address_one_hold_at_a_time_and_eight_holds_at_most() {
+        let mut book = OpeningBook::default();
+        let now = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        assert!(book.begin(a, 10, now));
+        // The same address again while its hold runs: no.
+        assert!(!book.begin(a, 10, now));
+        // Another port at the same address is another knocker (two computers
+        // behind one router).
+        assert!(book.begin(v4(203, 0, 113, 9, 44443), 10, now));
+        for i in 0..(MAX_OPENINGS as u8 - 2) {
+            assert!(book.begin(v4(203, 0, 113, 100 + i, 44442), 10, now));
+        }
+        assert_eq!(book.running(), MAX_OPENINGS);
+        // The ninth waits, whoever it is.
+        assert!(!book.begin(v4(203, 0, 113, 200, 44442), 10, now));
+        // And is taken once one ended.
+        book.end(&a);
+        assert!(book.begin(v4(203, 0, 113, 200, 44442), 10, now));
+    }
+
+    #[test]
+    fn an_address_rests_between_holds_and_has_three_an_hour() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        assert!(book.begin(a, 10, t0));
+        book.end(&a);
+        // The DHT lists the knock at the next look too: not again so soon.
+        assert!(!book.begin(a, 10, t0 + POLL_PERIOD));
+        assert!(!book.begin(a, 10, t0 + OPENING_REST - Duration::from_secs(1)));
+        // After the rest: the second, then the third.
+        assert!(book.begin(a, 10, t0 + OPENING_REST));
+        book.end(&a);
+        assert!(book.begin(a, 10, t0 + OPENING_REST * 2));
+        book.end(&a);
+        // A fourth in the same hour: no, however long it rested.
+        assert!(!book.begin(a, 10, t0 + OPENING_REST * 3));
+        // A new hour counts anew.
+        assert!(book.begin(a, 11, t0 + OPENING_REST * 3));
+        // A refused begin counted nothing and left nothing running.
+        book.end(&a);
+        assert_eq!(book.running(), 0);
+    }
+
+    #[test]
+    fn an_opening_marks_its_address_for_the_grace_and_no_longer() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let ip = Ipv4Addr::new(203, 0, 113, 9);
+        assert!(!book.opened_lately(ip, t0));
+        book.note_opening(ip, t0);
+        assert!(book.opened_lately(ip, t0));
+        assert!(book.opened_lately(ip, t0 + OPENED_GRACE - Duration::from_secs(1)));
+        // Another address was never opened toward.
+        assert!(!book.opened_lately(Ipv4Addr::new(203, 0, 113, 10), t0));
+        // A later opening dial renews the mark.
+        book.note_opening(ip, t0 + Duration::from_secs(60));
+        assert!(book.opened_lately(ip, t0 + OPENED_GRACE + Duration::from_secs(30)));
+        // And it runs out.
+        assert!(!book.opened_lately(ip, t0 + Duration::from_secs(60) + OPENED_GRACE));
+    }
+
+    #[test]
+    fn a_landing_ends_the_hold_it_was_for_and_only_that_one() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        let b = v4(203, 0, 113, 9, 44443);
+        // A connection from an address no hold runs toward is not kept.
+        book.note_landed(a, t0);
+        assert!(book.begin(a, 10, t0));
+        assert!(!book.landed_since(&a, t0));
+        // The knocker's dial lands.
+        book.note_landed(a, t0 + Duration::from_secs(5));
+        assert!(!book.landed_since(&b, t0));
+        assert!(book.landed_since(&a, t0));
+        // Read once.
+        assert!(!book.landed_since(&a, t0));
+        // A landing from before a later hold began does not end that hold.
+        book.note_landed(a, t0 + Duration::from_secs(6));
+        book.end(&a);
+        let later = t0 + OPENING_REST;
+        assert!(book.begin(a, 10, later));
+        assert!(!book.landed_since(&a, later));
+    }
+
+    /// The whole point of the opening dial: under a node id nobody holds, to
+    /// an address where nobody speaks the game's language, the endpoint still
+    /// SENDS, from its own socket, and the dial comes back without a link.
+    #[tokio::test]
+    async fn an_opening_dial_sends_from_the_games_socket_and_links_nothing() {
+        let endpoint = IrohEndpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![b"ssf".to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .expect("a loopback address")
+            .bind()
+            .await
+            .expect("an endpoint on loopback");
+        let game_port = endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).expect("an IPv4 socket").port();
+        let knocker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("a UDP socket");
+        let SocketAddr::V4(knocker_addr) = knocker.local_addr().unwrap() else { panic!("IPv4") };
+
+        let dial = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { opening_dial(&endpoint, knocker_addr).await }
+        });
+        let mut buf = [0u8; 2048];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(3), knocker.recv_from(&mut buf))
+            .await
+            .expect("a packet within three seconds")
+            .expect("a packet");
+        // A QUIC Initial is padded to 1200 bytes at least.
+        assert!(len >= 1200, "an Initial, not {len} bytes");
+        assert_eq!(from.port(), game_port, "from the game's own socket");
+        // Nobody answers: the dial ends by itself, inside its own timeout.
+        tokio::time::timeout(OPENING_DIAL_TIMEOUT + Duration::from_secs(2), dial).await.expect("the dial ends").unwrap();
+        endpoint.close().await;
+    }
+
+    /// A knock announced by one client is found by another at the same point,
+    /// with the port it named, on a DHT of this process's own.
+    #[tokio::test]
+    async fn a_knock_announced_is_found_at_its_point_and_nowhere_else() {
+        let testnet = n0_mainline::Testnet::new(8).await.expect("a DHT of our own");
+        let client = || {
+            let mut builder = DhtBuilder::default();
+            builder.bootstrap(&testnet.bootstrap);
+            KnockDht::start(&builder).expect("a DHT client")
+        };
+        let knocker = client();
+        let holder = client();
+        assert_eq!(knocker.dht.bootstrapped().await, Ok(true));
+        assert_eq!(holder.dht.bootstrapped().await, Ok(true));
+
+        let room = [7u8; 32];
+        let me = key(1);
+        let point = knock_point(&room, &me, 500_000);
+        assert_eq!(holder.lookup(point).await, Some(BTreeSet::new()));
+        knocker.announce(point, 44442).await.expect("the announce is stored");
+        let found = holder.lookup(point).await.expect("a lookup");
+        assert_eq!(found.into_iter().map(|a| a.port()).collect::<Vec<_>>(), vec![44442]);
+        // Another hour's point, and another room's, list nobody.
+        assert_eq!(holder.lookup(knock_point(&room, &me, 500_001)).await, Some(BTreeSet::new()));
+        assert_eq!(holder.lookup(knock_point(&[8u8; 32], &me, 500_000)).await, Some(BTreeSet::new()));
+    }
+}
