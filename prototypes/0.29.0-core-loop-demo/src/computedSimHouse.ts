@@ -1052,14 +1052,17 @@ export class SimHouse {
     // (Nor once any close of that round is abandoned: the pages abandon the
     // close their fold chose, which voids the round, and a rival of it that
     // nobody abandons would hold this house off for good.)
-    // (And the wait for a close ends with a reveal of the commitment it
-    // names, that house's reveal or its step-down: not with another house's
-    // step-down from a join of the same round.)
+    // (Nor once a house has revealed a close of the round: the round is that
+    // close's, and a rival of it on another house's commitment is nobody's
+    // to reveal. A step-down, which reveals no close, ends no wait: another
+    // house's from its own join of the round leaves the close waiting, and
+    // a close on a commitment stepped down is none the fold takes.)
     const theirs = fo && r - 1 > read.baseU
       && !closesAt(r - 1).some((c) => read.abandoned.has(c.hash))
+      && !read.reveals.some((v) => v.r === r - 1 && v.x.length > 0)
       && closesAt(r - 1).some((c) => {
         const h = c.h;
-        if (h === undefined || read.reveals.some((v) => v.r === r - 1 && v.commit === h)) return false;
+        if (h === undefined) return false;
         const k = whose(h);
         return k !== undefined && k !== this.pub && read.houseAt(k, r - 1);
       });

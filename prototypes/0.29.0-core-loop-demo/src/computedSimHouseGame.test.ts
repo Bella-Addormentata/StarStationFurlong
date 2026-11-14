@@ -1781,6 +1781,31 @@ describe("the simulations' houses at a FAIR ONLY game with two houses of its hol
     expect(room.recs('o:2:')).toEqual([]);
   });
 
+  it('both joined the first round, each named by a close; the house of the first join reveals its close as it steps down (no commitment carried) and starts again, the other stopped: the round is decided, and the rival close nobody reveals does not hold its next join off', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    // (Of two joins the pages name the lowest, and that house alone reveals: whichever of the two it is.)
+    const first = room.keys('o:1:').map((k) => room.ses().get(k) as { k: string })[0].k === H.pub;
+    const [F, O] = first ? [H, H2] : [H2, H];
+    const [mine, other] = first ? [room.house, room.house2] : [room.house2, room.house];
+    const [a, b] = [kit.slip(alice, 1, [red(5)]), kit.slip(bob, 1, [red(5)])];
+    const c = kit.close(alice, 1, SID, [a, b], kit.houseCommit(F, 1));
+    const rival = kit.close(bob, 1, SID, [b], kit.houseCommit(O, 1));
+    if (first) room.on2 = false;
+    else room.on = false;
+    room.put(a, b, c, rival, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    mine.steppingDown = true;
+    room.run(2_000);
+    const [h1] = room.recs('h:1:');
+    expect(h1).toMatchObject({ k: F.pub, x: [c.hash] });
+    expect(h1.c).toBeUndefined();
+    expect(other.wrote.reveals).toBe(0);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    mine.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:2:').map((v) => [v.k, v.c])).toEqual([[F.pub, kit.houseCommit(F, 2)]]);
+  });
+
   it('past a trim by the other house, a round that waits on the commitment its checkpoint carries: no join of the round after', () => {
     const room = new TwoRoom().start();
     room.played(1, SID);
