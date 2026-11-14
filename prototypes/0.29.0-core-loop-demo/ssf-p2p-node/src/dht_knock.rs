@@ -332,6 +332,16 @@ impl OpeningBook {
         }
     }
 
+    /// The hold toward `addr` is over because a link stands to that address
+    /// by now, made some other way than by a connection coming in from it (a
+    /// dial of our own that landed while the knocker's ran). Remembered as a
+    /// hold that got its link: it asks for no rest.
+    pub(crate) fn note_linked(&mut self, addr: &SocketAddrV4) {
+        if let Some(held) = self.begun.get_mut(addr) {
+            held.landed = true;
+        }
+    }
+
     /// A connection that came in from `addr` stands from now on.
     pub(crate) fn note_live(&mut self, addr: SocketAddrV4) {
         *self.live.entry(addr).or_insert(0) += 1;
@@ -603,10 +613,12 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
 }
 
 /// One opening hold: an opening dial toward `addr` every [`OPENING_PERIOD`]
-/// until a connection comes in from it or [`OPENING_WINDOW`] has passed.
+/// until a connection comes in from it, a link stands to it that was made
+/// some other way, or [`OPENING_WINDOW`] has passed.
 async fn opening_hold(hub: SharedHub, endpoint: IrohEndpoint, addr: SocketAddrV4, begun: Instant) {
     let Some(knock) = hub.dht_knock.as_ref() else { return };
     let mut landed = false;
+    let mut linked = false;
     while begun.elapsed() < OPENING_WINDOW {
         let round = Instant::now();
         noted_opening_dial(&knock.book, &endpoint, addr).await;
@@ -622,10 +634,22 @@ async fn opening_hold(hub: SharedHub, endpoint: IrohEndpoint, addr: SocketAddrV4
         if landed {
             break;
         }
+        // Before the next opening dial: a link that stands to the address by
+        // now, made by a dial of our own that landed while the knocker's ran,
+        // needs no more opening either. The knocker's dial has stopped by
+        // then (it found itself linked), so nothing will come in to say so,
+        // and the hold would send, and keep its slot, to the window's end.
+        if linked_addrs(&hub).contains(&addr) {
+            knock.book.lock().unwrap().note_linked(&addr);
+            linked = true;
+            break;
+        }
     }
     knock.book.lock().unwrap().end(&addr);
     if landed {
         println!("🚪 DHT knock: a connection came in from {addr} {} s after the opening began", begun.elapsed().as_secs());
+    } else if linked {
+        println!("🚪 DHT knock: a link stands to {addr} by a dial of our own, {} s after the opening began; the opening is over", begun.elapsed().as_secs());
     } else {
         println!("🚪 DHT knock: nothing came in from {addr} in {} s; the opening is over", OPENING_WINDOW.as_secs());
     }
@@ -1073,6 +1097,35 @@ mod tests {
         assert!(!book.begin(a, second + OPENING_REST + Duration::from_secs(60)));
         assert!(!book.begin(a, t0 + HOLDS_WINDOW - Duration::from_secs(1)));
         assert!(book.begin(a, t0 + HOLDS_WINDOW));
+    }
+
+    #[test]
+    fn a_hold_ended_by_a_link_made_another_way_asks_for_no_rest_but_counts() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        assert!(book.begin(a, t0));
+        // No connection came in from the address: a dial of our own reached
+        // it, and the hold ended on seeing the link.
+        assert!(!book.landed_since(&a, t0));
+        book.note_linked(&a);
+        book.end(&a);
+        // Listed still a minute on, and the link was lost (the caller looks
+        // at the links before it asks the book): no rest, as after a landing.
+        let second = t0 + Duration::from_secs(60);
+        assert!(book.begin(a, second));
+        book.end(&a);
+        // That one got nothing: the rest holds, and all of them count.
+        assert!(!book.begin(a, second + POLL_PERIOD));
+        assert!(book.begin(a, second + OPENING_REST));
+        book.end(&a);
+        assert!(!book.begin(a, second + OPENING_REST * 2), "three in the hour");
+        // The note makes up no hold toward an address none was begun for.
+        let b = v4(203, 0, 113, 10, 44442);
+        book.note_linked(&b);
+        assert!(book.begin(b, t0));
+        book.end(&b);
+        assert!(!book.begin(b, t0 + POLL_PERIOD), "its first hold got nothing, and rests");
     }
 
     #[test]
