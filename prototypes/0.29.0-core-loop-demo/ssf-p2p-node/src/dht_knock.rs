@@ -99,12 +99,18 @@ pub(crate) const MAX_OPENINGS: usize = 8;
 /// The DHT goes on listing a knock long after the knocker linked or left, and
 /// a listing does not say which. Three rules keep the holder from opening
 /// toward a listing for ever: no hold toward an address a connection that
-/// came in from it still stands to; at most this many holds per address per
-/// hour of the clock; and after a hold that nothing came in on, the next
+/// came in from it still stands to; at most this many holds per address in
+/// any [`HOLDS_WINDOW`]; and after a hold that nothing came in on, the next
 /// toward that address waits [`OPENING_REST`]. A hold that did get its
 /// connection asks for no rest: if that address is listed and no connection
 /// stands, the link was lost, and the knocker may well be dialing again.
-pub(crate) const MAX_HOLDS_PER_ADDR: u32 = 3;
+///
+/// The window is counted from when each hold began, not by the hour of the
+/// clock the knock points turn with: a hold is the same hold whichever hour's
+/// point listed it and whichever hour it began in, so no boundary can hand an
+/// address a fourth.
+pub(crate) const MAX_HOLDS_PER_ADDR: usize = 3;
+pub(crate) const HOLDS_WINDOW: Duration = Duration::from_secs(3600);
 pub(crate) const OPENING_REST: Duration = Duration::from_secs(600);
 
 /// How long an address an opening dial went to counts as one we sent to
@@ -217,27 +223,23 @@ pub(crate) fn knock_port(live: &[SocketAddr], advertised: &HashSet<SocketAddr>, 
     found.or(told).map(|sock| sock.port()).unwrap_or(bound)
 }
 
-/// What the holder remembers of one address's holds in an hour of the clock.
+/// What the holder remembers of one address's holds.
 struct Held {
-    /// The hour the holds are counted in.
-    hour: u64,
-    /// How many began in it.
-    count: u32,
-    /// When the last one began.
-    last: Instant,
+    /// When its holds of the last [`HOLDS_WINDOW`] began, oldest first.
+    began: Vec<Instant>,
     /// The last one got the connection it was for.
     landed: bool,
 }
 
-/// What the holder remembers of its opening holds: which run now, how many
-/// each address had this hour, where opening dials went lately, where a
+/// What the holder remembers of its opening holds: which run now, when each
+/// address's holds of the last hour began, where opening dials went lately, where a
 /// connection has come in from, and where one still stands. Pure: the clock is
 /// handed in.
 #[derive(Default)]
 pub(crate) struct OpeningBook {
     /// Holds running now, by the knocker's address.
     running: HashSet<SocketAddrV4>,
-    /// Per address, its holds of this hour.
+    /// Per address, its holds of the last [`HOLDS_WINDOW`].
     begun: HashMap<SocketAddrV4, Held>,
     /// Addresses an opening dial went to, and when the last one left.
     opened: HashMap<Ipv4Addr, Instant>,
@@ -249,38 +251,33 @@ pub(crate) struct OpeningBook {
 }
 
 impl OpeningBook {
-    /// Claim a hold toward `addr` in the hour `bucket`: `true` when it may
-    /// begin (and is now counted as running), `false` when one runs already,
+    /// Claim a hold toward `addr` at `now`: `true` when it may begin (and is
+    /// now counted as running), `false` when one runs already,
     /// [`MAX_OPENINGS`] run, a connection from that address stands, the
-    /// address had its [`MAX_HOLDS_PER_ADDR`] this hour, or its last hold got
-    /// no connection and began less than [`OPENING_REST`] ago.
-    pub(crate) fn begin(&mut self, addr: SocketAddrV4, bucket: u64, now: Instant) -> bool {
+    /// address had its [`MAX_HOLDS_PER_ADDR`] in the last [`HOLDS_WINDOW`],
+    /// or its last hold got no connection and began less than
+    /// [`OPENING_REST`] ago.
+    pub(crate) fn begin(&mut self, addr: SocketAddrV4, now: Instant) -> bool {
         if self.running.contains(&addr) || self.running.len() >= MAX_OPENINGS || self.live.contains_key(&addr) {
             return false;
         }
-        // What is kept of another hour is of use only while its rest runs: a
-        // hold that began just before the hour and got nothing must not begin
-        // again just after it, when the old hour's point still lists the knock.
-        self.begun.retain(|_, held| held.hour == bucket || now.duration_since(held.last) < OPENING_REST);
+        // Holds that began longer ago than the window count for nothing any
+        // more, and an address with none left is forgotten.
+        self.begun.retain(|_, held| {
+            held.began.retain(|at| now.duration_since(*at) < HOLDS_WINDOW);
+            !held.began.is_empty()
+        });
         match self.begun.get_mut(&addr) {
             Some(held) => {
-                if !held.landed && now.duration_since(held.last) < OPENING_REST {
+                let resting = !held.landed && held.began.last().is_some_and(|last| now.duration_since(*last) < OPENING_REST);
+                if resting || held.began.len() >= MAX_HOLDS_PER_ADDR {
                     return false;
                 }
-                if held.hour != bucket {
-                    // A new hour counts anew. The rest, above, did not.
-                    held.hour = bucket;
-                    held.count = 0;
-                }
-                if held.count >= MAX_HOLDS_PER_ADDR {
-                    return false;
-                }
-                held.count += 1;
-                held.last = now;
+                held.began.push(now);
                 held.landed = false;
             }
             None => {
-                self.begun.insert(addr, Held { hour: bucket, count: 1, last: now, landed: false });
+                self.begun.insert(addr, Held { began: vec![now], landed: false });
             }
         }
         self.running.insert(addr);
@@ -504,9 +501,7 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
     rounds.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         rounds.tick().await;
-        let now_unix = crate::chia_resolve::unix_now();
-        let bucket = bucket_of(now_unix);
-        let points = round_points(&rooms_to_poll(&hub), &me, now_unix);
+        let points = round_points(&rooms_to_poll(&hub), &me, crate::chia_resolve::unix_now());
         // All of a round's lookups side by side: one slow point holds no
         // other room up, and the round is over within LOOKUP_TIMEOUT.
         let looked = n0_future::join_all(
@@ -528,7 +523,7 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
                     continue;
                 }
                 let begun = Instant::now();
-                if !knock.book.lock().unwrap().begin(addr, bucket, begun) {
+                if !knock.book.lock().unwrap().begin(addr, begun) {
                     continue;
                 }
                 println!(
@@ -846,21 +841,21 @@ mod tests {
         let mut book = OpeningBook::default();
         let now = Instant::now();
         let a = v4(203, 0, 113, 9, 44442);
-        assert!(book.begin(a, 10, now));
+        assert!(book.begin(a, now));
         // The same address again while its hold runs: no.
-        assert!(!book.begin(a, 10, now));
+        assert!(!book.begin(a, now));
         // Another port at the same address is another knocker (two computers
         // behind one router).
-        assert!(book.begin(v4(203, 0, 113, 9, 44443), 10, now));
+        assert!(book.begin(v4(203, 0, 113, 9, 44443), now));
         for i in 0..(MAX_OPENINGS as u8 - 2) {
-            assert!(book.begin(v4(203, 0, 113, 100 + i, 44442), 10, now));
+            assert!(book.begin(v4(203, 0, 113, 100 + i, 44442), now));
         }
         assert_eq!(book.running(), MAX_OPENINGS);
         // The ninth waits, whoever it is.
-        assert!(!book.begin(v4(203, 0, 113, 200, 44442), 10, now));
+        assert!(!book.begin(v4(203, 0, 113, 200, 44442), now));
         // And is taken once one ended.
         book.end(&a);
-        assert!(book.begin(v4(203, 0, 113, 200, 44442), 10, now));
+        assert!(book.begin(v4(203, 0, 113, 200, 44442), now));
     }
 
     #[test]
@@ -868,49 +863,61 @@ mod tests {
         let mut book = OpeningBook::default();
         let t0 = Instant::now();
         let a = v4(203, 0, 113, 9, 44442);
-        assert!(book.begin(a, 10, t0));
+        assert!(book.begin(a, t0));
         book.end(&a);
         // The DHT lists the knock at the next look too: not again so soon.
-        assert!(!book.begin(a, 10, t0 + POLL_PERIOD));
-        assert!(!book.begin(a, 10, t0 + OPENING_REST - Duration::from_secs(1)));
+        assert!(!book.begin(a, t0 + POLL_PERIOD));
+        assert!(!book.begin(a, t0 + OPENING_REST - Duration::from_secs(1)));
         // After the rest: the second, then the third.
-        assert!(book.begin(a, 10, t0 + OPENING_REST));
+        assert!(book.begin(a, t0 + OPENING_REST));
         book.end(&a);
-        assert!(book.begin(a, 10, t0 + OPENING_REST * 2));
+        assert!(book.begin(a, t0 + OPENING_REST * 2));
         book.end(&a);
-        // A fourth in the same hour: no, however long it rested.
-        assert!(!book.begin(a, 10, t0 + OPENING_REST * 3));
-        // A new hour counts anew.
-        assert!(book.begin(a, 11, t0 + OPENING_REST * 3));
+        // A fourth inside the hour that began with the first: no, however
+        // long it rested.
+        assert!(!book.begin(a, t0 + OPENING_REST * 3));
+        assert!(!book.begin(a, t0 + HOLDS_WINDOW - Duration::from_secs(1)));
         // A refused begin counted nothing and left nothing running.
-        book.end(&a);
         assert_eq!(book.running(), 0);
+        // Once the first is an hour old it counts no more, and one fits.
+        assert!(book.begin(a, t0 + HOLDS_WINDOW));
+        book.end(&a);
+        // And then the next waits for the second to be an hour old.
+        assert!(!book.begin(a, t0 + HOLDS_WINDOW + OPENING_REST - Duration::from_secs(1)));
+        assert!(book.begin(a, t0 + HOLDS_WINDOW + OPENING_REST));
     }
 
     #[test]
-    fn the_rest_outlasts_the_hour_and_the_count_does_not() {
+    fn no_boundary_of_the_clocks_hour_hands_an_address_a_fourth_hold_or_ends_its_rest() {
+        // The book is never told the hour of the clock: a hold is counted
+        // from when it began, whichever hour's point listed the knock and
+        // whichever hour the lookup began or ended in. So the cases a clock
+        // boundary could open are closed by construction, and shown here by
+        // times alone.
         let mut book = OpeningBook::default();
         let t0 = Instant::now();
         let a = v4(203, 0, 113, 9, 44442);
-        // A hold just before the hour, and nothing came in on it.
-        assert!(book.begin(a, 10, t0));
+        // A hold that got nothing, begun seconds before the hour turned (a
+        // lookup begun in the old hour and ended in the new one).
+        assert!(book.begin(a, t0));
         book.end(&a);
-        // The hour turns. The old hour's point still lists the knock, and the
-        // holder looks at it during the overlap: the rest holds all the same.
-        assert!(!book.begin(a, 11, t0 + Duration::from_secs(60)));
-        assert!(!book.begin(a, 11, t0 + OPENING_REST - Duration::from_secs(1)));
-        // Another address, new this hour, is not held up by what is kept.
-        assert!(book.begin(v4(203, 0, 113, 10, 44442), 11, t0 + Duration::from_secs(60)));
-        // After the rest it begins, as the new hour's first: three more fit.
-        assert!(book.begin(a, 11, t0 + OPENING_REST));
+        // The hour has turned, and the old hour's point still lists the
+        // knock during the overlap: the rest holds all the same.
+        assert!(!book.begin(a, t0 + Duration::from_secs(8)));
+        assert!(!book.begin(a, t0 + OPENING_REST - Duration::from_secs(1)));
+        // Another address is not held up by what is kept of this one.
+        assert!(book.begin(v4(203, 0, 113, 10, 44442), t0 + Duration::from_secs(60)));
+        // In the new hour of the clock the address has two more holds, not
+        // three: the one from seconds before the boundary still counts.
+        assert!(book.begin(a, t0 + OPENING_REST));
         book.end(&a);
-        assert!(book.begin(a, 11, t0 + OPENING_REST * 2));
+        assert!(book.begin(a, t0 + OPENING_REST * 2));
         book.end(&a);
-        assert!(book.begin(a, 11, t0 + OPENING_REST * 3));
-        book.end(&a);
-        assert!(!book.begin(a, 11, t0 + OPENING_REST * 4));
-        // An hour's full count is not carried over either.
-        assert!(book.begin(a, 12, t0 + OPENING_REST * 4));
+        assert!(!book.begin(a, t0 + OPENING_REST * 3));
+        assert!(!book.begin(a, t0 + OPENING_REST * 5));
+        // In any sixty minutes, three: the fourth fits when the first is an
+        // hour old.
+        assert!(book.begin(a, t0 + HOLDS_WINDOW));
     }
 
     #[test]
@@ -920,24 +927,24 @@ mod tests {
         let a = v4(203, 0, 113, 9, 44442);
         let b = v4(203, 0, 113, 9, 44443);
         // The knocker's dial landed and its hold ended: the link stands.
-        assert!(book.begin(a, 10, t0));
+        assert!(book.begin(a, t0));
         book.note_landed(a, t0 + Duration::from_secs(2));
         assert!(book.landed_since(&a, t0));
         book.end(&a);
         book.note_live(a);
         // The DHT still lists the knock, at every look and after any rest:
         // nothing is opened toward a computer that is linked.
-        assert!(!book.begin(a, 10, t0 + POLL_PERIOD));
-        assert!(!book.begin(a, 10, t0 + OPENING_REST * 2));
+        assert!(!book.begin(a, t0 + POLL_PERIOD));
+        assert!(!book.begin(a, t0 + OPENING_REST * 2));
         // Another knocker behind the same router is not held up by it.
-        assert!(book.begin(b, 10, t0 + POLL_PERIOD));
+        assert!(book.begin(b, t0 + POLL_PERIOD));
         // Two connections from one address: the address is free once both
         // ended, not one.
         book.note_live(a);
         book.end_live(&a);
-        assert!(!book.begin(a, 10, t0 + OPENING_REST * 2));
+        assert!(!book.begin(a, t0 + OPENING_REST * 2));
         book.end_live(&a);
-        assert!(book.begin(a, 10, t0 + OPENING_REST * 2));
+        assert!(book.begin(a, t0 + OPENING_REST * 2));
         // An end nobody noted a beginning for changes nothing.
         book.end_live(&v4(203, 0, 113, 77, 44442));
     }
@@ -948,7 +955,7 @@ mod tests {
         let t0 = Instant::now();
         let a = v4(203, 0, 113, 9, 44442);
         // Linked through the first hold, and the link was lost a minute on.
-        assert!(book.begin(a, 10, t0));
+        assert!(book.begin(a, t0));
         book.note_landed(a, t0 + Duration::from_secs(2));
         assert!(book.landed_since(&a, t0));
         book.end(&a);
@@ -957,17 +964,19 @@ mod tests {
         // Listed, and no connection stands: the knocker may be dialing
         // again, so the second hold does not wait for the rest.
         let second = t0 + Duration::from_secs(60);
-        assert!(book.begin(a, 10, second));
+        assert!(book.begin(a, second));
         book.end(&a);
         // That one got nothing: the rest holds again.
-        assert!(!book.begin(a, 10, second + POLL_PERIOD));
-        assert!(book.begin(a, 10, second + OPENING_REST));
+        assert!(!book.begin(a, second + POLL_PERIOD));
+        assert!(book.begin(a, second + OPENING_REST));
         book.note_landed(a, second + OPENING_REST + Duration::from_secs(2));
         assert!(book.landed_since(&a, second + OPENING_REST));
         book.end(&a);
-        // Three this hour, landed or not: the fourth waits for the next hour.
-        assert!(!book.begin(a, 10, second + OPENING_REST + Duration::from_secs(60)));
-        assert!(book.begin(a, 11, second + OPENING_REST + Duration::from_secs(60)));
+        // Three in the hour, landed or not: the fourth waits until the first
+        // is an hour old, and then asks for no rest (the third landed).
+        assert!(!book.begin(a, second + OPENING_REST + Duration::from_secs(60)));
+        assert!(!book.begin(a, t0 + HOLDS_WINDOW - Duration::from_secs(1)));
+        assert!(book.begin(a, t0 + HOLDS_WINDOW));
     }
 
     #[test]
@@ -996,7 +1005,7 @@ mod tests {
         let b = v4(203, 0, 113, 9, 44443);
         // A connection from an address no hold runs toward is not kept.
         book.note_landed(a, t0);
-        assert!(book.begin(a, 10, t0));
+        assert!(book.begin(a, t0));
         assert!(!book.landed_since(&a, t0));
         // The knocker's dial lands.
         book.note_landed(a, t0 + Duration::from_secs(5));
@@ -1008,7 +1017,7 @@ mod tests {
         book.note_landed(a, t0 + Duration::from_secs(6));
         book.end(&a);
         let later = t0 + OPENING_REST;
-        assert!(book.begin(a, 10, later));
+        assert!(book.begin(a, later));
         assert!(!book.landed_since(&a, later));
     }
 
