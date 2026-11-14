@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
@@ -514,5 +516,33 @@ describe('welcome only: a pass to the welcome room added while standing in it (w
   it('once the room is here, says so and that the pass is saved', () => {
     const line = welcomePassAddedLine('SSF-WELCOME', false);
     expect(line).toBe('You are already aboard SSF-WELCOME. The pass is saved in MY ROOMS.');
+  });
+});
+
+describe('main.ts: a boot that lost the session publishes no override', () => {
+  const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+  const start = main.indexOf('async function bootstrapNetworking() {');
+  const body = main.slice(start, main.indexOf('\n}\n', start));
+
+  it('asks whether it still owns the session between each look for the node and the override it then publishes', () => {
+    expect(start).toBeGreaterThan(0);
+    // The two places a boot publishes the pass it is about to dial: the
+    // refreshed loopback override, and the docking's. A room swap publishes
+    // its own (performRoomSwap), and a Retry-node goes where the override
+    // says, so a boot that waited on the node asks before it writes, never
+    // only after.
+    const writes = [...body.matchAll(/pendingBootstrapOverride = boot;/g)].map((m) => m.index as number);
+    expect(writes.length).toBe(2);
+    for (const at of writes) {
+      const before = body.slice(0, at);
+      const lastAwait = before.lastIndexOf('await ');
+      expect(lastAwait).toBeGreaterThan(0);
+      const sinceAwait = before.slice(lastAwait);
+      const asked = sinceAwait.indexOf('if (yields()) {');
+      expect(asked, sinceAwait.slice(0, 80)).toBeGreaterThan(0);
+      expect(sinceAwait.slice(asked, asked + 90)).toMatch(/if \(yields\(\)\) \{\s+standDown\(\);\s+return;/);
+    }
+    // The swap's own write, which those checks protect.
+    expect(main).toContain('pendingBootstrapOverride = target;');
   });
 });

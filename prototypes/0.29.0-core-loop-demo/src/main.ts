@@ -1524,6 +1524,14 @@ async function bootstrapNetworking() {
       try {
         if (classifyAddress(new URL(override.wtUrl).hostname) === "loopback") {
           const fp = await awaitLocalNodeFingerprint();
+          // 🛰️ The look took a moment: a room swap may have published its
+          // own override meanwhile, and this boot's must not replace it (a
+          // Retry-node would then go where this boot was going, not to the
+          // room the player chose).
+          if (yields()) {
+            standDown();
+            return;
+          }
           if (fp && fp.base64) {
             const wtUrl = new URL(override.wtUrl);
             wtUrl.port = String(fp.port);
@@ -1607,6 +1615,14 @@ async function bootstrapNetworking() {
           boot = withPassRoutes(direct ? await resolveBridgeBootstrap(boot) : boot, welcome);
         } else {
           boot = await resolveBridgeBootstrap(welcome);
+        }
+        // 🛰️ The resolve above looked for the node, and a room swap may
+        // have published its own override meanwhile: this boot stands down
+        // before it publishes its own, not after (a Retry-node would
+        // otherwise return here instead of to the room the player chose).
+        if (yields()) {
+          standDown();
+          return;
         }
         // Persists like every override: a Retry-node stays classified as a
         // join and re-dials the station rather than claiming home.
