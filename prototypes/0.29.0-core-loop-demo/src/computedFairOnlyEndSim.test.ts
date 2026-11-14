@@ -37,6 +37,17 @@ afterAll(() => {
   if (lines.length > 0) console.log(`\n${lines.join('\n')}`);
 });
 
+/** The ended game of table `t` is compacted on every page (PR 6c-4b-3b): of its
+ *  FAIR ONLY records the doc holds the checkpoint that ends it and nothing else. */
+function expectCompacted(sim: Sim, t: string): void {
+  for (const sp of sim.pages) {
+    const top = sp.p.doc.getMap<unknown>('casinoComputed');
+    const keys = [...top.keys()].filter((k) => /^(ck|ses|xf|fin):/.test(k) && /^[pq]/.test(k.split(':')[2] ?? '') && k.split(':')[1] === t);
+    expect(keys.map((k) => k.split(':')[0]), `${sim.label} ${sp.name}`).toEqual(['ck']);
+    expect((top.get(keys[0]) as { e?: number }).e, `${sim.label} ${sp.name}`).toBe(1);
+  }
+}
+
 describe('FAIR ONLY roulette: the holder ends the game', () => {
   it('pressed while a round is in flight: the end order alone, the house decides the round, and its end counts it', async () => {
     const sim = await Sim.open({ name: 'fair-only-end-mid', seed: seed(1301), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
@@ -44,6 +55,7 @@ describe('FAIR ONLY roulette: the holder ends the game', () => {
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim);
     fairOnlyFinish(sim, s, [ROULETTE]);
+    expectCompacted(sim, ROULETTE);
     expect(end.said, sim.label).toEqual(['ending']);
     expect(sim.node!.ends, sim.label).toBe(1);
     expect(sim.ownerEndsWritten, sim.label).toBe(0);
@@ -58,6 +70,7 @@ describe('FAIR ONLY roulette: the holder ends the game', () => {
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim);
     fairOnlyFinish(sim, s, [ROULETTE]);
+    expectCompacted(sim, ROULETTE);
     expect(end.said, sim.label).toEqual(['ending', 'ok']);
     expect(sim.node!.ends + sim.ownerEndsWritten, sim.label).toBe(1);
     expect(s.voids, sim.label).toBe(0);
@@ -72,6 +85,7 @@ describe('FAIR ONLY roulette: the holder ends the game', () => {
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim);
     fairOnlyFinish(sim, s, [ROULETTE]);
+    expectCompacted(sim, ROULETTE);
     expect(end.said, sim.label).toEqual(['ok']);
     expect(end.over, sim.label).toBe(end.first);
     expect(sim.ownerEndsWritten, sim.label).toBe(1);
@@ -92,6 +106,7 @@ describe('FAIR ONLY roulette: the holder ends the game', () => {
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim, { houseAway: true });
     fairOnlyFinish(sim, s, [ROULETTE]);
+    expectCompacted(sim, ROULETTE);
     expect(end.said, sim.label).toEqual(['ending']);
     expect(end.over, sim.label).not.toBeNull();
     expect(sim.ownerEndsWritten, sim.label).toBe(1);
