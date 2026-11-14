@@ -10,6 +10,18 @@
 //! A raw seed from before the words ([`LEGACY_SEED_FILE`]) is retired when
 //! the wallet turns on, and a new wallet made from 24 words takes its place.
 //!
+//! 🆕 On a test network the wallet is on unless the player turned it off: a
+//! node that finds no switch file at its start (nobody has turned the switch
+//! on this network) loads the wallet by itself, minting it when none is on
+//! disk, and saves the switch on with a mark that says so ([`starts_unasked`],
+//! [`SwitchFile::auto`]). The Bank then says how the wallet came on, and its
+//! TURN OFF holds from the next start, as for any wallet. Without a wallet a
+//! station can read the Phone Book but cannot list itself or knock, and since
+//! stage 4 PR 12 the wallet pays for neither. Off a test network nothing
+//! changes: a wallet there is made by the Bank's CREATE, in the desktop app.
+//! A raw seed from before the words is left to the Bank's CREATE too, with
+//! its warning: replacing a wallet is never done unasked.
+//!
 //! The environment still decides first. `SSF_CHIA_LANE=1` holds the wallet on
 //! for that run (and is not remembered); any other non-empty value holds it
 //! off, and the Bank cannot override that (`SSF_CHIA_LANE=0` is the
@@ -227,56 +239,144 @@ pub struct SwitchFile {
     /// When it was last turned, unix seconds (for the operator reading it).
     #[serde(default)]
     pub at: u64,
+    /// On, and the node turned it on by itself at a start that found no
+    /// switch file ([`starts_unasked`]); no turn in the Bank has been saved
+    /// since. An older node reads the file without it, as on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
-/// What the switch file says: `Ok(false)` when there is none (a node that was
-/// never turned on), `Err` with the reason when it exists and cannot be read,
-/// so the node starts with the wallet off and says why rather than guessing.
+/// What the switch file says, or `Ok(None)` when there is none: nobody has
+/// turned the switch on this network, in the Bank or by a start of the node
+/// ([`starts_unasked`]). `Err` with the reason when it exists and cannot be
+/// read, so the node starts with the wallet off and says why rather than
+/// guessing.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn remembered(path: &Path) -> Result<bool, String> {
+pub fn chosen(path: &Path) -> Result<Option<SwitchFile>, String> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<SwitchFile>(&bytes)
-            .map(|f| f.on)
+            .map(Some)
             .map_err(|e| format!("{} is not a wallet switch the node can read ({e})", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{} cannot be read ({e})", path.display())),
     }
 }
 
-/// What the switch file says at startup ([`remembered`]), or `Ok(false)`
-/// unread while Chia is off on this computer (`strict`): the wallet does not
-/// start whatever the file says ([`starts_on`]), and the Bank's view of a
-/// wallet that is not loaded never shows it.
-#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn remembered_at_start(path: &Path, strict: bool) -> Result<bool, String> {
-    if strict {
-        return Ok(false);
-    }
-    remembered(path)
+/// Whether the switch file says on ([`chosen`]): `Ok(false)` when there is
+/// none. For the tests: the node asks [`chosen`], since on a test network
+/// no file is not an off ([`starts_unasked`], [`after_failed_turn`]).
+#[cfg(test)]
+pub fn remembered(path: &Path) -> Result<bool, String> {
+    chosen(path).map(|file| file.is_some_and(|f| f.on))
 }
 
-/// Remember the switch: written whole (a temporary file renamed over it),
-/// owner-only, like every file beside the identity.
+/// What the switch file says at startup ([`chosen`]), or `Ok(None)` unread
+/// while Chia is off on this computer (`strict`): the wallet does not start
+/// whatever the file says ([`starts_on`], [`starts_unasked`]), and the
+/// Bank's view of a wallet that is not loaded never shows it.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn chosen_at_start(path: &Path, strict: bool) -> Result<Option<SwitchFile>, String> {
+    if strict {
+        return Ok(None);
+    }
+    chosen(path)
+}
+
+/// 🆕 Whether the node turns its SSF wallet on by itself at this start: on a
+/// test network, with Chia on, `SSF_CHIA_LANE` unset, and no switch file
+/// (`chosen` is [`chosen_at_start`]'s answer: a file that says off holds,
+/// and one that cannot be read counts as off, so the caller never asks with
+/// it). Never where the only wallet on disk is a raw seed from before the 24
+/// words (`legacy_only`): turning on would retire it for a new wallet at a
+/// new address, which the Bank's CREATE does with a warning and a start
+/// does not do unasked. Off a test network a wallet is made only for the
+/// desktop app that can show its words ([`may_mint`]), by the Bank's CREATE.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn starts_unasked(test_net: bool, strict: bool, env: EnvSwitch, chosen: Option<&SwitchFile>, legacy_only: bool) -> bool {
+    test_net && !strict && env == EnvSwitch::Unset && chosen.is_none() && !legacy_only
+}
+
+/// 🆕 The node's line at a start that turned the wallet on unasked
+/// ([`starts_unasked`]). `minted`: this start made the wallet; otherwise one
+/// from before was on disk and came back.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn unasked_line(net_name: &str, minted: bool) -> String {
+    let which = if minted { "this start made one, from 24 words" } else { "the one on disk came back" };
+    format!(
+        "🏦 SSF wallet: on by itself — on {net_name} a node keeps an SSF wallet unless it is turned off in the SpacePhone's Bank, and no choice was saved here, so {which}; TURN OFF in the Bank holds from the next start"
+    )
+}
+
+/// 🆕 The memo after a start that turned the wallet on unasked tried to
+/// save the switch ([`remember_unasked`]). Saved: on, with the mark. Not
+/// saved: what the file now holds, read back (`reread`), since a failed
+/// save can still have landed. With no file the next start decides as this
+/// one did, so the wallet comes back and the memo says on; a file that
+/// cannot be read starts it off, and the memo carries why.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn unasked_memo(saved: Result<(), String>, reread: impl FnOnce() -> Result<Option<SwitchFile>, String>) -> SwitchMemo {
+    let on = SwitchMemo { remembered: true, error: None, auto: true };
+    match saved {
+        Ok(()) => on,
+        Err(_) => match reread() {
+            Ok(None) => on,
+            Ok(Some(file)) => SwitchMemo { remembered: file.on, error: None, auto: file.on && file.auto },
+            Err(why) => SwitchMemo { remembered: false, error: Some(why), auto: false },
+        },
+    }
+}
+
+/// 🆕 Whether the memo keeps the unasked mark after a Bank turn's save
+/// failed: only where the switch still reads on (`remembered`,
+/// [`after_failed_save`]'s answer) and the file, read back, still carries
+/// the mark. A file that cannot be read keeps what the memo held.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn auto_after_failed_save(remembered: bool, reread: Result<Option<SwitchFile>, String>, previous: bool) -> bool {
+    remembered
+        && match reread {
+            Ok(file) => file.is_some_and(|f| f.on && f.auto),
+            Err(_) => previous,
+        }
+}
+
+/// Remember the switch as the Bank turned it: written whole (a temporary
+/// file renamed over it), owner-only, like every file beside the identity.
+/// It carries no [`SwitchFile::auto`]: a turn in the Bank is the player's.
 #[cfg(feature = "chia-publish")]
 pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(&SwitchFile { on, at: now }).map_err(std::io::Error::other)?;
+    save(path, &SwitchFile { on, at: now, auto: false })
+}
+
+/// 🆕 Remember the switch on after a start that turned the wallet on
+/// unasked ([`starts_unasked`]), with the mark that says so.
+#[cfg(feature = "chia-publish")]
+pub fn remember_unasked(path: &Path, now: u64) -> std::io::Result<()> {
+    save(path, &SwitchFile { on: true, at: now, auto: true })
+}
+
+#[cfg(feature = "chia-publish")]
+fn save(path: &Path, file: &SwitchFile) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
     crate::chia_contact::write_private(path, &bytes)
 }
 
 /// Remember the switch off, for the Bank's TURN OFF: `Ok(true)` when the
-/// file was written. While Chia is off on this computer (`strict`) a missing
-/// file already reads as off ([`remembered`]), so none is created. An
-/// existing `chia_wallet.json` is still saved off while Chia is off, and
-/// that is deliberate: the player's off then holds at the next start with
-/// Chia on, unless `SSF_CHIA_LANE=1` is in the node's environment there,
-/// which turns the wallet on whatever the switch says
+/// file was written. While Chia is off on this computer (`strict`), off a
+/// test network, a missing file already reads as off ([`remembered`]), so
+/// none is created. On a test network (`test_net`) a missing file is no
+/// off: the next start with Chia on would turn the wallet on unasked
+/// ([`starts_unasked`]), so the off is saved there even while Chia is off.
+/// An existing `chia_wallet.json` is saved off while Chia is off on every
+/// network, and that is deliberate: the player's off then holds at the next
+/// start with Chia on, unless `SSF_CHIA_LANE=1` is in the node's
+/// environment there, which turns the wallet on whatever the switch says
 /// ([`starts_on`], [`turned_off_line`]). If that save fails, the Bank's
 /// route reads the file back to say what it now holds
 /// ([`after_failed_save`]). So with Chia off, a TURN OFF still writes this
 /// Chia file, and may read it.
 #[cfg(feature = "chia-publish")]
-pub fn remember_off(path: &Path, strict: bool, now: u64) -> std::io::Result<bool> {
-    if strict && !path.try_exists().unwrap_or(true) {
+pub fn remember_off(path: &Path, strict: bool, test_net: bool, now: u64) -> std::io::Result<bool> {
+    if strict && !test_net && !path.try_exists().unwrap_or(true) {
         return Ok(false);
     }
     remember(path, false, now).map(|()| true)
@@ -323,6 +423,42 @@ pub fn after_failed_save(
             format!("the switch could not be saved ({err}) or read back ({read}), so whether the wallet is on at the next start is not known"),
         ),
     }
+}
+
+/// 🆕 What the memo holds after a Bank turn's save of `target` failed with
+/// `err`, and how to say so: `(remembered, auto, why)`. The file is read
+/// back whole (`reread`, [`chosen`]), because no file is not an off where a
+/// start turns the wallet on unasked. `unasked_without` is
+/// [`starts_unasked`] of this node at a start with Chia on and no switch
+/// file: there, with no file read back (the unasked start's own save never
+/// landed, or the file went since), the next start decides as that one did
+/// and the wallet comes back on with the mark, whatever was asked, so an
+/// off is never said to hold (#436 review). Every other case is
+/// [`after_failed_save`]'s, the mark kept as [`auto_after_failed_save`]
+/// says. `previous` is the memo's `(remembered, auto)` before the turn.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn after_failed_turn(
+    target: bool,
+    err: &str,
+    reread: Result<Option<SwitchFile>, String>,
+    previous: (bool, bool),
+    strict: bool,
+    env: EnvSwitch,
+    unasked_without: bool,
+) -> (bool, bool, String) {
+    if unasked_without && matches!(reread, Ok(None)) {
+        let off = if target { "" } else { "the off does not hold: " };
+        return (
+            true,
+            true,
+            format!(
+                "the switch could not be saved ({err}), and with no switch file this node turns the wallet on by itself, so {off}the wallet comes back on at the next start with Chia on"
+            ),
+        );
+    }
+    let says_on = reread.as_ref().map(|file| file.as_ref().is_some_and(|f| f.on)).map_err(Clone::clone);
+    let (remembered, why) = after_failed_save(target, err, says_on, previous.0, strict, env);
+    (remembered, auto_after_failed_save(remembered, reread, previous.1), why)
 }
 
 /// What `SSF_CHIA_LANE=1` does at a start with Chia on (no
@@ -414,6 +550,11 @@ pub struct WalletSwitch {
     /// On: `SSF_CHIA_LANE=1` holds it on, so the Bank cannot turn it off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
+    /// On, and not `held`: the node turned it on by itself at a start that
+    /// found no choice saved ([`starts_unasked`]), and no turn in the Bank
+    /// has been saved since. The Bank says so. An older node never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
     /// On: the wallet is made from 24 words the node keeps, so the Bank can
     /// back them up. Ready: turning on makes (or loads) a wallet from 24
     /// words, so CREATE can promise them. The capability marker: an older
@@ -477,11 +618,14 @@ pub fn backup_of(test_net: bool, channel: bool) -> Backup {
 }
 
 /// The node's memory of the switch between turns: whether the file says on,
-/// and why the last turn (or the load at startup) failed.
+/// why the last turn (or the load at startup) failed, and whether the on is
+/// the node's own, from a start that turned the wallet on unasked
+/// ([`SwitchFile::auto`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SwitchMemo {
     pub remembered: bool,
     pub error: Option<String>,
+    pub auto: bool,
 }
 
 /// What the node knows of the wallet's files and key for the fingerprint:
@@ -527,6 +671,7 @@ pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts:
         legacy: ready && !facts.identity_on_disk && facts.legacy_on_disk,
         stays: on && (env == EnvSwitch::On || memo.remembered),
         held: on && env == EnvSwitch::On,
+        auto: on && env != EnvSwitch::On && memo.auto,
         // Every wallet this build turns on comes from 24 words.
         mnemonic: ready || (on && facts.mnemonic),
         backed_up: on && facts.mnemonic && facts.backed_up,
@@ -1083,6 +1228,7 @@ mod tests {
             legacy: false,
             stays: false,
             held: false,
+            auto: false,
             mnemonic: false,
             backed_up: false,
             reminted: false,
@@ -1112,6 +1258,145 @@ mod tests {
         assert!(!starts_on(true, false, Unset, false), "never turned on");
         assert!(!starts_on(true, false, Off, true), "SSF_CHIA_LANE=0 overrides the switch");
         assert!(!starts_on(false, false, On, true), "a read-only build never loads a wallet");
+    }
+
+    /// 🆕 With no choice saved, a test-network node turns its wallet on by
+    /// itself, and nothing else does: a saved off or on is a choice, Chia off
+    /// and `SSF_CHIA_LANE` decide first, mainnet waits for the Bank's CREATE,
+    /// and a raw seed from before the 24 words is never replaced unasked.
+    #[test]
+    fn a_wallet_nobody_chose_starts_by_itself_on_a_test_network_only() {
+        use EnvSwitch::*;
+        let off = SwitchFile { on: false, at: 1, auto: false };
+        let on = SwitchFile { on: true, at: 1, auto: false };
+        let unasked = SwitchFile { on: true, at: 1, auto: true };
+        assert!(starts_unasked(true, false, Unset, None, false), "testnet11, Chia on, nothing set, nothing saved");
+        assert!(!starts_unasked(false, false, Unset, None, false), "mainnet: only the Bank's CREATE makes a wallet");
+        assert!(!starts_unasked(true, true, Unset, None, false), "Chia off on this computer wins");
+        assert!(!starts_unasked(true, false, Off, None, false), "SSF_CHIA_LANE=0 holds it off");
+        assert!(!starts_unasked(true, false, On, None, false), "SSF_CHIA_LANE=1 is the operator's own on, and saves nothing");
+        assert!(!starts_unasked(true, false, Unset, None, true), "a raw seed from before the words is left to the Bank");
+        for file in [&off, &on, &unasked] {
+            assert!(!starts_unasked(true, false, Unset, Some(file), false), "a saved switch is a choice: {file:?}");
+        }
+        // Every other combination with any one of the holds in place.
+        for test_net in [false, true] {
+            for strict in [false, true] {
+                for env in [Unset, On, Off] {
+                    for chosen in [None, Some(&off), Some(&on)] {
+                        for legacy_only in [false, true] {
+                            let alone = test_net && !strict && env == Unset && chosen.is_none() && !legacy_only;
+                            assert_eq!(starts_unasked(test_net, strict, env, chosen, legacy_only), alone);
+                            // What the start then does: on by the file, by
+                            // the environment, or unasked; never while Chia
+                            // is off or under a hard off.
+                            let unasked = starts_unasked(test_net, strict, env, chosen, legacy_only);
+                            let starts = starts_on(true, strict, env, chosen.is_some_and(|f| f.on) || unasked);
+                            assert!(!(starts && (strict || env == Off)), "{test_net} {strict} {env:?} {chosen:?} {legacy_only}");
+                            if chosen == Some(&off) && env != On {
+                                assert!(!starts, "the player's off holds wherever the environment does not turn it on");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 🆕 The switch file carries the mark only for an on the node made, and
+    /// a file from before it, or from the Bank, reads without one.
+    #[test]
+    fn the_switch_file_marks_an_on_the_node_made_and_reads_without_the_mark() {
+        let unasked = SwitchFile { on: true, at: 5, auto: true };
+        assert_eq!(serde_json::to_string(&unasked).unwrap(), r#"{"on":true,"at":5,"auto":true}"#);
+        assert_eq!(serde_json::to_string(&SwitchFile { on: true, at: 5, auto: false }).unwrap(), r#"{"on":true,"at":5}"#, "the Bank's file is as it was");
+        assert_eq!(serde_json::from_str::<SwitchFile>(r#"{"on":true,"at":5}"#).unwrap(), SwitchFile { on: true, at: 5, auto: false });
+        assert_eq!(serde_json::from_str::<SwitchFile>(r#"{"on":true,"at":5,"auto":true}"#).unwrap(), unasked);
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-switch-unasked-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SWITCH_FILE);
+        assert_eq!(chosen(&path), Ok(None), "no file: nobody chose");
+        std::fs::write(&path, br#"{"on":false}"#).unwrap();
+        assert_eq!(chosen(&path), Ok(Some(SwitchFile { on: false, at: 0, auto: false })), "an off is a choice");
+        #[cfg(feature = "chia-publish")]
+        {
+            remember_unasked(&path, 7).unwrap();
+            assert_eq!(chosen(&path), Ok(Some(SwitchFile { on: true, at: 7, auto: true })));
+            assert_eq!(remembered(&path), Ok(true), "and it is back on at the next start, by the file");
+            remember(&path, true, 8).unwrap();
+            assert_eq!(chosen(&path), Ok(Some(SwitchFile { on: true, at: 8, auto: false })), "a turn in the Bank drops the mark");
+            remember_unasked(&path, 9).unwrap();
+            remember(&path, false, 10).unwrap();
+            assert_eq!(chosen(&path), Ok(Some(SwitchFile { on: false, at: 10, auto: false })), "and so does TURN OFF");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🆕 After an unasked start the memo says on with the mark when the
+    /// save landed, and otherwise what the file holds: with no file the next
+    /// start decides the same way, so the wallet still comes back.
+    #[test]
+    fn the_memo_after_an_unasked_start_follows_the_file_when_its_save_failed() {
+        let on = SwitchMemo { remembered: true, error: None, auto: true };
+        assert_eq!(unasked_memo(Ok(()), || panic!("a save that landed is not read back")), on);
+        assert_eq!(unasked_memo(Err("disk full".into()), || Ok(None)), on, "no file: the next start is unasked again");
+        assert_eq!(unasked_memo(Err("x".into()), || Ok(Some(SwitchFile { on: true, at: 1, auto: true }))), on, "the save landed after all");
+        assert_eq!(
+            unasked_memo(Err("x".into()), || Ok(Some(SwitchFile { on: true, at: 1, auto: false }))),
+            SwitchMemo { remembered: true, error: None, auto: false }
+        );
+        assert_eq!(
+            unasked_memo(Err("x".into()), || Ok(Some(SwitchFile { on: false, at: 1, auto: false }))),
+            SwitchMemo { remembered: false, error: None, auto: false },
+            "an off written meanwhile holds"
+        );
+        assert_eq!(
+            unasked_memo(Err("x".into()), || Err("torn".into())),
+            SwitchMemo { remembered: false, error: Some("torn".into()), auto: false },
+            "a file that cannot be read starts the wallet off, and the Bank is told why"
+        );
+        // After a Bank turn's save failed, the mark stays only with an on
+        // the file still marks.
+        let marked = || Ok(Some(SwitchFile { on: true, at: 1, auto: true }));
+        assert!(auto_after_failed_save(true, marked(), false));
+        assert!(!auto_after_failed_save(false, marked(), true), "the switch reads off");
+        assert!(!auto_after_failed_save(true, Ok(Some(SwitchFile { on: true, at: 1, auto: false })), true), "the Bank's on landed");
+        assert!(!auto_after_failed_save(true, Ok(None), true));
+        assert!(auto_after_failed_save(true, Err("torn".into()), true), "unreadable: what the memo held");
+        assert!(!auto_after_failed_save(true, Err("torn".into()), false));
+    }
+
+    /// 🆕 The Bank is told the wallet came on by itself only while it is on
+    /// for that reason: not while `SSF_CHIA_LANE=1` holds it, and never for a
+    /// wallet that is not loaded.
+    #[test]
+    fn the_unasked_mark_rides_only_with_a_wallet_that_is_on_and_not_held() {
+        use EnvSwitch::*;
+        let memo = SwitchMemo { remembered: true, error: None, auto: true };
+        let loaded = KeyFacts { mnemonic: true, ..KeyFacts::default() };
+        let v = view(true, Unset, true, &memo, &loaded);
+        assert!(v.auto && v.stays && !v.held);
+        assert!(serde_json::to_string(&v).unwrap().contains(r#""stays":true,"auto":true,"#));
+        let held = view(true, On, true, &memo, &loaded);
+        assert!(held.held && !held.auto, "the environment holds it on: that is the reason said");
+        for (built, env, is_loaded) in [(true, Unset, false), (true, Off, false), (false, Unset, false)] {
+            assert!(!view(built, env, is_loaded, &memo, &KeyFacts::default()).auto, "{built} {env:?}");
+        }
+        let turned = SwitchMemo { auto: false, ..memo };
+        let v = view(true, Unset, true, &turned, &loaded);
+        assert!(!v.auto);
+        assert!(!serde_json::to_string(&v).unwrap().contains("auto"), "absent, not false: an older page reads the switch as before");
+    }
+
+    #[test]
+    fn the_unasked_start_says_whether_it_made_the_wallet_and_how_to_turn_it_off() {
+        assert_eq!(
+            unasked_line("testnet11", true),
+            "🏦 SSF wallet: on by itself — on testnet11 a node keeps an SSF wallet unless it is turned off in the SpacePhone's Bank, and no choice was saved here, so this start made one, from 24 words; TURN OFF in the Bank holds from the next start"
+        );
+        let came_back = unasked_line("testnet11", false);
+        assert!(came_back.contains("the one on disk came back") && !came_back.contains("made one"), "{came_back}");
     }
 
     #[test]
@@ -1228,19 +1513,31 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(SWITCH_FILE);
         std::fs::write(&path, b"{\"on\":tr").unwrap();
-        assert_eq!(remembered_at_start(&path, true), Ok(false), "not read while Chia is off");
-        assert!(remembered_at_start(&path, false).is_err(), "read, and reported, with Chia on");
+        assert_eq!(chosen_at_start(&path, true), Ok(None), "not read while Chia is off");
+        assert!(chosen_at_start(&path, false).is_err(), "read, and reported, with Chia on");
         std::fs::write(&path, br#"{"on":true}"#).unwrap();
-        assert_eq!(remembered_at_start(&path, false), Ok(true));
+        assert_eq!(chosen_at_start(&path, false), Ok(Some(SwitchFile { on: true, at: 0, auto: false })));
         #[cfg(feature = "chia-publish")]
         {
-            assert!(remember_off(&path, true, 9).unwrap(), "a file an earlier run left is saved off");
-            assert_eq!(remembered(&path), Ok(false));
+            for test_net in [false, true] {
+                std::fs::write(&path, br#"{"on":true}"#).unwrap();
+                assert!(remember_off(&path, true, test_net, 9).unwrap(), "a file an earlier run left is saved off");
+                assert_eq!(remembered(&path), Ok(false));
+                std::fs::remove_file(&path).unwrap();
+            }
+            assert!(!remember_off(&path, true, false, 10).unwrap(), "off a test network: nothing to clear");
+            assert!(!path.exists(), "no chia_wallet.json created there while Chia is off");
+            // On a test network a missing file is no off (`starts_unasked`),
+            // so the off is written even while Chia is off, and holds.
+            assert!(remember_off(&path, true, true, 10).unwrap());
+            let saved = chosen(&path).unwrap();
+            assert_eq!(saved, Some(SwitchFile { on: false, at: 10, auto: false }));
+            assert!(!starts_unasked(true, false, EnvSwitch::Unset, saved.as_ref(), false), "the off holds at the next start with Chia on");
             std::fs::remove_file(&path).unwrap();
-            assert!(!remember_off(&path, true, 10).unwrap(), "nothing to clear");
-            assert!(!path.exists(), "no chia_wallet.json created while Chia is off");
-            assert!(remember_off(&path, false, 11).unwrap());
-            assert_eq!(remembered(&path), Ok(false), "with Chia on, TURN OFF writes the switch as before");
+            for test_net in [false, true] {
+                assert!(remember_off(&path, false, test_net, 11).unwrap());
+                assert_eq!(remembered(&path), Ok(false), "with Chia on, TURN OFF writes the switch as before");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1273,6 +1570,50 @@ mod tests {
         let (on, why) = after_failed_save(true, "disk full", Err("unreadable".into()), true, false, Unset);
         assert!(on && why.contains("not known"), "unreadable keeps the memo: {why}");
         assert!(!after_failed_save(true, "x", Err("y".into()), false, false, Unset).0);
+    }
+
+    /// 🆕 A Bank turn whose save failed and left no switch file, where a
+    /// start turns the wallet on unasked (#436 review): the memo says on,
+    /// with the mark, and the words never promise an off, since the next
+    /// start with Chia on brings the wallet back. Where no start is unasked,
+    /// or a file is there, the answer is `after_failed_save`'s as before.
+    #[test]
+    fn a_failed_turn_with_no_switch_file_never_promises_an_off_the_next_start_undoes() {
+        use EnvSwitch::*;
+        for strict in [false, true] {
+            for previous in [(true, true), (false, false)] {
+                let (on, auto, why) = after_failed_turn(false, "disk full", Ok(None), previous, strict, Unset, true);
+                assert!(on && auto, "{why}");
+                assert!(why.contains("the off does not hold") && why.contains("comes back on at the next start with Chia on"), "{why}");
+                assert!(!why.contains("stay off") && !why.contains("starts off") && !why.contains("read off"), "{why}");
+            }
+        }
+        let (on, auto, why) = after_failed_turn(true, "disk full", Ok(None), (true, true), false, Unset, true);
+        assert!(on && auto && why.contains("comes back on") && !why.contains("does not hold"), "{why}");
+        // No start is unasked here (off a test network, SSF_CHIA_LANE set,
+        // or only a raw seed on disk): no file reads as off, as it did.
+        for (target, previous) in [(false, (true, true)), (true, (false, false))] {
+            let (on, auto, why) = after_failed_turn(target, "disk full", Ok(None), previous, false, Unset, false);
+            assert_eq!((on, why), after_failed_save(target, "disk full", Ok(false), previous.0, false, Unset));
+            assert!(!auto);
+        }
+        // A file is there: it decides, whatever a start without one would do.
+        let file = |on: bool, auto: bool| Ok(Some(SwitchFile { on, at: 1, auto }));
+        for unasked in [false, true] {
+            let (on, auto, why) = after_failed_turn(false, "dir sync failed", file(false, false), (true, true), false, Unset, unasked);
+            assert!(!on && !auto && why.contains("stay off"), "the off landed: {why}");
+            let (on, auto, why) = after_failed_turn(false, "disk full", file(true, true), (true, true), false, Unset, unasked);
+            assert!(on && auto && why.contains("comes back on"), "the off did not land, and the node's on is still marked: {why}");
+            let (on, auto, _) = after_failed_turn(true, "dir sync failed", file(true, false), (true, true), false, Unset, unasked);
+            assert!(on && !auto, "the Bank's on landed: the on is the player's");
+            let (on, auto, why) = after_failed_turn(false, "disk full", Err("torn".into()), (true, true), false, Unset, unasked);
+            assert!(on && auto && why.contains("not known"), "unreadable keeps the memo: {why}");
+        }
+        // Chia off with SSF_CHIA_LANE=1: no start is unasked (`starts_unasked`
+        // wants it unset), so the environment's words stand.
+        assert!(!starts_unasked(true, false, On, None, false));
+        let (on, _, why) = after_failed_turn(false, "dir sync failed", file(false, false), (false, false), true, On, false);
+        assert!(!on && why.contains(STILL_ON_WORDS), "{why}");
     }
 
     /// ⛓️ A TURN OFF while Chia is off with `SSF_CHIA_LANE=1` saved but not
@@ -1373,7 +1714,7 @@ mod tests {
     #[test]
     fn the_bank_reads_one_state_and_only_the_facts_that_state_needs() {
         use EnvSwitch::*;
-        let memo = |remembered, error: Option<&str>| SwitchMemo { remembered, error: error.map(str::to_string) };
+        let memo = |remembered, error: Option<&str>| SwitchMemo { remembered, error: error.map(str::to_string), auto: false };
         let identity = KeyFacts { identity_on_disk: true, ..KeyFacts::default() };
         let none = KeyFacts::default();
         let v = view(false, On, false, &memo(true, Some("x")), &identity);
@@ -1444,7 +1785,7 @@ mod tests {
     #[test]
     fn the_words_flags_ride_only_in_the_state_they_describe() {
         use EnvSwitch::*;
-        let memo = |remembered| SwitchMemo { remembered, error: None };
+        let memo = |remembered| SwitchMemo { remembered, error: None, auto: false };
         let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true, ..KeyFacts::default() };
         let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
 
@@ -1478,7 +1819,7 @@ mod tests {
     #[test]
     fn the_at_rest_flags_ride_only_for_a_loaded_24_word_wallet() {
         use EnvSwitch::*;
-        let memo = SwitchMemo { remembered: true, error: None };
+        let memo = SwitchMemo { remembered: true, error: None, auto: false };
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
         let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Dpapi), ..KeyFacts::default() };
         assert_eq!(
@@ -1506,7 +1847,7 @@ mod tests {
     #[test]
     fn the_keychain_lock_rides_as_keychain() {
         use EnvSwitch::*;
-        let memo = SwitchMemo { remembered: true, error: None };
+        let memo = SwitchMemo { remembered: true, error: None, auto: false };
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
         let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Keychain), ..KeyFacts::default() };
         assert_eq!(
@@ -1958,7 +2299,7 @@ mod tests {
             assert_eq!(turn_refusal(true, None, env, true), (env == Off).then_some(OFF_WORDS), "{env:?}");
             assert_eq!(turn_refusal(false, None, env, true), Some(UNBUILT_WORDS), "{env:?}");
         }
-        let memo = SwitchMemo { remembered: true, error: None };
+        let memo = SwitchMemo { remembered: true, error: None, auto: false };
         let on_disk = KeyFacts { identity_on_disk: true, ..KeyFacts::default() };
         let loaded = KeyFacts { mnemonic: true, ..KeyFacts::default() };
         for net in ChiaNet::ALL {

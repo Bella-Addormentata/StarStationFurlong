@@ -11,6 +11,13 @@
 // node's fingerprint and the page's own state, and sends the request, so both
 // are tested without main.ts. The 24 words' BACK UP is bankBackup.ts.
 //
+// 🆕 On a test network a node with no choice saved turns its wallet on by
+// itself at its start, making one when none is on disk, so a new player's
+// computer can list itself and knock without a visit to the Bank. The node
+// marks such a wallet (`auto`), and RECEIVE says above the address how it
+// came on and that TURN OFF holds, until the player has saved its words or
+// turned the switch. CREATE and TURN ON stay for a wallet that is off.
+//
 // The node words its own refusals (a build that only reads, `SSF_CHIA_LANE`
 // holding the wallet off or on); the page only says what it saw itself (no
 // answer, a timeout, an older node).
@@ -153,6 +160,24 @@ const REMINTED = (net: ChiaNetwork, listing: ChiaListing | undefined): string =>
   return net.test && !listing?.dish && (!listing || listing.on) ? `${replaced} Until the new one holds a coin, your node is not listed in the Phone Book.` : replaced;
 };
 
+/** 🆕 The notice over the address of a wallet the node turned on by itself
+ *  (`ChiaWalletSwitch.auto`): how it came on, why a node keeps one, and
+ *  that the switch below still decides. It promises no listing: that is
+ *  LIST ME's, and the line under the network says who pays. */
+export const ON_BY_ITSELF = (net: ChiaNetwork): string =>
+  `Your station node turned this SSF wallet on by itself: on ${net.name} it keeps one unless you turn it off here, because without a wallet it can read the Phone Book but cannot list itself or knock. TURN OFF holds from its next start.`;
+
+/** The notices over the address of a wallet that is on: one the node
+ *  turned on by itself (on a test network only: no node does so anywhere
+ *  else), until its words are saved, and one this run made in place of a
+ *  raw-seed wallet. */
+function onNotice(net: ChiaNetwork, w: ChiaWalletSwitch, listing: ChiaListing | undefined): string | null {
+  if (w.state !== 'on') return null;
+  const byItself = net.test && w.auto === true && !w.held && !w.backed_up;
+  const said = [byItself ? ON_BY_ITSELF(net) : null, w.reminted ? REMINTED(net, listing) : null].filter((line): line is string => line !== null);
+  return said.length ? said.join(' ') : null;
+}
+
 /** ⛓️ The network line: what the node's coins are. */
 export function networkLine(net: ChiaNetwork): { text: string; warn: boolean } {
   return net.test
@@ -257,7 +282,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   const none = { ...bare, listing: pays } as const;
   if (fp.chia_address) {
     if (!w) return { ...bare, text: '', error: null, showsAddress: true };
-    const notice = w.state === 'on' && w.reminted ? REMINTED(net, listMe) : null;
+    const notice = onNotice(net, w, listMe);
     if (w.held) {
       return { ...none, notice, text: "SSF wallet on — SSF_CHIA_LANE=1 in your node's environment holds it on.", error, showsAddress: true };
     }
