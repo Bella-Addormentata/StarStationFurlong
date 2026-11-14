@@ -597,10 +597,15 @@ describe("the oracle's own base rule", () => {
       top.set(old![0], old![1]);
       top.set(forged.key, forged.value);
     });
-    await sim.run(2_000);
     await sim.syncAll();
     const held = A.p.doc.getMap<unknown>('casinoComputed');
     expect(held.has(old![0]) && held.has(forged.key) && held.has(realKey), sim.label).toBe(true);
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(realKey);
+    // The pages delete the forged one (PR 6c-4b-3a); the old one, below the base, is not looked at and stays.
+    await sim.run(8_000);
+    await sim.syncAll();
+    expect([held.has(old![0]), held.has(forged.key), held.has(realKey)], sim.label).toEqual([true, false, true]);
     sim.enter(A);
     expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(realKey);
     expect(sim.ledgerProblems(A), sim.label).toEqual([]);

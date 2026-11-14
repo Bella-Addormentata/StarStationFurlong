@@ -1106,14 +1106,23 @@ export class Sim {
       // 🤝 (And as its transfers and delegations change: the chain and the
       // houses the oracle holds for this load are the last the doc gave it,
       // so one that comes and goes between two looks is read as it comes.)
+      // (Once a game for a transaction, whatever it wrote of it: a flood of
+      // forged transfers is hundreds of keys, and the oracle reads them all
+      // at each look.)
+      const looked = new Set<string>();
+      const look = (t: string, inc: string): void => {
+        if (looked.has(`${t}|${inc}`)) return;
+        looked.add(`${t}|${inc}`);
+        this.foBase(sp, computed, { room: PAGE_ROOM, t, inc });
+      };
       for (const k of top ?? []) {
         if (k?.startsWith('xf:')) {
           const at = parseFairOnlyKey(k);
-          if (at?.kind === 'xf') this.foBase(sp, computed, { room: PAGE_ROOM, t: at.t, inc: at.inc });
+          if (at?.kind === 'xf') look(at.t, at.inc);
         } else if (k?.startsWith('hk:')) {
           for (const name of [...(this.foHeld.get(sp.p)?.keys() ?? [])]) {
             const [t, inc] = name.split('|');
-            this.foBase(sp, computed, { room: PAGE_ROOM, t, inc });
+            look(t, inc);
           }
         }
       }
@@ -1122,7 +1131,7 @@ export class Sim {
         // (The oracle's own base for this page, kept as its doc's checkpoints
         // change: the base it holds when the doc loses it is the last it had.)
         const at = parseFairOnlyKey(k);
-        if (at?.kind === 'ck') this.foBase(sp, computed, { room: PAGE_ROOM, t: at.t, inc: at.inc });
+        if (at?.kind === 'ck') look(at.t, at.inc);
         if (!computed.has(k)) continue;
         this.noteCk(k, computed.get(k));
         if (tr.origin === HOUSE_ORIGIN) this.houseCks.add(k);
