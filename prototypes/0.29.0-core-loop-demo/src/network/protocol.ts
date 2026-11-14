@@ -53,7 +53,7 @@ export type TransportMode =
 
 /** Surfaced diegetically as "station records backed up" (v006 §12.6). */
 export interface DurabilityState {
-  replicas: number;      // co-hosts holding the latest sealed state
+  replicas: number;      // computers holding the latest sealed state
   sealedEpoch: number;   // 0 until Station Seals land (Phase 3)
   pinned: boolean;
 }

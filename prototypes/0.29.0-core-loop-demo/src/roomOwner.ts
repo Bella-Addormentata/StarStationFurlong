@@ -7,17 +7,18 @@
  * predicate in the codebase had no coverage at all. It does now.
  *
  * 🔒 #142: this predicate does NOT decide every owner-gated surface. The
- * deed hand-over, the sole-croupier election, the room's access mode and
- * co-host accept/deny/revoke all take main.ts's `currentRoomDeedIsMine()` —
- * the RAW owner — because they can lock a room out or unseat the people
- * keeping it alive, and the shareholder branch below rests on a peer-written
- * record that names neither this room nor its owner.
+ * deed hand-over, the sole-croupier election and the room's access mode all
+ * take main.ts's `currentRoomDeedIsMine()` — the RAW owner — because they
+ * can hand a room away or lock it out, and the shareholder branch below rests
+ * on a peer-written record that names neither this room nor its owner.
+ * (Co-host accept/deny/revoke sat with them until rooms came to be served by
+ * every computer that holds them, roomHolders.ts: nobody is picked now.)
  *
  * The authoritative split, surface by surface, is documented ONCE at
  * main.ts's `isLocalPlayerRoomOwner` (the wrapper that supplies this
  * predicate's live getters). Deliberately not repeated here: a second copy
  * is a second thing to forget when a surface moves, which is exactly how
- * this header came to claim co-hosts after they had left.
+ * this header once went on claiming a surface that had left.
  *
  * Dependencies arrive as an argument rather than by import, so a test can
  * state "this player, holding these shares" directly. main.ts keeps a
@@ -40,9 +41,9 @@ export interface OwnerContext {
    *
    *  #68's V1 owner rule makes joint owners owner-equivalent on the surfaces
    *  this predicate decides — NOT "everywhere", which is what this line said
-   *  before #142 narrowed it. The deed hand-over, the croupier election, the
-   *  room's access mode and co-host management take the raw deed holder
-   *  instead; see main.ts's `isLocalPlayerRoomOwner` for the full split.
+   *  before #142 narrowed it. The deed hand-over, the croupier election and
+   *  the room's access mode take the raw deed holder instead; see main.ts's
+   *  `isLocalPlayerRoomOwner` for the full split.
    *
    *  ⚠️ Worth knowing at the point you SUPPLY this: whatever computes it
    *  reads a peer-written record. main.ts's `isVentureShareholder` consults
@@ -143,9 +144,9 @@ export interface DeedContext {
  *
  * Deliberately the RAW owner, not the shareholder-extended `isRoomOwner`: a
  * venture's co-owners get access to the property, not the right to sell it.
- * Since #142 this also decides the room's access mode and co-host management,
- * so it is the narrower of the two authority predicates and the one that
- * governs everything irreversible.
+ * Since #142 this also decides the room's access mode, so it is the narrower
+ * of the two authority predicates and the one that governs everything
+ * irreversible.
  *
  * Two ways to hold it, and the second is why `ownerKeyB64` exists: the owner
  * id may be our player id directly, or it may be an id whose `players` entry

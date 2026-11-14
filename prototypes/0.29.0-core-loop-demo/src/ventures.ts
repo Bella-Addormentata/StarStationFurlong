@@ -10,9 +10,9 @@
  * one seam.
  *
  * 🔒 #142 NARROWED IT — "full" owner-equivalence is no longer accurate. The
- * room's ACCESS MODE and co-host accept/deny/revoke now take the raw deed
- * holder, as the deed hand-over and the croupier election always have, so a
- * shareholder cannot lock a venture property out or unseat its co-hosts. The
+ * room's ACCESS MODE now takes the raw deed holder, as the deed hand-over
+ * and the croupier election always have, so a shareholder cannot lock a
+ * venture property out. The
  * reason is in THIS module: the record `isVentureShareholder` reads is
  * shape-checked only, and nothing in it is related to the room it sits in
  * (see the note below on why no client-side relation check can exist) — so a

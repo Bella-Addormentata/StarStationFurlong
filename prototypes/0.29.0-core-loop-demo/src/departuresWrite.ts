@@ -62,7 +62,7 @@ import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
-import { keeperNodeTrust } from './coHostNodes';
+import { holderNodeTrust } from './roomHolders';
 import { roomStateArrived, underWriteDeadline, withTimeout } from './farDoorWrite';
 import { applyDeparturesPublish, publishRoomOrder } from './departuresDoc';
 import type { DeparturesPublish } from './departuresDoc';
@@ -179,7 +179,7 @@ async function session(
       roomId: boot.roomId,
       channel,
       ...ysyncSigner(),
-      ...keeperNodeTrust, // 🤝 C3: the room's keeper nodes count as its own state
+      ...holderNodeTrust, // 🤝 a holder's node counts as the room's own state
       bootRecord: () => p.getBootRecord(),
     });
     const s = sync;

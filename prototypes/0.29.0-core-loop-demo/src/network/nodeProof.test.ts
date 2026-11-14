@@ -1,7 +1,7 @@
 /**
  * 🤝 A node's proof that it built a room-sync frame (C3, #332 review): the
  * bytes it signs, the check, and the readiness gate it opens for a room whose
- * owner's game is closed but whose keepers' nodes still serve it.
+ * owner's game is closed but which other computers that hold it still serve.
  */
 import * as ed from '@noble/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
@@ -9,7 +9,7 @@ import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { CO_HOST_NODES_MAP, keeperNodeOk, keeperNodeTrust, keeperNodesIn, setLocalKeeperNode, signCoHostNode, type CoHostSigner } from '../coHostNodes';
+import { HOLDER_NODES_MAP, MAX_AGE_MS, MAX_HOLDERS, holderNodeOk, holderNodeTrust, holderNodesIn, setLocalHolderNode, signHolderNode, type HolderSigner } from '../roomHolders';
 import { NODE_PROOF_SKEW_MS, nodeProofSigner, nodeStateSignBytes } from './nodeProof';
 import { YjsSync } from './YjsSync';
 
@@ -31,7 +31,7 @@ function nodeKey(name: string) {
 }
 
 /** A player's identity, as the tabs keep one. */
-function identity(name: string): CoHostSigner {
+function identity(name: string): HolderSigner {
   const seed = sha256(utf8ToBytes(`ssf-identity-test|${name}`));
   return { pub: b64url(ed.getPublicKey(seed)), sign: (bytes) => b64url(ed.sign(bytes, seed)) };
 }
@@ -61,15 +61,19 @@ function nodeReply(state: Uint8Array, node: ReturnType<typeof nodeKey> | null, a
   return { env, payload };
 }
 
-/** A room doc whose owner filed `node` as theirs. */
-function roomKeptBy(owner: CoHostSigner, node: ReturnType<typeof nodeKey>, now: number): Y.Doc {
+/** A room doc (an owner, a name) whose owner filed `node` as theirs. */
+function roomKeptBy(owner: HolderSigner, node: ReturnType<typeof nodeKey>, now: number): Y.Doc {
   const doc = new Y.Doc();
   doc.getMap('roomInfo').set('owner', 'player-1');
   doc.getMap('roomInfo').set('name', 'Kept');
   doc.getMap('players').set('player-1', { keyB64: owner.pub });
-  const record = signCoHostNode(ROOM, { irohNodeId: node.id }, now - 1000, owner)!;
-  doc.getMap(CO_HOST_NODES_MAP).set(owner.pub, record);
+  file(doc, owner, node, now - 1000);
   return doc;
+}
+
+/** `who` files `node` as theirs in `doc`, stamped `at`. */
+function file(doc: Y.Doc, who: HolderSigner, node: ReturnType<typeof nodeKey>, at: number, room = ROOM): void {
+  doc.getMap(HOLDER_NODES_MAP).set(who.pub, signHolderNode(room, { irohNodeId: node.id }, at, who, false)!);
 }
 
 describe('🤝 a node’s proof', () => {
@@ -80,7 +84,7 @@ describe('🤝 a node’s proof', () => {
   });
 
   it('names the node that proved the frame, for this room, sequence and bytes, while fresh', () => {
-    const node = nodeKey('keeper');
+    const node = nodeKey('holder');
     const now = 1_800_000_000_000;
     const { env, payload } = nodeReply(new Uint8Array([1, 2, 3]), node, now - 1000);
     expect(nodeProofSigner(env, ROOM, payload, now, verify, unb64)).toBe(node.id);
@@ -95,97 +99,124 @@ describe('🤝 a node’s proof', () => {
   });
 });
 
-describe('🤝 the nodes that keep a room', () => {
-  it('are the owner’s and the co-hosts’, each filed under its own key for this room', () => {
+describe('🤝 the nodes that hold a room', () => {
+  it('are everyone’s who filed one under their own key for this room: nobody is picked', () => {
     const now = Date.now();
     const owner = identity('owner');
-    const coHost = identity('co-host');
-    const stranger = identity('stranger');
-    const [n1, n2, n3] = [nodeKey('1'), nodeKey('2'), nodeKey('3')];
+    const visitor = identity('visitor');
+    const other = identity('other');
+    const [n1, n2, n3, n4] = [nodeKey('1'), nodeKey('2'), nodeKey('3'), nodeKey('4')];
     const doc = roomKeptBy(owner, n1, now);
-    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
-    doc.getMap(CO_HOST_NODES_MAP).set(coHost.pub, signCoHostNode(ROOM, { irohNodeId: n2.id }, now - 1000, coHost)!);
-    // A stranger's record counts for nothing, nor one signed for another room.
-    doc.getMap(CO_HOST_NODES_MAP).set(stranger.pub, signCoHostNode(ROOM, { irohNodeId: n3.id }, now - 1000, stranger)!);
-    expect([...keeperNodesIn(doc, ROOM, now)].sort()).toEqual([n1.id, n2.id].sort());
-    expect(keeperNodesIn(doc, 'room-other', now).size).toBe(0);
-    // A new owner: the old owner's record no longer counts.
-    doc.getMap('players').set('player-2', { keyB64: stranger.pub });
+    file(doc, visitor, n2, now - 1000);
+    // Signed for another room, or by another key than the one it is filed under: nothing.
+    file(doc, other, n3, now - 1000, 'room-other');
+    doc.getMap(HOLDER_NODES_MAP).set('someone', signHolderNode(ROOM, { irohNodeId: n4.id }, now - 1000, other)!);
+    expect([...holderNodesIn(doc, ROOM, now)].sort()).toEqual([n1.id, n2.id].sort());
+    expect([...holderNodesIn(doc, 'room-other', now)]).toEqual([n3.id]);
+    // A new owner changes nothing: the old owner's computer still holds the room.
+    doc.getMap('players').set('player-2', { keyB64: visitor.pub });
     doc.getMap('roomInfo').set('owner', 'player-2');
-    expect([...keeperNodesIn(doc, ROOM, now)].sort()).toEqual([n2.id, n3.id].sort());
-    // The legacy marker names no player, so no owner.
-    doc.getMap('roomInfo').set('owner', 'Local-Clone');
-    expect([...keeperNodesIn(doc, ROOM, now)]).toEqual([n2.id]);
+    expect([...holderNodesIn(doc, ROOM, now)].sort()).toEqual([n1.id, n2.id].sort());
+    // The old grant maps are not read: a co-host grant adds nobody.
+    doc.getMap('coHosts').set(other.pub, { pub: other.pub, name: 'Co', grantedAt: now - 5000 });
+    expect(holderNodesIn(doc, ROOM, now).size).toBe(2);
   });
 
-  it('count a grant only as the room reads one: under its own key, named (#338 review)', () => {
+  it('are every listed holder’s, past the eight a pass carries, and no more than the list', () => {
     const now = Date.now();
     const owner = identity('owner');
-    const coHost = identity('co-host');
-    const n1 = nodeKey('1');
-    const n2 = nodeKey('2');
-    const doc = roomKeptBy(owner, n1, now);
-    doc.getMap(CO_HOST_NODES_MAP).set(coHost.pub, signCoHostNode(ROOM, { irohNodeId: n2.id }, now - 1000, coHost)!);
-    // Filed under another key (the owner's revoke of the co-host's key
-    // wouldn't reach it), or without a name: no grant.
-    doc.getMap('coHosts').set('someone-else', { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
-    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(false);
-    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, grantedAt: now - 5000 });
-    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(false);
-    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
-    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(true);
-  });
-
-  it('are every keeper’s, past the eight a pass carries (#338 review)', () => {
-    const now = Date.now();
-    const owner = identity('owner');
-    const doc = roomKeptBy(owner, nodeKey('owner'), now);
+    const ownerNode = nodeKey('owner');
+    const doc = roomKeptBy(owner, ownerNode, now);
     const nodes: string[] = [];
     for (let i = 0; i < 10; i++) {
-      const c = identity(`co-${i}`);
-      const n = nodeKey(`co-${i}`);
+      const n = nodeKey(`h-${i}`);
       nodes.push(n.id);
-      doc.getMap('coHosts').set(c.pub, { pub: c.pub, name: `Co ${i}`, grantedAt: now - 10_000 + i });
-      doc.getMap(CO_HOST_NODES_MAP).set(c.pub, signCoHostNode(ROOM, { irohNodeId: n.id }, now - 1000, c)!);
+      file(doc, identity(`h-${i}`), n, now - 2000 - i);
     }
-    const keepers = keeperNodesIn(doc, ROOM, now);
-    expect(keepers.size).toBe(11);
-    expect(keepers.has(nodes[9])).toBe(true);
+    const ten = holderNodesIn(doc, ROOM, now);
+    expect(ten.size).toBe(11);
+    expect(ten.has(nodes[9])).toBe(true);
+    // A crowd: the freshest of the list, and always the owner's.
+    for (let i = 10; i < MAX_HOLDERS + 10; i++) {
+      const n = nodeKey(`h-${i}`);
+      nodes.push(n.id);
+      file(doc, identity(`h-${i}`), n, now - 2000 - i);
+    }
+    const crowd = holderNodesIn(doc, ROOM, now);
+    expect(crowd.size).toBe(MAX_HOLDERS);
+    expect(crowd.has(ownerNode.id)).toBe(true);
+    expect(crowd.has(nodes[0])).toBe(true);
+    expect(crowd.has(nodes[nodes.length - 1])).toBe(false);
   });
 });
 
-describe('🤝 a keeper’s own node, with no record of it yet (#338 second review)', () => {
-  it('counts for the room only while the doc it serves lists this player as a keeper', () => {
+describe('🤝 whether a proved copy counts as the room', () => {
+  it('never while the copy is empty, whoever proved it', () => {
+    const now = Date.now();
+    const visitor = identity('visitor');
+    const n = nodeKey('n');
+    // A node that only registered the room: records at most, no owner, no name.
+    const doc = new Y.Doc();
+    file(doc, visitor, n, now - 1000);
+    expect(holderNodesIn(doc, ROOM, now).has(n.id)).toBe(true);
+    expect(holderNodeOk(n.id, doc, ROOM, now, visitor.pub)).toBe(false);
+    doc.getMap('roomInfo').set('name', 'Half');
+    expect(holderNodeOk(n.id, doc, ROOM, now, visitor.pub)).toBe(false);
+    doc.getMap('roomInfo').set('owner', 'player-1');
+    expect(holderNodeOk(n.id, doc, ROOM, now, visitor.pub)).toBe(true);
+  });
+
+  it('from any listed holder’s node, and from no node nobody filed', () => {
     const now = Date.now();
     const owner = identity('owner');
-    const coHost = identity('co-host');
+    const visitor = identity('visitor');
+    const [n1, n2] = [nodeKey('1'), nodeKey('2')];
+    const doc = roomKeptBy(owner, n1, now);
+    file(doc, visitor, n2, now - 1000);
+    const me = identity('me').pub;
+    expect(holderNodeOk(n1.id, doc, ROOM, now, me)).toBe(true);
+    expect(holderNodeOk(n2.id, doc, ROOM, now, me)).toBe(true);
+    expect(holderNodeOk(nodeKey('3').id, doc, ROOM, now, me)).toBe(false);
+    // A record too old to be a route no longer counts for others.
+    file(doc, visitor, n2, now - MAX_AGE_MS - 60_000);
+    expect(holderNodeOk(n2.id, doc, ROOM, now, me)).toBe(false);
+  });
+
+  it('from this machine’s own node for the owner, and for a player whose own record names it', () => {
+    const now = Date.now();
+    const owner = identity('owner');
+    const back = identity('back-after-a-long-while');
     const visitor = identity('visitor');
     const mine = nodeKey('mine');
     const doc = roomKeptBy(owner, nodeKey('owner'), now);
-    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
     try {
       // No node known on this machine: nothing.
-      setLocalKeeperNode(null);
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(false);
-      setLocalKeeperNode(mine.id);
-      // The co-host's own node, filed nowhere: it counts for them, so their
-      // game can file the record that lets everyone else count it too.
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(true);
-      expect(keeperNodesIn(doc, ROOM, now).has(mine.id)).toBe(false);
-      // The owner's too, in a room the owner's machine doesn't host.
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(true);
-      // A visitor's own node gains nothing, nor does another node that
-      // claims to be this one's keeper.
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, visitor.pub)).toBe(false);
-      expect(keeperNodeOk(nodeKey('other').id, doc, ROOM, now, coHost.pub)).toBe(false);
-      // A grant the owner took back counts for nothing either.
-      doc.getMap('coHosts').delete(coHost.pub);
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(false);
+      setLocalHolderNode(null);
+      expect(holderNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(false);
+      setLocalHolderNode(mine.id);
+      // The owner's own node, filed nowhere (a room their machine did not start).
+      expect(holderNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(true);
+      expect(holderNodesIn(doc, ROOM, now).has(mine.id)).toBe(false);
+      // A visitor's own node gains nothing: it has no record of theirs to show.
+      expect(holderNodeOk(mine.id, doc, ROOM, now, visitor.pub)).toBe(false);
+      // A holder back after the route age: their old record is no route for
+      // anyone else, and still lets their own node reopen the room for them.
+      file(doc, back, mine, now - 3 * MAX_AGE_MS);
+      expect(holderNodesIn(doc, ROOM, now).has(mine.id)).toBe(false);
+      expect(holderNodeOk(mine.id, doc, ROOM, now, back.pub)).toBe(true);
+      expect(holderNodeOk(mine.id, doc, ROOM, now, visitor.pub)).toBe(false);
+      // Not for another node than this machine's, a record naming another
+      // node, or one somebody else wrote under their key.
+      expect(holderNodeOk(nodeKey('other').id, doc, ROOM, now, back.pub)).toBe(false);
+      file(doc, back, nodeKey('elsewhere'), now - 3 * MAX_AGE_MS);
+      expect(holderNodeOk(mine.id, doc, ROOM, now, back.pub)).toBe(false);
+      doc.getMap(HOLDER_NODES_MAP).set(back.pub, signHolderNode(ROOM, { irohNodeId: mine.id }, now - 3 * MAX_AGE_MS, visitor)!);
+      expect(holderNodeOk(mine.id, doc, ROOM, now, back.pub)).toBe(false);
       // Not a node id at all: none is kept.
-      setLocalKeeperNode('not-a-node');
-      expect(keeperNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(false);
+      setLocalHolderNode('not-a-node');
+      expect(holderNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(false);
     } finally {
-      setLocalKeeperNode(null);
+      setLocalHolderNode(null);
     }
   });
 });
@@ -197,7 +228,7 @@ describe('🤝 a room whose owner’s game is closed', () => {
       readable: new ReadableStream<Uint8Array>({ start: (c) => { toClient = c; } }),
       writable: new WritableStream<Uint8Array>(),
     };
-    const sync = new YjsSync({ roomId: ROOM, channel, bootRecord: () => ({}), verify, ...keeperNodeTrust });
+    const sync = new YjsSync({ roomId: ROOM, channel, bootRecord: () => ({}), verify, ...holderNodeTrust });
     await sync.start();
     if (opts.linked !== false) sync.markPeerLinked();
     const json = new TextEncoder().encode(JSON.stringify(reply));
@@ -220,7 +251,17 @@ describe('🤝 a room whose owner’s game is closed', () => {
     expect(await visit(nodeReply(state, node, now).env)).toEqual({ linked: true, name: 'Kept' });
   });
 
-  it('not from another node, an unproved or stale frame, or before the link', async () => {
+  it('and from any other computer that holds it, with nobody having picked that computer', async () => {
+    const owner = identity('owner');
+    const visitor = identity('earlier-visitor');
+    const theirs = nodeKey('earlier-visitor-node');
+    const now = Date.now();
+    const doc = roomKeptBy(owner, nodeKey('owner-node'), now);
+    file(doc, visitor, theirs, now - 1000);
+    expect(await visit(nodeReply(Y.encodeStateAsUpdate(doc), theirs, now).env)).toEqual({ linked: true, name: 'Kept' });
+  });
+
+  it('not from a node nobody filed, an unproved or stale frame, or before the link', async () => {
     const owner = identity('owner');
     const node = nodeKey('owner-node');
     const now = Date.now();
@@ -229,5 +270,16 @@ describe('🤝 a room whose owner’s game is closed', () => {
     expect((await visit(nodeReply(state, null, now).env)).linked).toBe(false);
     expect((await visit(nodeReply(state, node, now - NODE_PROOF_SKEW_MS - 60_000).env)).linked).toBe(false);
     expect((await visit(nodeReply(state, node, now).env, { linked: false })).linked).toBe(false);
+  });
+
+  it('not from a filed node whose copy is empty (a computer still waiting for the room itself)', async () => {
+    const waiting = identity('waiting');
+    const node = nodeKey('waiting-node');
+    const now = Date.now();
+    const empty = new Y.Doc();
+    file(empty, waiting, node, now - 1000);
+    expect((await visit(nodeReply(Y.encodeStateAsUpdate(empty), node, now).env)).linked).toBe(false);
+    // A node with nothing at all proves its empty reply too.
+    expect((await visit(nodeReply(Y.encodeStateAsUpdate(new Y.Doc()), node, now).env)).linked).toBe(false);
   });
 });

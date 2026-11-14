@@ -2050,8 +2050,7 @@ class RoomEditController {
       // (roomLeavesUnderWay), a peer writing roomInfo.owner, a change in the
       // venture's shareholder set, and the sync object going away on teardown
       // — that last one answers 'yes, offline rooms are yours'. So this can
-      // swing either way, not just expire. NOT a co-host grant, though —
-      // co-hosts never pass this gate in the first place (roomRoles.ts).
+      // swing either way, not just expire.
       //
       // What this covers: DELETE and the theme writes, which commit here and
       // now. MOVE is only STARTED here — ctxMove puts the item in hand and the

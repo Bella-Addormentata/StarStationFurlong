@@ -23,8 +23,9 @@
  * This is a CACHE, not durability: browsers may evict under pressure (we call
  * `navigator.storage.persist()` once, best-effort). LRU evicts non-owned rooms
  * first and NEVER owned ones — your copy of your own room may be the only one
- * in the universe (which is exactly why the co-host/sealed-snapshot tiers
- * exist). Every entry point is try/catch: privacy-mode IndexedDB failure
+ * in the universe (which is exactly why every computer that loads a room
+ * keeps and serves it, roomHolders.ts, and why sealed snapshots are
+ * planned). Every entry point is try/catch: privacy-mode IndexedDB failure
  * degrades to exactly today's no-cache behavior.
  */
 
