@@ -363,8 +363,20 @@ describe("the oracle's own base rule", () => {
     const E = await sim.add({ name: 'E', pid: 'player-A', identity: 'A', node: true, bot: null });
     expect(sim.also.map((m) => m.sp), sim.label).toEqual([E]);
     expect(sim.nodes, sim.label).toHaveLength(2);
+    expect(E.p.pub, sim.label).toBe(sim.house.p.pub);
     await sim.run(20_000);
     expect(sim.also[0].node.wrote.beats, sim.label).toBeGreaterThan(0);
+    // Its page asleep with its doc syncing: the node runs on (as the owner's does), and stops with the doc cut off.
+    let beats = sim.also[0].node.wrote.beats;
+    sim.sleep(E, true);
+    await sim.run(15_000);
+    expect(sim.also[0].node.wrote.beats, sim.label).toBeGreaterThan(beats);
+    sim.wake(E);
+    // A third machine named by the second's page: the same key again.
+    const F = await sim.add({ name: 'F', pid: 'player-A', identity: 'E', bot: null });
+    expect(F.p.pub, sim.label).toBe(sim.house.p.pub);
+    beats = sim.also[0].node.wrote.beats;
+    expect(beats, sim.label).toBeGreaterThan(0);
     const [, B, C] = sim.pages;
     expect(await sim.handOver(B, { node: 'same' }), sim.label).toEqual({ ok: true });
     expect(sim.node2, sim.label).toBe(sim.node);

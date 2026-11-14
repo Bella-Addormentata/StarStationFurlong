@@ -146,10 +146,9 @@ export const between = (r: Rng, lo: number, hi: number): number => lo + Math.flo
 export class Device {
   readonly store = new Map<string, string>();
 
-  constructor(readonly name: string, seed: number, identity: string = name) {
-    // The identity seed keypair.ts would mint, fixed by name and run seed
-    // (`identity`: another profile's, a player's key brought to a second machine).
-    this.store.set('ssf-identity-seed', b64url(sha256(utf8ToBytes(`ssf-sim-identity|${seed}|${identity}`))));
+  constructor(readonly name: string, seed: number) {
+    // The identity seed keypair.ts would mint, fixed by name and run seed.
+    this.store.set('ssf-identity-seed', b64url(sha256(utf8ToBytes(`ssf-sim-identity|${seed}|${name}`))));
   }
 }
 
@@ -235,9 +234,9 @@ export interface PageSpec {
   pid?: string;
   /** Its browser profile (default its own, by name): a second tab names the first's. */
   device?: string;
-  /** 🏠🏠 Its identity key is that of the page named (its own profile, the
-   *  same key: a player's second machine; with that page's `pid`, the same
-   *  player). */
+  /** 🏠🏠 Its identity key is that of the page named, loaded before it (its
+   *  own profile, the same key: a player's second machine; with that page's
+   *  `pid`, the same player). */
   identity?: string;
   /** 🏠🏠 Its machine runs a node of its own (with houseNode), which its page
    *  tells its key to as the house's page does: a second house of the room's
@@ -991,7 +990,15 @@ export class Sim {
   private deviceOf(spec: PageSpec): Device {
     const name = spec.device ?? spec.name;
     let d = this.devices.get(name);
-    if (!d) this.devices.set(name, d = new Device(name, this.opts.seed, spec.identity ?? name));
+    if (!d) {
+      this.devices.set(name, d = new Device(name, this.opts.seed));
+      if (spec.identity !== undefined) {
+        // (The key of the page named, as its profile holds it: its own, a tab's shared one, or one it was given.)
+        const of = this.pages.find((sp) => sp.name === spec.identity);
+        if (!of) throw new Error(`${this.label}: page ${spec.name} names the identity of ${spec.identity}, which is no page loaded before it`);
+        d.store.set('ssf-identity-seed', of.device.store.get('ssf-identity-seed')!);
+      }
+    }
     return d;
   }
 
@@ -1628,7 +1635,8 @@ export class Sim {
    *  doc of that machine's page. */
   private async houseTickAlso(m: { sp: SimPage; node: SimHouse; up: boolean; on: Page | null }): Promise<void> {
     const { sp } = m;
-    if (!m.up || sp.mode !== 'up' || !this.net.connected(sp)) return;
+    // (As the other nodes: while its page hears the room, frames or none.)
+    if (!m.up || !this.net.connected(sp)) return;
     await this.as(sp, (now) => {
       if (m.on !== sp.p) {
         sp.p.table.setLocalHouse(m.node.pub);

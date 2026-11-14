@@ -1714,6 +1714,23 @@ describe("the simulations' houses at a FAIR ONLY game with two houses of its hol
     expect(room.fold().rounds.map((d) => [d.r, d.decided])).toEqual([[1, 'house'], [2, 'void'], [3, 'house']]);
   });
 
+  it('two closes of the round that waits on the other house, and only the one the fold chose abandoned: the round is void, and the rival nobody abandons does not hold the join off', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c, b } = room.closed(2, r1.c.hash);
+    const rival = kit.close(bob, 2, r1.c.hash, [b], kit.houseCommit(H, 2));
+    room.put(rival);
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    const tip = room.fold().tip!.close;
+    expect([c.hash, rival.hash]).toContain(tip);
+    room.put(kit.abandon(bob, 2, tip));
+    room.tick(TICK);
+    expect(room.fold()).toMatchObject({ open: 3 });
+    expect(by2(room, 'o:3:').map((v) => v.c)).toEqual([kit.houseCommit(H2, 3)]);
+  });
+
   it('…and when the other house reveals that round, its reveal carries the next commitment: still no join', () => {
     const room = new TwoRoom().start();
     const r1 = room.played(1, SID);

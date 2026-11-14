@@ -1046,9 +1046,13 @@ export class SimHouse {
     // checkpoint, the reveal that carried it is the copy a trim keeps.)
     const whose = (h: string): string | undefined => read.joins.find((o) => o.r === r - 1 && o.c === h)?.k
       ?? read.reveals.find((v) => v.r === r - 2 && v.c === h)?.k;
+    // (Nor once any close of that round is abandoned: the pages abandon the
+    // close their fold chose, which voids the round, and a rival of it that
+    // nobody abandons would hold this house off for good.)
     const theirs = fo && r - 1 > read.baseU && !read.reveals.some((h) => h.r === r - 1)
+      && !closesAt(r - 1).some((c) => read.abandoned.has(c.hash))
       && closesAt(r - 1).some((c) => {
-        if (c.h === undefined || read.abandoned.has(c.hash)) return false;
+        if (c.h === undefined) return false;
         const k = whose(c.h);
         return k !== undefined && k !== this.pub && read.houseAt(k, r - 1);
       });
