@@ -49,18 +49,28 @@ Full setup instructions: [prototypes/0.29.0-core-loop-demo/README.md](prototypes
 
 ### Default station (where a first run docks)
 
-A brand-new install docks at the **default station's welcome room** instead of
-minting an empty home module, so a new player's first sight is a whole station
-with people in it. The room is one constant — `WELCOME_ROOM_LINK` in
+A brand-new install docks at the **default station's welcome room** and never
+mints an empty home module of its own at startup, so a new player's first sight
+is a whole station with people in it. The room is one constant — `WELCOME_ROOM_LINK` in
 [`prototypes/0.29.0-core-loop-demo/src/defaultStation.ts`](prototypes/0.29.0-core-loop-demo/src/defaultStation.ts)
 — and the station's layout ships beside it as
 [`defaultStation.atlas.json`](prototypes/0.29.0-core-loop-demo/src/defaultStation.atlas.json),
 so the whole station renders from space before the room has even synced. The
 file header explains how to point a build at a new station (GENERATE PASS in the
 new welcome room, paste the link, re-export the atlas from the devtools console).
-Keep the host node running: if the station does not answer, a first run falls
-back to its own home module, and the station stays one tap away in
-SpacePhone → ACCESS → DEFAULT STATION.
+Keep the host node running: until an install has reached the welcome room once,
+every start docks there, and if nobody answers it stays docked in an empty copy
+of the room and keeps asking (the rules are in
+[`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). A link
+to the welcome room that another player hands a newcomer (`?seed=`) is used as
+given, with the bundled pass's routes beside its own, so the newcomer's computer
+also dials the node that link names, and on arrival it is that pass, with both
+sets of routes, that MY ROOMS keeps for the room. It no
+longer falls back to a module of its own, so today a new player's first room
+depends on that one node: the
+[External Infrastructure Register](docs/TDD/ExternalInfrastructureRegister.md)
+§2 lists it with the work that ends it. Once reached, the station stays one tap
+away in SpacePhone → ACCESS → DEFAULT STATION.
 
 ---
 
