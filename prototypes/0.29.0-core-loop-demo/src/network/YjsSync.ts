@@ -58,6 +58,13 @@ export interface YjsSyncOptions {
    *  readiness gate as the host's signed frame does, so a room whose owner's
    *  game is closed still counts as synced. Needs `verify`. */
   keeperNode?: (nodeId: string, doc: Y.Doc, roomId: string) => boolean;
+  /** 🛰️ What else the node writes on THIS stream. The node answers a
+   *  handshake's dial on the stream the handshake came in on: its `bridge`
+   *  reports (dialing / connected / failed) for the record's first computer
+   *  arrive here, between the y-sync frames, and nowhere else. Without a
+   *  listener they are dropped, as every other kind is. A listener that
+   *  throws does not stop the reader. */
+  onOtherEnvelope?: (env: { kind?: string; room?: string; payload?: string }) => void;
 }
 
 function u8ToB64(u8: Uint8Array): string {
@@ -517,6 +524,12 @@ export class YjsSync {
                 ver.verified,
                 this.#nodeProofOf(wireEnvelope, payload),
               );
+            }
+          } else if (this.opts.onOtherEnvelope) {
+            try {
+              this.opts.onOtherEnvelope(wireEnvelope);
+            } catch (e) {
+              console.warn('YjsSync: the listener for the other envelopes of the stream threw:', e);
             }
           }
         }

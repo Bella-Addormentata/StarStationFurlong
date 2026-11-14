@@ -33,6 +33,7 @@ import {
   routeHint,
   setShareCard,
   type PostureSources,
+  withPassRoutes,
   writeNodeCard,
 } from "./network/roomCap.ts";
 import { YjsSync } from "./network/YjsSync";
@@ -475,6 +476,35 @@ import {
   atlasForBundle,
   defaultStationAtlas,
 } from "./defaultStation";
+import {
+  bootRoute,
+  bootYields,
+  clearWelcomePending,
+  markWelcomePending,
+  recoverLostLink,
+  seekWelcome,
+  seekingWelcome,
+  welcomeArrivedLine,
+  welcomeMarked,
+  welcomeNodeLostLine,
+  welcomePassAddedLine,
+  welcomePassToKeep,
+  welcomeRecordWithHeld,
+  welcomeRetryLine,
+  welcomeSeekDelayMs,
+  welcomeStateHere,
+} from "./welcomeOnly";
+import type { MarkStore } from "./welcomeOnly";
+import {
+  STEP_COLOR,
+  enterMode,
+  enterNote,
+  firstRunSteps,
+  newDialTally,
+  noteDial,
+  stepGlyph,
+} from "./firstRunSteps";
+import type { FirstRunFacts } from "./firstRunSteps";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -826,14 +856,154 @@ let resumeRetried = false;
 /** 🛰️ "Is this a first run" — snapshotted before anything can lazily mint the
  *  identity seed, so the boot and the title screen agree (defaultStation.ts). */
 const IS_FIRST_RUN_INSTALL = !hasStoredIdentity();
-/** 🛰️ Guards a single default-station attempt per boot (defaultStation.ts). */
-let defaultStationAttempted = false;
+/** 🛰️ Welcome only (welcomeOnly.ts): this page has seen the welcome room's
+ *  shared state arrive. From then on the install is a returning one. */
+let welcomeReachedThisPage = false;
+/** 🛰️ The session (sessionEpoch) the seek's one loop runs for, so no
+ *  session ever runs two (seekWelcomeIn). */
+let welcomeSeekEpoch: number | null = null;
+/** 🛰️ A pass the page was opened with (?seed=), as it was given: the room it
+ *  names and the seed. An arrival at the welcome room by it keeps it in MY
+ *  ROOMS (welcomePassForMyRooms). */
+let suppliedUrlPass: { roomId: string; seed: string } | null = null;
+/** 🛰️ Dockings in a row that could not start: paces the retry
+ *  (welcomeSeekDelayMs), and the line is said for the first only. */
+let welcomeDockFailures = 0;
+let welcomeRetryTimer: number | null = null;
+/** 🛰️ The dial-failure advice was said once while seeking: the node dials
+ *  again at every ask (seekWelcome), and the seek's own line says the rest. */
+let welcomeDialFailureSaid = false;
+/** 🛰️ First run (firstRunSteps.ts): what the title screen shows of the search
+ *  for the welcome room. The dial reports of the welcome room's session, by
+ *  computer; whether a boot or the latest probe found this computer's node
+ *  silent; and the title's own repaint, set only while the title shows the
+ *  steps. */
+const firstRunDial = newDialTally();
+let firstRunNodeSilent = false;
+let firstRunRepaint: (() => void) | null = null;
+
+/** 🛰️ The facts the title's steps are drawn from, as they stand now. */
+function firstRunFactsNow(): FirstRunFacts {
+  // Only a node that answered the latest probe: the last-known fingerprint
+  // outlives a node that stopped (refreshLocalFingerprint keeps it for the
+  // live sessions), and the title must not call that node running.
+  const fp = localNodeLive ? localFingerprint : null;
+  return {
+    node: fp ? "up" : firstRunNodeSilent ? "down" : "unknown",
+    chiaOff: fp?.chia_lane ? fp.chia_lane.off : undefined,
+    wallet: fp?.chia_wallet?.state,
+    dialing: firstRunDial.dialing.size,
+    failed: firstRunDial.failed.size,
+    linked: firstRunDial.linked,
+    arrived: welcomeReachedThisPage,
+  };
+}
+
+/** 🌉 One `bridge` report from this computer's node: where its dial of
+ *  another computer stands (dialing / connected / failed). The node sends it
+ *  two ways: on the stream of the handshake that asked for the dial (the
+ *  record's first computer; YjsSync hands those over, `onOtherEnvelope`), and
+ *  on a stream of its own to every page in the room (the record's other
+ *  computers, and the dials the node starts by itself). Both end here. */
+function noteBridgeEnvelope(env: { kind?: string; payload?: string; room?: string }): void {
+  if (env.kind !== "bridge" || typeof env.payload !== "string") return;
+  try {
+    const status = JSON.parse(atob(env.payload)) as {
+      target?: string;
+      status?: string;
+      detail?: string;
+    };
+    const shortTarget = (status.target ?? "").slice(0, 8);
+    // 🛰️ The title's steps count the welcome room's dials by computer
+    // (firstRunSteps.ts); another room's dials are not its business.
+    if (env.room === DEFAULT_STATION.welcomeRoomId) {
+      noteDial(firstRunDial, status.target, status.status);
+      firstRunRepaint?.();
+    }
+    if (status.status === "dialing") {
+      setNetworkRow(
+        "network-bridge-status",
+        `DIALING → ${shortTarget}…`,
+        "#d4a84b",
+      );
+    } else if (status.status === "connected") {
+      setNetworkRow(
+        "network-bridge-status",
+        `LINKED ↔ ${shortTarget}`,
+        "#00e676",
+      );
+      logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
+      // The peer JUST linked — but our opening SyncStep1 fired before the
+      // dial finished and was relayed to an empty neighbor set, so the host
+      // never sent its (static) room state. Re-issue SyncStep1 now that the
+      // host is a live neighbor to pull the roster / room name / furniture.
+      // Mark the link first so the SyncStep2 this resync pulls is the one
+      // that opens the post-link readiness gate (whenLinkedSynced) — the
+      // arrival curtain + birth-door healing wait on THAT, not the empty
+      // pre-link handshake.
+      yjsSync?.markPeerLinked();
+      yjsSync?.resync();
+    } else if (status.status === "failed") {
+      setNetworkRow(
+        "network-bridge-status",
+        `FAILED → ${shortTarget} (see node log)`,
+        "#ff1744",
+      );
+      // 🛰️ While this install waits at the welcome room its node dials
+      // again at every ask (seekWelcome): the advice is said for
+      // the first failure, and the seek's own line says the rest. The
+      // NETWORK row above shows every one.
+      const seekingHere =
+        activeBootstrap?.roomId === DEFAULT_STATION.welcomeRoomId &&
+        welcomeSeeking();
+      if (!seekingHere || !welcomeDialFailureSaid) {
+        if (seekingHere) welcomeDialFailureSaid = true;
+        logToPhoneSystem(
+          `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
+        );
+      }
+    }
+  } catch (e) {
+    console.warn("Unparseable bridge status envelope:", e);
+  }
+}
+
+/** 🛰️ Where the welcome mark is kept; null where storage is closed. */
+function welcomeStore(): MarkStore | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null; // privacy mode: seeking lasts this page only
+  }
+}
+
+/** 🛰️ Whether this install is still on its way to the welcome room
+ *  (welcomeOnly.ts): a first run, or a later start of one that never arrived.
+ *  While it is, no boot goes to the home module. */
+function welcomeSeeking(): boolean {
+  return seekingWelcome({
+    welcomeRoomId: DEFAULT_STATION.welcomeRoomId,
+    homeRoomId: getDefaultRoomId(),
+    firstRun: IS_FIRST_RUN_INSTALL,
+    marked: welcomeMarked(welcomeStore()),
+    reached: welcomeReachedThisPage,
+  });
+}
+// 🛰️ The mark goes down here, in the same step as the first-run snapshot
+// above and before anything can store the identity that makes the next start
+// a returning one. A page closed at any later moment (while a ?seed= link is
+// still being resolved through the local node, say) leaves an install that
+// still seeks, never one with an identity and no mark, which would boot home.
+if (welcomeSeeking()) markWelcomePending(welcomeStore());
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
 // ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
 /** Re-entrancy latch: one transit at a time (the player can only stand in
  *  one vestibule, and the fade/join sequence must never interleave). */
 let transitInProgress = false;
+/** Settles when the swap under way ends (performRoomSwap); settled while none
+ *  is. For what must wait a swap out instead of giving up (transitEnded). */
+let transitEnds: Promise<void> = Promise.resolve();
 /**
  * 🪃 Session return route (owner bug: "the lobby I return to from the casino
  * is an OLD lobby"). Shared hub rooms (casino / pool) keep ONE back-pointing
@@ -1379,10 +1549,27 @@ async function bootstrapNetworking() {
   // 🆕 #79 P4: true while this boot is resuming a persisted last room, so a
   // dial failure (that room's host offline) can fall back to home once.
   let resumingLastRoom = false;
-  // 🛰️ True while this boot is a FIRST RUN docking at the default station
-  // (defaultStation.ts), so a station that does not answer falls back to home
-  // once, the same way.
+  // 🛰️ True while this boot is docking at the welcome room (welcomeOnly.ts):
+  // an install that has not reached it yet. A join, never a claim, and one
+  // that gets no answer waits there: nothing falls back to the home module.
   let arrivingAtDefaultStation = false;
+  // 🛰️ The session count as this boot began (welcomeOnly.ts bootYields). The
+  // looks for the player's own node below take a moment, and a newer join or
+  // leave may take the session meanwhile: Retry-node, a pass the player
+  // followed, or a second boot the docking's own retry started. This boot
+  // then stands down: it neither joins on top of that session nor cleans up
+  // after itself over it.
+  const bootEpoch = sessionEpoch;
+  const yields = (): boolean => bootYields(bootEpoch, sessionEpoch, transitInProgress);
+  const standDown = (): void => {
+    console.info("🛰️ A newer join or leave owns the session: this boot stands down.");
+    // Still on the way to the welcome room: looked at again at the retry's
+    // pace, which does nothing while a session is live.
+    if (welcomeSeeking()) scheduleWelcomeRetry(/* failed */ false);
+  };
+  // True from the moment this boot calls joinRoom: a failure from there on
+  // is this boot's own session's (a superseded join returns silently).
+  let joining = false;
   try {
     // One-time UI init: phone input behaviors, hooks, and date-stamps
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
@@ -1393,18 +1580,39 @@ async function bootstrapNetworking() {
     // the dial goes through the local node, and so the resume/default-station
     // branches below see the override whatever the timing.
     if (urlSeedImport) await urlSeedImport;
+    // 🛰️ Welcome only (welcomeOnly.ts): an install that has not reached the
+    // welcome room yet goes there at every start, and the mark keeps that true
+    // on a later start, when the identity this run stores has made it no
+    // first run. The mark was saved as the page loaded, before the identity
+    // could be (beside IS_FIRST_RUN_INSTALL).
+    const seeking = welcomeSeeking();
+    let savedLastRoom: string | null = null;
+    try {
+      savedLastRoom = localStorage.getItem("ssf-last-room");
+    } catch {
+      /* privacy mode — resume is best-effort */
+    }
+    // The one rule for where this boot goes: an explicit ?seed=/Use-link
+    // import always wins; a seeking install docks at the welcome room, and its
+    // saved last room is not resumed; a returning one resumes, else boots home.
+    const route = bootRoute(
+      seeking,
+      pendingBootstrapOverride?.roomId ?? null,
+      DEFAULT_STATION.welcomeRoomId,
+      !!savedLastRoom,
+    );
     // 🆕 #79 P4: resume the room the player last shut down in (persisted on
-    // entry). Only when there's no explicit override — a ?seed=/Use-link import
-    // always wins — and it becomes a normal JOIN into that room.
-    if (!pendingBootstrapOverride) {
+    // entry). It becomes a normal JOIN into that room.
+    if (route === "resume" && savedLastRoom) {
       try {
-        const saved = localStorage.getItem("ssf-last-room");
-        if (saved) {
-          pendingBootstrapOverride = JSON.parse(atob(saved)) as RoomBootstrap;
-          resumingLastRoom = true;
-        }
+        pendingBootstrapOverride = JSON.parse(atob(savedLastRoom)) as RoomBootstrap;
+        resumingLastRoom = true;
       } catch {
-        localStorage.removeItem("ssf-last-room");
+        try {
+          localStorage.removeItem("ssf-last-room");
+        } catch {
+          /* privacy mode */
+        }
       }
     }
     const override = pendingBootstrapOverride;
@@ -1420,6 +1628,14 @@ async function bootstrapNetworking() {
       try {
         if (classifyAddress(new URL(override.wtUrl).hostname) === "loopback") {
           const fp = await awaitLocalNodeFingerprint();
+          // 🛰️ The look took a moment: a room swap may have published its
+          // own override meanwhile, and this boot's must not replace it (a
+          // Retry-node would then go where this boot was going, not to the
+          // room the player chose).
+          if (yields()) {
+            standDown();
+            return;
+          }
           if (fp && fp.base64) {
             const wtUrl = new URL(override.wtUrl);
             wtUrl.port = String(fp.port);
@@ -1435,10 +1651,16 @@ async function bootstrapNetworking() {
         /* malformed wtUrl → the normal dial-failure path reports it */
       }
     }
+    if (yields()) {
+      standDown();
+      return;
+    }
     if (!boot) {
       console.warn(
         "⚠️ No running Rust node found. Seamlessly falling back to offline mode.",
       );
+      firstRunNodeSilent = true;
+      firstRunRepaint?.();
       updateHUDNode("OFFLINE", "#ff1744");
       updateHUDP2P("OFFLINE", "#ff1744");
       setNetworkRow(
@@ -1446,35 +1668,73 @@ async function bootstrapNetworking() {
         "BASIC · join-only (no local node)",
         "#ffb300",
       );
+      // 🛰️ Welcome only: an install still on its way to the welcome room whose
+      // own node is not up yet (a slow start, a node started after the game)
+      // looks again by itself at the seek's pace, and docks once the node
+      // answers — it is not left offline until a manual Retry-node.
+      if (route === "dock") {
+        if (welcomeDockFailures === 0) {
+          logToPhoneSystem(welcomeRetryLine(DEFAULT_STATION.name));
+        }
+        scheduleWelcomeRetry();
+      }
       return;
     }
 
-    // 🛰️ Default station (defaultStation.ts): a genuine first run — no stored
-    // identity, no ?seed=/Use-link override, nothing to resume — docks at the
-    // default station's welcome room instead of an empty freshly-minted home
-    // module. It rides the imported-pass path exactly: the pass is merged with
-    // the LOCAL node (resolveBridgeBootstrap), so the browser dials its own
-    // node and the node bridges to the station's iroh hints, and it is a JOIN,
-    // never a claim. Once per boot — after the fallback in the catch below
-    // this block is skipped and the boot proceeds home. The install that HOSTS
-    // the welcome room never treats its own home as a foreign join.
-    if (
-      !override &&
-      IS_FIRST_RUN_INSTALL &&
-      !defaultStationAttempted &&
-      DEFAULT_STATION.welcomeRoomId &&
-      DEFAULT_STATION.welcomeRoomId !== getDefaultRoomId()
-    ) {
-      defaultStationAttempted = true;
+    // 🛰️ Default station (defaultStation.ts, welcomeOnly.ts): an install that
+    // has not reached the welcome room yet — a first run, or a later start of
+    // one that never arrived — docks there instead of an empty freshly-minted
+    // home module, with no ?seed=/Use-link override to another room. It rides
+    // the imported-pass path exactly: the pass is merged with the LOCAL node
+    // (resolveBridgeBootstrap), so the browser dials its own node and the node
+    // bridges to the station's iroh hints, and it is a JOIN, never a claim. An
+    // override that is the welcome room itself — a pass to it the player
+    // supplied (?seed=, Use-link), or this docking's own, kept for Retry-node
+    // — is a docking too, and that pass STANDS: its routes may name a holder
+    // of the room the bundled pass does not, or fresher addresses, so they
+    // are kept and the bundled pass's routes ride beside them
+    // (withPassRoutes). The install that HOSTS the welcome room is never
+    // seeking: its home IS that room. A welcome link no build should ship,
+    // one that names a room and does not decode here, leaves the boot as it
+    // was (defaultStation.test.ts parses the shipped one).
+    if (route === "dock") {
       const welcome = decodeBootstrapInput(DEFAULT_STATION.welcomeRoomLink);
       if (welcome) {
-        boot = await resolveBridgeBootstrap(welcome);
+        // Set before the resolve: a failure from here on is the docking's,
+        // and is tried again rather than left offline (the catch below).
+        arrivingAtDefaultStation = true;
+        if (override && override.roomId === welcome.roomId) {
+          // A pass resolved while this computer's node was not up yet stays
+          // as it was given (resolveBridgeBootstrap), and one whose wtUrl is
+          // another computer's would be dialed straight from the page at
+          // every retry, node or no node. It is resolved again here, so the
+          // docking goes through this computer's node once it runs and the
+          // node dials the pass's holders. A loopback one was refreshed
+          // above already.
+          const direct = (() => {
+            try {
+              return classifyAddress(new URL(boot.wtUrl).hostname) !== "loopback";
+            } catch {
+              return false; // unreadable: the dial-failure path reports it
+            }
+          })();
+          boot = withPassRoutes(direct ? await resolveBridgeBootstrap(boot) : boot, welcome);
+        } else {
+          boot = await resolveBridgeBootstrap(welcome);
+        }
+        // 🛰️ The resolve above looked for the node, and a room swap may
+        // have published its own override meanwhile: this boot stands down
+        // before it publishes its own, not after (a Retry-node would
+        // otherwise return here instead of to the room the player chose).
+        if (yields()) {
+          standDown();
+          return;
+        }
         // Persists like every override: a Retry-node stays classified as a
         // join and re-dials the station rather than claiming home.
         pendingBootstrapOverride = boot;
-        arrivingAtDefaultStation = true;
         console.info(
-          `🛰️ First run — docking at ${DEFAULT_STATION.name}, the default station.`,
+          `🛰️ Docking at ${DEFAULT_STATION.name}, the default station: this install has not reached it yet.`,
         );
       }
     }
@@ -1487,35 +1747,25 @@ async function bootstrapNetworking() {
     // race this prevents. pendingBootstrapOverride intentionally persists
     // after use, so a Retry-node following a seed import stays classified as
     // a join.
+    if (yields()) {
+      standDown();
+      return;
+    }
+    joining = true;
     await joinRoom(
       boot,
       /* claimRoomDefaults */ !override && !arrivingAtDefaultStation,
     );
 
-    if (arrivingAtDefaultStation) {
-      // The join above only proves the LOCAL node answered. The station is
-      // reached when its host's room state lands over the bridge — the same
-      // signal the transit curtain waits on (linkedSynced, or roomInfo
-      // owner+name). Nothing is held meanwhile: the exterior already shows the
-      // station (bundled atlas), and entering early lands in a replica that
-      // fills in as the sync arrives.
-      const epochAtJoin = sessionEpoch;
-      await awaitInitialRoomState(DEFAULT_STATION_SYNC_GATE_MS);
-      if (epochAtJoin !== sessionEpoch) return; // a newer session owns the state
-      const sync = yjsSync;
-      const reached = !!sync && initialRoomStateReady(sync);
-      if (!reached) {
-        throw new Error(
-          `${DEFAULT_STATION.name} did not answer within ${DEFAULT_STATION_SYNC_GATE_MS / 1000}s`,
-        );
-      }
-      // Into MY ROOMS (no prefetch — it is the active room), so the station
-      // is one tap away on every later visit.
-      addPass(DEFAULT_STATION.welcomeRoomLink);
-      logToPhoneSystem(
-        `🛰️ Welcome aboard ${DEFAULT_STATION.name}. Any door's keypad can PROVISION NEW MODULE when you want a room of your own.`,
-      );
-    }
+    // 🛰️ The join above only proves the LOCAL node answered. The station is
+    // reached when the room's own state lands over the bridge (roomInfo
+    // owner+name: welcomeStateHere), and the session's own seek waits for
+    // that and keeps asking for as long as it takes (seekWelcomeIn, started
+    // by the join) — the install never boots a module of its own instead
+    // (owner direction 2026-11-12). Nothing is held meanwhile: the exterior
+    // already shows the station (bundled atlas), and entering early lands in
+    // a replica that fills in as the sync arrives.
+    if (arrivingAtDefaultStation) welcomeDockFailures = 0;
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -1523,37 +1773,31 @@ async function bootstrapNetworking() {
     // connected-but-labeled-OFFLINE. Only CURRENT-session failures reach
     // this catch (superseded joins return silently from joinRoom), so the
     // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
+    // 🛰️ A failure BEFORE this boot's own join (a look for the node that
+    // threw) is another matter: when a newer join or leave owns the session
+    // by now, the session is not this boot's to tear down, and this boot
+    // stands down like one that got as far as its join.
+    if (!joining && yields()) {
+      standDown();
+      return;
+    }
     await leaveRoom();
-    // 🛰️ The default station did not answer this first run (or its join failed
-    // outright) — forget it and boot HOME once, the way a failed resume does;
-    // defaultStationAttempted keeps the retry out of the station branch. The
-    // station still lands in MY ROOMS (after home is up, so the pass manager
-    // is initialised) — one tap away once its host is back; its row reads
-    // OFFLINE until then.
+    // 🛰️ Welcome only (welcomeOnly.ts): the docking itself could not start —
+    // the player's own node did not take the join. (A welcome room that does
+    // not answer is no failure: that session stays docked and keeps asking,
+    // seekWelcomeIn.) It never falls back to the home module: said once, and tried
+    // again by itself at the seek's pace, then on to the offline readouts
+    // below. The override stays the welcome room's, so Retry-node docks too
+    // and nothing can claim a local fork of it (review of #156, round 2).
     if (arrivingAtDefaultStation) {
       console.warn(
-        `${DEFAULT_STATION.name} unreachable — falling back to home:`,
+        `${DEFAULT_STATION.name}: the docking could not start — trying again:`,
         err,
       );
-      try {
-        localStorage.removeItem("ssf-last-room"); // persisted at connect time
-      } catch {
-        /* privacy mode */
+      if (welcomeDockFailures === 0) {
+        logToPhoneSystem(welcomeRetryLine(DEFAULT_STATION.name));
       }
-      pendingBootstrapOverride = null;
-      // ⚠️ Forget the station as the ACTIVE room too. The connect succeeded
-      // before the gate gave up, so activeBootstrap names the station, and
-      // leaveRoom keeps it as last-room memory — fetchDefaultBootstrap would
-      // then mint the "home" boot from the station's id and key, rejoin a
-      // local replica of it with claimRoomDefaults=true, and CLAIM that fork
-      // (review of #156, round 2). Home is getDefaultRoomId(), nothing else.
-      activeBootstrap = null;
-      logToPhoneSystem(
-        `⚠️ ${DEFAULT_STATION.name} did not answer — booting your own module instead. It stays in ACCESS → ROOMS; enter it from there once it reads READY.`,
-      );
-      await bootstrapNetworking();
-      addPass(DEFAULT_STATION.welcomeRoomLink);
-      return;
+      scheduleWelcomeRetry();
     }
     // 🆕 #79 P4: if the RESUME into the last room failed (its host is offline),
     // forget it and fall back to the home station — once (resumeRetried guards
@@ -1772,6 +2016,20 @@ function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBoot
   const coHosts = coHostRouteHints(roomId);
   if (coHosts.length === 0) return record;
   return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), coHosts) };
+}
+
+/** 🛰️ A welcome-room session's dial record with the routes of the pass the
+ *  player holds to the room (MY ROOMS) beside its own (welcomeOnly.ts
+ *  welcomeRecordWithHeld). The pass is decoded once per seed: every outgoing
+ *  sync envelope asks. */
+let heldWelcomeMemo: { seed: string; boot: RoomBootstrap | null } | null = null;
+function withHeldWelcomeRoutes(record: RoomBootstrap | null): RoomBootstrap | null {
+  const roomId = DEFAULT_STATION.welcomeRoomId;
+  if (!record || !roomId || record.roomId !== roomId) return record;
+  const seed = passSeed(roomId);
+  if (!seed) return record;
+  if (heldWelcomeMemo?.seed !== seed) heldWelcomeMemo = { seed, boot: decodeBootstrapInput(seed) };
+  return welcomeRecordWithHeld(record, roomId, heldWelcomeMemo.boot, withPassRoutes);
 }
 
 /** 🤝 C3: a keeper's game (the owner's, or a co-host's) files its node's
@@ -2280,7 +2538,16 @@ async function joinRoomAtEpoch(
     // 🤝 C3: the node dials the room's co-hosts beside the pass's own
     // hints, so a returning visitor reaches the room through a co-host's
     // node while the owner's is off.
-    bootRecord: () => withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
+    // 🛰️ And, in the welcome room, the holders the player's own pass to it
+    // names (MY ROOMS): a pass added while the session waits is asked at
+    // the next handshake.
+    bootRecord: () => withHeldWelcomeRoutes(withCoHostHints(networkProvider.getBootRecord(), boot.roomId)),
+    // 🌉 The node reports the dial of the record's first computer on this
+    // very stream: handed to the same handler as its other reports, for as
+    // long as this is the page's session.
+    onOtherEnvelope: (env) => {
+      if (env.kind === "bridge" && yjsSync === sync) noteBridgeEnvelope(env);
+    },
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
@@ -2322,6 +2589,24 @@ async function joinRoomAtEpoch(
   if (neighbourWarmer.seedDoc(sync.doc, boot.roomId)) {
     console.log(`🚪🔥 joined ${boot.roomId} from its warm replica`);
     roomReplicaSeeded = true;
+  }
+  // 🛰️ First run (firstRunSteps.ts): the handshake below asks the node to
+  // dial every computer this welcome session's record names. The title
+  // counts those computers from the record itself, BEFORE the handshake
+  // leaves, so a report that comes back at once (a failure, an answer) is
+  // never overwritten by a late "dialing"; the node's reports move each one
+  // on from there (noteBridgeEnvelope).
+  if (boot.roomId === DEFAULT_STATION.welcomeRoomId) {
+    const own = localFingerprint?.iroh_node_id;
+    const record = withHeldWelcomeRoutes(
+      withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
+    );
+    for (const hint of collectMemberHints(record)) {
+      if (hint.irohNodeId && hint.irohNodeId !== own) {
+        noteDial(firstRunDial, hint.irohNodeId, "dialing");
+      }
+    }
+    firstRunRepaint?.();
   }
   await sync.start();
   if (epoch !== sessionEpoch) {
@@ -2431,51 +2716,7 @@ async function joinRoomAtEpoch(
         }
         return;
       }
-      if (env.kind === "bridge" && typeof env.payload === "string") {
-        try {
-          const status = JSON.parse(atob(env.payload)) as {
-            target?: string;
-            status?: string;
-            detail?: string;
-          };
-          const shortTarget = (status.target ?? "").slice(0, 8);
-          if (status.status === "dialing") {
-            setNetworkRow(
-              "network-bridge-status",
-              `DIALING → ${shortTarget}…`,
-              "#d4a84b",
-            );
-          } else if (status.status === "connected") {
-            setNetworkRow(
-              "network-bridge-status",
-              `LINKED ↔ ${shortTarget}`,
-              "#00e676",
-            );
-            logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
-            // The peer JUST linked — but our opening SyncStep1 fired before the
-            // dial finished and was relayed to an empty neighbor set, so the host
-            // never sent its (static) room state. Re-issue SyncStep1 now that the
-            // host is a live neighbor to pull the roster / room name / furniture.
-            // Mark the link first so the SyncStep2 this resync pulls is the one
-            // that opens the post-link readiness gate (whenLinkedSynced) — the
-            // arrival curtain + birth-door healing wait on THAT, not the empty
-            // pre-link handshake.
-            yjsSync?.markPeerLinked();
-            yjsSync?.resync();
-          } else if (status.status === "failed") {
-            setNetworkRow(
-              "network-bridge-status",
-              `FAILED → ${shortTarget} (see node log)`,
-              "#ff1744",
-            );
-            logToPhoneSystem(
-              `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
-            );
-          }
-        } catch (e) {
-          console.warn("Unparseable bridge status envelope:", e);
-        }
-      }
+      if (env.kind === "bridge") noteBridgeEnvelope(env);
     },
   );
 
@@ -3218,6 +3459,15 @@ async function joinRoomAtEpoch(
     );
   }, 1_000);
   setActivePassRoom(boot.roomId);
+  // 🛰️ Welcome only (welcomeOnly.ts): for an install still on its way here,
+  // this room's own state landing IS the arrival, and until it lands the
+  // session keeps asking — by whichever path the join came (the docking at a
+  // start, Retry-node, GO TO, a pass, a failed room swap falling back here)
+  // and however long after the join. After the pass manager is up: the
+  // arrival files the pass.
+  if (boot.roomId === DEFAULT_STATION.welcomeRoomId && welcomeSeeking()) {
+    seekWelcomeIn(epoch, sync);
+  }
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap("roomInfo");
@@ -3922,12 +4172,6 @@ const SWAP_WATCHDOG_MS = 15_000;
  *  values. On timeout we enter with defaults, which the roomInfo observer
  *  (main.ts ~577) repaints live the moment the real state does arrive. */
 const SYNC_GATE_MS = 8_000;
-/** 🛰️ How long a FIRST RUN waits for the default station's room state before
- *  giving up on it and booting home (defaultStation.ts). Longer than the
- *  transit gate: this is a first cross-internet dial — DHT lookup, hole punch —
- *  the ACCESS app's own "up to ~30s". Nothing is held while it runs. */
-const DEFAULT_STATION_SYNC_GATE_MS = 30_000;
-
 /** 🛰️ The ONE rule for "has this room's shared state arrived": a post-link
  *  SyncStep2 (`linkedSynced`), or the host's roomInfo owner+name — the
  *  reasoning lives in awaitInitialRoomState below. It also gates the atlas
@@ -4019,6 +4263,181 @@ function onRoomStateReady(sync: YjsSync, fn: () => void): void {
   void sync.whenLinkedSynced.then(check);
 }
 
+/** 🛰️ Run `fn` once the welcome room's own state is in `sync`'s doc
+ *  (welcomeStateHere: roomInfo owner+name): at once if it is, else when the
+ *  write that brings it lands. Narrower than onRoomStateReady on purpose: a
+ *  post-link sync with another install that is itself still waiting brings
+ *  no state, and is no arrival. Returns the way to stop watching; the watch
+ *  ends with the doc too. */
+function onWelcomeState(sync: YjsSync, fn: () => void): () => void {
+  const roomMap = sync.doc.getMap("roomInfo");
+  if (welcomeStateHere(roomMap)) {
+    fn();
+    return () => {};
+  }
+  let done = false;
+  const check = (): void => {
+    if (done || !welcomeStateHere(roomMap)) return;
+    stop();
+    fn();
+  };
+  const stop = (): void => {
+    if (done) return;
+    done = true;
+    try {
+      roomMap.unobserve(check);
+    } catch {
+      /* doc may be destroyed */
+    }
+  };
+  roomMap.observe(check);
+  return stop;
+}
+
+/** 🛰️ Resolve once the welcome room's own state is in `sync`'s doc
+ *  (onWelcomeState), or after `timeoutMs`, and stop watching either way: a
+ *  seek waits many times on one doc. Never rejects; a doc destroyed mid-wait
+ *  resolves on the timer, and the caller checks its session. */
+function awaitWelcomeState(sync: YjsSync, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let stop: () => void = () => {};
+    const timer = window.setTimeout(() => {
+      stop();
+      resolve();
+    }, timeoutMs);
+    stop = onWelcomeState(sync, () => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/**
+ * 🛰️ Record the arrival, if `sync` is the live session, in the welcome room,
+ * and holds its state: the install stops seeking (the mark goes), the pass
+ * lands in MY ROOMS so the station is one tap away on every later visit (no
+ * prefetch — it is the active room), and the player is welcomed. Once per
+ * page; true when the welcome room has been reached, now or earlier.
+ */
+function noteWelcomeReached(sync: YjsSync | null): boolean {
+  if (welcomeReachedThisPage) return true;
+  if (
+    !sync ||
+    yjsSync !== sync ||
+    activeBootstrap?.roomId !== DEFAULT_STATION.welcomeRoomId ||
+    !welcomeStateHere(sync.doc.getMap("roomInfo"))
+  ) {
+    return false;
+  }
+  welcomeReachedThisPage = true;
+  firstRunRepaint?.();
+  clearWelcomePending(welcomeStore());
+  if (welcomeRetryTimer !== null) {
+    window.clearTimeout(welcomeRetryTimer);
+    welcomeRetryTimer = null;
+  }
+  addPass(welcomePassForMyRooms());
+  logToPhoneSystem(welcomeArrivedLine(DEFAULT_STATION.name));
+  return true;
+}
+
+/**
+ * 🛰️ The welcome room's pass an arrival files in MY ROOMS (welcomeOnly.ts
+ * welcomePassToKeep): the bundled link, or the pass the player opened the
+ * page with (?seed=) or holds to the room (ADD PASS), as given, with the
+ * other's routes and the bundled pass's beside its own. addPass replaces the
+ * room's saved pass, so filing the bundled link over the player's own would
+ * drop the holder that pass names. Never activeBootstrap: bridged through this
+ * computer's node, it names this computer and its addresses, and the pass in
+ * MY ROOMS is the seed the atlas harvest hands on for the room.
+ */
+function welcomePassForMyRooms(): string {
+  const roomId = DEFAULT_STATION.welcomeRoomId;
+  // Both of the player's own passes, when there are two: the one this page
+  // was opened with (the docking's) leads, and the one saved before rides
+  // beside it. One alone would drop the other's holder at this filing.
+  const supplied = suppliedUrlPass?.roomId === roomId ? suppliedUrlPass.seed : null;
+  return welcomePassToKeep([supplied, passSeed(roomId)], DEFAULT_STATION.welcomeRoomLink, {
+    decode: decodeBootstrapInput,
+    encode: encodeBootstrapSeed,
+    withRoutes: withPassRoutes,
+  });
+}
+
+/**
+ * 🛰️ The seek of this welcome-room session (welcomeOnly.ts seekWelcome), for
+ * an install still on its way here: wait for the room's state, say when it
+ * has not answered, and keep asking until it does. One per session, started
+ * by the join itself, so every way into the room has it. Each ask re-issues
+ * the sync handshake — its envelope carries the pass's hints, and the node
+ * dials every hint it is not already dialing or linked to, so an ask while a
+ * dial runs costs nothing. It ends on arrival, or when the session is no
+ * longer this one (the player followed a link, or Retry-node docked afresh
+ * and seeks itself).
+ *
+ * It also ends when the link to the player's own node closes under the
+ * session (the node restarted or stopped): nothing reconnects a session's
+ * transport, so asking on would reach nobody while the phone said it kept
+ * trying. The dead session is left and the docking starts again at the
+ * retry's pace, which finds the node when it is back.
+ */
+function seekWelcomeIn(epoch: number, sync: YjsSync): void {
+  if (welcomeSeekEpoch === epoch) return;
+  welcomeSeekEpoch = epoch;
+  const live = (): boolean => epoch === sessionEpoch && yjsSync === sync;
+  void seekWelcome({
+    name: DEFAULT_STATION.name,
+    wait: (ms) => awaitWelcomeState(sync, ms),
+    linkLost: networkProvider.whenLinkLost(),
+    ask: () => sync.resync(),
+    arrived: () => noteWelcomeReached(sync),
+    current: live,
+    say: logToPhoneSystem,
+  }).then((end) => {
+    if (end !== "link-lost") return;
+    console.warn(`${DEFAULT_STATION.name}: the link to the local node closed while waiting — docking afresh.`);
+    logToPhoneSystem(welcomeNodeLostLine(DEFAULT_STATION.name));
+    // A room swap under way owns the session until it ends, and is waited
+    // out: it can also END with this dead session still the live one (the
+    // link closed after its join), which is then left here like any other
+    // (welcomeOnly.ts recoverLostLink).
+    void recoverLostLink({
+      swapEnded: transitEnded,
+      current: live,
+      leave: async () => {
+        await leaveRoom();
+        updateHUDNode("OFFLINE", "#ff1744");
+        updateHUDP2P("OFFLINE", "#ff1744");
+      },
+      retry: () => scheduleWelcomeRetry(),
+    }).catch((err) => {
+      console.warn(`${DEFAULT_STATION.name}: leaving the session whose link closed failed:`, err);
+    });
+  });
+}
+
+/** 🛰️ A docking that could not start, or whose link to the player's own node
+ *  closed, is tried again by itself, one timer at a time, at the seek's pace
+ *  (bootstrapNetworking, seekWelcomeIn). Nothing is done when the install has
+ *  arrived meanwhile or a session is live (the player followed a link, or
+ *  pressed Retry-node); a room swap under way is looked at again after it.
+ *  `failed` false is a boot that stood down for a newer one
+ *  (bootstrapNetworking): looked at again at the same pace, and no failure
+ *  counted. */
+function scheduleWelcomeRetry(failed = true): void {
+  if (welcomeRetryTimer !== null) return;
+  const wait = welcomeSeekDelayMs(failed ? welcomeDockFailures++ : welcomeDockFailures);
+  welcomeRetryTimer = window.setTimeout(() => {
+    welcomeRetryTimer = null;
+    if (!welcomeSeeking() || yjsSync) return;
+    if (transitInProgress) {
+      scheduleWelcomeRetry();
+      return;
+    }
+    void bootstrapNetworking();
+  }, wait);
+}
+
 /** Ease the transit curtain to fully opaque (true) or clear (false).
  *  Resolves after the transition duration (timer, not transitionend — the
  *  event is droppable when the tab is backgrounded mid-transit). */
@@ -4098,6 +4517,10 @@ async function performRoomSwap(
 ): Promise<RoomSwapResult> {
   if (transitInProgress) return "busy";
   transitInProgress = true;
+  let endTransit: () => void = () => {};
+  transitEnds = new Promise<void>((resolve) => {
+    endTransit = resolve;
+  });
   // Snapshot BEFORE leaving: leaveRoom keeps activeBootstrap as last-room
   // memory, but joinRoom(target) overwrites it — this is the way back.
   const originalBoot = activeBootstrap;
@@ -4223,7 +4646,13 @@ async function performRoomSwap(
     return stranded ? new StrandedOfflineError(failure.message) : failure;
   } finally {
     transitInProgress = false;
+    endTransit();
   }
+}
+
+/** Resolves once no room swap is under way; at once when none is. */
+async function transitEnded(): Promise<void> {
+  while (transitInProgress) await transitEnds;
 }
 
 /** 🗺️🎫 #192: the pass this install holds for `roomId`, for the holotable's
@@ -9471,6 +9900,23 @@ function setupSpacePhoneOverlay() {
         return;
       }
       accessInput.value = "";
+      // 🛰️ A pass to the welcome room, added while the player stands in it:
+      // the live session owns the room, so nothing warms and there is no
+      // entry to wait for (the list reads CURRENT). The session's record
+      // names the pass's holders from now on (withHeldWelcomeRoutes), and one
+      // handshake asks them at once: for an install still waiting there,
+      // that pass may be the way in.
+      if (
+        yjsSync &&
+        result.roomId === DEFAULT_STATION.welcomeRoomId &&
+        result.roomId === activeBootstrap?.roomId
+      ) {
+        yjsSync.resync();
+        setAccessFeedback(
+          welcomePassAddedLine(DEFAULT_STATION.name, !welcomeStateHere(yjsSync.doc.getMap("roomInfo"))),
+        );
+        return;
+      }
       // Streamlined "join now": pasting a pass IS a request to enter that room,
       // so arm an auto-enter — we still wait for it to warm to READY (the
       // sync-before-enter gate, #60) before swapping, so you never land in a
@@ -9736,6 +10182,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       listMeArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
+    // 🛰️ The title's steps say so too (firstRunSteps.ts): a node that stopped
+    // while the title waits is not answering, whatever it said before.
+    firstRunNodeSilent = true;
+    firstRunRepaint?.();
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
@@ -9761,6 +10211,11 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
+  // 🛰️ The title's steps read the node, the Phone Book and the wallet from
+  // the fingerprint of a node that answers (firstRunSteps.ts): told once the
+  // node counts as live.
+  firstRunNodeSilent = false;
+  firstRunRepaint?.();
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
   // words, or words marked saved (bankBackup.ts reconcileBackupUi).
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
@@ -10336,6 +10791,7 @@ function setupNetworkDetailsPanel() {
       // last-room resume and the default station whatever the timing — and
       // bootstrapNetworking awaits `urlSeedImport` to dial the bridged form.
       pendingBootstrapOverride = imported;
+      suppliedUrlPass = { roomId: imported.roomId, seed: urlSeed };
       urlSeedImport = resolveBridgeBootstrap(imported)
         .then((resolved) => {
           pendingBootstrapOverride = resolved;
@@ -11924,12 +12380,109 @@ function setupClickToEnter() {
       btnNew.type = "button";
       btnNew.textContent = "🚀  NEW PLAYER";
       btnNew.style.cssText = primary;
-      btnNew.addEventListener("click", (e) => {
-        e.stopPropagation();
+      // 🛰️ First run (firstRunSteps.ts): while this install looks for the
+      // welcome room, the title shows where the search stands, one line per
+      // step, and NEW PLAYER holds the reveal a short while so the room has a
+      // chance to be here. ENTER is there from that moment on, whatever the
+      // search says: the room fills in by itself when a computer answers.
+      const seeksAtTitle = welcomeSeeking();
+      /** This title waits for the welcome room: the install was seeking it
+       *  when the page loaded, and the session is that room's or not joined
+       *  yet. A page opened with a pass to another room is never held. */
+      const waitsForWelcome = (): boolean => {
+        if (!seeksAtTitle) return false;
+        const room =
+          activeBootstrap?.roomId ?? pendingBootstrapOverride?.roomId ?? null;
+        return room === null || room === DEFAULT_STATION.welcomeRoomId;
+      };
+      const steps = document.createElement("div");
+      steps.id = "first-run-steps";
+      steps.setAttribute("role", "status");
+      steps.setAttribute("aria-live", "polite");
+      steps.style.cssText =
+        "display:none; flex-direction:column; gap:4px; margin-top:6px; width:380px; " +
+        "max-width:86vw; text-align:left; font:400 12px/1.45 inherit;";
+      const btnEnter = document.createElement("button");
+      btnEnter.type = "button";
+      btnEnter.id = "first-run-enter";
+      btnEnter.textContent = "ENTER NOW";
+      btnEnter.style.cssText = secondary;
+      btnEnter.style.display = "none";
+      /** When NEW PLAYER was chosen and the title began to wait for the room;
+       *  null before that. */
+      let heldSince: number | null = null;
+      let holdTimer: number | null = null;
+      let restoreBox: HTMLElement | null = null;
+      let paintedSteps = "";
+      const proceed = () => {
+        if (holdTimer !== null) window.clearInterval(holdTimer);
+        holdTimer = null;
+        firstRunRepaint = null;
         wrap.remove();
         dwellDone = true; // proceed at once — don't wait out the intro dwell
         proceedChosen = true;
         maybeFade();
+      };
+      const paintSteps = () => {
+        if (!waitsForWelcome()) {
+          steps.style.display = "none";
+          paintedSteps = "";
+          // Another room after all (a pass resolved late): nothing to wait for.
+          if (heldSince !== null) proceed();
+          return;
+        }
+        const facts = firstRunFactsNow();
+        const lines = firstRunSteps(facts, DEFAULT_STATION.name);
+        // Repainted only when a line changed, so a screen reader is told of
+        // changes and not of every tick.
+        const painted = lines.map((l) => `${l.mark}:${l.text}`).join("\n");
+        if (painted !== paintedSteps) {
+          paintedSteps = painted;
+          steps.replaceChildren(
+            ...lines.map((l) => {
+              const row = document.createElement("div");
+              row.dataset.step = l.key;
+              row.dataset.mark = l.mark;
+              row.style.color = STEP_COLOR[l.mark];
+              row.textContent = `${stepGlyph(l.mark)}  ${l.text}`;
+              return row;
+            }),
+          );
+        }
+        steps.style.display = "flex";
+        if (heldSince === null) return;
+        const mode = enterMode(facts.arrived, performance.now() - heldSince);
+        if (mode === "reveal") {
+          proceed();
+          return;
+        }
+        if (btnEnter.dataset.mode !== mode) {
+          btnEnter.dataset.mode = mode;
+          btnEnter.style.cssText = mode === "lit" ? primary : secondary;
+          note.textContent = enterNote(mode, DEFAULT_STATION.name);
+        }
+      };
+      btnNew.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!waitsForWelcome() || welcomeReachedThisPage) {
+          proceed();
+          return;
+        }
+        heldSince = performance.now();
+        btnNew.style.display = "none";
+        btnLoad.style.display = "none";
+        restoreBox?.remove();
+        btnEnter.style.display = "";
+        // The button that was pressed is gone, and Tab is the phone's key
+        // here: the way in takes the focus, so a keyboard can still enter.
+        btnEnter.focus({ preventScroll: true });
+        paintSteps();
+        // The patience runs on a clock no event reports: look twice a second.
+        holdTimer = window.setInterval(paintSteps, 500);
+      });
+      btnEnter.addEventListener("click", (e) => {
+        e.stopPropagation();
+        proceed();
       });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
@@ -11981,13 +12534,18 @@ function setupClickToEnter() {
           setTimeout(() => window.location.reload(), 700);
         });
         box.append(ta, doRestore);
+        restoreBox = box;
         wrap.insertBefore(box, note);
         note.textContent =
           "Paste the recovery key you saved from Settings → Backup / restore identity.";
         ta.focus();
       });
-      wrap.append(btnNew, btnLoad, note);
+      wrap.append(btnNew, btnLoad, btnEnter, note, steps);
       content.appendChild(wrap);
+      // The search began with the page: show where it stands from the first
+      // frame of the title, and again at every change the page hears of.
+      firstRunRepaint = paintSteps;
+      paintSteps();
     }
   }
 

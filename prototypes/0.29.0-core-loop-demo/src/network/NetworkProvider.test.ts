@@ -586,3 +586,73 @@ describe('NetworkProvider — the faucet request stream', () => {
     expect(wt.opened).toHaveLength(0);
   });
 });
+
+describe('NetworkProvider — the link lost under a live session (whenLinkLost)', () => {
+  /** A fake whose `closed` is the real transport's promise; the test settles it. */
+  const closable = () => {
+    const wt = new FakeTransport();
+    let drop!: () => void;
+    let fail!: (err: Error) => void;
+    (wt as unknown as { closed: unknown }).closed = new Promise<void>((resolve, reject) => {
+      drop = resolve;
+      fail = reject;
+    });
+    wt.acceptHandshake();
+    return { wt, drop, fail };
+  };
+  const settled = async (p: Promise<void>): Promise<boolean> =>
+    Promise.race([p.then(() => true), settle().then(() => false)]);
+
+  it('tells a waiter when the transport closes by itself, cleanly or with an error', async () => {
+    for (const how of ['clean', 'error'] as const) {
+      const { wt, drop, fail } = closable();
+      queueTransports(wt);
+      const provider = new NetworkProvider();
+      await provider.connect(BOOT);
+      const lost = provider.whenLinkLost();
+      expect(await settled(lost)).toBe(false); // the session is live
+      if (how === 'clean') drop();
+      else fail(new Error('connection lost'));
+      expect(await settled(lost)).toBe(true);
+      await provider.disconnect();
+    }
+  });
+
+  it('stays quiet for its own disconnect, before any session, and for a transport with no closed promise', async () => {
+    const idle = new NetworkProvider();
+    expect(await settled(idle.whenLinkLost())).toBe(false);
+
+    const { wt, drop } = closable();
+    queueTransports(wt);
+    const provider = new NetworkProvider();
+    await provider.connect(BOOT);
+    const lost = provider.whenLinkLost();
+    await provider.disconnect(); // ours: the room was left
+    drop(); // …and the transport's own promise settles after it
+    expect(await settled(lost)).toBe(false);
+    expect(await settled(provider.whenLinkLost())).toBe(false);
+
+    const plain = new FakeTransport(); // `closed` is no promise here
+    plain.acceptHandshake();
+    queueTransports(plain);
+    const other = new NetworkProvider();
+    await other.connect(BOOT);
+    expect(await settled(other.whenLinkLost())).toBe(false);
+    await other.disconnect();
+  });
+
+  it('does not take the loss of a replaced transport for the new session', async () => {
+    const first = closable();
+    const second = closable();
+    queueTransports(first.wt, second.wt);
+    const provider = new NetworkProvider();
+    await provider.connect(BOOT);
+    await provider.disconnect();
+    await provider.connect(BOOT);
+    first.drop(); // the old transport, long since left
+    expect(await settled(provider.whenLinkLost())).toBe(false);
+    second.drop();
+    expect(await settled(provider.whenLinkLost())).toBe(true);
+    await provider.disconnect();
+  });
+});
