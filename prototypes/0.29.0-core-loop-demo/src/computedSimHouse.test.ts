@@ -481,6 +481,16 @@ describe('the simulations\' house, as house.rs', () => {
     expect(room.recs('h:2:').map((v) => [v.k, v.x])).toEqual([[other.pub, [d.hash]]]);
   });
 
+  it('a second house joins the round after one in flight on the first house\'s commitment, as house.rs does (the wait for the other house is a FAIR ONLY game\'s rule: computedSimHouseGame)', () => {
+    const room = new TwinRoom();
+    const other = room.secondHouse();
+    room.start();
+    room.closedOnTheJoin();
+    room.tick(200);
+    expect(room.recs('h:1:')).toHaveLength(0);
+    expect(room.entries('o:2:').map(([, v]) => v.k)).toEqual([other.pub]);
+  });
+
   it('of two houses joining a round, only the one the pages name reveals', () => {
     const room = new TwinRoom();
     room.secondHouse();

@@ -1662,3 +1662,164 @@ describe("the simulations' houses at a FAIR ONLY game that changes hands (N1)", 
     expect(resolved(room)).toMatchObject({ live: true, holder: buyer.pub, base: { key }, pending: false, invalid: [] });
   });
 });
+
+describe("the simulations' houses at a FAIR ONLY game with two houses of its holder", () => {
+  const DLB = delegation(owner, H2.pub);
+  /** The room with a second house the game's owner delegated too; either can be stopped. */
+  class TwoRoom extends GameRoom {
+    readonly house2 = new SimHouse(H2.secret);
+    on = true;
+    on2 = true;
+
+    constructor() {
+      super();
+      this.top().set(delegationKey(H2.pub), DLB);
+    }
+
+    override tick(after: number): void {
+      this.now += after;
+      if (this.on) this.house.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+      if (this.on2) this.house2.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+    }
+  }
+  const by2 = (room: TwoRoom, prefix: string) => room.recs(prefix).filter((v) => v.k === H2.pub);
+
+  it('one house to a round: the second house joins nothing where the first has joined, nor where its reveal carried a commitment', () => {
+    const room = new TwoRoom().start();
+    expect(room.recs('o:1:').map((v) => v.k)).toEqual([H.pub]);
+    const r1 = room.played(1, SID);
+    expect(r1.h).toMatchObject({ k: H.pub, c: kit.houseCommit(H, 2) });
+    room.run(2_000);
+    expect(room.house2.wrote).toMatchObject({ joins: 0, reveals: 0, stepDowns: 0 });
+    expect(room.house2.trims + room.house2.sweeps).toBe(0);
+  });
+
+  it('a round that waits on the other house (its close names the commitment that house\'s reveal carried): no join of the round after until a bettor voids it', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c } = room.closed(2, r1.c.hash);
+    room.run(SETTLE_MS + 4_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    expect(room.house2.wrote).toMatchObject({ joins: 0, reveals: 0 });
+    room.put(kit.abandon(alice, 2, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:3:').map((v) => v.c)).toEqual([kit.houseCommit(H2, 3)]);
+    // Round 3 is the second house's: it reveals the close that names its join.
+    const [a, b] = [kit.slip(alice, 3, [red(5)]), kit.slip(bob, 3, [red(5)])];
+    const c3 = kit.close(alice, 3, c.hash, [a, b], kit.houseCommit(H2, 3));
+    room.put(a, b, c3, kit.reveal(3, 'alice'), kit.reveal(3, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:3:').map((v) => [v.x, v.k, v.c])).toEqual([[[c3.hash], H2.pub, kit.houseCommit(H2, 4)]]);
+    expect(room.fold().rounds.map((d) => [d.r, d.decided])).toEqual([[1, 'house'], [2, 'void'], [3, 'house']]);
+  });
+
+  it('two closes of the round that waits on the other house, and only the one the fold chose abandoned: the round is void, and the rival nobody abandons does not hold the join off', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c, b } = room.closed(2, r1.c.hash);
+    const rival = kit.close(bob, 2, r1.c.hash, [b], kit.houseCommit(H, 2));
+    room.put(rival);
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    const tip = room.fold().tip!.close;
+    expect([c.hash, rival.hash]).toContain(tip);
+    room.put(kit.abandon(bob, 2, tip));
+    room.tick(TICK);
+    expect(room.fold()).toMatchObject({ open: 3 });
+    expect(by2(room, 'o:3:').map((v) => v.c)).toEqual([kit.houseCommit(H2, 3)]);
+  });
+
+  it('…and when the other house reveals that round, its reveal carries the next commitment: still no join', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    room.closed(2, r1.c.hash);
+    room.run(2_000);
+    room.on = true;
+    room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    room.run(2_000);
+    expect(room.recs('h:2:').map((v) => [v.k, v.c])).toEqual([[H.pub, kit.houseCommit(H, 3)]]);
+    expect(room.recs('o:3:')).toEqual([]);
+    expect(room.house2.wrote.joins).toBe(0);
+  });
+
+  it('a first round that waits on the other house\'s join: no join of the second round', () => {
+    const room = new TwoRoom().start();
+    room.on = false;
+    const { c } = room.closed(1, SID);
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:2:')).toEqual([]);
+    room.put(kit.abandon(alice, 1, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:2:')).toHaveLength(1);
+  });
+
+  it('an abandon of that close signed for another round voids nothing, and ends no wait', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c } = room.closed(2, r1.c.hash);
+    room.put(kit.abandon(alice, 3, c.hash));
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    expect(room.recs('o:3:')).toEqual([]);
+  });
+
+  it('both joined the first round, and the house whose join the close does not name steps down from it and starts again: the round still waits on the other, and it joins nothing', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    room.on = false;
+    room.closed(1, SID);
+    room.house2.steppingDown = true;
+    room.tick(TICK);
+    expect(by2(room, 'h:1:').map((v) => v.x)).toEqual([[]]);
+    room.house2.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 1 });
+    expect(room.recs('o:2:')).toEqual([]);
+  });
+
+  it('both joined the first round, each named by a close; the house of the first join reveals its close as it steps down (no commitment carried) and starts again, the other stopped: the round is decided, and the rival close nobody reveals does not hold its next join off', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    // (Of two joins the pages name the lowest, and that house alone reveals: whichever of the two it is.)
+    const first = room.keys('o:1:').map((k) => room.ses().get(k) as { k: string })[0].k === H.pub;
+    const [F, O] = first ? [H, H2] : [H2, H];
+    const [mine, other] = first ? [room.house, room.house2] : [room.house2, room.house];
+    const [a, b] = [kit.slip(alice, 1, [red(5)]), kit.slip(bob, 1, [red(5)])];
+    const c = kit.close(alice, 1, SID, [a, b], kit.houseCommit(F, 1));
+    const rival = kit.close(bob, 1, SID, [b], kit.houseCommit(O, 1));
+    if (first) room.on2 = false;
+    else room.on = false;
+    room.put(a, b, c, rival, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    mine.steppingDown = true;
+    room.run(2_000);
+    const [h1] = room.recs('h:1:');
+    expect(h1).toMatchObject({ k: F.pub, x: [c.hash] });
+    expect(h1.c).toBeUndefined();
+    expect(other.wrote.reveals).toBe(0);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    mine.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:2:').map((v) => [v.k, v.c])).toEqual([[F.pub, kit.houseCommit(F, 2)]]);
+  });
+
+  it('past a trim by the other house, a round that waits on the commitment its checkpoint carries: no join of the round after', () => {
+    const room = new TwoRoom().start();
+    room.played(1, SID);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 1_200);
+    expect(room.house.trims).toBe(1);
+    expect(room.house2.trims + room.house2.sweeps).toBe(0);
+    expect(room.base()).toMatchObject({ u: 1, h: kit.houseCommit(H, 2), k: H.pub });
+    room.on = false;
+    const { c } = room.closed(2, room.sid());
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    room.put(kit.abandon(alice, 2, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:3:')).toHaveLength(1);
+  });
+});

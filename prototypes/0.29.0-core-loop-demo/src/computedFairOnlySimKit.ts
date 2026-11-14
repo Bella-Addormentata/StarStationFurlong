@@ -71,8 +71,8 @@ export async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSu
 
 /** What a FAIR ONLY room adds to a finish (the header's list). */
 export function fairOnlyFinish(sim: Sim, s: SimSummary, ended: readonly string[] = []): void {
-  // (The owner's node, and after a hand-over the buyer's with it: what the two did, together.)
-  const nodes = [sim.node!, ...(sim.node2 ? [sim.node2] : [])];
+  // (The owner's node, after a hand-over the buyer's with it, and those of the holder's other machines: what they did, together.)
+  const nodes = sim.nodes;
   const sum = (of: (n: typeof nodes[number]) => number): number => nodes.reduce((a, n) => a + of(n), 0);
   const node = {
     wrote: nodes.length === 1 ? nodes[0].wrote : nodes.map((n) => n.wrote), trims: sum((n) => n.trims), sweeps: sum((n) => n.sweeps), ends: sum((n) => n.ends),

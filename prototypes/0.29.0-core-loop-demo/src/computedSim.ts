@@ -234,6 +234,14 @@ export interface PageSpec {
   pid?: string;
   /** Its browser profile (default its own, by name): a second tab names the first's. */
   device?: string;
+  /** 🏠🏠 Its identity key is that of the page named, loaded before it (its
+   *  own profile, the same key: a player's second machine; with that page's
+   *  `pid`, the same player). */
+  identity?: string;
+  /** 🏠🏠 Its machine runs a node of its own (with houseNode), which its page
+   *  tells its key to as the house's page does: a second house of the room's
+   *  deed holder, on a page with the holder's `identity` and `pid`. */
+  node?: boolean;
   /** False for a page the spec plays a cheat on: it counts for no stall. */
   honest?: boolean;
   /** Its bot (null: none), and the tables it plays (default every one). */
@@ -764,6 +772,13 @@ export class Sim {
   node2: SimHouse | null = null;
   node2Up = true;
   private node2On: Page | null = null;
+  /** 🤝 The owner's node went with the room (handOver, node 'same'): it runs
+   *  on the buyer's page's doc only, and never again on the house's page's. */
+  private nodeMoved = false;
+  /** 🏠🏠 The other machines of the deed holder's that run a node (PageSpec
+   *  node): each one's page, its node, whether that runs, and the load of
+   *  the page it last told its key to. */
+  readonly also: { sp: SimPage; node: SimHouse; up: boolean; on: Page | null }[] = [];
   /** 🔒 fairOnly: when the house's page opened each table's game (ms into the
    *  run), and what its press answered before. */
   readonly opened = new Map<string, number>();
@@ -975,7 +990,15 @@ export class Sim {
   private deviceOf(spec: PageSpec): Device {
     const name = spec.device ?? spec.name;
     let d = this.devices.get(name);
-    if (!d) this.devices.set(name, d = new Device(name, this.opts.seed));
+    if (!d) {
+      this.devices.set(name, d = new Device(name, this.opts.seed));
+      if (spec.identity !== undefined) {
+        // (The key of the page named, as its profile holds it: its own, a tab's shared one, or one it was given.)
+        const of = this.pages.find((sp) => sp.name === spec.identity);
+        if (!of) throw new Error(`${this.label}: page ${spec.name} names the identity of ${spec.identity}, which is no page loaded before it`);
+        d.store.set('ssf-identity-seed', of.device.store.get('ssf-identity-seed')!);
+      }
+    }
     return d;
   }
 
@@ -995,6 +1018,8 @@ export class Sim {
     sp.roomIn = opts.connect === false;
     await this.load(sp, spec, this.skewOf(spec));
     this.pages.push(sp);
+    // 🏠🏠 (Its machine's node, when it has one: at the start or as it comes later.)
+    if (this.node && spec.node) this.also.push({ sp, node: new SimHouse(sha256(utf8ToBytes(`sim-house-node-also|${this.opts.seed}|${sp.name}`))), up: true, on: null });
     if (opts.connect !== false) this.net.connect(sp);
     return sp;
   }
@@ -1553,6 +1578,7 @@ export class Sim {
     if (beat) this.net.resync();
     if (this.node) await this.houseTick();
     await this.houseTick2();
+    for (const m of this.also) await this.houseTickAlso(m);
     if (this.opts.fairOnly) await this.openGames();
     for (const sp of this.pages) {
       if (sp.mode !== 'up' || this.T < sp.pauseUntil) continue;
@@ -1578,7 +1604,7 @@ export class Sim {
    *  fingerprint), its clock the room's (monotonic) and the page's (wall). */
   private async houseTick(): Promise<void> {
     const sp = this.house;
-    if (!this.nodeUp || !this.net.connected(sp)) return;
+    if (!this.nodeUp || this.nodeMoved || !this.net.connected(sp)) return;
     await this.as(sp, (now) => {
       if (this.nodeOn !== sp.p) {
         sp.p.table.setLocalHouse(this.node!.pub);
@@ -1605,13 +1631,48 @@ export class Sim {
     });
   }
 
+  /** 🏠🏠 The tick of a node on another machine of the deed holder's, on the
+   *  doc of that machine's page. */
+  private async houseTickAlso(m: { sp: SimPage; node: SimHouse; up: boolean; on: Page | null }): Promise<void> {
+    const { sp } = m;
+    // (As the other nodes: while its page hears the room, frames or none.)
+    if (!m.up || !this.net.connected(sp)) return;
+    await this.as(sp, (now) => {
+      if (m.on !== sp.p) {
+        sp.p.table.setLocalHouse(m.node.pub);
+        if (this.opts.fairOnly) sp.p.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+        m.on = sp.p;
+      }
+      m.node.tick(PAGE_ROOM, sp.p.doc, this.T, now);
+    });
+  }
+
+  /** 🏠 Every simulated house of the run, each once: the owner's node, the
+   *  buyer's after a hand-over, and those of the holder's other machines. */
+  get nodes(): SimHouse[] {
+    return [...new Set([this.node, this.node2, ...this.also.map((m) => m.node)].filter((n): n is SimHouse => n !== null))];
+  }
+
+  /** 🏠 House `node` stops (`up` false: its machine, or its process), or
+   *  starts again with what a restart keeps (SimHouse restart). */
+  runs(node: SimHouse, up: boolean): void {
+    if (up) node.restart();
+    if (node === this.node && !this.nodeMoved) this.nodeUp = up;
+    if (node === this.node2) this.node2Up = up;
+    for (const m of this.also) if (m.node === node) m.up = up;
+  }
+
   /** 🤝 The room's deed goes to page `buyer` by an offer made out to its key
    *  (design §8.7): the page that holds the deed makes the offer (offers
    *  makeOffer), the buyer's page redeems it (redeemDeedOffer, which moves
    *  the FAIR ONLY games too: computedTable adoptFairOnlyGames). With `node`
-   *  (the default), the buyer's own node becomes its house (node2). What the
-   *  redemption answered. */
-  async handOver(buyer: SimPage, opts: { node?: boolean } = {}): Promise<{ ok: boolean }> {
+   *  (the default), the buyer's own node becomes its house (node2); with
+   *  'same', the seller's node does (the machine goes with the room: one
+   *  house key, delegated by the seller and then by the buyer, and the node
+   *  runs on the buyer's page's doc from here on, never on the seller's:
+   *  runs() starts and stops it there). What the redemption
+   *  answered. */
+  async handOver(buyer: SimPage, opts: { node?: boolean | 'same' } = {}): Promise<{ ok: boolean }> {
     const seller = this.holder;
     const offer = await this.as(seller, () => seller.p.offers.makeOffer({ kind: 'deed', roomId: PAGE_ROOM, roomName: 'The Room' }, seller.name, { toPub: buyer.p.pub }));
     // (Told first, so the oracle knows whose the checkpoint the redemption writes is.)
@@ -1622,7 +1683,15 @@ export class Sim {
       this.buyer = before;
       return out;
     }
-    if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
+    if (opts.node === 'same') {
+      // (The seller's node: the owner's at the first hand-over; after one, the
+      // node the last buyer ran, node2 as it is, or none.)
+      if (before === null) {
+        this.node2 = this.node;
+        this.nodeUp = false;
+        this.nodeMoved = true;
+      }
+    } else if (opts.node !== false && !this.node2) this.node2 = new SimHouse(sha256(utf8ToBytes(`sim-house-node-2|${this.opts.seed}`)));
     return out;
   }
 
