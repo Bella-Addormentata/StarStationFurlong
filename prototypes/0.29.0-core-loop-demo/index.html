@@ -161,6 +161,23 @@
           <div id="list-me-warning" hidden></div>
           <div id="list-me-error" role="status" hidden></div>
         </div>
+        <!-- 🔦 The beacon (beaconSwitch.ts): whether this computer's node is a
+             public door into the welcome room on its Chia network, what it
+             waits for, and the one button that lights it (after CONFIRM) or
+             puts it out. Out on every network until the player lights it
+             here. main.ts writes these with textContent, hidden and data-*
+             only, so focus stays on the button from LIGHT BEACON to CONFIRM
+             to LIGHTING. -->
+        <div class="network-row" id="beacon-row">
+          <span class="label">Beacon</span>
+          <span class="value" id="network-beacon">--</span>
+        </div>
+        <div class="chia-lane-detail" id="beacon-detail">
+          <div id="beacon-note" hidden></div>
+          <button type="button" id="beacon-switch" hidden aria-describedby="beacon-note beacon-warning"></button>
+          <div id="beacon-warning" hidden></div>
+          <div id="beacon-error" role="status" hidden></div>
+        </div>
         <div class="network-row">
           <span class="label">Bridge</span>
           <span class="value" id="network-bridge-status">--</span>

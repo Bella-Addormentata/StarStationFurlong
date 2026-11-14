@@ -255,8 +255,8 @@ type ListMeAsk = Box<dyn Fn() -> bool + Send + Sync>;
 /// write the player stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resend {
-    /// Whatever LIST ME says: the beacon's writes (their own setting,
-    /// `SSF_CHIA_BEACON`), the dish's and every other spend.
+    /// Whatever LIST ME says: the beacon's writes (their own switch,
+    /// chia_beacon_switch.rs), the dish's and every other spend.
     Always,
     /// Only while LIST ME is on: the listing's writes and the knocks'.
     WhileListed,
@@ -2506,7 +2506,7 @@ pub fn money_memo_refusal(net: crate::chia_network::ChiaNet) -> Option<String> {
 pub fn money_memo_line(net: crate::chia_network::ChiaNet) -> Option<String> {
     (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub: on {} the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is turned on (SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain.",
+            "⛓️ ChiaHub: on {} the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is lit (the SpacePhone's Network settings, or SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain.",
             net.name()
         )
     })
@@ -3928,14 +3928,6 @@ pub struct MemoWrite {
 
 // ── #231 P6b: knocks and beacons ─────────────────────────────────────────────
 
-/// D7: the beacon role is opt-in (`SSF_CHIA_BEACON=1`): a public entry point
-/// that keeps the welcome room served and lets a newcomer with nobody to dial
-/// find it. Off by default, since the beacon hint is derivable by anyone and a
-/// roster of every active node id would be a public weekly directory.
-pub fn beacon_enabled() -> bool {
-    std::env::var("SSF_CHIA_BEACON").ok().as_deref() == Some("1")
-}
-
 /// The variable that chose who paid for a test network's Phone Book writes
 /// until stage 4 PR 12 (design §8 (2), §13 rows 9 and 12): at `0` the SSF
 /// wallet's own coin paid for the listing and the knocks, at the wallet's
@@ -3957,7 +3949,7 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// dish coin, for the fuse once the edition's
 /// `claim_write::MAX_GIFTS_PER_ERA` gifts are given, for a spend still
 /// settling or for an unread chain, uses none of its attempts; the beacon,
-/// where it is on (`SSF_CHIA_BEACON=1`), written from its key B as a burner
+/// where it is lit (chia_beacon_switch.rs), written from its key B as a burner
 /// key, which the lobby dish funds for its first write, from its slot or
 /// after a late start (§4.1, the beacon rows; §4.3 T5, [`beacon_arm_due`]);
 /// and the claim-and-write self-test hook ([`claim_write_selftest`]). The
@@ -3965,13 +3957,14 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// still uses an attempt (§10).
 ///
 /// `None` off a test network: there [`money_memo_line`] says once what the
-/// node writes, the beacon is the operator's to turn on, and the listing
-/// and the knocks are the player's (LIST ME, `chia_listing`, §4.5 (6), off
-/// there until turned on). It reads no environment.
+/// node writes, the beacon is the player's to light (chia_beacon_switch.rs,
+/// off on every network until then), and the listing and the knocks are
+/// the player's too (LIST ME, `chia_listing`, §4.5 (6), off there until
+/// turned on). It reads no environment.
 pub fn burners_line(net: crate::chia_network::ChiaNet) -> Option<String> {
     net.is_test().then(|| {
         format!(
-            "⛓️ ChiaHub burners: on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's {} gifts given, a spend still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The SSF wallet pays for none of these writes.",
+            "⛓️ ChiaHub burners: on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's {} gifts given, a spend still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. Where the beacon is lit (the SpacePhone's Network settings, or SSF_CHIA_BEACON=1) it is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The SSF wallet pays for none of these writes.",
             net.name(),
             claim_write::MAX_GIFTS_PER_ERA,
             HEARTBEAT_RETRY_SECS / 60
@@ -6231,7 +6224,8 @@ pub async fn heartbeat_loop(
     // The sign-off review's audit (stage 4 design §11), off unless
     // SSF_CHIA_AUDIT=1: what it has named this run, so the listing's keys
     // and each knock's key are named once ([`AuditBook`]). The beacon's key
-    // is named where the wallet loads (main.rs `announce_wallet`). The
+    // is named where the wallet loads with the beacon lit (main.rs
+    // `announce_wallet`), or where it is lit later (`turn_beacon`). The
     // book is made from the process's switch and from nothing else
     // (`audit::tests::every_audit_line_is_printed_behind_the_processs_switch`).
     let mut audit = AuditBook::new(audit_enabled());
@@ -6290,8 +6284,10 @@ pub async fn heartbeat_loop(
     // mark. Its key B is the key and payer the beacon wallet had before
     // burner keys, so a mark and the lease's records from then carry over.
     // B is the keys' own ([`PublisherKeys::beacon`]), made when the
-    // publisher starts.
-    let beacon_on = beacon_enabled();
+    // publisher starts. Whether it is lit is the hub's switch
+    // (chia_beacon_switch.rs: the player's, or `SSF_CHIA_BEACON=1`), asked
+    // at each tick below, so the mark is read here whatever it says now: a
+    // beacon lit later in the run is judged by the mark of its era.
     let beacon_mark_file = crate::chia_network::net().path(BEACON_MARK_FILE);
     let beacon_mark_path = beacon_mark_file.as_path();
     // Where this network's beacon pushes are dated for the other network's
@@ -6299,7 +6295,7 @@ pub async fn heartbeat_loop(
     // ([`beacon_on_path`]), and here only when a mark is forgotten.
     let beacon_pushed_file = crate::chia_network::net().path(BEACON_PUSHED_FILE);
     let beacon_pushed_path = beacon_pushed_file.as_path();
-    let mut beacon_mark: Option<BeaconMark> = beacon_on.then(|| BeaconMark::load(beacon_mark_path)).flatten();
+    let mut beacon_mark: Option<BeaconMark> = BeaconMark::load(beacon_mark_path);
     let mut beacon_attempt: Option<Instant> = None;
     // What the beacon's slot gate remembers between ticks: the era's first
     // peak and its late start (§4.3 T5, T2).
@@ -6320,7 +6316,7 @@ pub async fn heartbeat_loop(
     // rest of the era.
     let mut chain_knocked = ChainKnocked::default();
     let mut welcome_warned = false;
-    if let (true, Some(m)) = (beacon_on, &beacon_mark) {
+    if let (true, Some(m)) = (hub.beacon.on(), &beacon_mark) {
         println!(
             "⛓️ ChiaHub beacon: last written in era {} (hint {}, {})",
             m.era,
@@ -6393,6 +6389,13 @@ pub async fn heartbeat_loop(
             hub.presence_status.lock().unwrap().take();
         }
         let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
+        // 🔦 The beacon switch (chia_beacon_switch.rs), asked anew at every
+        // tick, so a turn in the SpacePhone's Network settings holds from
+        // the next one. Put out, the arm's last look is shown no longer.
+        let beacon_on = hub.beacon.on();
+        if !beacon_on {
+            hub.beacon_status.lock().unwrap().take();
+        }
         let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
         if peak == 0 && (findable.is_some() || knock_waiting || beacon_on) {
             peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
@@ -6943,6 +6946,9 @@ pub async fn heartbeat_loop(
                 node_id: &self_id,
             };
             let due = beacon_arm_due(&mut beacon_clock, &facts, &mut rand::rngs::OsRng);
+            // What this look found, for the page (the fingerprint's
+            // `chia_beacon`): why a lit beacon is or is not written yet.
+            *hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));
             // Due, and the peak not aged out during the lookups above.
             if due && !peak_aged("beacon") {
                 let tried = Instant::now();
@@ -6972,6 +6978,7 @@ pub async fn heartbeat_loop(
                         }
                         println!("{}", beacon_sent_line(write.acked, era, &mark.hint));
                         beacon_mark = Some(mark);
+                        *hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));
                     }
                     Err(_) => {
                         if let Some(line) = say {
@@ -6985,6 +6992,16 @@ pub async fn heartbeat_loop(
             }
         }
     }
+}
+
+/// What the beacon's arm found at one look, for the page
+/// (chia_beacon_switch.rs `BeaconStatus`): the edition, the two things a
+/// beacon waits for, and whether this node's beacon of this edition was
+/// sent and read back (`mark`: the mark as the arm holds it; one of another
+/// edition or another node id says nothing of this one). Pure.
+fn beacon_status(era: u64, reachable: bool, serves_welcome: bool, mark: Option<&BeaconMark>, node_id: &str) -> crate::chia_beacon_switch::BeaconStatus {
+    let own = mark.filter(|m| m.era == era && m.node_id.as_deref() == Some(node_id));
+    crate::chia_beacon_switch::BeaconStatus { era, reachable, serves_welcome, sent: own.is_some(), confirmed: own.is_some_and(|m| m.confirmed) }
 }
 
 /// The first characters of a node id, for the log.
@@ -12222,7 +12239,7 @@ mod tests {
         let line = money_memo_line(ChiaNet::Mainnet).unwrap();
         assert_eq!(
             line,
-            "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is turned on (SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain."
+            "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is lit (the SpacePhone's Network settings, or SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain."
         );
         assert!(!line.contains("only reads") && !line.contains("until burner keys") && !line.contains("yet"), "{line}");
         // The refusal is short enough for a row of the page to repeat whole
@@ -12294,7 +12311,7 @@ mod tests {
     fn burner_keys_are_the_only_keys_and_the_old_variable_is_said_to_be_unread() {
         use crate::chia_network::ChiaNet;
         use std::ffi::OsStr;
-        const ON: &str = "⛓️ ChiaHub burners: on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's 16 gifts given, a spend still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. With SSF_CHIA_BEACON=1 the beacon is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The SSF wallet pays for none of these writes.";
+        const ON: &str = "⛓️ ChiaHub burners: on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's 16 gifts given, a spend still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. Where the beacon is lit (the SpacePhone's Network settings, or SSF_CHIA_BEACON=1) it is written from a key of its own, which the lobby dish funds for its first write, in each edition's first day or within about an hour of coming online after it. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The SSF wallet pays for none of these writes.";
         assert_eq!(burners_line(ChiaNet::Testnet11).as_deref(), Some(ON));
         for net in ChiaNet::ALL {
             let line = burners_line(net);
@@ -12779,6 +12796,33 @@ mod tests {
         let mut untouched = BeaconClock::default();
         beacon_sees_peak(&mut untouched, &g.root, 0, &mut seeded(seed));
         assert_eq!((untouched.first, untouched.last_peak), (None, None));
+    }
+
+    /// What the page is shown of a lit beacon: the two conditions as they
+    /// stand, and "sent" and "confirmed" only from a mark of this era under
+    /// this node's own id. A mark of another era, or one another node id
+    /// wrote from this folder, says nothing of this week's beacon.
+    #[test]
+    fn the_beacons_status_counts_only_this_eras_mark_under_this_node() {
+        let mark = |era: u64, node: Option<&str>, confirmed: bool| BeaconMark { era, node_id: node.map(str::to_string), confirmed, ..Default::default() };
+        let st = |m: Option<&BeaconMark>| beacon_status(7, true, false, m, "me");
+        let none = st(None);
+        assert_eq!((none.era, none.reachable, none.serves_welcome, none.sent, none.confirmed), (7, true, false, false, false));
+        let flipped = beacon_status(7, false, true, None, "me");
+        assert_eq!((flipped.reachable, flipped.serves_welcome), (false, true), "each condition is its own word");
+        let pending = st(Some(&mark(7, Some("me"), false)));
+        assert_eq!((pending.sent, pending.confirmed), (true, false), "sent, not yet read back");
+        let landed = st(Some(&mark(7, Some("me"), true)));
+        assert_eq!((landed.sent, landed.confirmed), (true, true));
+        for (m, why) in [
+            (mark(6, Some("me"), true), "last era's beacon"),
+            (mark(8, Some("me"), true), "a mark from ahead"),
+            (mark(7, Some("another"), true), "another node id's beacon"),
+            (mark(7, None, true), "a mark that names no node"),
+        ] {
+            let s = st(Some(&m));
+            assert_eq!((s.sent, s.confirmed), (false, false), "{why}");
+        }
     }
 
     /// Whether the beacon arm tries a write, over every combination of what
@@ -13822,7 +13866,7 @@ use foreign_pause::{ForeignPause, Paused, FOREIGN_PAUSE_FILE};
 /// writes its listing, its knocks and its beacon from, and never a key.
 mod audit;
 use audit::AuditBook;
-pub use audit::{audit, audit_enabled, wallet_lines as audit_wallet_lines};
+pub use audit::{audit, audit_enabled, beacon_lit_line as audit_beacon_lit_line, wallet_lines as audit_wallet_lines};
 
 /// What the publisher holds of the SSF wallet (stage 4 design §3.4): the
 /// burner root, the beacon's key and the wallet's payer, which is a puzzle
