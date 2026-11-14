@@ -117,7 +117,8 @@ pub(crate) const OPENING_REST: Duration = Duration::from_secs(600);
 /// How long an address an opening dial went to counts as one we sent to
 /// first: main.rs `DIAL_PINHOLE_GRACE`, for the same reason (a connection
 /// that comes back through an opening our own packets made is not
-/// unsolicited, and proves nothing about being reachable).
+/// unsolicited, and proves nothing about being reachable). Counted, as that
+/// one is, from when the dial was let go ([`noted_opening_dial`]).
 pub(crate) const OPENED_GRACE: Duration = Duration::from_secs(120);
 
 /// A dial that is answered at once needs no knock: the knocker waits this
@@ -464,6 +465,19 @@ pub(crate) async fn opening_dial(endpoint: &IrohEndpoint, addr: SocketAddrV4) {
     }
 }
 
+/// One opening dial of a hold, noted in the book for [`OPENED_GRACE`] twice:
+/// as it begins, so that a connection landing while it runs is known for one
+/// we sent toward first, and again as it is let go. The dial's packets leave
+/// for as long as it runs (measured 2026-11-14: Initials at 0, 1 and 3 s, a
+/// last packet as the dial is let go at 4 s, none in the 146 s after), and
+/// the grace counts from the last of them, as main.rs counts a dial of our
+/// own from when it ended (`release_dial`).
+async fn noted_opening_dial(book: &Mutex<OpeningBook>, endpoint: &IrohEndpoint, addr: SocketAddrV4) {
+    book.lock().unwrap().note_opening(*addr.ip(), Instant::now());
+    opening_dial(endpoint, addr).await;
+    book.lock().unwrap().note_opening(*addr.ip(), Instant::now());
+}
+
 /// The rooms the holder looks its knock points up for: the rooms this node is
 /// in whose key it holds, SSF-WELCOME first, [`MAX_ROOMS`] at most.
 fn rooms_to_poll(hub: &SharedHub) -> Vec<(String, [u8; 32])> {
@@ -559,8 +573,7 @@ async fn opening_hold(hub: SharedHub, endpoint: IrohEndpoint, addr: SocketAddrV4
     let mut landed = false;
     while begun.elapsed() < OPENING_WINDOW {
         let round = Instant::now();
-        knock.book.lock().unwrap().note_opening(*addr.ip(), round);
-        opening_dial(&endpoint, addr).await;
+        noted_opening_dial(&knock.book, &endpoint, addr).await;
         // Look twice a second for the knocker's dial to land, up to the next
         // opening dial: a hold that got what it was for sends nothing more.
         while round.elapsed() < OPENING_PERIOD {
@@ -1126,6 +1139,34 @@ mod tests {
         // Another hour's point, and another room's, list nobody.
         assert_eq!(holder.lookup(knock_point(&room, &me, 500_001), LOOKUP_TIMEOUT).await, Some(BTreeSet::new()));
         assert_eq!(holder.lookup(knock_point(&[8u8; 32], &me, 500_000), LOOKUP_TIMEOUT).await, Some(BTreeSet::new()));
+    }
+
+    #[tokio::test]
+    async fn the_grace_after_an_opening_dial_counts_from_when_it_was_let_go() {
+        let endpoint = IrohEndpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![b"ssf".to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .expect("a loopback address")
+            .bind()
+            .await
+            .expect("an endpoint on loopback");
+        // A socket that never answers: the dial runs its whole timeout.
+        let knocker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("a UDP socket");
+        let SocketAddr::V4(knocker_addr) = knocker.local_addr().unwrap() else { panic!("IPv4") };
+        let book = Mutex::new(OpeningBook::default());
+        let began = Instant::now();
+        noted_opening_dial(&book, &endpoint, knocker_addr).await;
+        let let_go = Instant::now();
+        let ran = let_go.duration_since(began);
+        assert!(ran >= OPENING_DIAL_TIMEOUT - Duration::from_millis(100), "the dial ran its timeout, not {ran:?}");
+        // The dial sent until it was let go, so the address is still marked a
+        // whole grace after it BEGAN, short of nothing but the dial's length.
+        let ip = *knocker_addr.ip();
+        assert!(book.lock().unwrap().opened_lately(ip, began + OPENED_GRACE + Duration::from_secs(1)));
+        assert!(book.lock().unwrap().opened_lately(ip, let_go + OPENED_GRACE - Duration::from_secs(1)));
+        // And the mark runs out a grace after the dial was let go.
+        assert!(!book.lock().unwrap().opened_lately(ip, let_go + OPENED_GRACE + Duration::from_secs(1)));
+        endpoint.close().await;
     }
 
     #[tokio::test]
