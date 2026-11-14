@@ -2376,6 +2376,14 @@ interface FairOnlyState {
    *  that checks it counts the game again (countTransaction), as it does a result
    *  whose fold waited. */
   committingWaits: boolean;
+  /** 🔒 The deed holder's houses that are the game's too (PR 6c-5d-2): keys the
+   *  deed holder pins now that are houses of the game for the open round (of the first
+   *  STAND_IN_SCAN_MAX pins; none while the game is not live, or is not the deed holder's
+   *  to delegate for). One of them heard, other than the house a close would
+   *  depend on, can play the game on if that house is gone
+   *  (computedStandInHeard). A page hears them as the room's houses anyway (the
+   *  pin), so the list costs no beat a stranger can add. */
+  standIns: readonly string[];
 }
 
 /** A checkpoint this page counted: the value the doc held (put back as it
@@ -3674,6 +3682,12 @@ let houseBeats = new Map<string, { n: number; at: number | null }>();
 let gameHouseRefs = new Map<string, number>();
 /** What a FAIR ONLY game that is not live hears. */
 const NO_HOUSES: ReadonlySet<string> = new Set();
+/** …and the houses that stand in for its committing house: none. */
+const NO_STAND_INS: readonly string[] = [];
+/** How many of the deed holder's pins a game looks through for its stand-ins at a
+ *  count (each costs a search of the game's delegations): a holder runs a node or
+ *  two, and one heard is enough. */
+export const STAND_IN_SCAN_MAX = 16;
 /** The newest Fair setting by the deed holder this page has seen, per table. */
 let fairSeen = new Map<string, FairSettingRec>();
 /** The best valid owner-signed checkpoint (`hs:`) this page has counted, per
@@ -4123,6 +4137,23 @@ function houseOfOpen(resolved: Resolution, res: FoldResult, onWait: () => void):
   };
 }
 
+/** The deed holder's houses that are a game's: of the keys the deed holder pins
+ *  now (the first STAND_IN_SCAN_MAX of them, in the order they were pinned),
+ *  those `houseOfOpen` says are the game's for the open round. A game of another authority than the deed holder has none: its
+ *  houses are that authority's delegations, which the pins are not. */
+function standInsOf(houseOfOpen: (pub: string) => boolean): readonly string[] {
+  const owner = deedHolderKey();
+  if (!owner) return NO_STAND_INS;
+  const out: string[] = [];
+  let scanned = 0;
+  for (const [pub, by] of housePinned) {
+    if (by !== owner) continue;
+    if (scanned++ >= STAND_IN_SCAN_MAX) break;
+    if (houseOfOpen(pub)) out.push(pub);
+  }
+  return out.length > 0 ? out : NO_STAND_INS;
+}
+
 /** Forget when `pub` was last heard: it is heard again from the next beat that
  *  comes in. A key some deed holder pinned keeps its count (housePinned holds
  *  it anyway), so the record it was counted from is no beat when a peer writes
@@ -4331,7 +4362,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkUnder: new Map(), hkOver: new Map(), hkWaits: false, lacking: false, tableOut: false, returns: 0, tableOuts: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkUnder: new Map(), hkOver: new Map(), hkWaits: false, lacking: false, tableOut: false, returns: 0, tableOuts: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false, standIns: NO_STAND_INS }
     : null;
   // (…and the page keeps which keys it answered were, and the delegation the
   // resolution went by for each: they are what the fold's counts stand on,
@@ -5114,6 +5145,24 @@ export function computedGameMovedOf(tableId: string): { from: string; to: string
   return moved ? { ...moved } : null;
 }
 
+/** 🔒 Whether another house could play FAIR ONLY game `inc` of table `tableId`
+ *  on from a close that names commitment `h`: the page can tell the house that
+ *  holds the seed behind `h` (computedCommitHouse), and another house of the game
+ *  was heard in the last HOUSE_HEARD_MS: one of the deed holder's that is the
+ *  game's for the open round (FairOnlyState.standIns), or one that joined the
+ *  open round (FairOnlyState.houses). What lets a page close a round whose house
+ *  is away (computedTable closePaused): the close is voided by an abandon, which
+ *  lifts the commitment, and the house heard joins the round after. False for a
+ *  game with no other house heard, and for a house the page can't tell. Read-only. */
+export function computedStandInHeard(tableId: string, inc: string, h: string | undefined, now = Date.now()): boolean {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c?.last || !c.fo) return false;
+  const house = houseOfCommit(c.last, c.fo.committing, h);
+  if (house === undefined) return false;
+  for (const k of c.fo.houses) if (k !== house && houseHeardFrom(k, now)) return true;
+  return c.fo.standIns.some((k) => k !== house && houseHeardFrom(k, now));
+}
+
 /** 🔒 How many times table `tableId`'s game moved to or from a live FAIR ONLY one
  *  since this page bound the doc (a game opened at it, ended, or S9's choice went from
  *  one to another), 0 for none. No duty of the table's page-signed incarnation runs
@@ -5156,8 +5205,11 @@ function countFairOnly(c: ComputedInc, map: Y.Map<unknown>, whole: boolean, keys
   // checks it counts the game again, committingWaits.)
   let waits = false;
   fo.committing = live ? committingHouse(res, baseHouseOf(resolved), houseOfOpen(resolved, res, () => { waits = true; })) : undefined;
-  fo.committingWaits = waits;
   setGameHouses(fo, live ? commitHouses(res, fo.committing) : []);
+  // (And the deed holder's houses that are the game's for the open round: one
+  // heard stands in for the house a close depends on.)
+  fo.standIns = live ? standInsOf(houseOfOpen(resolved, res, () => { waits = true; })) : NO_STAND_INS;
+  fo.committingWaits = waits;
   // (A house whose answer was put off, or a base not told yet, is no house let go.)
   keepHouses(c, res.pending || resolved.pending);
   // What the page counted from is what it goes on from if the doc loses it

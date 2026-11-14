@@ -10,9 +10,10 @@
  * its commitment for the next round, and so on; the other writes nothing
  * but its beat. The other takes the game when the first steps down (no
  * round lost), or when a round of the first's is voided by a bettor (the
- * first stopped with a round in flight). It does not take over a commitment
- * left between rounds: the table waits for the house that made it (design
- * addendum 1b, limit 4). Split apart with a round in flight, each side plays
+ * first stopped with a round in flight, or between rounds with its
+ * commitment for the next one out: the pages close on that commitment once
+ * they hear the other house and not the first, PR 6c-5d-2, and the round is
+ * lost to the void). Split apart with a round in flight, each side plays
  * on with its own house, and the heal keeps one line (the limit the house
  * tables have: TODO.md "Computed casino tables", splits).
  *
@@ -123,24 +124,39 @@ describe('FAIR ONLY roulette: two houses of one holder', () => {
     expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(sim.house.p.table.ABANDON_MS + 2 * sim.house.p.table.GRACE_MAX_MS);
   }, TIMEOUT);
 
-  it('the house that plays stops between rounds for 40 s: the table waits for it, the other house up, and plays on when it is back (the limit: no takeover of a commitment)', async () => {
-    const sim = await Sim.open({ name: 'fair-only-two-houses-wait', seed: seed(1507), pages: room(), houseNode: true, fairOnly: true });
-    // (The bots' usual pace: with nobody to trim it, what they lay on the felt while the table waits stays in the session.)
+  it('the house that plays stops for good between rounds, its commitment for the next one out: the pages close on it with the other house heard, the bettors void that round, and the other house plays on (PR 6c-5d-2)', async () => {
+    const sim = await Sim.open({ name: 'fair-only-two-houses-takeover-quiet', seed: seed(1507), pages: room(), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
     let was: SimHouse | null = null;
-    const went = once(sim, 60_000, () => flight(sim) === 'quiet', () => { was = playing(sim).on; sim.runs(was, false); });
-    let other = 0;
-    let atReturn = 0;
-    const back = once(sim, 60_000, () => went.at !== null && sim.elapsed >= went.at + 40_000, () => { other = sim.nodes.find((n) => n !== was)!.wrote.reveals; atReturn = was!.wrote.reveals; sim.runs(was!, true); });
+    let before = 0;
+    const went = once(sim, 60_000, () => flight(sim) === 'quiet', () => { was = playing(sim).on; before = was.wrote.reveals; sim.runs(was, false); });
     await sim.run(RUN_MS);
     const s = await rouletteFinish(sim, { houseAway: true });
     fairOnlyFinish(sim, s);
-    lines.push(`wait: ${two(sim)}; voids ${s.voids}; stall ${s.worstStallMs}`);
+    lines.push(`takeover, quiet: ${two(sim)}; voids ${s.voids}; stall ${s.worstStallMs}`);
+    expect(went.at, sim.label).not.toBeNull();
+    const other = sim.nodes.find((n) => n !== was)!;
+    expect(was!.wrote.reveals, sim.label).toBe(before);
+    expect(s.voids, sim.label).toBe(1);
+    expect(other.wrote.reveals, sim.label).toBeGreaterThanOrEqual(2);
+    expect(other.trims, sim.label).toBeGreaterThanOrEqual(1);
+    expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(sim.house.p.table.ABANDON_MS + 2 * sim.house.p.table.GRACE_MAX_MS);
+  }, TIMEOUT);
+
+  it('the house that plays stops between rounds for 40 s: that round is lost to the void all the same, and the game goes on with the house whose join of the round after comes first, the other or the one that is back', async () => {
+    const sim = await Sim.open({ name: 'fair-only-two-houses-takeover-back', seed: seed(1508), pages: room(), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
+    let was: SimHouse | null = null;
+    const went = once(sim, 60_000, () => flight(sim) === 'quiet', () => { was = playing(sim).on; sim.runs(was, false); });
+    const all = (): number => sim.nodes.reduce((n, h) => n + h.wrote.reveals, 0);
+    let atReturn = 0;
+    const back = once(sim, 60_000, () => went.at !== null && sim.elapsed >= went.at + 40_000, () => { atReturn = all(); sim.runs(was!, true); });
+    await sim.run(RUN_MS);
+    const s = await rouletteFinish(sim, { houseAway: true });
+    fairOnlyFinish(sim, s);
+    lines.push(`takeover, back: ${two(sim)}; voids ${s.voids}; stall ${s.worstStallMs}`);
     expect(back.at, sim.label).not.toBeNull();
-    expect(other, sim.label).toBe(0);
-    expect(sim.nodes.find((n) => n !== was)!.wrote.reveals, sim.label).toBe(0);
-    expect(s.voids, sim.label).toBe(0);
-    expect(s.worstStallMs, sim.label).toBeGreaterThanOrEqual(35_000);
-    expect(was!.wrote.reveals, sim.label).toBeGreaterThan(atReturn);
+    expect(all(), sim.label).toBeGreaterThanOrEqual(atReturn + 2);
+    expect(s.voids, sim.label).toBe(1);
+    expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(sim.house.p.table.ABANDON_MS + 2 * sim.house.p.table.GRACE_MAX_MS);
   }, TIMEOUT);
 
   it('the house that plays steps down as its node shuts down: the other house joins the next round (a round is lost only where a close named the commitment as it was stepped down)', async () => {
