@@ -84,6 +84,12 @@ mod chia_watch;
 /// #231 P6b: the knock book (knocks sent and read, the rendezvous schedule).
 #[cfg(feature = "chia-read")]
 mod chia_knock;
+// 🚪 The DHT knock (dht_knock.rs): a dial that is not answered at once leaves
+// a knock on the Mainline DHT, and the computer it dials opens its router
+// toward the knocker. No coin and no chain; it needs a room's key, which the
+// node holds in the read build.
+#[cfg(feature = "chia-read")]
+mod dht_knock;
 // The faucet dish's coin (#231 onboarding phase): per-room address, status,
 // and — in a publish build — the keyless claim and the give spend.
 #[cfg(feature = "chia-read")]
@@ -745,6 +751,12 @@ pub struct HubState {
     /// Written and pruned by `release_dial`, read and pruned by `dialed_lately`.
     #[cfg(feature = "chia-read")]
     pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
+    /// 🚪 The DHT knock (dht_knock.rs): the node's own DHT client for knocks
+    /// and the holder's book of opening holds. `None` with the DHT off
+    /// (`SSF_NO_DHT=1`), the knock off (`SSF_DHT_KNOCK=0`), or a client that
+    /// could not start: no knock is then sent and none is looked for.
+    #[cfg(feature = "chia-read")]
+    pub dht_knock: Option<dht_knock::KnockDht>,
     /// #231 P6a: serializes contact-card sends with room-posture changes. The
     /// maintenance loop holds it from reading a room's posture through ONE
     /// send (bounded by `CARD_SEND_TIMEOUT`), card by card; the local browser's
@@ -1478,6 +1490,33 @@ mod fingerprint_json_tests {
     }
 }
 
+/// The DHT bootstrap hosts an operator named in `SSF_DHT_BOOTSTRAP`
+/// (`host:port`, comma-separated), or `None` for the library's own four (the
+/// External Infrastructure Register §3). Blank entries are dropped; a value
+/// with none left counts as unset, so an empty variable never leaves the node
+/// with no way into the DHT.
+fn dht_bootstrap_of(raw: Option<&str>) -> Option<Vec<String>> {
+    let hosts: Vec<String> = raw?.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect();
+    (!hosts.is_empty()).then_some(hosts)
+}
+
+#[cfg(test)]
+mod dht_bootstrap_tests {
+    use super::dht_bootstrap_of;
+
+    #[test]
+    fn the_override_takes_hosts_and_an_empty_one_is_no_override() {
+        assert_eq!(dht_bootstrap_of(None), None);
+        assert_eq!(dht_bootstrap_of(Some("")), None);
+        assert_eq!(dht_bootstrap_of(Some(" , ,")), None);
+        assert_eq!(dht_bootstrap_of(Some("10.0.0.1:6881")), Some(vec!["10.0.0.1:6881".to_string()]));
+        assert_eq!(
+            dht_bootstrap_of(Some(" 10.0.0.1:6881 ,, 10.0.0.2:25401 ")),
+            Some(vec!["10.0.0.1:6881".to_string(), "10.0.0.2:25401".to_string()])
+        );
+    }
+}
+
 fn load_configured_relays_from_env() -> Vec<String> {
     let Some(raw) = std::env::var("SSF_RELAYS").ok() else {
         return Vec::new();
@@ -2007,14 +2046,25 @@ async fn node_main() -> Result<()> {
     // resolves remote node IDs the same way: no DNS, no registration, no n0 infra.
     // AddrFilter::unfiltered is REQUIRED: the default (relay_only) would publish
     // nothing at all in our relay-less posture.
-    if std::env::var("SSF_NO_DHT").ok().as_deref() == Some("1") {
+    // The DHT's way in is the library's own four bootstrap hosts (External
+    // Infrastructure Register §3) unless the operator names others
+    // (`SSF_DHT_BOOTSTRAP=host:port,host:port`): then those alone, for both
+    // of the node's DHT clients (this lookup and the knock's, dht_knock.rs).
+    let dht_bootstrap = dht_bootstrap_of(std::env::var("SSF_DHT_BOOTSTRAP").ok().as_deref());
+    let dht_on = std::env::var("SSF_NO_DHT").ok().as_deref() != Some("1");
+    if !dht_on {
         println!("🕳️ Mainline DHT lookup DISABLED (SSF_NO_DHT=1)");
     } else {
-        match iroh_mainline_address_lookup::DhtAddressLookup::builder()
+        let mut lookup = iroh_mainline_address_lookup::DhtAddressLookup::builder()
             .secret_key(secret_key.clone())
-            .addr_filter(iroh::endpoint_info::AddrFilter::unfiltered())
-            .build()
-        {
+            .addr_filter(iroh::endpoint_info::AddrFilter::unfiltered());
+        if let Some(hosts) = &dht_bootstrap {
+            let mut dht_builder = n0_mainline::DhtBuilder::default();
+            dht_builder.bootstrap(hosts);
+            lookup = lookup.dht_builder(dht_builder);
+            println!("🕳️ Mainline DHT bootstrap: {} host(s) from SSF_DHT_BOOTSTRAP, in place of the built-in ones", hosts.len());
+        }
+        match lookup.build() {
             Ok(dht) => {
                 builder = builder.address_lookup(dht);
                 println!("🕳️ Mainline DHT lookup ENABLED — publishing + resolving via BitTorrent Mainline (set SSF_NO_DHT=1 to disable)");
@@ -2157,6 +2207,32 @@ async fn node_main() -> Result<()> {
         .find(|s| s.is_ipv4())
         .map(|s| s.port())
         .unwrap_or(DEFAULT_IROH_PORT);
+
+    // 🚪 The DHT knock (dht_knock.rs), on with the DHT: a client of its own on
+    // the Mainline DHT (the address lookup keeps its client to itself), by
+    // the same way in. `SSF_DHT_KNOCK=0` holds the knock alone off.
+    #[cfg(feature = "chia-read")]
+    let dht_knock = if !dht_on {
+        None
+    } else if dht_knock::knock_off(std::env::var("SSF_DHT_KNOCK").ok().as_deref()) {
+        println!("🚪 DHT knock OFF (SSF_DHT_KNOCK=0): no knock is sent and none is looked for");
+        None
+    } else {
+        let mut dht_builder = n0_mainline::DhtBuilder::default();
+        if let Some(hosts) = &dht_bootstrap {
+            dht_builder.bootstrap(hosts);
+        }
+        match dht_knock::KnockDht::start(&dht_builder) {
+            Ok(knock) => {
+                println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)");
+                Some(knock)
+            }
+            Err(e) => {
+                eprintln!("⚠️ DHT knock: its DHT client could not start ({e}); no knock is sent and none is looked for");
+                None
+            }
+        }
+    };
 
     // 🔄 Dynamic public-IP advertising (default `auto` since R1; also
     // auto:<port>): resolve now, then re-check every AUTO_ADDR_RECHECK_SECS.
@@ -2612,6 +2688,8 @@ async fn node_main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         recent_dials: Mutex::new(HashMap::new()),
         #[cfg(feature = "chia-read")]
+        dht_knock,
+        #[cfg(feature = "chia-read")]
         card_gate: tokio::sync::Mutex::new(()),
         #[cfg(feature = "chia-read")]
         chia_peak: Mutex::new(chia_resolve::ChainPeak::default()),
@@ -2825,6 +2903,13 @@ async fn node_main() -> Result<()> {
     tokio::spawn(async move {
         start_http_api_server(hub_http, iroh_http).await;
     });
+
+    // 🚪 The DHT knock's holder side: look this node's knock points up and
+    // open toward whoever knocked (dht_knock.rs).
+    #[cfg(feature = "chia-read")]
+    if hub.dht_knock.is_some() {
+        tokio::spawn(dht_knock::run_holder(hub.clone(), iroh_endpoint.clone()));
+    }
 
     // Start background Iroh Inbound connection acceptance loop
     let hub_iroh = hub.clone();
@@ -3403,6 +3488,14 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         let connection = match accepting.await {
             Ok(conn) => conn,
             Err(e) => {
+                // 🚪 While a DHT knock of ours is out, the computer we knocked
+                // on opens its router with a dial that cannot finish
+                // (dht_knock.rs `opening_dial`): it ends here, as it must.
+                #[cfg(feature = "chia-read")]
+                if hub.dht_knock.as_ref().is_some_and(|knock| knock.knock_out()) {
+                    println!("🚪 DHT knock: an inbound dial ended before it linked, as an opening dial does (a knock of ours is out); still listening");
+                    continue;
+                }
                 eprintln!("⚠️ Iroh handshake failed — still listening: {:?}", e);
                 continue;
             }
@@ -3411,6 +3504,11 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
         #[cfg(feature = "chia-read")]
         note_inbound_verified(&hub, remote_id, &inbound_path);
+        // 🚪 A knocker's dial that lands ends the opening hold toward it.
+        #[cfg(feature = "chia-read")]
+        if let (Some(knock), iroh::endpoint::IncomingAddr::Ip(from)) = (hub.dht_knock.as_ref(), &inbound_path.0) {
+            knock.note_landed(*from);
+        }
 
         // 📦 A blob-lane connection is answered by the lane, under its serving
         // rule (a connected member of the blob's room), and never enters the
@@ -3427,7 +3525,17 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
+        // 🚪 For as long as this connection stands, no opening hold begins
+        // toward the address it came from: the DHT goes on listing a knock
+        // long after the knocker linked (dht_knock.rs).
+        #[cfg(feature = "chia-read")]
+        let live_from = match &inbound_path.0 {
+            iroh::endpoint::IncomingAddr::Ip(from) => dht_knock::KnockDht::live_from(&hub, *from),
+            _ => None,
+        };
         tokio::spawn(async move {
+            #[cfg(feature = "chia-read")]
+            let _live_from = live_from;
             // Inbound-accepted: learn the room from the peer's first ysync stream.
             if let Err(e) = handle_iroh_connection(hub_clone, connection, iroh_clone, None).await {
                 eprintln!("⚠️ Swarm connection error with peer ({}): {:?}", remote_id, e);
@@ -3438,7 +3546,8 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
 /// #231 P6a: an accepted connection whose Initial came DIRECTLY (no relay) from
 /// a PUBLIC address, with that address validated, from a peer we were not
-/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`] — is proof that this
+/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`], nor sent an opening
+/// dial toward (the DHT knock, dht_knock.rs) — is proof that this
 /// node is reachable inbound on that address family — the only thing a
 /// presence record's flag may claim. A connection that arrived through a relay,
 /// from a LAN peer, or after our own dial Initials opened the pinhole (a dial
@@ -3458,7 +3567,15 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
         std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
         std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
     };
-    if !public || dialed_lately(hub, &remote_id, std::time::Instant::now()) {
+    let now_mono = std::time::Instant::now();
+    if !public || dialed_lately(hub, &remote_id, now_mono) {
+        return;
+    }
+    // 🚪 Nor is one from an address an opening dial of ours went to lately
+    // (dht_knock.rs): our own packets made the way in for it. The opening dial
+    // names no peer (the DHT gave an address, not a node id), so this one is
+    // judged by address.
+    if hub.dht_knock.as_ref().is_some_and(|knock| knock.opened_lately(sa.ip(), now_mono)) {
         return;
     }
     let now = chia_resolve::unix_now();
@@ -3675,6 +3792,15 @@ async fn dial_peer_inner(
     send: Option<std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>>,
 ) {
     report_dial_status(&hub, &send, &room_id, &target_str, "dialing", None).await;
+    // 🚪 While this dial runs, a knock through the DHT (dht_knock.rs): a
+    // target behind a router that answers nobody sees it and opens toward us,
+    // and one of the attempts below then lands. Nothing is sent for a target
+    // that answers at once. Dropped, and the knocking stopped, the moment an
+    // attempt lands, and otherwise when the dial ends, however it ends (the
+    // chain's rung 6 below is still this dial, and its holds are helped by a
+    // knock as the ladder's attempts are).
+    #[cfg(feature = "chia-read")]
+    let knocking = dht_knock::knock_while_dialing(&hub, &iroh_ep, &room_id, target_pub_key);
     let mut delay = std::time::Duration::from_millis(DIAL_BACKOFF_START_MS);
     for attempt in 1..=MAX_DIAL_ATTEMPTS {
         let still_needs = {
@@ -3704,6 +3830,10 @@ async fn dial_peer_inner(
 
         match iroh_ep.connect(addr, b"ssf").await {
             Ok(iroh_conn) => {
+                // The dial landed: the knocking ends here, before anything is
+                // waited for (the report below waits on the page's stream).
+                #[cfg(feature = "chia-read")]
+                drop(knocking);
                 println!(
                     "🎯 Iroh connection secured to peer node (attempt {}/{}).",
                     attempt, MAX_DIAL_ATTEMPTS
