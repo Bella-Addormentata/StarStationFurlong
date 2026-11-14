@@ -14,6 +14,10 @@ wtransport = { version = "0.6", features = ["quinn"] }
 iroh = { version = "1", default-features = false, features = ["tls-ring", "portmapper"] }
 # Sovereign zero-server discovery: publish/resolve node addresses via the BitTorrent Mainline DHT.
 iroh-mainline-address-lookup = "0.4"
+# PROBE ONLY (claude/dht-knock-probe, never merged): the DHT library the address
+# lookup above already brings in, named directly so examples/dht_knock_probe.rs
+# can announce and look up peers.
+n0-mainline = "0.5"
 # Zero-hint same-LAN discovery (bare room key resolves on the local network, no internet needed).
 iroh-mdns-address-lookup = "0.4"
 # 📦 The blob lane (media plan §4 step 1): a room member's file as a BLAKE3

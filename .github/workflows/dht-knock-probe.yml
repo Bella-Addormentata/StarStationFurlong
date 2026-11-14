@@ -1,0 +1,154 @@
+name: "🧪 DHT knock probe (probe branch, never to merge)"
+
+# Two questions about a DHT knock, asked on GitHub's machines and on the real
+# Mainline DHT, before anything is built into the node:
+#
+#   1. announce / peers: one machine announces the game's UDP port (44442) at a
+#      20-byte meeting point; a second machine looks that point up and must be
+#      handed an address with that port.
+#   2. holder / newcomer: the whole knock between two machines. The holder
+#      announces at its door point and polls its knock point; the newcomer
+#      reads the door point, announces at the knock point and dials the holder
+#      by node id; the holder sends an opening dial to every address its knock
+#      point lists. A link here needs both machines' outbound NAT to keep the
+#      game's port, which hosted runners do not promise: no link in this pair
+#      is recorded, not failed.
+#
+#   3. lab: examples/dht_knock_lab.py builds two home routers out of network
+#      namespaces on one machine, with a private DHT and no route to the real
+#      network, and runs four scenarios: two that must link and two that must
+#      not (the holder sends no opening dial; a router changes the port).
+#
+# The tool is examples/dht_knock_probe.rs. It is not the game: it speaks its
+# own protocol name, uses throwaway keys worked out from the run's number, and
+# reads and writes nothing of the game's. The DHT bootstrap hosts are the four
+# the node's address lookup already uses (the External Infrastructure Register
+# §3, first row); no other host is asked.
+#
+# It lives on the branch claude/dht-knock-probe alone and is not meant to reach
+# main. Logs are printed with every address cut to its family and port.
+
+on:
+  push:
+    branches: [claude/dht-knock-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: dht-knock-probe
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_DIR: prototypes/0.29.0-core-loop-demo/ssf-p2p-node
+
+jobs:
+  build:
+    name: build the probe
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.NODE_DIR }} -> target'
+          key: dht-knock-probe
+
+      - name: Build the probe
+        run: cargo build --example dht_knock_probe --manifest-path "$NODE_DIR/Cargo.toml"
+
+      - name: Keep the probe for the other jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dht-knock-probe
+          path: ${{ env.NODE_DIR }}/target/debug/examples/dht_knock_probe
+          retention-days: 3
+
+  announce:
+    name: 1a. announce port 44442 at a meeting point
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dht-knock-probe
+      - name: Announce, and stay up five minutes
+        run: |
+          chmod +x dht_knock_probe
+          POINT=$(printf 'ssf-dht-knock-probe/announce/%s/%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | sha1sum | cut -c1-40)
+          SSF_PROBE_LIFE_SECS=300 ./dht_knock_probe announce real "$POINT" 44442
+
+  peers:
+    name: 1b. a second machine reads the meeting point
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dht-knock-probe
+      - name: Look the meeting point up until an address with port 44442 comes back
+        run: |
+          chmod +x dht_knock_probe
+          POINT=$(printf 'ssf-dht-knock-probe/announce/%s/%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | sha1sum | cut -c1-40)
+          ./dht_knock_probe peers real "$POINT" 400 44442
+
+  holder:
+    name: 2a. holder (announces its door, polls its knock point)
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dht-knock-probe
+      - name: Hold the door for seven minutes
+        run: |
+          chmod +x dht_knock_probe
+          SECRET=$(printf 'ssf-dht-knock-probe/holder/%s/%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-64)
+          SSF_PROBE_LIFE_SECS=420 SSF_PROBE_POLL_SECS=10 ./dht_knock_probe holder real punch "$SECRET" \
+            || echo "RECORDED: nobody linked to the holder (see the header: hosted runners may not keep the port)"
+
+  newcomer:
+    name: 2b. newcomer (reads the door, knocks, dials)
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dht-knock-probe
+      - name: Knock for up to six minutes
+        run: |
+          chmod +x dht_knock_probe
+          SECRET=$(printf 'ssf-dht-knock-probe/holder/%s/%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-64)
+          HOLDER=$(./dht_knock_probe id "$SECRET")
+          ./dht_knock_probe newcomer real "$HOLDER" - 360 \
+            || echo "RECORDED: no link (see the header: hosted runners may not keep the port)"
+
+  lab:
+    name: 3. two emulated home routers (no real network)
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: dht-knock-probe
+      - name: Run the four scenarios
+        run: |
+          chmod +x dht_knock_probe
+          sudo python3 -m pip install -q pyroute2
+          for sc in punch latedial nopunch randomport; do
+            sudo env SSF_PROBE_BIN="$PWD/dht_knock_probe" SSF_LAB_OUT="$PWD/lab-logs" python3 "$NODE_DIR/examples/dht_knock_lab.py" "$sc" 40
+          done
