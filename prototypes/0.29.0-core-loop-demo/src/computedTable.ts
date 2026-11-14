@@ -5175,7 +5175,8 @@ export function computedCompactionPending(): boolean {
  *  stand-down too, whose end the page must be awake at), or a live game this
  *  page has something at stake in (serveLeftGames: its seed to reveal, its
  *  close, its abandon, what it puts back), or a game this page holds with an
- *  end order standing (fairEndDuty: its end). All are an awake page's, and with
+ *  end order standing (fairEndDuty: its end), or a game with forged records to
+ *  delete (fairTidyDuty). All are an awake page's, and with
  *  the room's last table out World would mark no frame: the page would read as
  *  asleep a lapse on, and for good. (Without this term the table went back by
  *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
@@ -5191,6 +5192,10 @@ export function computedFairOnlyPending(): boolean {
     // in the round or none, and with its table taken out of the room there
     // may be no other table to keep the page awake for it.)
     if (computedGamesEnding(getIdentityPub()).length > 0) return true;
+    // (A game with forged records to delete, fairTidyDuty: past
+    // MAX_FORGED_XFS of them its answer waits until they are gone, and the
+    // casino's spending with it, computedSettled.)
+    if (computedFairOnlyForged().length > 0) return true;
     if (fairTables.size === 0) return false;
     const me = getPlayerId();
     for (const st of fairTables.values()) {

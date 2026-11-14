@@ -14,7 +14,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { faironlyInc, xfId, xfKey } from './computedFairOnly';
+import { faironlyInc, sealFin, xfId, xfKey } from './computedFairOnly';
 import type { XferRec } from './computedFairOnly';
 import { dutyRank, nextSid3 } from './computedFold';
 import { buyer, changed, delegation, hex, house as H, NAME, offerOf, owner, rootOf, stranger, trimOf, xferOf } from './computedFairOnlyKit';
@@ -253,6 +253,33 @@ describe('the forged records of a game are deleted (P7)', () => {
     expect(has(first, forged.key)).toBe(true);
     run([first], wake + STEP, wake + 60_000, { step: STEP, until: () => !has(first, forged.key) });
     expect(has(first, forged.key)).toBe(false);
+  });
+
+  it('a page that wakes in a room with no table left, the game ended, still deletes a flood, and the casino is settled again', async () => {
+    const [a] = await gameRoom(['A']);
+    // The game's end, by its holder: no table to put back, nothing owed.
+    const end = trimOf(G, 'p', { u: 5, l: hex('e', 32), n: {}, e: 1, f: sealFin(G, owner.pub, owner.sign).value, s: undefined, h: undefined, k: owner.pub, dl: undefined });
+    clockOf(a, T0 + STEP);
+    a.doc.transact(() => top(a).set(end.key, end.value), 'peer');
+    const quiet = run([a], T0 + 2 * STEP, T0 + 300_000, { step: STEP, tables: [], until: () => !a.table.tableFrame(0) });
+    expect(a.table.tableFrame(0)).toBe(false);
+    expect(resolved(a)).toMatchObject({ live: false, pending: false });
+    const flood = Array.from({ length: MAX_FORGED_XFS + 6 }, (_, i) => forgedXf(5, i));
+    // no frame for a minute, the flood meanwhile, and no table in the room at the frames after: only the work owed marks them.
+    clockOf(a, quiet + 1_000);
+    a.doc.transact(() => { for (const r of flood) top(a).set(r.key, r.value); }, 'peer');
+    const wake = quiet + 62_000;
+    run([a], wake, wake, { step: STEP, tables: [] });
+    expect(a.croupier.tablesAwake(wake)).toBe(false);
+    expect(resolved(a).pending).toBe(true);
+    expect(a.casino.computedSettled()).toBe(false);
+    expect(a.table.tableFrame(0)).toBe(true);
+    run([a], wake + STEP, wake + 60_000, { step: STEP, tables: [], until: () => flood.every((r) => !has(a, r.key)) });
+    expect(flood.filter((r) => has(a, r.key)).length).toBe(0);
+    run([a], Date.now() + STEP, Date.now() + 2_000, { step: STEP, tables: [] });
+    expect(resolved(a).pending).toBe(false);
+    expect(a.casino.computedSettled()).toBe(true);
+    expect(a.casino.computedFairOnlyForged()).toEqual([]);
   });
 
   it('answers a peer that writes the forged record again, each time', async () => {
