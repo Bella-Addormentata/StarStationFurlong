@@ -110,7 +110,7 @@ export const beaconDefaultOutNote = (net: ChiaNetwork | null): string =>
   `The beacon is out for ${where(net)}, where it starts out. Lit, your node becomes a public door into the welcome room: ${WHAT_FOR}.`;
 
 export const beaconOutNote = (net: ChiaNetwork | null): string =>
-  `The beacon is out for ${where(net)}: your node writes no beacon there. One it wrote before stays on the chain; readers stop finding it once its edition and the next have passed.`;
+  `The beacon is out for ${where(net)}: your node starts no new beacon there. One it wrote before stays on the chain, and one already sent when it was put out may still land there; readers stop finding it once its edition and the next have passed.`;
 
 export const beaconDamagedNote = (net: ChiaNetwork | null): string =>
   `The saved beacon switch could not be read, and a switch that cannot be read counts as off: your node writes no beacon on ${where(net)}. Lit here, it is saved anew.`;
@@ -170,7 +170,7 @@ export function beaconState(fp: LocalFingerprint): { value: string; colour: stri
 
 /** What a lit beacon shows the world, before CONFIRM. */
 export function beaconWarning(net: ChiaNetwork | null): string {
-  return `Light a beacon on ${where(net)}? Once an edition (about a week), while your node can be reached from outside and serves the welcome room, it writes its node id in the clear where anyone can read it, from a key of its own that the lobby dish pays for, never from your SSF wallet. Anyone can then list the nodes that lit a beacon that week and look up this node's network addresses from its id; new players' games dial it to load the welcome room; and the Chia full nodes your node talks to see its IP address. Your node writes the same id on every Chia network, so one that lights a beacon on two of them can be linked across them. Putting the beacon out stops new ones; what is written stays on the chain. Tap CONFIRM.`;
+  return `Light a beacon on ${where(net)}? Once an edition (about a week), while your node can be reached from outside and serves the welcome room, it writes its node id in the clear where anyone can read it, from a key of its own that the lobby dish pays for, never from your SSF wallet. Anyone can then list the nodes that lit a beacon that week and look up this node's network addresses from its id; new players' games dial it to load the welcome room; and the Chia full nodes your node talks to see its IP address. Your node writes the same id on every Chia network, so one that lights a beacon on two of them can be linked across them. Putting the beacon out stops new ones; what is written stays on the chain, and a beacon already sent when you put it out may still land there. Tap CONFIRM.`;
 }
 
 /** The turn an act sends: `true` to light, `false` to put out, or none

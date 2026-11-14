@@ -22,7 +22,7 @@ This is the text the game's help should carry. Today the game says part of it, i
 >
 > On testnet11 it is the same from this version on. An older version paid for each listing and each knock there from your SSF wallet, and those stay on the chain at your wallet's address.
 >
-> A beacon makes your computer a public door into the welcome room for new players. While it is lit, your node writes its id in the clear about once a week, where anyone can read it, and anyone can look up the node's network addresses from that id. It is out until you light it (SETTINGS, NETWORK, BEACON), on each Chia network apart. Putting it out stops new ones; what is written stays.
+> A beacon makes your computer a public door into the welcome room for new players. While it is lit, your node writes its id in the clear about once a week, where anyone can read it, and anyone can look up the node's network addresses from that id. It is out until you light it (SETTINGS, NETWORK, BEACON), on each Chia network apart. Putting it out stops new ones; what is written stays, and a beacon already sent when you put it out may still land.
 >
 > The Chia full nodes your station talks to see its IP address on everything it sends and asks for. To stop that, turn Chia off (SETTINGS, NETWORK, CHIA). Your station then never contacts Chia at all.
 

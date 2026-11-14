@@ -154,7 +154,7 @@ describe('what a lit beacon is doing', () => {
 describe('the beacon texts, whole', () => {
   it('says before CONFIRM what a beacon shows, to whom, and that it stays', () => {
     expect(beaconWarning(MAINNET)).toBe(
-      "Light a beacon on Chia mainnet? Once an edition (about a week), while your node can be reached from outside and serves the welcome room, it writes its node id in the clear where anyone can read it, from a key of its own that the lobby dish pays for, never from your SSF wallet. Anyone can then list the nodes that lit a beacon that week and look up this node's network addresses from its id; new players' games dial it to load the welcome room; and the Chia full nodes your node talks to see its IP address. Your node writes the same id on every Chia network, so one that lights a beacon on two of them can be linked across them. Putting the beacon out stops new ones; what is written stays on the chain. Tap CONFIRM.",
+      "Light a beacon on Chia mainnet? Once an edition (about a week), while your node can be reached from outside and serves the welcome room, it writes its node id in the clear where anyone can read it, from a key of its own that the lobby dish pays for, never from your SSF wallet. Anyone can then list the nodes that lit a beacon that week and look up this node's network addresses from its id; new players' games dial it to load the welcome room; and the Chia full nodes your node talks to see its IP address. Your node writes the same id on every Chia network, so one that lights a beacon on two of them can be linked across them. Putting the beacon out stops new ones; what is written stays on the chain, and a beacon already sent when you put it out may still land there. Tap CONFIRM.",
     );
     expect(beaconWarning(TESTNET11)).toBe(beaconWarning(MAINNET).replace('Chia mainnet', 'testnet11'));
     expect(beaconWarning(null)).toContain('Light a beacon on the Chia network your node runs on?');
@@ -165,7 +165,7 @@ describe('the beacon texts, whole', () => {
       "The beacon is out for testnet11, where it starts out. Lit, your node becomes a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node.",
     );
     expect(beaconOutNote(MAINNET)).toBe(
-      'The beacon is out for Chia mainnet: your node writes no beacon there. One it wrote before stays on the chain; readers stop finding it once its edition and the next have passed.',
+      'The beacon is out for Chia mainnet: your node starts no new beacon there. One it wrote before stays on the chain, and one already sent when it was put out may still land there; readers stop finding it once its edition and the next have passed.',
     );
     expect(beaconLitNote(TESTNET11, BEACON_ON_CHAIN)).toBe(
       "The beacon is lit for testnet11. Your node is a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node. This edition's beacon is on the chain.",
