@@ -495,6 +495,15 @@ import {
   welcomeStateHere,
 } from "./welcomeOnly";
 import type { MarkStore } from "./welcomeOnly";
+import {
+  enterMode,
+  enterNote,
+  firstRunSteps,
+  newDialTally,
+  noteDial,
+  stepGlyph,
+} from "./firstRunSteps";
+import type { FirstRunFacts, StepMark } from "./firstRunSteps";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -863,6 +872,27 @@ let welcomeRetryTimer: number | null = null;
 /** 🛰️ The dial-failure advice was said once while seeking: the node dials
  *  again at every ask (seekWelcome), and the seek's own line says the rest. */
 let welcomeDialFailureSaid = false;
+/** 🛰️ First run (firstRunSteps.ts): what the title screen shows of the search
+ *  for the welcome room. The dial reports of the welcome room's session, by
+ *  computer; whether a boot found this computer's node silent; and the
+ *  title's own repaint, set only while the title shows the steps. */
+const firstRunDial = newDialTally();
+let firstRunNodeSilent = false;
+let firstRunRepaint: (() => void) | null = null;
+
+/** 🛰️ The facts the title's steps are drawn from, as they stand now. */
+function firstRunFactsNow(): FirstRunFacts {
+  const fp = localFingerprint;
+  return {
+    node: fp ? "up" : firstRunNodeSilent ? "down" : "unknown",
+    chiaOff: fp?.chia_lane ? fp.chia_lane.off : undefined,
+    wallet: fp?.chia_wallet?.state,
+    dialing: firstRunDial.dialing.size,
+    failed: firstRunDial.failed.size,
+    linked: firstRunDial.linked,
+    arrived: welcomeReachedThisPage,
+  };
+}
 
 /** 🛰️ Where the welcome mark is kept; null where storage is closed. */
 function welcomeStore(): MarkStore | null {
@@ -1555,6 +1585,8 @@ async function bootstrapNetworking() {
       console.warn(
         "⚠️ No running Rust node found. Seamlessly falling back to offline mode.",
       );
+      firstRunNodeSilent = true;
+      firstRunRepaint?.();
       updateHUDNode("OFFLINE", "#ff1744");
       updateHUDP2P("OFFLINE", "#ff1744");
       setNetworkRow(
@@ -2502,6 +2534,24 @@ async function joinRoomAtEpoch(
   // No awaits below this line — the epoch can no longer go stale mid-bind,
   // so every observer/handler below attaches to the CURRENT session's doc.
 
+  // 🛰️ First run (firstRunSteps.ts): the handshake above asked the node to
+  // dial every computer this welcome session's record names, and the node's
+  // report of that first dial can come before the handler below listens (a
+  // page's first join has none yet). The title counts those computers from
+  // the record itself; the node's later reports move each one on.
+  if (boot.roomId === DEFAULT_STATION.welcomeRoomId) {
+    const own = localFingerprint?.iroh_node_id;
+    const record = withHeldWelcomeRoutes(
+      withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
+    );
+    for (const hint of collectMemberHints(record)) {
+      if (hint.irohNodeId && hint.irohNodeId !== own) {
+        noteDial(firstRunDial, hint.irohNodeId, "dialing");
+      }
+    }
+    firstRunRepaint?.();
+  }
+
   // 🚪🔥 A warm session (open, dialling, or already hung up) may have linked
   // this node to the room's host, and the node keeps that peer and does not
   // dial it again, so no bridge `connected` status may ever reach this
@@ -2594,6 +2644,12 @@ async function joinRoomAtEpoch(
             detail?: string;
           };
           const shortTarget = (status.target ?? "").slice(0, 8);
+          // 🛰️ The title's steps count the welcome room's dials by computer
+          // (firstRunSteps.ts); another room's dials are not its business.
+          if (env.room === DEFAULT_STATION.welcomeRoomId) {
+            noteDial(firstRunDial, status.target, status.status);
+            firstRunRepaint?.();
+          }
           if (status.status === "dialing") {
             setNetworkRow(
               "network-bridge-status",
@@ -4254,6 +4310,7 @@ function noteWelcomeReached(sync: YjsSync | null): boolean {
     return false;
   }
   welcomeReachedThisPage = true;
+  firstRunRepaint?.();
   clearWelcomePending(welcomeStore());
   if (welcomeRetryTimer !== null) {
     window.clearTimeout(welcomeRetryTimer);
@@ -10128,6 +10185,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // node restarted between two probes), is armed no longer: CONFIRM is for
   // the warning that was read.
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
+  // 🛰️ The title's steps read the node, the Phone Book and the wallet from
+  // the fingerprint (firstRunSteps.ts).
+  firstRunNodeSilent = false;
+  firstRunRepaint?.();
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
@@ -12294,12 +12355,112 @@ function setupClickToEnter() {
       btnNew.type = "button";
       btnNew.textContent = "🚀  NEW PLAYER";
       btnNew.style.cssText = primary;
-      btnNew.addEventListener("click", (e) => {
-        e.stopPropagation();
+      // 🛰️ First run (firstRunSteps.ts): while this install looks for the
+      // welcome room, the title shows where the search stands, one line per
+      // step, and NEW PLAYER holds the reveal a short while so the room has a
+      // chance to be here. ENTER is there from that moment on, whatever the
+      // search says: the room fills in by itself when a computer answers.
+      const seeksAtTitle = welcomeSeeking();
+      /** This title waits for the welcome room: the install was seeking it
+       *  when the page loaded, and the session is that room's or not joined
+       *  yet. A page opened with a pass to another room is never held. */
+      const waitsForWelcome = (): boolean => {
+        if (!seeksAtTitle) return false;
+        const room =
+          activeBootstrap?.roomId ?? pendingBootstrapOverride?.roomId ?? null;
+        return room === null || room === DEFAULT_STATION.welcomeRoomId;
+      };
+      const steps = document.createElement("div");
+      steps.id = "first-run-steps";
+      steps.setAttribute("role", "status");
+      steps.setAttribute("aria-live", "polite");
+      steps.style.cssText =
+        "display:none; flex-direction:column; gap:4px; margin-top:6px; width:380px; " +
+        "max-width:86vw; text-align:left; font:400 12px/1.45 inherit;";
+      const markColor: Record<StepMark, string> = {
+        done: "#9fe0a0",
+        busy: "#f0d090",
+        wait: "rgba(212,168,75,0.8)",
+        off: "rgba(212,168,75,0.55)",
+      };
+      const btnEnter = document.createElement("button");
+      btnEnter.type = "button";
+      btnEnter.id = "first-run-enter";
+      btnEnter.textContent = "ENTER NOW";
+      btnEnter.style.cssText = secondary;
+      btnEnter.style.display = "none";
+      /** When NEW PLAYER was chosen and the title began to wait for the room;
+       *  null before that. */
+      let heldSince: number | null = null;
+      let holdTimer: number | null = null;
+      let restoreBox: HTMLElement | null = null;
+      let paintedSteps = "";
+      const proceed = () => {
+        if (holdTimer !== null) window.clearInterval(holdTimer);
+        holdTimer = null;
+        firstRunRepaint = null;
         wrap.remove();
         dwellDone = true; // proceed at once — don't wait out the intro dwell
         proceedChosen = true;
         maybeFade();
+      };
+      const paintSteps = () => {
+        if (!waitsForWelcome()) {
+          steps.style.display = "none";
+          paintedSteps = "";
+          // Another room after all (a pass resolved late): nothing to wait for.
+          if (heldSince !== null) proceed();
+          return;
+        }
+        const facts = firstRunFactsNow();
+        const lines = firstRunSteps(facts, DEFAULT_STATION.name);
+        // Repainted only when a line changed, so a screen reader is told of
+        // changes and not of every tick.
+        const painted = lines.map((l) => `${l.mark}:${l.text}`).join("\n");
+        if (painted !== paintedSteps) {
+          paintedSteps = painted;
+          steps.replaceChildren(
+            ...lines.map((l) => {
+              const row = document.createElement("div");
+              row.dataset.step = l.key;
+              row.dataset.mark = l.mark;
+              row.style.color = markColor[l.mark];
+              row.textContent = `${stepGlyph(l.mark)}  ${l.text}`;
+              return row;
+            }),
+          );
+        }
+        steps.style.display = "flex";
+        if (heldSince === null) return;
+        const mode = enterMode(facts.arrived, performance.now() - heldSince);
+        if (mode === "reveal") {
+          proceed();
+          return;
+        }
+        if (btnEnter.dataset.mode !== mode) {
+          btnEnter.dataset.mode = mode;
+          btnEnter.style.cssText = mode === "lit" ? primary : secondary;
+          note.textContent = enterNote(mode, DEFAULT_STATION.name);
+        }
+      };
+      btnNew.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!waitsForWelcome() || welcomeReachedThisPage) {
+          proceed();
+          return;
+        }
+        heldSince = performance.now();
+        btnNew.style.display = "none";
+        btnLoad.style.display = "none";
+        restoreBox?.remove();
+        btnEnter.style.display = "";
+        paintSteps();
+        // The patience runs on a clock no event reports: look twice a second.
+        holdTimer = window.setInterval(paintSteps, 500);
+      });
+      btnEnter.addEventListener("click", (e) => {
+        e.stopPropagation();
+        proceed();
       });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
@@ -12351,13 +12512,18 @@ function setupClickToEnter() {
           setTimeout(() => window.location.reload(), 700);
         });
         box.append(ta, doRestore);
+        restoreBox = box;
         wrap.insertBefore(box, note);
         note.textContent =
           "Paste the recovery key you saved from Settings → Backup / restore identity.";
         ta.focus();
       });
-      wrap.append(btnNew, btnLoad, note);
+      wrap.append(btnNew, btnLoad, btnEnter, note, steps);
       content.appendChild(wrap);
+      // The search began with the page: show where it stands from the first
+      // frame of the title, and again at every change the page hears of.
+      firstRunRepaint = paintSteps;
+      paintSteps();
     }
   }
 
