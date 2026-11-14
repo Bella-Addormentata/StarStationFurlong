@@ -55,6 +55,10 @@ mod chia_strict;
 // player's switch for this station's Phone Book writes on one Chia network,
 // off where the coins are real money until the player turns it on.
 mod chia_listing;
+// 🔦 The beacon switch (#231 D7): the player's switch for this node's
+// welcome-room beacon on one Chia network, off everywhere until lit in the
+// SpacePhone's Network settings (or held by SSF_CHIA_BEACON).
+mod chia_beacon_switch;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
@@ -431,6 +435,18 @@ pub struct Fingerprint {
     /// from an older node. Loopback only, like the address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_listing: Option<chia_listing::ListingView>,
+    /// 🔦 The beacon on this node's network (chia_beacon_switch.rs): whether
+    /// it is lit (`on`), whether the player turned the switch (`chosen`),
+    /// `held` when `SSF_CHIA_BEACON` in the node's environment decides
+    /// instead, `damaged` when its file cannot be read, and while it is lit
+    /// and a publisher has looked, what that look found (`status`: the
+    /// edition, whether this node was reached from outside in it, whether
+    /// it serves the welcome room, and whether this edition's beacon was
+    /// sent and read back). Read live per request; absent from a read-only
+    /// build, which writes nothing, and from an older node. Loopback only,
+    /// like the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_beacon: Option<chia_beacon_switch::BeaconView>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -800,6 +816,17 @@ pub struct HubState {
     /// in the SpacePhone's Network settings holds within the run.
     #[cfg(feature = "chia-publish")]
     pub list_me: chia_listing::ListMe,
+    /// 🔦 The beacon switch for the process's network
+    /// (chia_beacon_switch.rs): whether the publisher's beacon arm may
+    /// write. The heartbeat asks it at every tick, so a turn in the
+    /// SpacePhone's Network settings holds within the run.
+    #[cfg(feature = "chia-publish")]
+    pub beacon: chia_beacon_switch::BeaconSwitch,
+    /// 🔦 What the beacon arm's last look found, mirrored here for the
+    /// loopback fingerprint (`None` until a lit beacon's first look, and
+    /// again once it is put out).
+    #[cfg(feature = "chia-publish")]
+    pub beacon_status: Mutex<Option<chia_beacon_switch::BeaconStatus>>,
     /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
     /// per era) and knocks read from our inbox, each with the confirmation
     /// height both sides dial by.
@@ -1094,6 +1121,7 @@ pub fn compute_fingerprint(
         chia_network: None,
         chia_lane: None,
         chia_listing: None,
+        chia_beacon: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -1232,6 +1260,7 @@ mod fingerprint_json_tests {
             chia_network: None,
             chia_lane: None,
             chia_listing: None,
+            chia_beacon: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -2316,6 +2345,12 @@ async fn node_main() -> Result<()> {
     // The wallet key outlives this block so the publisher's heartbeat
     // (spawned after HubState exists: it reads the hub) can be handed its
     // keys (`start_publisher`).
+    // 🔦 The beacon switch for this network (chia_beacon_switch.rs), read
+    // before the wallet loads, whose lines say whether the beacon is lit,
+    // and kept by the hub for the run. A build that only reads the chain
+    // has no switch.
+    #[cfg(feature = "chia-publish")]
+    let beacon = chia_beacon_switch::BeaconSwitch::read(chia_net, chia_net.path(chia_beacon_switch::BEACON_FILE), chia_beacon_switch::env_switch());
     #[cfg(feature = "chia-publish")]
     let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-publish")]
@@ -2355,7 +2390,7 @@ async fn node_main() -> Result<()> {
         match load_wallet() {
             Ok((id, meta)) => {
                 let chia_sk = id.wallet.clone();
-                announce_wallet(chia_net, &id);
+                announce_wallet(chia_net, &id, beacon.on());
                 startup_wallet_meta = Some(meta);
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
@@ -2442,6 +2477,11 @@ async fn node_main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     if !chia_off {
         if let Some(line) = list_me.start_line() {
+            println!("{line}");
+        }
+        // 🔦 And the beacon switch's, where the player turned it or the
+        // environment holds it.
+        if let Some(line) = beacon.start_line() {
             println!("{line}");
         }
     }
@@ -2625,6 +2665,10 @@ async fn node_main() -> Result<()> {
         knock_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-publish")]
         list_me,
+        #[cfg(feature = "chia-publish")]
+        beacon,
+        #[cfg(feature = "chia-publish")]
+        beacon_status: Mutex::new(None),
         #[cfg(feature = "chia-read")]
         knocks: Mutex::new(chia_knock::KnockBook::at_start(&chia_network::net().path(chia_knock::KNOCKS_FILE), chia_off)),
         #[cfg(feature = "chia-publish")]
@@ -6645,23 +6689,20 @@ mod test_hook_tests {
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address, with the
-/// beacon on the beacon's line (which names no address, [`beacon_lines`]),
+/// beacon lit (`beacon_on`: the hub's switch, chia_beacon_switch.rs) the
+/// beacon's line (which names no address, [`beacon_lines`]),
 /// on a test network what burner keys do, a note where the retired
 /// SSF_CHIA_BURNERS is still set, and with SSF_CHIA_AUDIT set to `1`, the
 /// audit's notice and the beacon key's address
 /// (`chia_publish::audit_wallet_lines`). Never the words.
 #[cfg(feature = "chia-publish")]
-fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
+fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity, beacon_on: bool) {
     chia_wallet::log_receive_address(net, id);
     // #231 P6b/D7: the beacon role pays from a key of its own, derived from
     // the wallet key (so it changes with a re-mint). The lobby dish funds
     // it, and its line names no address (stage 4 design §4.5 (8)).
-    if chia_publish::beacon_enabled() {
-        let (line, warning) = beacon_lines(net);
-        println!("{line}");
-        if let Some(warning) = warning {
-            eprintln!("{warning}");
-        }
+    if beacon_on {
+        say_beacon(net);
     }
     // Stage 4 design §8 (2), §13 row 12: on a test network, what burner
     // keys do there (off one, the money line says it once). And where the
@@ -6677,8 +6718,20 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
     // Stage 4 design §11: the sign-off review's audit, with SSF_CHIA_AUDIT
     // set to `1` alone: its notice, and with the beacon on the address of
     // the beacon's key. Nothing is said otherwise.
-    for line in chia_publish::audit_wallet_lines(net, chia_publish::audit(), chia_publish::beacon_enabled(), &id.wallet) {
+    for line in chia_publish::audit_wallet_lines(net, chia_publish::audit(), beacon_on, &id.wallet) {
         println!("{line}");
+    }
+}
+
+/// ⛓️ Say the beacon's line, and off a test network its warning
+/// ([`beacon_lines`]): where a wallet loads with the beacon lit, and where
+/// a beacon is lit with the wallet loaded ([`turn_beacon`]).
+#[cfg(feature = "chia-publish")]
+fn say_beacon(net: chia_network::ChiaNet) {
+    let (line, warning) = beacon_lines(net);
+    println!("{line}");
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
     }
 }
 
@@ -6697,7 +6750,7 @@ fn beacon_lines(net: chia_network::ChiaNet) -> (String, Option<String>) {
     // promise that the two chains are never linked, so the warning stays.
     let warning = (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
+            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave the beacon out here to keep them apart.",
             net.name(),
             chia_network::ChiaNet::Testnet11.name(),
             chia_network::ChiaNet::Testnet11.name(),
@@ -6741,7 +6794,7 @@ mod beacon_line_tests {
         let warning = warning.expect("mainnet warns");
         assert_eq!(
             warning,
-            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
+            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave the beacon out here to keep them apart."
         );
         assert!(!warning.contains("once it writes"), "it writes there now: {warning}");
         assert!(!warning.contains("xch1") && !warning.contains("fund"), "{warning}");
@@ -7111,7 +7164,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             Ok(Err(e)) => return fail(format!("the wallet could not be loaded: {e:#}")),
             Err(e) => return fail(format!("the wallet could not be loaded ({e})")),
         };
-        announce_wallet(net, &id);
+        announce_wallet(net, &id, hub.beacon.on());
         let chia_sk = id.wallet.clone();
         drop(id);
         // The lease's parking outlives the process (see startup): restored
@@ -7206,6 +7259,45 @@ fn turn_listing(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) 
     {
         let _ = (hub, on);
         ("409 Conflict", serde_json::json!({ "ok": false, "error": chia_listing::UNBUILT_WORDS }))
+    }
+}
+
+/// 🔦 One turn of the beacon switch for the SpacePhone's Network settings
+/// (chia_beacon_switch.rs): the switch saves it and answers, and the node
+/// says its line. Put out, the arm's last look is shown no longer. Lit with
+/// a wallet already loaded, the node says what that wallet's load says
+/// where the beacon is lit at the start: the beacon's own line (and off a
+/// test network its warning), and with SSF_CHIA_AUDIT set to `1` the
+/// beacon key's address. With no wallet loaded yet, the load says them. A
+/// build that only reads the chain has no switch.
+fn turn_beacon(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) {
+    #[cfg(feature = "chia-publish")]
+    {
+        let net = chia_network::net();
+        let turned = hub.beacon.turn(on, chia_listing::unix_now(), chia_strict::strict());
+        match &turned.line {
+            Some(line) if turned.failed => eprintln!("{line}"),
+            Some(line) => println!("{line}"),
+            None => {}
+        }
+        if !hub.beacon.on() {
+            hub.beacon_status.lock().unwrap().take();
+        }
+        if turned.newly_lit {
+            let wallet = hub.chia_wallet.lock().unwrap().clone();
+            if let Some(wallet) = wallet {
+                say_beacon(net);
+                if let Some(line) = chia_publish::audit_beacon_lit_line(net, chia_publish::audit(), &wallet) {
+                    println!("{line}");
+                }
+            }
+        }
+        (turned.status, turned.body)
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = (hub, on);
+        ("409 Conflict", serde_json::json!({ "ok": false, "error": chia_beacon_switch::UNBUILT_WORDS }))
     }
 }
 
@@ -7537,6 +7629,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                         // 📖 LIST ME on this network, live too: a turn in
                         // the Network settings shows at the next read.
                         fp.chia_listing = Some(hub_clone.list_me.view());
+                        // 🔦 The beacon switch, live too, with what the
+                        // publisher's last look at a lit beacon found.
+                        fp.chia_beacon = Some(hub_clone.beacon.view().with(*hub_clone.beacon_status.lock().unwrap()));
                         // 📖 And the Phone Book listing state the publisher
                         // mirrored on its last tick, for the top bar's icon.
                         fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
@@ -7720,6 +7815,33 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
                 let (status, body) = match chia_listing::listing_gate(local, target, chia_network::net(), &node_id) {
                     Ok(on) => turn_listing(&hub_clone, on),
+                    Err(refused) => refused,
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/chia/beacon?") || req.starts_with("POST /api/chia/beacon ") {
+                // 🔦 The SpacePhone's beacon switch (chia_beacon_switch.rs):
+                // `on=1` lets this node write its welcome-room beacon on its
+                // network from the publisher's next tick, `on=0` stops it,
+                // and either is remembered for that network alone. Behind
+                // the wallet switch's gate: only this machine's own game
+                // page may ask.
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
+                // An on names the network and the node it was confirmed
+                // for, and is taken only by that node on that network.
+                let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
+                let (status, body) = match chia_beacon_switch::beacon_gate(local, target, chia_network::net(), &node_id) {
+                    Ok(on) => turn_beacon(&hub_clone, on),
                     Err(refused) => refused,
                 };
                 let body = body.to_string();

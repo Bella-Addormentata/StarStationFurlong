@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
-import { parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseHouseFold, parseNodeFingerprint } from './nodeFingerprint';
+import { parseChiaBeacon, parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseHouseFold, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -191,6 +191,49 @@ describe('parseNodeFingerprint', () => {
     }
     // Nothing else is copied.
     expect(fp({ on: false, chosen: true, at: 1_700_000_000, path: '/home/x/chia_listing.json' })).toEqual({ on: false, chosen: true });
+  });
+
+  it('keeps what the beacon switch says only in the node\'s own shape, and never reads a damaged switch as lit (🔦 beacon)', () => {
+    const fp = (chia_beacon: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_beacon })?.chia_beacon;
+    // Every shape the node sends (chia_beacon_switch.rs BeaconView).
+    expect(fp({ on: false, chosen: false })).toEqual({ on: false, chosen: false });
+    expect(fp({ on: true, chosen: true })).toEqual({ on: true, chosen: true });
+    expect(fp({ on: false, chosen: true })).toEqual({ on: false, chosen: true });
+    expect(fp({ on: true, chosen: false, held: true })).toEqual({ on: true, chosen: false, held: true });
+    expect(fp({ on: false, chosen: true, held: true })).toEqual({ on: false, chosen: true, held: true });
+    expect(fp({ on: false, chosen: false, damaged: true })).toEqual({ on: false, chosen: false, damaged: true });
+    // A switch that cannot be read counts as off, whatever `on` says...
+    expect(fp({ on: true, chosen: false, damaged: true })).toEqual({ on: false, chosen: false, damaged: true });
+    // ...unless the node's environment holds the beacon on: that is the
+    // environment's word, not the file's.
+    expect(fp({ on: true, chosen: false, held: true, damaged: true })).toEqual({ on: true, chosen: false, held: true, damaged: true });
+    // The publisher's last look rides on a lit beacon, whole.
+    const status = { era: 2900, reachable: true, serves_welcome: false, sent: false, confirmed: false };
+    expect(fp({ on: true, chosen: true, status })).toEqual({ on: true, chosen: true, status });
+    const landed = { era: 2900, reachable: true, serves_welcome: true, sent: true, confirmed: true };
+    expect(fp({ on: true, chosen: true, status: landed })).toEqual({ on: true, chosen: true, status: landed });
+    // Never on a beacon that is out, and never in part.
+    expect(fp({ on: false, chosen: true, status })).toEqual({ on: false, chosen: true });
+    for (const junk of [null, 'sent', 7, [], {}, { ...status, era: -1 }, { ...status, era: 1.5 }, { ...status, era: '2900' }, { ...status, reachable: 1 }, { ...status, serves_welcome: undefined }, { ...status, sent: 'true' }, { ...status, confirmed: null }]) {
+      expect(fp({ on: true, chosen: true, status: junk })).toEqual({ on: true, chosen: true });
+    }
+    // A beacon that was not sent is never read as confirmed.
+    expect(fp({ on: true, chosen: true, status: { ...status, confirmed: true } })?.status).toEqual({ ...status, confirmed: false });
+    // An older node, and a build that only reads the chain, send no switch.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_beacon).toBeUndefined();
+    // `held` and `damaged` only as true.
+    for (const junk of [false, 'true', 1, null, 0]) {
+      expect(fp({ on: true, chosen: true, held: junk, damaged: junk })).toEqual({ on: true, chosen: true });
+    }
+    // An `on` or a `chosen` that is not a boolean, or no object at all: no
+    // switch, never one guessed as lit.
+    for (const bad of [null, undefined, 'on', 1, true, [], {}, { on: true }, { chosen: true }, { on: 'true', chosen: true }, { on: 1, chosen: false }, { on: true, chosen: null }]) {
+      expect(fp(bad)).toBeUndefined();
+      expect(parseChiaBeacon(bad)).toBeUndefined();
+    }
+    // Nothing else is copied.
+    expect(fp({ on: false, chosen: true, at: 1_700_000_000, path: '/home/x/chia_beacon.json' })).toEqual({ on: false, chosen: true });
+    expect(fp({ on: true, chosen: true, status: { ...landed, hint: 'ab', coin_id: 'cd' } })?.status).toEqual(landed);
   });
 
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {

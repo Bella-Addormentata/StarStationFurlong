@@ -86,6 +86,16 @@ export interface LocalFingerprint {
    *  absent from older nodes and from builds that only read the chain. Kept
    *  only in the node's shape (`parseChiaListing`). */
   chia_listing?: ChiaListing;
+  /** 🔦 The beacon switch, the player's choice to make this node a public
+   *  door into the welcome room on the node's network (the node's
+   *  chia_beacon_switch.rs `BeaconView`): whether the beacon is lit, whether
+   *  the player turned the switch, whether `SSF_CHIA_BEACON` in the node's
+   *  environment holds it, and what the publisher's last look found
+   *  (beaconSwitch.ts). Sent by every node that has the switch
+   *  (`POST /api/chia/beacon`); absent from older nodes and from builds that
+   *  only read the chain. Kept only in the node's shape
+   *  (`parseChiaBeacon`). */
+  chia_beacon?: ChiaBeacon;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
@@ -374,6 +384,75 @@ export function parseChiaListing(v: unknown): ChiaListing | undefined {
   return listing;
 }
 
+/** 🔦 What the node's publisher found at its last look at the beacon (the
+ *  node's chia_beacon_switch.rs `BeaconStatus`): the two things a beacon
+ *  needs, and whether this edition's is sent and read back. */
+export interface ChiaBeaconStatus {
+  /** The edition (era) looked at. */
+  era: number;
+  /** The node took a direct connection from outside in this edition. */
+  reachable: boolean;
+  /** The node serves the welcome room, which is where a beacon leads. */
+  serves_welcome: boolean;
+  /** This edition's beacon was handed to the Chia full nodes. */
+  sent: boolean;
+  /** This edition's beacon was read back from the chain. */
+  confirmed: boolean;
+}
+
+/** 🔦 What the node's beacon switch says for its network (the node's
+ *  chia_beacon_switch.rs). Without `status` it says what the switch says,
+ *  never whether anything was written. */
+export interface ChiaBeacon {
+  /** The beacon is lit: by the player's word here, or held on by
+   *  `SSF_CHIA_BEACON=1` in the node's environment. Off on every network
+   *  until then. */
+  on: boolean;
+  /** The player turned the switch on this network (`false`: nobody did, or
+   *  its file cannot be read). */
+  chosen: boolean;
+  /** `SSF_CHIA_BEACON` in the node's environment decides, and the switch
+   *  cannot change it: with `on` it holds the beacon lit, without it holds
+   *  the beacon out. */
+  held?: true;
+  /** The switch's file is there but cannot be read, so it counts as off. */
+  damaged?: true;
+  /** The publisher's last look, only while the beacon is lit and a
+   *  publisher has looked (none runs without an SSF wallet on). */
+  status?: ChiaBeaconStatus;
+}
+
+/** The node's beacon `status` in its own shape, or undefined for anything
+ *  else. A beacon that is not sent is never read as confirmed. */
+function parseChiaBeaconStatus(v: unknown): ChiaBeaconStatus | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (!isCount(r.era)) return undefined;
+  for (const flag of ['reachable', 'serves_welcome', 'sent', 'confirmed']) if (typeof r[flag] !== 'boolean') return undefined;
+  const sent = r.sent === true;
+  return { era: r.era, reachable: r.reachable === true, serves_welcome: r.serves_welcome === true, sent, confirmed: sent && r.confirmed === true };
+}
+
+/** The node's `chia_beacon` in its own shape, or undefined when `on` or
+ *  `chosen` is not a boolean (or it is not an object at all): a switch this
+ *  page cannot read is no switch, and the page then offers none. `held` and
+ *  `damaged` are kept only as true. A switch that cannot be read never reads
+ *  as lit here unless the node's environment holds it on. `status` is kept
+ *  only for a lit beacon, and only whole. Nothing else is copied. */
+export function parseChiaBeacon(v: unknown): ChiaBeacon | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.on !== 'boolean' || typeof r.chosen !== 'boolean') return undefined;
+  const held = r.held === true;
+  const damaged = r.damaged === true;
+  const beacon: ChiaBeacon = { on: r.on && (held || !damaged), chosen: r.chosen };
+  if (held) beacon.held = true;
+  if (damaged) beacon.damaged = true;
+  const status = beacon.on ? parseChiaBeaconStatus(r.status) : undefined;
+  if (status) beacon.status = status;
+  return beacon;
+}
+
 const PRESENCE_STATES: ReadonlySet<string> = new Set<ChiaPresenceState>(['listed', 'sent', 'outdated', 'unlisted']);
 
 const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
@@ -466,6 +545,8 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (lane) fp.chia_lane = lane;
   const listing = parseChiaListing(r.chia_listing);
   if (listing) fp.chia_listing = listing;
+  const beacon = parseChiaBeacon(r.chia_beacon);
+  if (beacon) fp.chia_beacon = beacon;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;

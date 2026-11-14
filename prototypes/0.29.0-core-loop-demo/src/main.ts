@@ -299,6 +299,7 @@ import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
+import { BEACON_BUTTON_ID, beaconRow, beaconStands, beaconTarget, beaconTurnOf, turnBeacon, type BeaconTarget } from "./beaconSwitch";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
@@ -1169,6 +1170,85 @@ function renderListMeRow(): void {
   }
 }
 
+/** 🔦 The BEACON row's switch (beaconSwitch.ts): armed and waiting for
+ *  CONFIRM (for the network and the node whose warning was read, and no
+ *  other: a fingerprint that names another disarms it), a turn in flight,
+ *  and the last turn's failure. Opening the Network view disarms it and
+ *  clears the failure; the node's own memory of the switch rides on its
+ *  fingerprint. */
+let beaconArmed: BeaconTarget | null = null;
+let beaconTurning: "on" | "off" | null = null;
+let beaconError: string | null = null;
+/** When the switch last changed what it does (the CHIA switch's rule: a tap
+ *  within BANK_SETTLE_MS of that is no decision). */
+let beaconChangedAt = 0;
+/** What the switch did at the last render. */
+let beaconShownAct: string | null = null;
+
+/** 🔦 Is the Network view on screen? A phone that is put away is only slid
+ *  offscreen: its views keep their classes and a control in it keeps the
+ *  focus, so it still takes Enter and Space (treasuryViewOnScreen). */
+function networkViewOnScreen(): boolean {
+  const view = document.getElementById("phone-app-settings-network");
+  return Boolean(view && treasuryViewOnScreen(view));
+}
+
+/** 🔦 Drop an armed CONFIRM: the warning it stands under is no longer being
+ *  read (the phone was put away, or a tap came from a phone that is). */
+function disarmBeacon(): void {
+  if (beaconArmed === null) return;
+  beaconArmed = null;
+  renderBeaconRow();
+}
+
+/** 🔦 The BEACON row of the Network rows and the note, switch, warning and
+ *  error under it, from the node that answered the last probe (none while
+ *  it does not). Written with textContent, hidden and attributes only,
+ *  never innerHTML, so focus stays on the one button from LIGHT BEACON to
+ *  CONFIRM to LIGHTING. */
+function renderBeaconRow(): void {
+  const fp = localNodeLive ? localFingerprint : null;
+  const row = beaconRow(fp, { armed: beaconStands(beaconArmed, fp), turning: beaconTurning, error: beaconError });
+  setNetworkRow("network-beacon", row.value, row.colour);
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("beacon-note", row.note);
+  line("beacon-warning", row.warning);
+  line("beacon-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== beaconShownAct) {
+    beaconShownAct = b?.act ?? null;
+    beaconChangedAt = performance.now();
+  }
+  const btn = document.getElementById(BEACON_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went hands focus to its view, not to the page behind
+    // the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
 /** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
  *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
  *  the address override, the two room switches and the override's text box.
@@ -1272,6 +1352,26 @@ async function turnListMeSwitch(on: boolean): Promise<void> {
   await refreshLocalFingerprint();
   listMeChangedAt = performance.now();
   renderListMeRow();
+}
+
+/** 🔦 Ask the node to light its beacon or put it out for its network, then
+ *  read its fingerprint again so the row and the switch show what the node
+ *  now holds, not what the page hoped. */
+async function turnBeaconSwitch(on: boolean): Promise<void> {
+  if (beaconTurning) return;
+  // An on goes out for what CONFIRM was armed for, not for whatever node
+  // answers when it arrives: the node refuses another's.
+  const armedFor = beaconArmed;
+  beaconTurning = on ? "on" : "off";
+  beaconArmed = null;
+  beaconError = null;
+  renderBeaconRow();
+  const turned = await turnBeacon(localNodeOrigin, on, on ? armedFor : null);
+  beaconTurning = null;
+  beaconError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  beaconChangedAt = performance.now();
+  renderBeaconRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -8983,6 +9083,10 @@ function setupSpacePhoneOverlay() {
       listMeArmed = null;
       if (!listMeTurning) listMeError = null;
       renderListMeRow();
+      // 🔦 And for a beacon armed on an earlier visit.
+      beaconArmed = null;
+      if (!beaconTurning) beaconError = null;
+      renderBeaconRow();
       // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
       // and every other control without a pointer (Tab is the app's phone
       // toggle, not a tab stop).
@@ -9283,6 +9387,9 @@ function setupSpacePhoneOverlay() {
         // to hand focus back to.
         const focused = document.activeElement;
         if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        // 🔦 And a beacon CONFIRM armed in the Network view is dropped: its
+        // warning went offscreen with the phone.
+        disarmBeacon();
         // Hand focus back to whatever opened the phone from outside it. The
         // phone is only moved offscreen, never display:none, so a control
         // left focused inside it keeps answering the arrow keys against
@@ -9531,6 +9638,14 @@ function setupSpacePhoneOverlay() {
       autoEnterRoomId = null;
       const seed = passSeed(rid);
       if (seed) {
+        // The phone is put away under the player, mid-read: a control left
+        // focused inside it lets go (togglePhone's rule; the phone is only
+        // moved offscreen, so it would keep taking Enter and Space), and a
+        // beacon CONFIRM armed in the Network view is dropped, its warning
+        // no longer on screen.
+        const focused = document.activeElement;
+        if (container && focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        disarmBeacon();
         container?.classList.remove("active");
         void enterRoomFromPass(seed);
       }
@@ -9734,6 +9849,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       bankWalletArmed = false;
       chiaLaneArmed = false;
       listMeArmed = null;
+      beaconArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -9746,6 +9862,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // ⛓️ Nor the Chia switch: there is no node to send it to.
     renderChiaLaneRow();
     renderListMeRow();
+    renderBeaconRow();
     return localFingerprint;
   }
   // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
@@ -9759,6 +9876,8 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // node restarted between two probes), is armed no longer: CONFIRM is for
   // the warning that was read.
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
+  // 🔦 The same for a beacon armed on another node or network.
+  if (!beaconStands(beaconArmed, fingerprint)) beaconArmed = null;
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
@@ -9783,6 +9902,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   renderPhoneBookIndicator(fingerprint);
   renderChiaLaneRow();
   renderListMeRow();
+  renderBeaconRow();
   refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
@@ -10281,6 +10401,38 @@ function setupNetworkDetailsPanel() {
     });
     // A held Enter or Space repeats its keydown, and each one taps the button.
     listBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
+    });
+  }
+  // 🔦 The beacon switch (beaconSwitch.ts), LIST ME's rules: LIGHT BEACON
+  // arms CONFIRM, and CONFIRM and PUT OUT each take a fresh tap.
+  const beaconBtn = document.getElementById(BEACON_BUTTON_ID) as HTMLButtonElement | null;
+  if (beaconBtn) {
+    beaconBtn.addEventListener("click", (e) => {
+      if (beaconBtn.getAttribute("aria-disabled") === "true") return;
+      // Nothing is armed, lit or put out from a phone that is put away. The
+      // phone is only slid offscreen, so the button may still hold the focus
+      // and take Enter or Space with its warning out of sight: a pass that
+      // finished warming puts the phone away under the player (the
+      // auto-enter). An armed CONFIRM is dropped with the tap.
+      if (!networkViewOnScreen()) {
+        disarmBeacon();
+        return;
+      }
+      const act = beaconBtn.dataset.act;
+      if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), beaconChangedAt)) return;
+      if (act === "arm") {
+        beaconArmed = beaconTarget(localNodeLive ? localFingerprint : null);
+        beaconError = null;
+        beaconChangedAt = performance.now();
+        renderBeaconRow();
+        return;
+      }
+      const lit = beaconTurnOf(act);
+      if (lit !== null) void turnBeaconSwitch(lit);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    beaconBtn.addEventListener("keydown", (e) => {
       if (laneKeyRepeat(e)) e.preventDefault();
     });
   }
