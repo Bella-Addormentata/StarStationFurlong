@@ -137,9 +137,13 @@ const KEY_WAIT_PERIOD: Duration = Duration::from_millis(250);
 const KNOCK_PERIOD: Duration = Duration::from_secs(120);
 const MAX_KNOCKS_PER_DIAL: u32 = 3;
 
-/// An announce that has not ended in this long is given up (measured: 0.3 to
-/// 7 s on the real DHT).
-const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(20);
+/// An announce that has not ended in this long is no longer waited for. It
+/// goes on in the DHT client all the same, so the knock may still be stored
+/// ([`Announced::Unconfirmed`]). Measured on the real DHT: 0.3 to 7 s from
+/// cloud runners, and 18 s from a home line whose node had joined the DHT
+/// half a minute before (2026-11-14), which the first limit of 20 s left no
+/// room for.
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A knocker's port below this is not opened toward: the game never binds
 /// one, and nothing is sent to another service's port on a knocker's word.
@@ -369,9 +373,10 @@ impl OpeningBook {
 pub struct KnockDht {
     dht: Dht,
     book: Mutex<OpeningBook>,
-    /// Knocks of ours that are out now: dials whose knock was stored and that
-    /// still run. While any is, a handshake that fails on the way in is most
-    /// likely the opening dial we asked for (main.rs `run_iroh_listener`).
+    /// Knocks of ours that are out now: dials that still run and whose knock
+    /// is stored or on its way to be ([`announced`]). While any is, a
+    /// handshake that fails on the way in is most likely the opening dial we
+    /// asked for (main.rs `run_iroh_listener`).
     knocks_out: AtomicUsize,
 }
 
@@ -655,9 +660,10 @@ async fn opening_hold(hub: SharedHub, endpoint: IrohEndpoint, addr: SocketAddrV4
     }
 }
 
-/// A dial's knock has not been stored (yet).
+/// A dial has no knock out (yet).
 const KNOCK_NOT_OUT: u8 = 0;
-/// A dial's knock was stored and is counted in `KnockDht::knocks_out`.
+/// A dial's knock is out, or on its way out, and is counted in
+/// `KnockDht::knocks_out`.
 const KNOCK_OUT: u8 = 1;
 /// The dial ended: nothing more is counted for it.
 const KNOCK_ENDED: u8 = 2;
@@ -685,8 +691,8 @@ impl Drop for Knocking {
     }
 }
 
-/// Count a dial's stored knock as out, once per dial, and only while the dial
-/// still runs: a guard dropped meanwhile leaves the count as it was.
+/// Count a dial's knock as out, once per dial, and only while the dial still
+/// runs: a guard dropped meanwhile leaves the count as it was.
 fn count_knock_out(knocks_out: &AtomicUsize, state: &AtomicU8) {
     if state.load(Ordering::SeqCst) != KNOCK_NOT_OUT {
         return;
@@ -694,6 +700,53 @@ fn count_knock_out(knocks_out: &AtomicUsize, state: &AtomicU8) {
     knocks_out.fetch_add(1, Ordering::SeqCst);
     if state.compare_exchange(KNOCK_NOT_OUT, KNOCK_OUT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         knocks_out.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Take a dial's knock out of the count again: its announce failed, so
+/// nothing of this dial's is out. A guard dropped meanwhile has taken it out
+/// already, and the count moves once.
+fn uncount_knock_out(knocks_out: &AtomicUsize, state: &AtomicU8) {
+    if state.compare_exchange(KNOCK_OUT, KNOCK_NOT_OUT, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        knocks_out.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How one announce of a knock ended.
+#[derive(Debug, PartialEq)]
+enum Announced {
+    /// The DHT nodes nearest the point answered: the knock is stored.
+    Stored,
+    /// The announce was not over in time. It goes on in the DHT client, so
+    /// the knock may be stored all the same.
+    Unconfirmed,
+    /// The announce failed: it stored nothing.
+    Failed(String),
+}
+
+/// One announce of a dial's knock, waited for at most `within`, with the knock
+/// counted as out from the moment the announce BEGINS. An announce is a walk
+/// to the DHT nodes nearest the point and then a store at each, and it ends
+/// only when the slowest of them has answered or timed out. The holder can
+/// find the knock before that: between two home routers its opening dial came
+/// in half a second before the announce was over (2026-11-14), and was logged
+/// as a failed handshake because the knock was not counted yet. An announce
+/// that fails takes the knock out of the count again, unless an earlier
+/// announce of this dial (`out_before`) is out.
+async fn announced<F>(knocks_out: &AtomicUsize, state: &AtomicU8, out_before: bool, within: Duration, announce: F) -> Announced
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    count_knock_out(knocks_out, state);
+    match tokio::time::timeout(within, announce).await {
+        Ok(Ok(())) => Announced::Stored,
+        Ok(Err(e)) => {
+            if !out_before {
+                uncount_knock_out(knocks_out, state);
+            }
+            Announced::Failed(e)
+        }
+        Err(_) => Announced::Unconfirmed,
     }
 }
 
@@ -750,6 +803,9 @@ async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU
     if knock.dht.bootstrapped().await.is_err() {
         return;
     }
+    // Whether an earlier announce of this dial is out (stored, or not known
+    // not to be).
+    let mut out_before = false;
     for round in 0..MAX_KNOCKS_PER_DIAL {
         if round > 0 {
             tokio::time::sleep(KNOCK_PERIOD).await;
@@ -763,16 +819,22 @@ async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU
         let live: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
         let port = knock_port(&live, &hub.reach.self_advertised.lock().unwrap(), bound, crate::ipv4_is_public);
         let began = Instant::now();
-        match tokio::time::timeout(ANNOUNCE_TIMEOUT, knock.announce(point, port)).await {
-            Ok(Ok(())) => {
-                count_knock_out(&knock.knocks_out, &state);
+        match announced(&knock.knocks_out, &state, out_before, ANNOUNCE_TIMEOUT, knock.announce(point, port)).await {
+            Announced::Stored => {
+                out_before = true;
                 println!(
                     "🚪 DHT knock: knocked on {shown}… through the DHT (port {port}, {:.1} s); it opens toward this computer when it sees the knock",
                     began.elapsed().as_secs_f32()
                 );
             }
-            Ok(Err(e)) => eprintln!("🚪 DHT knock: the knock on {shown}… was not stored ({e}); the dial goes on without it"),
-            Err(_) => eprintln!("🚪 DHT knock: the knock on {shown}… was not stored in {} s; the dial goes on without it", ANNOUNCE_TIMEOUT.as_secs()),
+            Announced::Unconfirmed => {
+                out_before = true;
+                eprintln!(
+                    "🚪 DHT knock: the knock on {shown}… (port {port}) was not confirmed in {} s; the DHT may hold it all the same, and the dial goes on",
+                    ANNOUNCE_TIMEOUT.as_secs()
+                );
+            }
+            Announced::Failed(e) => eprintln!("🚪 DHT knock: the knock on {shown}… was not stored ({e}); the dial goes on without it"),
         }
     }
 }
@@ -813,6 +875,63 @@ mod tests {
         count_knock_out(&count, &ended);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(ended.load(Ordering::SeqCst), KNOCK_ENDED);
+    }
+
+    /// The holder can find a knock, and its opening dial can come in, before
+    /// the announce is over (seen between two home routers, 2026-11-14). The
+    /// knock is counted as out for as long as the announce runs, not only
+    /// after it.
+    #[tokio::test]
+    async fn a_knock_counts_as_out_while_its_announce_is_still_under_way() {
+        let count = AtomicUsize::new(0);
+        let state = AtomicU8::new(KNOCK_NOT_OUT);
+        let (answer, answered) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let announce = announced(&count, &state, false, Duration::from_secs(30), async { answered.await.expect("an answer") });
+        tokio::pin!(announce);
+        // The DHT has not answered yet.
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut announce).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1, "counted while the announce runs");
+        assert_eq!(state.load(Ordering::SeqCst), KNOCK_OUT);
+        answer.send(Ok(())).expect("the announce still waits");
+        assert_eq!(announce.await, Announced::Stored);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "and once, not again when it is stored");
+    }
+
+    #[tokio::test]
+    async fn an_announce_that_fails_takes_its_knock_out_of_the_count_unless_an_earlier_one_is_out() {
+        // A first announce that fails: nothing of this dial's is out.
+        let count = AtomicUsize::new(0);
+        let state = AtomicU8::new(KNOCK_NOT_OUT);
+        let failed = announced(&count, &state, false, Duration::from_secs(30), async { Err("no node answered".to_string()) }).await;
+        assert_eq!(failed, Announced::Failed("no node answered".to_string()));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.load(Ordering::SeqCst), KNOCK_NOT_OUT);
+        // The next round's announce is stored: counted then.
+        assert_eq!(announced(&count, &state, false, Duration::from_secs(30), async { Ok(()) }).await, Announced::Stored);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // A later round that fails leaves the stored one counted.
+        assert!(matches!(announced(&count, &state, true, Duration::from_secs(30), async { Err("x".to_string()) }).await, Announced::Failed(_)));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.load(Ordering::SeqCst), KNOCK_OUT);
+        // A dial that ended while its first announce ran: its guard took the
+        // knock out of the count, and the failure does not take it out twice.
+        let other = AtomicUsize::new(1);
+        let ended = AtomicU8::new(KNOCK_ENDED);
+        uncount_knock_out(&other, &ended);
+        assert_eq!(other.load(Ordering::SeqCst), 1);
+        assert_eq!(ended.load(Ordering::SeqCst), KNOCK_ENDED);
+    }
+
+    /// An announce that outlasts the wait goes on in the DHT client, so the
+    /// knock may be stored: it stays counted.
+    #[tokio::test]
+    async fn an_announce_that_outlasts_the_wait_stays_counted() {
+        let count = AtomicUsize::new(0);
+        let state = AtomicU8::new(KNOCK_NOT_OUT);
+        let slow = announced(&count, &state, false, Duration::from_millis(50), std::future::pending::<Result<(), String>>()).await;
+        assert_eq!(slow, Announced::Unconfirmed);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.load(Ordering::SeqCst), KNOCK_OUT);
     }
 
     #[test]
