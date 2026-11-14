@@ -73,10 +73,11 @@ const FIRST_POLL_DELAY: Duration = Duration::from_secs(10);
 /// half a minute of its announce.
 pub(crate) const POLL_PERIOD: Duration = Duration::from_secs(30);
 
-/// A lookup that has not ended in this long is given up for this round. A
-/// round's lookups run side by side, so a round is over within this, well
-/// inside [`POLL_PERIOD`]: a slow point holds no other up, and the rounds keep
-/// their rhythm.
+/// A lookup is given this long. Its answers come one DHT node at a time and
+/// the last can be long in coming: what it found by then is kept
+/// ([`gathered_until`]) and the rest is not waited for. A round's lookups run
+/// side by side, so a round is over within this, well inside [`POLL_PERIOD`]:
+/// a slow point holds no other up, and the rounds keep their rhythm.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// At most this many rooms are looked up per round, SSF-WELCOME first.
@@ -122,6 +123,10 @@ pub(crate) const OPENED_GRACE: Duration = Duration::from_secs(120);
 /// A dial that is answered at once needs no knock: the knocker waits this
 /// long before it announces. A reachable computer answers well inside it.
 const KNOCK_GRACE: Duration = Duration::from_secs(3);
+
+/// How often a knock whose room's key is not filed yet looks for it
+/// ([`room_key_when_held`]).
+const KEY_WAIT_PERIOD: Duration = Duration::from_millis(250);
 
 /// While its dial runs the knocker announces again every this long (a new
 /// hour may have begun, and a DHT node that held the announce may be gone),
@@ -397,15 +402,15 @@ impl KnockDht {
         Some(LiveFrom { hub: hub.clone(), addr: v4 })
     }
 
-    /// Everything the DHT lists at `point` now.
-    async fn lookup(&self, point: [u8; 20]) -> Option<BTreeSet<SocketAddrV4>> {
+    /// What the DHT lists at `point`, as far as it answered `within` that
+    /// long. `None` only when the DHT client has stopped.
+    async fn lookup(&self, point: [u8; 20], within: Duration) -> Option<BTreeSet<SocketAddrV4>> {
         let id = Id::from_bytes(point).ok()?;
-        let mut found = BTreeSet::new();
-        let mut stream = self.dht.get_peers(id).await.ok()?;
-        while let Some(batch) = stream.next().await {
-            found.extend(batch);
+        let deadline = tokio::time::Instant::now() + within;
+        match tokio::time::timeout_at(deadline, self.dht.get_peers(id)).await {
+            Ok(answers) => Some(gathered_until(answers.ok()?, deadline).await),
+            Err(_) => Some(BTreeSet::new()),
         }
-        Some(found)
     }
 
     /// Announce `port` at `point`: "the computer at the address you see this
@@ -414,6 +419,21 @@ impl KnockDht {
         let id = Id::from_bytes(point).map_err(|e| e.to_string())?;
         self.dht.announce_peer(id, Some(port)).await.map(|_| ()).map_err(|e| e.to_string())
     }
+}
+
+/// Every address `answers` hands over before `deadline`, and all of them when
+/// the stream ends sooner. A knock found early in a lookup is not thrown away
+/// because the lookup's tail was slow: the holder opens toward it this round,
+/// not at some later round whose tail happens to be quick.
+async fn gathered_until<S>(mut answers: S, deadline: tokio::time::Instant) -> BTreeSet<SocketAddrV4>
+where
+    S: n0_future::Stream<Item = Vec<SocketAddrV4>> + Unpin,
+{
+    let mut found = BTreeSet::new();
+    while let Ok(Some(batch)) = tokio::time::timeout_at(deadline, answers.next()).await {
+        found.extend(batch);
+    }
+    found
 }
 
 /// A connection that came in from an address, for as long as it stands
@@ -503,20 +523,15 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         rounds.tick().await;
         let points = round_points(&rooms_to_poll(&hub), &me, crate::chia_resolve::unix_now());
         // All of a round's lookups side by side: one slow point holds no
-        // other room up, and the round is over within LOOKUP_TIMEOUT.
-        let looked = n0_future::join_all(
-            points.into_iter().map(|(room_id, point)| async move { (room_id, tokio::time::timeout(LOOKUP_TIMEOUT, knock.lookup(point)).await) }),
-        )
-        .await;
+        // other room up, and the round is over within LOOKUP_TIMEOUT, with
+        // whatever each lookup had found by then.
+        let looked =
+            n0_future::join_all(points.into_iter().map(|(room_id, point)| async move { (room_id, knock.lookup(point, LOOKUP_TIMEOUT).await) })).await;
         let own = own_ips(&endpoint, knock).await;
         for (room_id, found) in looked {
-            let found = match found {
-                Ok(Some(found)) => found,
-                Ok(None) => {
-                    eprintln!("🚪 DHT knock: the DHT client stopped; no knock is seen or sent in this run");
-                    return;
-                }
-                Err(_) => continue,
+            let Some(found) = found else {
+                eprintln!("🚪 DHT knock: the DHT client stopped; no knock is seen or sent in this run");
+                return;
             };
             for addr in found {
                 if !knock_admitted(addr, &own, crate::ipv4_is_public) {
@@ -609,26 +624,54 @@ fn count_knock_out(knocks_out: &AtomicUsize, state: &AtomicU8) {
     }
 }
 
+/// The room's key, as soon as the node holds it. The page hands the key over
+/// on a stream of its own (the `cap`) and does not wait for that before it
+/// starts the room's sync, so a first dial can begin a moment before the key
+/// is filed. The knock waits for the key rather than give the whole dial up.
+/// The wait ends with the dial ([`Knocking`] aborts the task), so a room
+/// whose key never comes costs a look every [`KEY_WAIT_PERIOD`] and sends
+/// nothing.
+async fn room_key_when_held(rooms: &Mutex<HashMap<String, crate::chia_rooms::ChiaRoomCap>>, room_id: &str) -> [u8; 32] {
+    loop {
+        let held = rooms.lock().unwrap().get(room_id).map(|cap| cap.room_key);
+        if let Some(room_key) = held {
+            return room_key;
+        }
+        tokio::time::sleep(KEY_WAIT_PERIOD).await;
+    }
+}
+
+/// Whether a knock is still wanted, asked at the moment it would be sent.
+/// `linked` is whether the target is linked in the room, `None` when the room
+/// is no longer open here. The dial ladder asks the same before each attempt.
+/// The knock asks for itself because its guard can outlive the link by as
+/// long as the caller waits on something else (the page's stream, when it
+/// reports the dial).
+fn knock_wanted(linked: Option<bool>) -> bool {
+    linked == Some(false)
+}
+
 /// Knock on `target` for `room_id` while a dial to it runs: after
 /// [`KNOCK_GRACE`] (a reachable computer has answered by then, and the caller
 /// has dropped the guard), announce the game's outside IPv4 port
 /// ([`knock_port`]) at the knock point, and again every [`KNOCK_PERIOD`].
-/// `None`, and nothing sent, when the knock is off, the room's key is not
-/// held, or the game has no IPv4 socket.
+/// `None`, and nothing sent, when the knock is off or the game has no IPv4
+/// socket. A room whose key the node does not hold yet is waited for
+/// ([`room_key_when_held`]).
 pub(crate) fn knock_while_dialing(hub: &SharedHub, endpoint: &IrohEndpoint, room_id: &str, target: PublicKey) -> Option<Knocking> {
     hub.dht_knock.as_ref()?;
-    let room_key = hub.chia_rooms.lock().unwrap().get(room_id)?.room_key;
     let bound = endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port())?;
     let state = Arc::new(AtomicU8::new(KNOCK_NOT_OUT));
-    let task = tokio::spawn(knock_rounds(hub.clone(), endpoint.clone(), state.clone(), room_key, target, bound));
+    let task = tokio::spawn(knock_rounds(hub.clone(), endpoint.clone(), state.clone(), room_id.to_string(), target, bound));
     Some(Knocking { task: task.abort_handle(), hub: hub.clone(), state })
 }
 
 /// The knocking itself, for as long as its dial runs ([`Knocking`] aborts it).
-async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU8>, room_key: [u8; 32], target: PublicKey, bound: u16) {
+async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU8>, room_id: String, target: PublicKey, bound: u16) {
     let Some(knock) = hub.dht_knock.as_ref() else { return };
     let shown: String = target.to_string().chars().take(8).collect();
     tokio::time::sleep(KNOCK_GRACE).await;
+    let room_key = room_key_when_held(&hub.chia_rooms, &room_id).await;
     // A node that has only just started (a first run) may still be joining the
     // DHT: an announce before that is stored by nobody.
     if knock.dht.bootstrapped().await.is_err() {
@@ -637,6 +680,10 @@ async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU
     for round in 0..MAX_KNOCKS_PER_DIAL {
         if round > 0 {
             tokio::time::sleep(KNOCK_PERIOD).await;
+        }
+        let linked = hub.rooms.lock().unwrap().get(&room_id).map(|room| room.remote_peers.contains_key(&target));
+        if !knock_wanted(linked) {
+            return;
         }
         let point = knock_point(&room_key, &target, bucket_of(crate::chia_resolve::unix_now()));
         // Asked at each round: a port mapping may have come since the last.
@@ -1072,12 +1119,65 @@ mod tests {
         let room = [7u8; 32];
         let me = key(1);
         let point = knock_point(&room, &me, 500_000);
-        assert_eq!(holder.lookup(point).await, Some(BTreeSet::new()));
+        assert_eq!(holder.lookup(point, LOOKUP_TIMEOUT).await, Some(BTreeSet::new()));
         knocker.announce(point, 44442).await.expect("the announce is stored");
-        let found = holder.lookup(point).await.expect("a lookup");
+        let found = holder.lookup(point, LOOKUP_TIMEOUT).await.expect("a lookup");
         assert_eq!(found.into_iter().map(|a| a.port()).collect::<Vec<_>>(), vec![44442]);
         // Another hour's point, and another room's, list nobody.
-        assert_eq!(holder.lookup(knock_point(&room, &me, 500_001)).await, Some(BTreeSet::new()));
-        assert_eq!(holder.lookup(knock_point(&[8u8; 32], &me, 500_000)).await, Some(BTreeSet::new()));
+        assert_eq!(holder.lookup(knock_point(&room, &me, 500_001), LOOKUP_TIMEOUT).await, Some(BTreeSet::new()));
+        assert_eq!(holder.lookup(knock_point(&[8u8; 32], &me, 500_000), LOOKUP_TIMEOUT).await, Some(BTreeSet::new()));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_keeps_what_it_found_when_its_tail_is_slow() {
+        let knocker = v4(203, 0, 113, 7, 44442);
+        let other = v4(203, 0, 113, 8, 44442);
+        // A lookup that answers once and then never ends: what came before the
+        // deadline is kept, and the deadline is not run past by much.
+        let stalled = n0_future::stream::once(vec![knocker]).chain(n0_future::stream::pending());
+        let began = Instant::now();
+        let found = gathered_until(stalled, tokio::time::Instant::now() + Duration::from_millis(200)).await;
+        assert_eq!(found, BTreeSet::from([knocker]));
+        assert!(began.elapsed() >= Duration::from_millis(200) && began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        // A lookup that ends by itself is not waited on: all of it, at once.
+        let ended = n0_future::stream::iter(vec![vec![knocker], vec![other, knocker]]);
+        let began = Instant::now();
+        let found = gathered_until(ended, tokio::time::Instant::now() + Duration::from_secs(60)).await;
+        assert_eq!(found, BTreeSet::from([knocker, other]));
+        assert!(began.elapsed() < Duration::from_secs(30), "{:?}", began.elapsed());
+        // A lookup that says nothing in time found nobody.
+        let silent = n0_future::stream::pending::<Vec<SocketAddrV4>>();
+        assert!(gathered_until(silent, tokio::time::Instant::now() + Duration::from_millis(50)).await.is_empty());
+    }
+
+    fn cap(byte: u8) -> crate::chia_rooms::ChiaRoomCap {
+        crate::chia_rooms::ChiaRoomCap { room_key: [byte; 32], share_card: true, public_room: None, seq: 0, restored: false, pass_private: false, prefetch: false }
+    }
+
+    #[tokio::test]
+    async fn a_dial_begun_before_its_rooms_key_was_filed_knocks_once_it_is() {
+        // The page's cap and its sync ride streams of their own, and the cap
+        // is not waited for: the first dial of a session can be the earlier.
+        let rooms = Arc::new(Mutex::new(HashMap::new()));
+        // Another room's key is not this room's.
+        rooms.lock().unwrap().insert("other".to_string(), cap(8));
+        let waiting = tokio::spawn({
+            let rooms = rooms.clone();
+            async move { room_key_when_held(&rooms, "room").await }
+        });
+        tokio::time::sleep(KEY_WAIT_PERIOD * 2).await;
+        assert!(!waiting.is_finished(), "no key yet: the knock waits, it does not give the dial up");
+        rooms.lock().unwrap().insert("room".to_string(), cap(7));
+        let room_key = tokio::time::timeout(KEY_WAIT_PERIOD * 20, waiting).await.expect("seen within a few looks").expect("the wait ended by itself");
+        assert_eq!(room_key, [7u8; 32]);
+        // A key that is held already is given at once.
+        assert_eq!(tokio::time::timeout(KEY_WAIT_PERIOD, room_key_when_held(&rooms, "room")).await, Ok([7u8; 32]));
+    }
+
+    #[test]
+    fn a_knock_is_sent_only_for_an_open_room_and_a_target_not_linked_in_it() {
+        assert!(knock_wanted(Some(false)));
+        assert!(!knock_wanted(Some(true)), "linked meanwhile, by this dial's own attempt or by another path");
+        assert!(!knock_wanted(None), "the room is no longer open here");
     }
 }

@@ -3792,13 +3792,15 @@ async fn dial_peer_inner(
     send: Option<std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>>,
 ) {
     report_dial_status(&hub, &send, &room_id, &target_str, "dialing", None).await;
-    // 🚪 While this ladder runs, a knock through the DHT (dht_knock.rs): a
+    // 🚪 While this dial runs, a knock through the DHT (dht_knock.rs): a
     // target behind a router that answers nobody sees it and opens toward us,
     // and one of the attempts below then lands. Nothing is sent for a target
-    // that answers at once. Dropped, and the knocking stopped, when the
-    // ladder ends, however it ends.
+    // that answers at once. Dropped, and the knocking stopped, the moment an
+    // attempt lands, and otherwise when the dial ends, however it ends (the
+    // chain's rung 6 below is still this dial, and its holds are helped by a
+    // knock as the ladder's attempts are).
     #[cfg(feature = "chia-read")]
-    let _knocking = dht_knock::knock_while_dialing(&hub, &iroh_ep, &room_id, target_pub_key);
+    let knocking = dht_knock::knock_while_dialing(&hub, &iroh_ep, &room_id, target_pub_key);
     let mut delay = std::time::Duration::from_millis(DIAL_BACKOFF_START_MS);
     for attempt in 1..=MAX_DIAL_ATTEMPTS {
         let still_needs = {
@@ -3828,6 +3830,10 @@ async fn dial_peer_inner(
 
         match iroh_ep.connect(addr, b"ssf").await {
             Ok(iroh_conn) => {
+                // The dial landed: the knocking ends here, before anything is
+                // waited for (the report below waits on the page's stream).
+                #[cfg(feature = "chia-read")]
+                drop(knocking);
                 println!(
                     "🎯 Iroh connection secured to peer node (attempt {}/{}).",
                     attempt, MAX_DIAL_ATTEMPTS
