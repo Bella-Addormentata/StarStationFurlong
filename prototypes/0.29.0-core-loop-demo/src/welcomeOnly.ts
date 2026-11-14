@@ -235,30 +235,92 @@ export interface PassCodec<B> {
 
 /**
  * The welcome room's pass an arrival files in MY ROOMS. With no pass of the
- * player's own it is the bundled link. A pass the player already holds to the
- * room, or supplied for this docking (?seed=), STANDS, as it does for the
+ * player's own it is the bundled link. A pass the player supplied for this
+ * docking (?seed=), or already holds to the room, STANDS, as it does for the
  * docking itself: it may name a holder of the room the bundled pass does not,
  * and that holder may be how this install got in. The bundled pass's routes
  * ride beside its own, so a later visit tries both.
+ *
+ * `own` is the player's passes to the room, the one that leads first: the
+ * pass this docking was opened with, then the one saved before. The first
+ * readable one stands, and the routes of every other ride beside its own:
+ * filing replaces the room's saved pass, so a pass left out here would take
+ * its holder with it.
  *
  * Never the live session's bootstrap: that one is bridged through the
  * player's own node and names this computer and its addresses, and the pass
  * in MY ROOMS is what the station atlas hands on for the room.
  */
 export function welcomePassToKeep<B extends { roomId: string }>(
-  own: string | null | undefined,
+  own: string | null | undefined | readonly (string | null | undefined)[],
   bundled: string,
   codec: PassCodec<B>,
 ): string {
-  if (!own || own === bundled) return bundled;
+  const given: readonly (string | null | undefined)[] = typeof own === 'string' || own == null ? [own] : own;
+  const owns = given.filter((pass): pass is string => !!pass && pass !== bundled);
+  if (owns.length === 0) return bundled;
   try {
-    const held = codec.decode(own);
     const extra = codec.decode(bundled);
-    if (!held || !extra || held.roomId !== extra.roomId) return bundled;
+    if (!extra) return bundled;
+    let held: B | null = null;
+    for (const pass of owns) {
+      const boot = codec.decode(pass);
+      if (!boot || boot.roomId !== extra.roomId) continue;
+      held = held ? codec.withRoutes(held, boot) : boot;
+    }
+    if (!held) return bundled;
     return codec.encode(codec.withRoutes(held, extra));
   } catch {
-    return own; // it could not be rewritten: the player's pass stays as it is
+    return owns[0]; // it could not be rewritten: the player's pass stays as it is
   }
+}
+
+/**
+ * A welcome-room session's dial record with the routes of the pass the player
+ * holds to the room (MY ROOMS) beside its own. The record is what every sync
+ * handshake of the session carries to the player's own node, which dials each
+ * holder named in it. A pass added while the session waits is then asked at
+ * the next handshake, and one saved on an earlier day is asked from the
+ * first, whichever way the session began. Routes only: the record's own
+ * holders stay first, and its key and its link to the player's node stand.
+ * Any other room's record, and one with no readable pass to add, is returned
+ * as it is.
+ */
+export function welcomeRecordWithHeld<B extends { roomId: string }>(
+  record: B | null,
+  welcomeRoomId: string,
+  held: B | null | undefined,
+  withRoutes: (held: B, extra: B) => B,
+): B | null {
+  if (!record || !welcomeRoomId || record.roomId !== welcomeRoomId) return record;
+  if (!held || held.roomId !== welcomeRoomId) return record;
+  return withRoutes(record, held);
+}
+
+/**
+ * Whether a boot that began when the session count stood at `beganAt` must
+ * stand down. A boot looks for the player's own node before it joins, and
+ * that takes a moment; meanwhile the player may have pressed Retry-node or
+ * followed a pass, and the docking's own retry may have started a second
+ * boot. Every join and every leave moves the count, so a count that moved
+ * means a newer join or leave owns the session: joining now would land on
+ * top of it with no leave between (two live copies of a room, or the
+ * welcome room over the room the player chose), and cleaning up after a
+ * failure would tear down a session that is not this boot's. A room swap
+ * under way owns the session until it ends, whatever the count.
+ */
+export function bootYields(beganAt: number, now: number, swapUnderWay: boolean): boolean {
+  return swapUnderWay || now !== beganAt;
+}
+
+/** What ADD PASS says for a pass to the welcome room added while the player
+ *  stands in it: nothing warms and nothing is entered, and the session asks
+ *  the pass's holders at once (`welcomeRecordWithHeld`). `waiting` says the
+ *  room's state has not arrived yet. */
+export function welcomePassAddedLine(name: string, waiting: boolean): string {
+  return waiting
+    ? `🛰️ Pass saved. Your computer now asks the computers it names for ${name} too, and this room fills in by itself when one answers.`
+    : `You are already aboard ${name}. The pass is saved in MY ROOMS.`;
 }
 
 /** The line once the first wait ends with no answer. */

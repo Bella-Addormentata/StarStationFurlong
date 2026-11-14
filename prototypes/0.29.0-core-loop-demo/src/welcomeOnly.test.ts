@@ -5,6 +5,7 @@ import {
   WELCOME_PENDING_KEY,
   WELCOME_SEEK_CAP_MS,
   bootRoute,
+  bootYields,
   clearWelcomePending,
   markWelcomePending,
   recoverLostLink,
@@ -13,7 +14,9 @@ import {
   welcomeArrivedLine,
   welcomeMarked,
   welcomeNodeLostLine,
+  welcomePassAddedLine,
   welcomePassToKeep,
+  welcomeRecordWithHeld,
   welcomeRetryLine,
   welcomeSeekDelayMs,
   welcomeStateHere,
@@ -408,5 +411,108 @@ describe('welcome only: the pass an arrival keeps in MY ROOMS (welcomePassToKeep
       },
     };
     expect(welcomePassToKeep(`${WELCOME}|friend`, BUNDLED, failing)).toBe(`${WELCOME}|friend`);
+  });
+
+  // Review round 3: a still-seeking install with a pass saved before opens the
+  // page with a fresh one. The docking uses the fresh pass's holder, and the
+  // filing must not drop it for the saved pass alone.
+  it('keeps both of the player\'s passes: the one the page was opened with leads, the saved one and the bundled ride beside it', () => {
+    expect(welcomePassToKeep([`${WELCOME}|fresh`, `${WELCOME}|saved`], BUNDLED, codec)).toBe(`${WELCOME}|fresh,saved,host`);
+    // One of the two alone is as before.
+    expect(welcomePassToKeep([null, `${WELCOME}|saved`], BUNDLED, codec)).toBe(`${WELCOME}|saved,host`);
+    expect(welcomePassToKeep([`${WELCOME}|fresh`, null], BUNDLED, codec)).toBe(`${WELCOME}|fresh,host`);
+    expect(welcomePassToKeep([null, undefined, ''], BUNDLED, codec)).toBe(BUNDLED);
+  });
+
+  it('of two passes, one that is unreadable, names another room, or is the bundled link adds nothing and takes nothing', () => {
+    expect(welcomePassToKeep(['junk', `${WELCOME}|saved`], BUNDLED, codec)).toBe(`${WELCOME}|saved,host`);
+    expect(welcomePassToKeep([`${OTHER}|elsewhere`, `${WELCOME}|saved`], BUNDLED, codec)).toBe(`${WELCOME}|saved,host`);
+    expect(welcomePassToKeep([`${WELCOME}|fresh`, `${OTHER}|elsewhere`], BUNDLED, codec)).toBe(`${WELCOME}|fresh,host`);
+    expect(welcomePassToKeep([BUNDLED, `${WELCOME}|saved`], BUNDLED, codec)).toBe(`${WELCOME}|saved,host`);
+    expect(welcomePassToKeep(['junk', `${OTHER}|elsewhere`], BUNDLED, codec)).toBe(BUNDLED);
+  });
+
+  it('of two passes that cannot be rewritten, the leading one stays as it is', () => {
+    const failing: PassCodec<Boot> = {
+      ...codec,
+      encode: () => {
+        throw new Error('not Latin-1');
+      },
+    };
+    expect(welcomePassToKeep([`${WELCOME}|fresh`, `${WELCOME}|saved`], BUNDLED, failing)).toBe(`${WELCOME}|fresh`);
+  });
+});
+
+describe('welcome only: a welcome-room session also asks the holders of the pass the player holds (welcomeRecordWithHeld)', () => {
+  interface Boot {
+    roomId: string;
+    link: string;
+    routes: string[];
+  }
+  const withRoutes = (held: Boot, extra: Boot): Boot => ({ ...held, routes: [...new Set([...held.routes, ...extra.routes])] });
+  const record: Boot = { roomId: WELCOME, link: 'this computer', routes: ['host'] };
+
+  it('adds the held pass\'s holders after the record\'s own, and leaves the record\'s link to the player\'s node as it is', () => {
+    const held: Boot = { roomId: WELCOME, link: 'the minter', routes: ['friend', 'host'] };
+    expect(welcomeRecordWithHeld(record, WELCOME, held, withRoutes)).toEqual({
+      roomId: WELCOME,
+      link: 'this computer',
+      routes: ['host', 'friend'],
+    });
+    // The record handed in is not changed: the next handshake starts from it again.
+    expect(record.routes).toEqual(['host']);
+  });
+
+  it('returns the very record when there is no readable pass to add', () => {
+    expect(welcomeRecordWithHeld(record, WELCOME, null, withRoutes)).toBe(record);
+    expect(welcomeRecordWithHeld(record, WELCOME, undefined, withRoutes)).toBe(record);
+  });
+
+  it('adds nothing from a pass to another room, and nothing to another room\'s record', () => {
+    const elsewhere: Boot = { roomId: OTHER, link: 'the minter', routes: ['stranger'] };
+    expect(welcomeRecordWithHeld(record, WELCOME, elsewhere, withRoutes)).toBe(record);
+    const otherRecord: Boot = { roomId: OTHER, link: 'this computer', routes: ['owner'] };
+    const held: Boot = { roomId: WELCOME, link: 'the minter', routes: ['friend'] };
+    expect(welcomeRecordWithHeld(otherRecord, WELCOME, held, withRoutes)).toBe(otherRecord);
+  });
+
+  it('passes on no record, and does nothing in a build with no welcome room', () => {
+    const held: Boot = { roomId: WELCOME, link: 'the minter', routes: ['friend'] };
+    expect(welcomeRecordWithHeld(null, WELCOME, held, withRoutes)).toBeNull();
+    const blank: Boot = { roomId: '', link: 'this computer', routes: [] };
+    expect(welcomeRecordWithHeld(blank, '', { ...held, roomId: '' }, withRoutes)).toBe(blank);
+  });
+});
+
+describe('welcome only: a boot that lost the session stands down (bootYields)', () => {
+  it('goes on while the session count stands where the boot began and no room swap runs', () => {
+    expect(bootYields(0, 0, false)).toBe(false);
+    expect(bootYields(7, 7, false)).toBe(false);
+  });
+
+  it('stands down once any join or leave has moved the count: Retry-node, a pass the player followed, a second boot', () => {
+    expect(bootYields(3, 4, false)).toBe(true);
+    expect(bootYields(3, 9, false)).toBe(true);
+  });
+
+  it('stands down while a room swap is under way, whatever the count', () => {
+    expect(bootYields(3, 3, true)).toBe(true);
+    expect(bootYields(3, 4, true)).toBe(true);
+  });
+});
+
+describe('welcome only: a pass to the welcome room added while standing in it (welcomePassAddedLine)', () => {
+  it('while the room has not answered, says the pass is saved and its computers are asked now, and promises no entry', () => {
+    const line = welcomePassAddedLine('SSF-WELCOME', true);
+    expect(line).toContain('Pass saved');
+    expect(line).toContain('SSF-WELCOME');
+    expect(line).toContain('Your computer now asks the computers it names');
+    expect(line).toContain('fills in by itself');
+    expect(line).not.toMatch(/taken in|automatically|station/i);
+  });
+
+  it('once the room is here, says so and that the pass is saved', () => {
+    const line = welcomePassAddedLine('SSF-WELCOME', false);
+    expect(line).toBe('You are already aboard SSF-WELCOME. The pass is saved in MY ROOMS.');
   });
 });
