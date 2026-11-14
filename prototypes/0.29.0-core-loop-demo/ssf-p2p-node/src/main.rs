@@ -3525,7 +3525,17 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
+        // 🚪 For as long as this connection stands, no opening hold begins
+        // toward the address it came from: the DHT goes on listing a knock
+        // long after the knocker linked (dht_knock.rs).
+        #[cfg(feature = "chia-read")]
+        let live_from = match &inbound_path.0 {
+            iroh::endpoint::IncomingAddr::Ip(from) => dht_knock::KnockDht::live_from(&hub, *from),
+            _ => None,
+        };
         tokio::spawn(async move {
+            #[cfg(feature = "chia-read")]
+            let _live_from = live_from;
             // Inbound-accepted: learn the room from the peer's first ysync stream.
             if let Err(e) = handle_iroh_connection(hub_clone, connection, iroh_clone, None).await {
                 eprintln!("⚠️ Swarm connection error with peer ({}): {:?}", remote_id, e);

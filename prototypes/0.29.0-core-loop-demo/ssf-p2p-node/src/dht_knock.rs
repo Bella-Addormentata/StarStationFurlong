@@ -21,7 +21,10 @@
 //!   can never finish, and it does not need to: its first packets leave from
 //!   the game's port toward the knocker, which is what opens the holder's
 //!   router. The knocker's own dial, still running, then lands, and the holder
-//!   learns who it was from the handshake, as with any inbound link.
+//!   learns who it was from the handshake, as with any inbound link. The DHT
+//!   goes on listing a knock for a long while after: no hold begins toward an
+//!   address a connection that came in from it still stands to
+//!   ([`OpeningBook::begin`] has the other limits).
 //!
 //! What it does not do: it does not find a holder's address (the dial does
 //! that, from the pass and the DHT's address record), it does not help where a
@@ -88,10 +91,14 @@ const OPENING_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
 /// At most this many opening holds at once, whoever knocks.
 pub(crate) const MAX_OPENINGS: usize = 8;
 
-/// One address gets at most this many holds per hour of the clock, and after
-/// a hold toward it began the next waits [`OPENING_REST`]. The DHT goes on
-/// listing a knock long after the knocker linked or left, and this is what
-/// keeps the holder from opening toward it for ever.
+/// The DHT goes on listing a knock long after the knocker linked or left, and
+/// a listing does not say which. Three rules keep the holder from opening
+/// toward a listing for ever: no hold toward an address a connection that
+/// came in from it still stands to; at most this many holds per address per
+/// hour of the clock; and after a hold that nothing came in on, the next
+/// toward that address waits [`OPENING_REST`]. A hold that did get its
+/// connection asks for no rest: if that address is listed and no connection
+/// stands, the link was lost, and the knocker may well be dialing again.
 pub(crate) const MAX_HOLDS_PER_ADDR: u32 = 3;
 pub(crate) const OPENING_REST: Duration = Duration::from_secs(600);
 
@@ -167,43 +174,60 @@ pub(crate) fn knock_admitted(addr: SocketAddrV4, own: &HashSet<Ipv4Addr>, is_pub
     addr.port() >= MIN_KNOCK_PORT && is_public(*addr.ip()) && !own.contains(addr.ip())
 }
 
+/// What the holder remembers of one address's holds in an hour of the clock.
+struct Held {
+    /// The hour the holds are counted in.
+    hour: u64,
+    /// How many began in it.
+    count: u32,
+    /// When the last one began.
+    last: Instant,
+    /// The last one got the connection it was for.
+    landed: bool,
+}
+
 /// What the holder remembers of its opening holds: which run now, how many
-/// each address had this hour, where opening dials went lately, and where a
-/// connection has come in from. Pure: the clock is handed in.
+/// each address had this hour, where opening dials went lately, where a
+/// connection has come in from, and where one still stands. Pure: the clock is
+/// handed in.
 #[derive(Default)]
 pub(crate) struct OpeningBook {
     /// Holds running now, by the knocker's address.
     running: HashSet<SocketAddrV4>,
-    /// Per address: the hour its holds were counted in, how many began in it,
-    /// and when the last one began.
-    begun: HashMap<SocketAddrV4, (u64, u32, Instant)>,
+    /// Per address, its holds of this hour.
+    begun: HashMap<SocketAddrV4, Held>,
     /// Addresses an opening dial went to, and when the last one left.
     opened: HashMap<Ipv4Addr, Instant>,
     /// Addresses a connection came in from, and when.
     landed: HashMap<SocketAddrV4, Instant>,
+    /// Addresses a connection that came in from them stands to now, with how
+    /// many do.
+    live: HashMap<SocketAddrV4, u32>,
 }
 
 impl OpeningBook {
     /// Claim a hold toward `addr` in the hour `bucket`: `true` when it may
     /// begin (and is now counted as running), `false` when one runs already,
-    /// [`MAX_OPENINGS`] run, the address had its [`MAX_HOLDS_PER_ADDR`] this
-    /// hour, or its last hold began less than [`OPENING_REST`] ago.
+    /// [`MAX_OPENINGS`] run, a connection from that address stands, the
+    /// address had its [`MAX_HOLDS_PER_ADDR`] this hour, or its last hold got
+    /// no connection and began less than [`OPENING_REST`] ago.
     pub(crate) fn begin(&mut self, addr: SocketAddrV4, bucket: u64, now: Instant) -> bool {
-        if self.running.contains(&addr) || self.running.len() >= MAX_OPENINGS {
+        if self.running.contains(&addr) || self.running.len() >= MAX_OPENINGS || self.live.contains_key(&addr) {
             return false;
         }
         // What is kept of other hours is of no use to anyone.
-        self.begun.retain(|_, (hour, _, _)| *hour == bucket);
+        self.begun.retain(|_, held| held.hour == bucket);
         match self.begun.get_mut(&addr) {
-            Some((_, count, last)) => {
-                if *count >= MAX_HOLDS_PER_ADDR || now.duration_since(*last) < OPENING_REST {
+            Some(held) => {
+                if held.count >= MAX_HOLDS_PER_ADDR || (!held.landed && now.duration_since(held.last) < OPENING_REST) {
                     return false;
                 }
-                *count += 1;
-                *last = now;
+                held.count += 1;
+                held.last = now;
+                held.landed = false;
             }
             None => {
-                self.begun.insert(addr, (bucket, 1, now));
+                self.begun.insert(addr, Held { hour: bucket, count: 1, last: now, landed: false });
             }
         }
         self.running.insert(addr);
@@ -236,14 +260,33 @@ impl OpeningBook {
     }
 
     /// Did a connection come in from `addr` since `since`? The hold toward it
-    /// stops asking for one then. Forgets the mark once read as true.
+    /// stops asking for one then, and is remembered as one that got its
+    /// connection. Forgets the mark once read as true.
     pub(crate) fn landed_since(&mut self, addr: &SocketAddrV4, since: Instant) -> bool {
         match self.landed.get(addr) {
             Some(at) if *at >= since => {
                 self.landed.remove(addr);
+                if let Some(held) = self.begun.get_mut(addr) {
+                    held.landed = true;
+                }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// A connection that came in from `addr` stands from now on.
+    pub(crate) fn note_live(&mut self, addr: SocketAddrV4) {
+        *self.live.entry(addr).or_insert(0) += 1;
+    }
+
+    /// One connection that came in from `addr` ended.
+    pub(crate) fn end_live(&mut self, addr: &SocketAddrV4) {
+        if let Some(count) = self.live.get_mut(addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.live.remove(addr);
+            }
         }
     }
 
@@ -293,6 +336,17 @@ impl KnockDht {
         }
     }
 
+    /// A connection accepted from `addr` stands for as long as the guard this
+    /// hands back is kept (main.rs `run_iroh_listener` keeps it in the
+    /// connection's task): no opening hold begins toward that address
+    /// meanwhile. `None` with the knock off, or for an address that is not
+    /// IPv4.
+    pub(crate) fn live_from(hub: &SharedHub, addr: SocketAddr) -> Option<LiveFrom> {
+        let SocketAddr::V4(v4) = addr else { return None };
+        hub.dht_knock.as_ref()?.book.lock().unwrap().note_live(v4);
+        Some(LiveFrom { hub: hub.clone(), addr: v4 })
+    }
+
     /// Everything the DHT lists at `point` now.
     async fn lookup(&self, point: [u8; 20]) -> Option<BTreeSet<SocketAddrV4>> {
         let id = Id::from_bytes(point).ok()?;
@@ -309,6 +363,21 @@ impl KnockDht {
     async fn announce(&self, point: [u8; 20], port: u16) -> Result<(), String> {
         let id = Id::from_bytes(point).map_err(|e| e.to_string())?;
         self.dht.announce_peer(id, Some(port)).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// A connection that came in from an address, for as long as it stands
+/// ([`KnockDht::live_from`]).
+pub(crate) struct LiveFrom {
+    hub: SharedHub,
+    addr: SocketAddrV4,
+}
+
+impl Drop for LiveFrom {
+    fn drop(&mut self) {
+        if let Some(knock) = self.hub.dht_knock.as_ref() {
+            knock.book.lock().unwrap().end_live(&self.addr);
+        }
     }
 }
 
@@ -680,6 +749,63 @@ mod tests {
         // A refused begin counted nothing and left nothing running.
         book.end(&a);
         assert_eq!(book.running(), 0);
+    }
+
+    #[test]
+    fn no_hold_toward_an_address_a_connection_stands_from() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        let b = v4(203, 0, 113, 9, 44443);
+        // The knocker's dial landed and its hold ended: the link stands.
+        assert!(book.begin(a, 10, t0));
+        book.note_landed(a, t0 + Duration::from_secs(2));
+        assert!(book.landed_since(&a, t0));
+        book.end(&a);
+        book.note_live(a);
+        // The DHT still lists the knock, at every look and after any rest:
+        // nothing is opened toward a computer that is linked.
+        assert!(!book.begin(a, 10, t0 + POLL_PERIOD));
+        assert!(!book.begin(a, 10, t0 + OPENING_REST * 2));
+        // Another knocker behind the same router is not held up by it.
+        assert!(book.begin(b, 10, t0 + POLL_PERIOD));
+        // Two connections from one address: the address is free once both
+        // ended, not one.
+        book.note_live(a);
+        book.end_live(&a);
+        assert!(!book.begin(a, 10, t0 + OPENING_REST * 2));
+        book.end_live(&a);
+        assert!(book.begin(a, 10, t0 + OPENING_REST * 2));
+        // An end nobody noted a beginning for changes nothing.
+        book.end_live(&v4(203, 0, 113, 77, 44442));
+    }
+
+    #[test]
+    fn a_hold_that_got_its_connection_asks_for_no_rest_but_counts() {
+        let mut book = OpeningBook::default();
+        let t0 = Instant::now();
+        let a = v4(203, 0, 113, 9, 44442);
+        // Linked through the first hold, and the link was lost a minute on.
+        assert!(book.begin(a, 10, t0));
+        book.note_landed(a, t0 + Duration::from_secs(2));
+        assert!(book.landed_since(&a, t0));
+        book.end(&a);
+        book.note_live(a);
+        book.end_live(&a);
+        // Listed, and no connection stands: the knocker may be dialing
+        // again, so the second hold does not wait for the rest.
+        let second = t0 + Duration::from_secs(60);
+        assert!(book.begin(a, 10, second));
+        book.end(&a);
+        // That one got nothing: the rest holds again.
+        assert!(!book.begin(a, 10, second + POLL_PERIOD));
+        assert!(book.begin(a, 10, second + OPENING_REST));
+        book.note_landed(a, second + OPENING_REST + Duration::from_secs(2));
+        assert!(book.landed_since(&a, second + OPENING_REST));
+        book.end(&a);
+        // Three this hour, landed or not: the fourth waits for the next hour.
+        assert!(!book.begin(a, 10, second + OPENING_REST + Duration::from_secs(60)));
+        assert!(book.begin(a, 11, second + OPENING_REST + Duration::from_secs(60)));
     }
 
     #[test]
