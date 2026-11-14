@@ -183,6 +183,7 @@ import {
   computedTablePidBytes,
   computedTablePids,
   COMPUTED_MIN_BUILD,
+  computedStandInHeard,
   computedVerdictOf,
   delegationHeld,
   delegationOf,
@@ -3554,8 +3555,15 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
  *   few long felts the table's strangers put down on the round that is open.
  * - the house whose commitment the close would name (`h`) is not heard
  *   (houseAway): only that house holds the seed behind it, so a close written
- *   while it is away is a round nobody reveals for. Another house heard
- *   decides nothing. A house the page can't tell, or that is none of the
+ *   while it is away is a round nobody reveals for. Unless another house
+ *   of the game is heard (computedStandInHeard, PR 6c-5d-2: one the deed holder
+ *   pins that is the game's for the open round, or one that joined the open
+ *   round): then the close is written
+ *   to be voided. No house reveals for it, a bettor's abandon voids it after
+ *   HOUSE_HEARD_MS (abandonWait), the void lifts the commitment, and the
+ *   house heard joins the round after: one round lost, and the table plays
+ *   on. (The committing house back in time reveals, and the round counts.) A
+ *   house the page can't tell, or that is none of the
  *   game's for the open round any more (a hand-over moved the game to a
  *   holder whose houses it is not), is no pause: the close that names it is
  *   voided by an abandon, and the round after is the houses' that are, the
@@ -3566,7 +3574,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
 function closePaused(st: TableState, res: FoldResult, h: string, now: number): boolean {
   return fairClosePaused(
     res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, (computedResolutionOf(st.t, st.inc)?.fin ?? null) !== null,
-  ) || houseAway(st, h, now);
+  ) || (houseAway(st, h, now) && !computedStandInHeard(st.t, st.inc, h, now));
 }
 
 /** closePaused's rule on its own inputs: the session's kept bytes, the room's
