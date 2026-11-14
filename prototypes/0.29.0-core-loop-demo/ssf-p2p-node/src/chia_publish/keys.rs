@@ -459,11 +459,25 @@ mod tests {
             "if beacon_on && peak > 0 && !era_guard(peak) {",
         ]);
         assert_eq!(code_lines(heartbeat, "BeaconMark::load("), ["let mut beacon_mark: Option<BeaconMark> = BeaconMark::load(beacon_mark_path);"]);
+        // What the page is shown of the arm's last look: dropped while the
+        // beacon is out; dropped at the first tick of another era, before
+        // any arm can take the tick (#440 review: the listing's or a knock's
+        // `continue` would leave the last era's look standing as this
+        // one's); written at each look of the arm and again after a write.
         assert_eq!(code_lines(heartbeat, "hub.beacon_status"), [
             "hub.beacon_status.lock().unwrap().take();",
+            "drop_other_eras_look(&mut hub.beacon_status.lock().unwrap(), chia_lane::era_of(peak));",
             "*hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));",
             "*hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));",
         ]);
+        // The drop sits beside the beacon clock's own look at the tick's
+        // peak, above the listing's arm: no `continue` lies between the
+        // peak's read and it.
+        let drop_at = heartbeat.find("drop_other_eras_look(&mut hub.beacon_status").expect("the drop");
+        let clock_at = heartbeat.find("beacon_sees_peak(&mut beacon_clock, root, peak").expect("the clock's look");
+        let listing_at = heartbeat.find("if let Some(listed) = findable {").expect("the listing's arm");
+        assert!(clock_at < drop_at && drop_at < listing_at, "the drop comes with the clock's look, before the first arm");
+        assert_eq!(code_lines(&heartbeat[clock_at..drop_at], "continue"), [""; 0]);
         assert_eq!(code_lines(publish, "BURNERS_ENV").len(), 2, "the variable's name, and the note that it is no longer read");
         assert_eq!(code_lines(publish, "pub const BURNERS_ENV"), ["pub const BURNERS_ENV: &str = \"SSF_CHIA_BURNERS\";"]);
         assert_eq!(code_lines(&main, "BURNERS"), ["if let Some(note) = chia_publish::burners_env_note(std::env::var_os(chia_publish::BURNERS_ENV).as_deref()) {"]);

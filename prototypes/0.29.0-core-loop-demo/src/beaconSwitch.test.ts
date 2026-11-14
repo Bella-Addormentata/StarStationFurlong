@@ -365,6 +365,44 @@ describe('main.ts and index.html wire the beacon switch', () => {
     expect(visit).toContain('beaconArmed = null;\n      if (!beaconTurning) beaconError = null;\n      renderBeaconRow();');
   });
 
+  it('acts on nothing from a phone that is put away, and drops an armed CONFIRM when the phone goes', () => {
+    // On screen means the phone is up AND the view is shown: a phone put away
+    // is only slid offscreen, and its button can still hold the focus.
+    const onScreen = body('function networkViewOnScreen(): boolean {');
+    expect(onScreen).toContain('document.getElementById("phone-app-settings-network")');
+    expect(onScreen).toContain('return Boolean(view && treasuryViewOnScreen(view));');
+    const both = body('function treasuryViewOnScreen(view: HTMLElement): boolean {');
+    expect(both).toContain('phone?.classList.contains("active")');
+    expect(both).toContain('view.classList.contains("active")');
+    const disarm = body('function disarmBeacon(): void {');
+    expect(disarm).toContain('if (beaconArmed === null) return;\n  beaconArmed = null;\n  renderBeaconRow();');
+    // The switch asks before it reads what it does: no arm, no CONFIRM and
+    // no PUT OUT goes through with the warning out of sight.
+    const at = main.indexOf('document.getElementById(BEACON_BUTTON_ID) as HTMLButtonElement | null;\n  if (beaconBtn)');
+    expect(at).toBeGreaterThan(0);
+    const wiring = main.slice(at, main.indexOf("// The view's own ↑/↓ traversal", at));
+    const guard = wiring.indexOf('if (!networkViewOnScreen()) {\n        disarmBeacon();\n        return;\n      }');
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(wiring.indexOf('const act = beaconBtn.dataset.act;'));
+    // The pass auto-enter puts the phone away under the player: the focused
+    // control lets go and the CONFIRM is dropped, before the phone goes.
+    const auto = main.indexOf('// Auto-enter driver:');
+    expect(auto).toBeGreaterThan(0);
+    const away = main.slice(auto, main.indexOf('void enterRoomFromPass(seed);', auto));
+    const blur = away.indexOf('if (container && focused instanceof HTMLElement && container.contains(focused)) focused.blur();');
+    const drop = away.indexOf('disarmBeacon();');
+    const gone = away.indexOf('container?.classList.remove("active");');
+    expect(blur).toBeGreaterThan(0);
+    expect(drop).toBeGreaterThan(blur);
+    expect(gone).toBeGreaterThan(drop);
+    // Tab and the bezel: the same on the phone's own close.
+    const toggle = main.indexOf('const togglePhone = (): void => {');
+    expect(toggle).toBeGreaterThan(0);
+    const closed = main.slice(toggle, main.indexOf('releasePhoneOpener();', toggle));
+    expect(closed).toContain('focused.blur();');
+    expect(closed).toContain('disarmBeacon();');
+  });
+
   it('stands as its own row under LIST ME, as one button whose words main.ts writes', () => {
     const listMe = html.indexOf('id="list-me-detail"');
     const row = html.indexOf('<div class="network-row" id="beacon-row">');

@@ -6410,6 +6410,14 @@ pub async fn heartbeat_loop(
         // reach the beacon's own arm (`beacon_sees_peak`).
         if beacon_on {
             beacon_sees_peak(&mut beacon_clock, root, peak, &mut rand::rngs::OsRng);
+            // 🔦 And a look of another edition is shown no longer from the
+            // first tick whose agreed peak is in a new one, whether or not
+            // this tick reaches the beacon's own arm: the listing's or a
+            // knock's arm may take it, for a run of ticks, and the page
+            // would go on reading the last edition's beacon as this one's.
+            if peak > 0 {
+                drop_other_eras_look(&mut hub.beacon_status.lock().unwrap(), chia_lane::era_of(peak));
+            }
         }
         // Every era-bound write of this tick (presence, knock, beacon) is
         // signed for the era of that peak, and the era guard's budget
@@ -7002,6 +7010,16 @@ pub async fn heartbeat_loop(
 fn beacon_status(era: u64, reachable: bool, serves_welcome: bool, mark: Option<&BeaconMark>, node_id: &str) -> crate::chia_beacon_switch::BeaconStatus {
     let own = mark.filter(|m| m.era == era && m.node_id.as_deref() == Some(node_id));
     crate::chia_beacon_switch::BeaconStatus { era, reachable, serves_welcome, sent: own.is_some(), confirmed: own.is_some_and(|m| m.confirmed) }
+}
+
+/// The beacon arm's last look, as the page is shown it, at a tick whose
+/// agreed peak is in `era`: a look of another edition says nothing of this
+/// one, and is dropped (the page then says the node has not looked at this
+/// edition yet, until the arm's next look). One of this edition stays. Pure.
+fn drop_other_eras_look(status: &mut Option<crate::chia_beacon_switch::BeaconStatus>, era: u64) {
+    if status.as_ref().is_some_and(|s| s.era != era) {
+        *status = None;
+    }
 }
 
 /// The first characters of a node id, for the log.
@@ -12823,6 +12841,32 @@ mod tests {
             let s = st(Some(&m));
             assert_eq!((s.sent, s.confirmed), (false, false), "{why}");
         }
+    }
+
+    /// #440 review: after an era change the listing's or a knock's arm can
+    /// take the tick before the beacon's own arm looks, and the last era's
+    /// look ("sent, on the chain") must not be shown as this edition's.
+    #[test]
+    fn a_look_of_another_era_is_shown_no_longer_and_one_of_this_era_stays() {
+        let look = |era: u64| beacon_status(era, true, true, Some(&BeaconMark { era, node_id: Some("me".to_string()), confirmed: true, ..Default::default() }), "me");
+        // Last era's look, confirmed: gone at the first tick of the new era.
+        let mut status = Some(look(6));
+        assert!(status.is_some_and(|s| s.sent && s.confirmed));
+        drop_other_eras_look(&mut status, 7);
+        assert!(status.is_none(), "the page must not read era 6's beacon as era 7's");
+        // This era's look stays, through any number of ticks.
+        let mut status = Some(look(7));
+        drop_other_eras_look(&mut status, 7);
+        drop_other_eras_look(&mut status, 7);
+        assert!(status.is_some_and(|s| s.era == 7 && s.sent && s.confirmed));
+        // A look from ahead (the peers' agreed peak fell back an era) is no look of this era either.
+        let mut status = Some(look(8));
+        drop_other_eras_look(&mut status, 7);
+        assert!(status.is_none());
+        // No look: none.
+        let mut status = None;
+        drop_other_eras_look(&mut status, 7);
+        assert!(status.is_none());
     }
 
     /// Whether the beacon arm tries a write, over every combination of what

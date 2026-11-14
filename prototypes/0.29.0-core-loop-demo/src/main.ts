@@ -1185,6 +1185,22 @@ let beaconChangedAt = 0;
 /** What the switch did at the last render. */
 let beaconShownAct: string | null = null;
 
+/** 🔦 Is the Network view on screen? A phone that is put away is only slid
+ *  offscreen: its views keep their classes and a control in it keeps the
+ *  focus, so it still takes Enter and Space (treasuryViewOnScreen). */
+function networkViewOnScreen(): boolean {
+  const view = document.getElementById("phone-app-settings-network");
+  return Boolean(view && treasuryViewOnScreen(view));
+}
+
+/** 🔦 Drop an armed CONFIRM: the warning it stands under is no longer being
+ *  read (the phone was put away, or a tap came from a phone that is). */
+function disarmBeacon(): void {
+  if (beaconArmed === null) return;
+  beaconArmed = null;
+  renderBeaconRow();
+}
+
 /** 🔦 The BEACON row of the Network rows and the note, switch, warning and
  *  error under it, from the node that answered the last probe (none while
  *  it does not). Written with textContent, hidden and attributes only,
@@ -9371,6 +9387,9 @@ function setupSpacePhoneOverlay() {
         // to hand focus back to.
         const focused = document.activeElement;
         if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        // 🔦 And a beacon CONFIRM armed in the Network view is dropped: its
+        // warning went offscreen with the phone.
+        disarmBeacon();
         // Hand focus back to whatever opened the phone from outside it. The
         // phone is only moved offscreen, never display:none, so a control
         // left focused inside it keeps answering the arrow keys against
@@ -9619,6 +9638,14 @@ function setupSpacePhoneOverlay() {
       autoEnterRoomId = null;
       const seed = passSeed(rid);
       if (seed) {
+        // The phone is put away under the player, mid-read: a control left
+        // focused inside it lets go (togglePhone's rule; the phone is only
+        // moved offscreen, so it would keep taking Enter and Space), and a
+        // beacon CONFIRM armed in the Network view is dropped, its warning
+        // no longer on screen.
+        const focused = document.activeElement;
+        if (container && focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        disarmBeacon();
         container?.classList.remove("active");
         void enterRoomFromPass(seed);
       }
@@ -10383,6 +10410,15 @@ function setupNetworkDetailsPanel() {
   if (beaconBtn) {
     beaconBtn.addEventListener("click", (e) => {
       if (beaconBtn.getAttribute("aria-disabled") === "true") return;
+      // Nothing is armed, lit or put out from a phone that is put away. The
+      // phone is only slid offscreen, so the button may still hold the focus
+      // and take Enter or Space with its warning out of sight: a pass that
+      // finished warming puts the phone away under the player (the
+      // auto-enter). An armed CONFIRM is dropped with the tap.
+      if (!networkViewOnScreen()) {
+        disarmBeacon();
+        return;
+      }
       const act = beaconBtn.dataset.act;
       if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), beaconChangedAt)) return;
       if (act === "arm") {
