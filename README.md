@@ -61,7 +61,12 @@ new welcome room, paste the link, re-export the atlas from the devtools console)
 Keep the host node running: until an install has reached the welcome room once,
 every start docks there, and if nobody answers it stays docked in an empty copy
 of the room and keeps asking (the rules are in
-[`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). A link
+[`welcomeOnly.ts`](prototypes/0.29.0-core-loop-demo/src/welcomeOnly.ts)). On a
+first start the title shows where that search stands, one line per step, and
+NEW PLAYER holds the reveal for the room: the station is revealed by itself when
+the room answers, ENTER NOW lights after 45 seconds without an answer, and ENTER
+NOW is there throughout
+([`firstRunSteps.ts`](prototypes/0.29.0-core-loop-demo/src/firstRunSteps.ts)). A link
 to the welcome room that another player hands a newcomer (`?seed=`) is used as
 given, with the bundled pass's routes beside its own, so the newcomer's computer
 also dials the node that link names, and on arrival it is that pass, with both

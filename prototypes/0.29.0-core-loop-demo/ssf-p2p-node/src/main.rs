@@ -3150,6 +3150,10 @@ async fn handle_wt_connection_inner(
                     // behind an async Mutex — each writer holds the lock across a whole
                     // framed message, so frames never interleave.
                     let send = std::sync::Arc::new(tokio::sync::Mutex::new(send));
+                    // The computers this stream has named in its dial hints: one
+                    // already linked in the room is answered `connected` here,
+                    // once (NamedOnStream).
+                    let mut named = NamedOnStream::default();
                     let mut length_buf = [0u8; 4];
                     loop {
                         if let Err(_) = recv.read_exact(&mut length_buf).await {
@@ -3324,6 +3328,14 @@ async fn handle_wt_connection_inner(
                                         .map(|room| !room.remote_peers.contains_key(&target_pub_key))
                                         .unwrap_or(false)
                                 };
+                                // Already linked: no dial begins, so no dial reports.
+                                // The page is told here, at this stream's first
+                                // naming of the computer (NamedOnStream).
+                                if target_pub_key != iroh_clone.id()
+                                    && named.first_naming_of_a_linked(target_pub_key, linked_in_room(&hub_clone, &envelope.room, &target_pub_key))
+                                {
+                                    tell_already_linked(&send, &envelope.room, target_node_id_str);
+                                }
 
                                 // Single-flight (issue #60): claim the dial before
                                 // spawning. Without this, a slow hole-punch keeps
@@ -3385,6 +3397,12 @@ async fn handle_wt_connection_inner(
                                     let rooms = hub_clone.rooms.lock().unwrap();
                                     rooms.get(&envelope.room).map(|r| !r.remote_peers.contains_key(&mk)).unwrap_or(true)
                                 };
+                                // Already linked, as for the first computer above. A
+                                // computer named both ways is told once: the set is
+                                // the stream's.
+                                if named.first_naming_of_a_linked(mk, linked_in_room(&hub_clone, &envelope.room, &mk)) {
+                                    tell_already_linked(&send, &envelope.room, &mh.iroh_node_id);
+                                }
                                 let claimed = needs_dial && hub_clone.dialing.lock().unwrap().insert(mk);
                                 if claimed {
                                     let hub_m = hub_clone.clone();
@@ -3737,7 +3755,6 @@ pub(crate) fn release_dial(hub: &HubState, peer: PublicKey) {
 /// the room went away or another path linked first. A hold that ended with the
 /// peer linked is contact, whichever path made the link; one that ended with no
 /// link and no exhausted window (the room is gone) counts as nothing.
-#[cfg(feature = "chia-read")]
 pub(crate) fn linked_in_room(hub: &HubState, room_id: &str, peer: &PublicKey) -> bool {
     hub.rooms.lock().unwrap().get(room_id).is_some_and(|room| room.remote_peers.contains_key(peer))
 }
@@ -3779,7 +3796,17 @@ async fn dial_peer_with_retry(
 }
 
 /// Whether a dial's status goes to EVERY page of the room, whichever page's
-/// envelope began the dial: `connected` does. A page asks the room for its
+/// envelope began the dial: its end does, `connected` and `failed`; `dialing`
+/// stays with the page that began it.
+///
+/// `failed`: a computer is dialed once for all the pages of a room (the
+/// single-flight claim, `hub.dialing`), so a page that came to the room while
+/// another page's dial was running begins none of its own and has no stream
+/// that dial reports on. Told nothing, it went on showing the computer as
+/// being dialed after the dial had given up (the first-run title's "Dialing 1
+/// computer…").
+///
+/// `connected`: a page asks the room for its
 /// state when it hears `connected` (it sends SyncStep1 again), and that
 /// question is also what tells the dialed node which room the new connection
 /// is for: until a frame names the room, the dialed node says nothing on it,
@@ -3787,15 +3814,16 @@ async fn dial_peer_with_retry(
 ///
 /// The pages hear dial statuses on the streams the NODE opens toward them.
 /// On the stream a page opened itself, the one its envelope came in on, the
-/// game's page reads sync frames only, so a `connected` written there alone
-/// was never heard. It went unnoticed because a page also asks again by
+/// game's page read sync frames only (the first-run title has since given
+/// that stream's other frames the same reader), so a `connected` written
+/// there alone was never heard. It went unnoticed because a page also asks again by
 /// itself every 2 s for its first 30 s in a room, and a dial to a reachable
 /// computer lands inside that. One that lands later did not link: a dial
 /// opened by a DHT knock landed 46 s after it began (two home routers,
 /// 2026-11-14), the two nodes connected, and 16 s later the connection was
 /// dropped as silent with the page never having asked.
 fn dial_status_is_for_every_page(status: &str) -> bool {
-    status == "connected"
+    status == "connected" || status == "failed"
 }
 
 /// Report a dial's status to the browser: to the specific `send` stream when the
@@ -3824,19 +3852,132 @@ async fn report_dial_status(
     }
 }
 
+/// How many computers one page stream is remembered to have named
+/// ([`NamedOnStream`]). A room's record names a handful.
+const NAMED_ON_STREAM_MAX: usize = 256;
+
+/// The computers one page stream has named in its dial hints.
+///
+/// A page that asks for a dial hears how it went from the dial itself:
+/// `dialing`, then `connected` or `failed`. One that names a computer this
+/// node is ALREADY linked to in the room begins no dial, so it heard nothing
+/// and could not tell a link that is up from a dial that never began (a page
+/// loaded again while its node kept the link, a second page of the room).
+/// The first time a stream names such a computer, the node answers
+/// `connected` on that stream ([`tell_already_linked`]).
+///
+/// Once per stream and computer, whatever happens to the link afterwards: a
+/// page asks the room for its state again when it hears `connected`, and
+/// that question carries the same hints, so an answer to every naming would
+/// go round for ever. A computer first named while it was not linked is
+/// reported by its dial.
+#[derive(Default)]
+struct NamedOnStream(std::collections::HashSet<PublicKey>);
+
+impl NamedOnStream {
+    /// Note that the stream named `target`, which is linked in the room or
+    /// not (`linked`). `true` when the page is owed the word that it is
+    /// already linked: the first naming of a computer that is. Past
+    /// [`NAMED_ON_STREAM_MAX`] computers nothing more is remembered and
+    /// nothing more is owed, so a stream cannot grow the set without bound
+    /// and a computer that is not remembered is never told twice.
+    fn first_naming_of_a_linked(&mut self, target: PublicKey, linked: bool) -> bool {
+        if self.0.len() >= NAMED_ON_STREAM_MAX && !self.0.contains(&target) {
+            return false;
+        }
+        self.0.insert(target) && linked
+    }
+}
+
+/// Tell one page, on the stream its question came in on, that the computer it
+/// asked for is already linked in the room ([`NamedOnStream`]). Off the
+/// reader loop, as a dial's reports are: the write waits for the stream's
+/// lock and for the page to read.
+fn tell_already_linked(send: &std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>, room_id: &str, target: &str) {
+    let (send, room_id, target) = (send.clone(), room_id.to_string(), target.to_string());
+    tokio::spawn(async move {
+        let mut stream = send.lock().await;
+        let _ = write_bridge_status(&mut *stream, &room_id, &target, "connected", Some("already linked")).await;
+    });
+}
+
 #[cfg(test)]
 mod dial_status_tests {
-    use super::dial_status_is_for_every_page;
+    use super::{dial_status_is_for_every_page, NamedOnStream, NAMED_ON_STREAM_MAX};
+    use iroh::SecretKey;
 
-    /// Only a dial that landed is told to every page of the room: the
-    /// statuses of a dial still going, or given up, stay with the page whose
-    /// envelope began it. The real binary's side is tests/dial_landed.rs.
+    fn computer(n: u16) -> iroh::PublicKey {
+        let mut seed = [7u8; 32];
+        seed[..2].copy_from_slice(&n.to_le_bytes());
+        SecretKey::from_bytes(&seed).public()
+    }
+
+    /// A page is told once that a computer it names is already linked: at
+    /// the stream's first naming of it. Its next question names it again
+    /// (the page asks when it hears `connected`), and an answer to that one
+    /// would go round for ever.
     #[test]
-    fn only_a_landed_dial_is_told_to_every_page() {
+    fn a_page_is_told_of_a_link_already_up_at_its_first_naming_alone() {
+        let mut named = NamedOnStream::default();
+        let (a, b) = (computer(1), computer(2));
+        assert!(named.first_naming_of_a_linked(a, true));
+        assert!(!named.first_naming_of_a_linked(a, true));
+        // First named while not linked: its dial reports it, here nothing,
+        // and nothing later either, when the dial has landed.
+        assert!(!named.first_naming_of_a_linked(b, false));
+        assert!(!named.first_naming_of_a_linked(b, true));
+        // A link that went and came back is not announced a second time.
+        assert!(!named.first_naming_of_a_linked(a, false));
+        assert!(!named.first_naming_of_a_linked(a, true));
+    }
+
+    /// A stream that names computers without end fills the set and no
+    /// further: the ones past it are not remembered, so they are not told at
+    /// all, where telling them at every naming would be the loop. The ones
+    /// already remembered stay told once.
+    #[test]
+    fn a_full_set_remembers_no_more_and_owes_no_more() {
+        let mut named = NamedOnStream::default();
+        for n in 0..NAMED_ON_STREAM_MAX as u16 {
+            assert!(named.first_naming_of_a_linked(computer(n), true), "{n}");
+        }
+        let past = computer(NAMED_ON_STREAM_MAX as u16);
+        assert!(!named.first_naming_of_a_linked(past, true));
+        assert!(!named.first_naming_of_a_linked(past, true));
+        assert_eq!(named.0.len(), NAMED_ON_STREAM_MAX);
+        assert!(!named.first_naming_of_a_linked(computer(0), true));
+    }
+
+    /// A dial's end is told to every page of the room, landed or given up:
+    /// a page that began no dial of its own (another page's was running)
+    /// hears it nowhere else. A dial still going stays with the page whose
+    /// envelope began it. The real binary's side, for both ends, is
+    /// tests/dial_landed.rs.
+    #[test]
+    fn a_dials_end_is_told_to_every_page() {
         assert!(dial_status_is_for_every_page("connected"));
-        for other in ["dialing", "failed", "", "Connected", "connected ", "linked"] {
+        assert!(dial_status_is_for_every_page("failed"));
+        for other in ["dialing", "", "Connected", "connected ", "Failed", "failed ", "linked"] {
             assert!(!dial_status_is_for_every_page(other), "{other:?}");
         }
+    }
+
+    /// Every `failed` the dial writes goes through `report_dial_status`,
+    /// which is where the rule above is asked: a `failed` written straight
+    /// to one page's stream would reach that page alone.
+    #[test]
+    fn every_failed_dial_is_reported_through_the_one_reporter() {
+        let src = include_str!("main.rs");
+        let reporter = src.find("async fn report_dial_status(").expect("the reporter");
+        let body_end = reporter + src[reporter..].find("\n}\n").expect("the reporter's end");
+        let body = &src[reporter..body_end];
+        assert!(body.contains("if dial_status_is_for_every_page(status) {"), "the reporter asks the rule");
+        assert!(body.contains("broadcast_bridge_status(hub, room_id, target, status, detail).await;"), "and broadcasts");
+        // Outside the reporter and the once-per-stream `connected`
+        // (`tell_already_linked`), nothing writes a status to a page's stream.
+        // (The words are joined here so that this test is not a third.)
+        let direct = src.matches(&["write_bridge_status(", "&mut"].concat()).count();
+        assert_eq!(direct, 2, "the reporter's own write and the already-linked answer");
     }
 }
 

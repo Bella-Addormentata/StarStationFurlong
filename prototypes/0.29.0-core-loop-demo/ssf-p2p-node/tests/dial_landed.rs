@@ -2,7 +2,7 @@
 //! binary: two `ssf-p2p-node` processes on this computer, the holder and the
 //! newcomer, each in a directory of its own, and stand-in pages, each a
 //! WebTransport client that reads and asks as the game's page does: one on
-//! the holder, two on the newcomer.
+//! the holder, two on the newcomer from the start, and a third that comes late.
 //!
 //! What it guards: a page's question (a sync frame, SyncStep1) is what tells
 //! a dialed node which room a new connection is for. Until a frame names the
@@ -31,7 +31,26 @@
 //!    holder's node answers it from the room it keeps, to both of the
 //!    newcomer's pages, so the link carries the room both ways;
 //! 3. neither node has dropped the other as silent once the time a silent
-//!    connection is given has passed.
+//!    connection is given has passed;
+//! 4. a page that comes to the room once the link is up, and names the
+//!    holder as the first page did, is told `connected` too: once, on the
+//!    stream its question went out on. Its node has the link and begins no
+//!    dial, so no dial reports to it, and a page that hears nothing cannot
+//!    tell a link that is up from a dial that never began (the game's title
+//!    counts the computers it asked for as still being dialed; the game's
+//!    page hands the dial statuses on its own stream to the same reader as
+//!    the others since that title). Once, because the page asks again when
+//!    it hears the word, and its question names the holder again.
+//!
+//! A second test holds the other end of a dial: one that gives up. A
+//! computer is dialed once for all the pages of a room, so a page that comes
+//! to the room while another page's dial is running begins none of its own,
+//! and no dial reports on its stream. A `failed` that went to the page that
+//! began the dial alone left the other showing the computer as being dialed
+//! for good (the game's first-run title, "Dialing 1 computer…"). There, one
+//! node and two pages: the first names a computer that is not there, the
+//! second names it while that dial runs, and both hear `failed`, each on a
+//! stream the node opened.
 //!
 //! Nothing outside this computer is spoken to: no Chia (`SSF_NO_CHIA_LANE=1`),
 //! no Mainline DHT, no mDNS, no public-address echo and no relay, and the
@@ -42,9 +61,11 @@
 //!
 //! The two nodes take the HTTP API's two ports (127.0.0.1:8080 and 8081), as
 //! tests/strict_lane.rs's node takes the first of them: cargo runs one test
-//! file at a time, and this file holds one test. It takes about half a
-//! minute, most of it the wait of (3), so it runs once per CI run, in the
-//! default feature set, which the cfg below names: what it guards is the
+//! file at a time, and this file's two tests run one after the other
+//! (`ONE_AT_A_TIME`). Each takes about half a minute, the first most of it
+//! in the wait of (3) and the second in the waits between a dial's eight
+//! attempts, so they run once per CI run, in the
+//! default feature set, which the cfg below names: what they guard is the
 //! same code in every feature set.
 #![cfg(not(any(feature = "chia-publish", feature = "torrent", feature = "house-fold")))]
 
@@ -99,8 +120,24 @@ const LINK_BOUND: Duration = Duration::from_secs(15);
 /// and a margin.
 const SILENT_BOUND: Duration = Duration::from_secs(3 * 5 + 5 + 3);
 
+/// How long the late page is listened to at the end for a second `connected`
+/// on its own stream. Its second question went out before the silent wait
+/// began, so whatever answered it is long written; the bound is for a runner
+/// slow enough to have had no wait left.
+const SECOND_WORD: Duration = Duration::from_secs(2);
+
+/// How long a dial with no route may take to give up and be told: eight
+/// attempts (`MAX_DIAL_ATTEMPTS` in src/main.rs) and the waits between them,
+/// 0.5 s doubling to 8 s, which is 31.5 s when every attempt ends at once;
+/// the rest is room for a slow runner.
+const GIVE_UP_BOUND: Duration = Duration::from_secs(75);
+
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(100);
+
+/// One test of this file at a time: each starts nodes on the HTTP API's
+/// first ports and measures waits.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A directory of the test's own under the system's temporary directory:
 /// `node/`, the node's working directory, and `node.log` beside it. Removed,
@@ -388,6 +425,19 @@ impl Page {
     /// the dial hints of `toward` when given: its node id and one address,
     /// as an invite's member hints carry them.
     async fn ask(&mut self, toward: Option<(&str, String)>) {
+        match toward {
+            Some((node_id, addr)) => {
+                let addrs = [addr];
+                self.ask_naming(Some((node_id, &addrs[..]))).await
+            }
+            None => self.ask_naming(None).await,
+        }
+    }
+
+    /// [`Page::ask`] with the dial hints of `toward` as given: its node id
+    /// and its addresses, which may be none (a pass can name a computer and
+    /// no address a dial can use).
+    async fn ask_naming(&mut self, toward: Option<(&str, &[String])>) {
         self.seq += 1;
         let mut envelope = json!({
             "v": 1,
@@ -397,10 +447,10 @@ impl Page {
             "author": BASE64_STANDARD.encode([0u8; 32]),
             "payload": BASE64_STANDARD.encode(SYNC_STEP_1),
         });
-        if let Some((node_id, addr)) = toward {
+        if let Some((node_id, addrs)) = toward {
             envelope["iroh_node_id"] = json!(node_id);
-            envelope["iroh_direct_addrs"] = json!([addr]);
-            envelope["iroh_member_hints"] = json!([{ "irohNodeId": node_id, "irohDirectAddrs": [addr] }]);
+            envelope["iroh_direct_addrs"] = json!(addrs);
+            envelope["iroh_member_hints"] = json!([{ "irohNodeId": node_id, "irohDirectAddrs": addrs }]);
             envelope["trust_tier"] = json!(2);
         }
         self.own.write_all(&framed(&envelope)).await.unwrap_or_else(|e| panic!("{}: the question was not written: {e}", self.who));
@@ -430,6 +480,7 @@ impl Page {
 
 #[test]
 fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (holder_dir, newcomer_dir) = (Scratch::new("holder"), Scratch::new("newcomer"));
     // One after the other: the first takes the HTTP API's first port, the
     // second finds it taken and takes the next.
@@ -553,9 +604,51 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
             );
         }
 
+        // (4) A page that comes to the room once the link is up, as the
+        // game's page does when it is loaded again while its node runs on.
+        // Its question names the holder as the first page's did; the node
+        // has the link, begins no dial, and says so on the stream the
+        // question came in on.
+        let mut late_page = Page::open("the newcomer's late page", &newcomer_fp).await;
+        late_page.ask(Some((&holder_fp.node_id, holder_addr.clone()))).await;
+        assert!(
+            late_page.hear(LINK_BOUND, |h| h.own && connected(h)).await.is_some(),
+            "{}",
+            failure(
+                &format!(
+                    "a page that came to the room after the link was up named the holder and heard no `connected` for it on its own stream within {LINK_BOUND:?}: \
+                     its node began no dial, since it has the link, so nothing told the page the holder is linked. It heard:\n{}",
+                    late_page.passed()
+                ),
+                &holder_dir,
+                &newcomer_dir
+            )
+        );
+        // Told, it asks again, as the game's page does, and its question
+        // names the holder again. What that brings is looked at below.
+        late_page.ask(Some((&holder_fp.node_id, holder_addr.clone()))).await;
+
         // (3) The pages stay, saying nothing more, for as long as a silent
         // connection is given.
         tokio::time::sleep(SILENT_BOUND.saturating_sub(landed.elapsed())).await;
+
+        // (4) again: once. A second `connected` would have the page ask
+        // again, and so on for as long as the page is in the room.
+        if let Some(second) = late_page.hear(SECOND_WORD, |h| h.own && connected(h)).await {
+            panic!(
+                "{}",
+                failure(
+                    &format!(
+                        "the late page was told `connected` for the holder a second time ({}), when it named it again: \
+                         the game's page asks again at every `connected`, so the two would go round for ever. Before it, it heard:\n{}",
+                        second.line(),
+                        late_page.passed()
+                    ),
+                    &holder_dir,
+                    &newcomer_dir
+                )
+            );
+        }
         landed
     });
 
@@ -570,4 +663,82 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
         "{}",
         failure(&format!("a node dropped the other as silent within {SILENT_BOUND:?} of the dial landing"), &holder_dir, &newcomer_dir)
     );
+}
+
+/// A dial that gives up is told to every page of the room, as one that
+/// lands is: the page that began no dial of its own hears it nowhere else.
+#[test]
+fn a_dial_that_gives_up_is_told_to_every_page_of_the_room() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (node_dir, absent_dir) = (Scratch::new("alone"), Scratch::new("absent"));
+    // A computer that is not there. Its id is a real one: a second node is
+    // started for it and stopped again before anything dials.
+    let absent_id = {
+        let mut absent = Node::start(&absent_dir, "the absent node");
+        let http = absent.http_port(&absent_dir);
+        fingerprint(http, "the absent node").node_id
+    };
+    let mut node = Node::start(&node_dir, "the node");
+    let node_http = node.http_port(&node_dir);
+    let node_fp = fingerprint(node_http, "the node");
+    assert_ne!(node_fp.node_id, absent_id, "two nodes, two ids");
+    let failure = |what: &str, node_dir: &Scratch| -> String { format!("{what}\n── the node, last lines ──\n{}", tail(&node_dir.log())) };
+    // The hint names the computer and no address, and with the DHT and mDNS
+    // off nothing finds one: every attempt ends at once, and the dial gives
+    // up after its eight attempts and the waits between them.
+    let no_address: [String; 0] = [];
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime");
+    runtime.block_on(async {
+        let status = |h: &Heard, wanted: &str| h.dial_status().is_some_and(|(status, target)| status == wanted && target == absent_id);
+
+        // The first page names the absent computer: its node dials, and
+        // says so on the stream the question came in on.
+        let mut first_page = Page::open("the first page", &node_fp).await;
+        first_page.ask_naming(Some((absent_id.as_str(), &no_address[..]))).await;
+        assert!(
+            first_page.hear(LINK_BOUND, |h| h.own && status(h, "dialing")).await.is_some(),
+            "{}",
+            failure(&format!("the first page was not told its dial began within {LINK_BOUND:?}. It heard:\n{}", first_page.passed()), &node_dir)
+        );
+
+        // The second page comes to the room while that dial runs and names
+        // the same computer. Its node answers its question; a computer is
+        // dialed once, so no dial begins for this page.
+        let mut second_page = Page::open("the second page", &node_fp).await;
+        second_page.ask_naming(Some((absent_id.as_str(), &no_address[..]))).await;
+        assert!(
+            second_page.hear(LINK_BOUND, |h| h.own && h.sync_subtype() == Some(1)).await.is_some(),
+            "{}",
+            failure(&format!("the node did not answer its second page's question within {LINK_BOUND:?}. It heard:\n{}", second_page.passed()), &node_dir)
+        );
+
+        // The dial gives up: every page of the room hears it, on a stream
+        // the node opened, the page that began no dial too.
+        for page in [&mut first_page, &mut second_page] {
+            assert!(
+                page.hear(GIVE_UP_BOUND, |h| !h.own && status(h, "failed")).await.is_some(),
+                "{}",
+                failure(
+                    &format!(
+                        "{} heard no `failed` for the absent computer on a stream the node opened within {GIVE_UP_BOUND:?} of the dial's start: \
+                         a page that began no dial of its own would go on showing the computer as being dialed. It heard:\n{}",
+                        page.who,
+                        page.passed()
+                    ),
+                    &node_dir
+                )
+            );
+        }
+
+        // One dial, not two: nothing told the second page that a dial of
+        // its own began or ended on the stream its question went out on.
+        let own_reports: Vec<String> = second_page.passed.iter().filter(|h| h.own && h.dial_status().is_some()).map(Heard::line).collect();
+        assert!(
+            own_reports.is_empty(),
+            "{}",
+            failure(&format!("the second page named a computer already being dialed, and a dial reported on its own stream: {own_reports:?}"), &node_dir)
+        );
+    });
+    node.must_run(&node_dir);
 }
