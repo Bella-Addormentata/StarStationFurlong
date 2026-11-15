@@ -22,6 +22,8 @@
  * worst a false entry does is dress one fox in one of the game's outfits.
  */
 
+import { cleanLook, type FoxLook } from './foxLook';
+
 /** A lane id as the page reads it off an addressed tick: 8 bytes, 16 hex. */
 const LANE_HEX = /^[0-9a-f]{16}$/;
 
@@ -63,13 +65,28 @@ export function laneOfPeerId(peerId: string): string | null {
  */
 export function outfitsByLane(entries: Iterable<[string, unknown]>): Map<string, string> {
   const found = new Map<string, string>();
+  for (const [lane, dress] of looksByLane(entries)) found.set(lane, dress.outfitId);
+  return found;
+}
+
+/** What the entry that claims a lane says of its fox: its outfit, and its
+ *  own look (foxLook.ts), cleaned, or null from a game with no looks. */
+export interface PeerDress {
+  outfitId: string;
+  look: FoxLook | null;
+}
+
+/** `outfitsByLane` with each entry's look beside its outfit: the same
+ *  entries count, and a lane two entries claim is left out the same way. */
+export function looksByLane(entries: Iterable<[string, unknown]>): Map<string, PeerDress> {
+  const found = new Map<string, PeerDress>();
   const claimedTwice = new Set<string>();
   for (const [, raw] of entries) {
     if (!raw || typeof raw !== 'object') continue;
-    const { lane, outfitId } = raw as { lane?: unknown; outfitId?: unknown };
+    const { lane, outfitId, look } = raw as { lane?: unknown; outfitId?: unknown; look?: unknown };
     if (!isLaneId(lane) || typeof outfitId !== 'string') continue;
     if (found.has(lane)) claimedTwice.add(lane);
-    else found.set(lane, outfitId);
+    else found.set(lane, { outfitId, look: look === undefined || look === null ? null : cleanLook(look) });
   }
   for (const lane of claimedTwice) found.delete(lane);
   return found;

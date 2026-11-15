@@ -1,0 +1,281 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as THREE from 'three';
+import {
+  CREAM_COLOURS,
+  DEFAULT_LOOK,
+  EAR_STYLES,
+  EYE_COLOURS,
+  EYE_SHAPES,
+  FUR_COLOURS,
+  SIZES,
+  cleanLook,
+  loadSavedLook,
+  lookParts,
+  randomLook,
+  sameLook,
+  saveLook,
+  type FoxLook,
+} from './foxLook';
+import { getOutfitById } from './outfits';
+
+/** Every colour the fake face canvas was handed, in order. */
+const painted: string[] = [];
+/** A canvas whose 2-D context draws nothing, and notes its fill colours. */
+function fakeCanvas() {
+  const ctx = new Proxy({} as Record<PropertyKey, unknown>, {
+    get: (target, key) => {
+      if (key in target) return target[key];
+      if (key === 'measureText') return () => ({ width: 40 });
+      if (key === 'createLinearGradient' || key === 'createRadialGradient') return () => ({ addColorStop: () => undefined });
+      if (key === 'getImageData') return () => ({ data: new Uint8ClampedArray(4) });
+      return () => undefined;
+    },
+    set: (target, key, value) => {
+      if (key === 'fillStyle' || key === 'strokeStyle') painted.push(String(value));
+      target[key] = value;
+      return true;
+    },
+  });
+  return { width: 0, height: 0, style: {}, getContext: () => ctx };
+}
+vi.stubGlobal('document', { createElement: fakeCanvas });
+vi.stubGlobal('window', { location: { search: '' } });
+const { VoxelCharacter } = await import('./voxelCharacter');
+
+const LISTS = { fur: FUR_COLOURS, cream: CREAM_COLOURS, eyes: EYE_SHAPES, eyeColour: EYE_COLOURS, ears: EAR_STYLES, size: SIZES } as const;
+
+describe('a look', () => {
+  it('is cleaned from anything: each choice a whole number in range, else its default', () => {
+    expect(cleanLook(undefined)).toEqual(DEFAULT_LOOK);
+    expect(cleanLook(null)).toEqual(DEFAULT_LOOK);
+    expect(cleanLook('fur=3')).toEqual(DEFAULT_LOOK);
+    expect(cleanLook({ fur: 3, cream: 1, eyes: 4, eyeColour: 5, ears: 2, size: 0 })).toEqual({ fur: 3, cream: 1, eyes: 4, eyeColour: 5, ears: 2, size: 0 });
+    const junk = cleanLook({ fur: 1.5, cream: -1, eyes: 99, eyeColour: '2', ears: NaN, size: Infinity, extra: 7 });
+    expect(junk).toEqual(DEFAULT_LOOK);
+    expect(Object.keys(junk).sort()).toEqual(Object.keys(DEFAULT_LOOK).sort());
+    // The last of each list is in range; one past it is not.
+    for (const [key, list] of Object.entries(LISTS) as [keyof FoxLook, readonly unknown[]][]) {
+      expect(cleanLook({ [key]: list.length - 1 })[key], key).toBe(list.length - 1);
+      expect(cleanLook({ [key]: list.length })[key], key).toBe(DEFAULT_LOOK[key]);
+    }
+  });
+
+  it('by default is the fox as it was first drawn', () => {
+    const parts = lookParts(DEFAULT_LOOK);
+    const rig = readFileSync(fileURLToPath(new URL('./voxelCharacter.ts', import.meta.url)), 'utf8');
+    const pal = (name: string) => Number(new RegExp(`\\n  ${name}:\\s+(0x[0-9a-f]{6}),`).exec(rig)![1]);
+    expect(parts.fur).toBe(pal('fur'));
+    expect(parts.cream).toBe(pal('cream'));
+    expect(parts.innerEar).toBe(pal('furShade'));
+    expect(rig).toContain(`private faceDrawn = { shape: 'round' as EyeShape, eye: '${parts.eye}', sheen: '${parts.eyeSheen}' };`);
+    expect(parts.eyeShape).toBe('round');
+    expect([parts.earScale, parts.earHeight, parts.earLean, parts.size]).toEqual([1, 1, 0, 1]);
+  });
+
+  it('has a name and an id of its own for every choice', () => {
+    for (const list of Object.values(LISTS)) {
+      const ids = list.map((x) => x.id);
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const x of list) expect(x.name.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('drawn at random stays in range', () => {
+    expect(randomLook(() => 0)).toEqual({ fur: 0, cream: 0, eyes: 0, eyeColour: 0, ears: 0, size: 0 });
+    const last = randomLook(() => 0.999999);
+    for (const [key, list] of Object.entries(LISTS) as [keyof FoxLook, readonly unknown[]][]) expect(last[key]).toBe(list.length - 1);
+    for (let i = 0; i < 50; i++) {
+      const look = randomLook();
+      expect(sameLook(cleanLook(look), look)).toBe(true);
+    }
+  });
+
+  describe('saved on this computer', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.stubGlobal('document', { createElement: fakeCanvas });
+      vi.stubGlobal('window', { location: { search: '' } });
+    });
+
+    it('comes back as it was saved, and as none when nothing was', () => {
+      const store = new Map<string, string>();
+      vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
+      expect(loadSavedLook()).toBeNull();
+      saveLook({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
+      expect(store.get('ssf-fox-look')).toBe(JSON.stringify({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 }));
+      expect(loadSavedLook()).toEqual({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
+      store.set('ssf-fox-look', '{not json');
+      expect(loadSavedLook()).toBeNull();
+    });
+
+    it('is none, and saving does nothing, where the browser keeps nothing', () => {
+      vi.stubGlobal('localStorage', {
+        getItem: () => {
+          throw new Error('denied');
+        },
+        setItem: () => {
+          throw new Error('denied');
+        },
+      });
+      expect(loadSavedLook()).toBeNull();
+      expect(() => saveLook(DEFAULT_LOOK)).not.toThrow();
+    });
+  });
+});
+
+describe('the fox rig in a look', () => {
+  const rig = () => new VoxelCharacter(new THREE.Scene());
+  /** The colour of the first material of each palette role. */
+  const colours = (r: InstanceType<typeof VoxelCharacter>) => {
+    const out: Record<string, number> = {};
+    r.masterGroup.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      const role = mesh.userData?.paletteRole as string | undefined;
+      if (mesh.isMesh && role && !(role in out)) out[role] = (mesh.material as THREE.MeshToonMaterial).color.getHex();
+    });
+    return out;
+  };
+  const ears = (r: InstanceType<typeof VoxelCharacter>) => {
+    const any = r as unknown as { leftEar: THREE.Group; rightEar: THREE.Group };
+    return [any.leftEar, any.rightEar];
+  };
+  const height = (r: InstanceType<typeof VoxelCharacter>) => {
+    r.masterGroup.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(r.masterGroup);
+    return box.max.y - box.min.y;
+  };
+  const SNOW_SMOKE = { ...DEFAULT_LOOK, fur: 1, cream: 4 };
+
+  it('takes the look\'s fur, markings and inner ears, and keeps its paws', () => {
+    const r = rig();
+    const before = colours(r);
+    r.setLook(lookParts(SNOW_SMOKE));
+    const after = colours(r);
+    expect(after.fur).toBe(FUR_COLOURS[1].fur);
+    expect(after.cream).toBe(CREAM_COLOURS[4].cream);
+    expect(after.furDeep).toBe(CREAM_COLOURS[4].innerEar);
+    expect(after.accent).toBe(before.accent);
+    r.setLook(null);
+    expect(colours(r)).toEqual(before);
+  });
+
+  it('worn with an outfit keeps its own colours, and the outfit its paws and accessory, either way round', () => {
+    const ember = getOutfitById('ember')!;
+    const a = rig();
+    a.setOutfit(ember);
+    a.setLook(lookParts(SNOW_SMOKE));
+    const b = rig();
+    b.setLook(lookParts(SNOW_SMOKE));
+    b.setOutfit(ember);
+    for (const r of [a, b]) {
+      const c = colours(r);
+      expect(c.fur).toBe(FUR_COLOURS[1].fur);
+      expect(c.cream).toBe(CREAM_COLOURS[4].cream);
+      expect(c.furDeep).toBe(CREAM_COLOURS[4].innerEar);
+      expect(c.accent).toBe(ember.paletteOverrides.accent);
+      expect((r as unknown as { accessoryGroup: THREE.Group | null }).accessoryGroup).not.toBeNull();
+    }
+    // Out of the outfit, the look stays and the paws come back.
+    const plain = colours(rig());
+    b.clearOutfit();
+    expect(colours(b)).toEqual({ ...plain, fur: FUR_COLOURS[1].fur, cream: CREAM_COLOURS[4].cream, furDeep: CREAM_COLOURS[4].innerEar });
+  });
+
+  it('with no look, an outfit recolours the whole fox as before', () => {
+    const midnight = getOutfitById('midnight')!;
+    const r = rig();
+    r.setOutfit(midnight);
+    const c = colours(r);
+    for (const role of ['fur', 'furDeep', 'cream', 'accent'] as const) expect(c[role]).toBe(midnight.paletteOverrides[role]);
+  });
+
+  it('comes out of the clone vat\'s pallor in its own colours', () => {
+    const r = rig();
+    r.setPallor(0.6);
+    r.setLook(lookParts(SNOW_SMOKE));
+    expect(colours(r).fur).not.toBe(FUR_COLOURS[1].fur);
+    r.setPallor(0);
+    expect(colours(r).fur).toBe(FUR_COLOURS[1].fur);
+  });
+
+  it('draws its eyes in their colour, and only when they change', () => {
+    const r = rig();
+    painted.length = 0;
+    r.setLook(lookParts({ ...DEFAULT_LOOK, eyes: 1, eyeColour: 2 }));
+    expect(painted).toContain(EYE_COLOURS[2].eye);
+    expect(painted).toContain(EYE_COLOURS[2].sheen);
+    expect(painted).not.toContain(EYE_COLOURS[0].eye);
+    painted.length = 0;
+    r.setLook(lookParts({ ...DEFAULT_LOOK, eyes: 1, eyeColour: 2, fur: 3 }));
+    expect(painted).toEqual([]);
+    for (let shape = 0; shape < EYE_SHAPES.length; shape++) {
+      painted.length = 0;
+      r.setLook(lookParts({ ...DEFAULT_LOOK, eyes: shape, eyeColour: 5 }));
+      expect(painted.length, EYE_SHAPES[shape].id).toBeGreaterThan(0);
+    }
+  });
+
+  it('sets its ears\' size and lean, both sides alike', () => {
+    const r = rig();
+    const [l0, r0] = ears(r).map((e) => ({ scale: e.scale.clone(), z: e.rotation.z }));
+    const droopy = EAR_STYLES.findIndex((e) => e.id === 'droopy');
+    r.setLook(lookParts({ ...DEFAULT_LOOK, ears: droopy }));
+    const [left, right] = ears(r);
+    const style = EAR_STYLES[droopy];
+    expect(left.scale.x).toBeCloseTo(style.scale);
+    expect(left.scale.y).toBeCloseTo(l0.scale.y * style.scale * style.height);
+    expect(left.rotation.z).toBeCloseTo(l0.z + style.lean);
+    expect(right.rotation.z).toBeCloseTo(r0.z - style.lean);
+    r.setLook(null);
+    expect(left.scale.toArray()).toEqual(l0.scale.toArray());
+    expect(right.rotation.z).toBeCloseTo(r0.z);
+  });
+
+  it('grows or shrinks from its feet, and still squishes', () => {
+    const r = rig();
+    (r as unknown as { clock: { getDelta: () => number; getElapsedTime: () => number } }).clock = { getDelta: () => 0.02, getElapsedTime: () => 0 };
+    r.update();
+    const h0 = height(r);
+    const tall = SIZES.findIndex((s) => s.id === 'tall');
+    r.setLook(lookParts({ ...DEFAULT_LOOK, size: tall }));
+    r.update();
+    expect(height(r) / h0).toBeCloseTo(SIZES[tall].scale, 2);
+    r.squishTo(0.6, 0);
+    for (let i = 0; i < 80; i++) r.update();
+    const visual = (r as unknown as { visualGroup: THREE.Group }).visualGroup;
+    expect(visual.scale.x).toBeCloseTo(0.6 * SIZES[tall].scale, 2);
+    expect(visual.scale.y).toBeCloseTo(SIZES[tall].scale);
+    expect(r.masterGroup.scale.toArray()).toEqual([1, 1, 1]);
+  });
+});
+
+describe('the wiring', () => {
+  const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+  const world = readFileSync(fileURLToPath(new URL('./world.ts', import.meta.url)), 'utf8');
+
+  it('draws the saved look on our fox, and writes it into our players entry', () => {
+    expect(main).toContain('const savedLook = loadSavedLook();\n    if (savedLook) (world.getPlayer() as any).character.setLook(lookParts(savedLook));');
+    const writer = main.indexOf('function updateLocalPlayerEntry(): void {');
+    const body = main.slice(writer, main.indexOf('\n}\n', writer));
+    expect(body).toContain('const savedLook = loadSavedLook();');
+    expect(body).toContain('...(savedLook ? { look: savedLook } : {}),');
+    const apply = main.indexOf('const applyLook = (raw: unknown): FoxLook => {');
+    const applied = main.slice(apply, apply + 400);
+    expect(applied).toContain('const look = cleanLook(raw);');
+    expect(applied).toContain('saveLook(look);');
+    expect(applied).toContain('updateLocalPlayerEntry();');
+  });
+
+  it('dresses a remote fox in the look its entry names, with or without an outfit this game knows', () => {
+    const resolver = main.indexOf('world.setPeerLooks((peerId) => {');
+    const body = main.slice(resolver, resolver + 400);
+    expect(body).toContain('const look = found.look ? lookParts(found.look) : null;');
+    expect(body).toContain('return outfit || look ? { outfit, look } : null;');
+    const dress = world.indexOf('private dressPeer(avatar: RemoteAvatar, id: string): void {');
+    const dressed = world.slice(dress, world.indexOf('\n  }\n', dress));
+    expect(dressed).toContain('avatar.rig.setLook(dress.look);');
+    expect(dressed).toContain('avatar.rig.setLook(null);');
+  });
+});
