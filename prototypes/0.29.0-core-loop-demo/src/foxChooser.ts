@@ -134,6 +134,26 @@ export function focusInView(el: Focusable): void {
   else if (r.bottom > b.bottom - IN_VIEW_MARGIN) box.scrollTop += r.bottom - (b.bottom - IN_VIEW_MARGIN);
 }
 
+/** What `releaseRenderer` needs of a three.js renderer. */
+export interface Releasable {
+  setAnimationLoop(loop: null): void;
+  dispose(): void;
+  forceContextLoss(): void;
+  domElement: { remove(): void };
+}
+
+/** Stop a preview's renderer and give its drawing context back, each step
+ *  on its own: a context half made or already lost may refuse one. */
+export function releaseRenderer(r: Releasable): void {
+  for (const step of [() => r.setAnimationLoop(null), () => r.dispose(), () => r.forceContextLoss(), () => r.domElement.remove()]) {
+    try {
+      step();
+    } catch {
+      /* the rest still runs */
+    }
+  }
+}
+
 export interface FoxChooser {
   /** The chooser's element, to put on the title. */
   element: HTMLElement;
@@ -206,7 +226,9 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
       gl.render(scene, camera);
     });
   } catch {
-    // No WebGL for a second context: the rows still choose, unseen.
+    // No WebGL for a second context, or the preview failed after it was
+    // made: give back what was made, and the rows still choose, unseen.
+    if (renderer) releaseRenderer(renderer);
     renderer = null;
     rig = null;
     preview.style.display = 'none';
@@ -312,12 +334,7 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
       random,
     ],
     dispose: () => {
-      if (renderer) {
-        renderer.setAnimationLoop(null);
-        renderer.dispose();
-        renderer.forceContextLoss();
-        renderer.domElement.remove();
-      }
+      if (renderer) releaseRenderer(renderer);
       renderer = null;
       rig = null;
     },

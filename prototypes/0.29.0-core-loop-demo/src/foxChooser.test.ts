@@ -7,7 +7,7 @@ import { CREAM_COLOURS, DEFAULT_LOOK, EAR_STYLES, EYE_COLOURS, EYE_SHAPES, FUR_C
 // canvas as it loads: a canvas that draws nothing will do here.
 vi.stubGlobal('document', { createElement: () => ({ width: 0, height: 0, style: {}, getContext: () => new Proxy({}, { get: () => () => ({ addColorStop: () => undefined }) }) }) });
 vi.stubGlobal('window', { location: { search: '' } });
-const { CHOICE_ROWS, arrowChoice, cssHex, focusInView, nextTabStop, startingLook, withChoice } = await import('./foxChooser');
+const { CHOICE_ROWS, arrowChoice, cssHex, focusInView, nextTabStop, releaseRenderer, startingLook, withChoice } = await import('./foxChooser');
 
 describe('the chooser\'s rows', () => {
   it('set every choice of a look, each once', () => {
@@ -108,6 +108,32 @@ describe('a choice brought into view', () => {
   });
 });
 
+describe('a preview\'s renderer, released', () => {
+  const fake = (failing: string[] = []) => {
+    const done: string[] = [];
+    const step = (name: string) => () => {
+      done.push(name);
+      if (failing.includes(name)) throw new Error(name);
+    };
+    return {
+      done,
+      r: { setAnimationLoop: step('loop'), dispose: step('dispose'), forceContextLoss: step('lose'), domElement: { remove: step('remove') } },
+    };
+  };
+
+  it('stops its loop, frees it, gives its context back and takes its canvas off', () => {
+    const { r, done } = fake();
+    releaseRenderer(r);
+    expect(done).toEqual(['loop', 'dispose', 'lose', 'remove']);
+  });
+
+  it('runs every step even when one refuses (a context half made or lost)', () => {
+    const { r, done } = fake(['dispose']);
+    expect(() => releaseRenderer(r)).not.toThrow();
+    expect(done).toEqual(['loop', 'dispose', 'lose', 'remove']);
+  });
+});
+
 describe('cssHex', () => {
   it('writes a colour as six hex digits', () => {
     expect(cssHex(0x0a0b0c)).toBe('#0a0b0c');
@@ -184,9 +210,12 @@ describe('the chooser on the title (main.ts)', () => {
     expect(loop.indexOf('gl.render(scene, camera);')).toBeGreaterThan(loop.indexOf('r.masterGroup.rotation.y ='));
   });
 
-  it('frees its drawing context when it is done', () => {
+  it('frees its drawing context when it is done, and when the preview fails after the context was made', () => {
     const dispose = chooser.slice(chooser.indexOf('dispose: () => {'));
-    expect(dispose).toContain('renderer.setAnimationLoop(null);');
-    expect(dispose).toContain('renderer.forceContextLoss();');
+    expect(dispose).toContain('if (renderer) releaseRenderer(renderer);');
+    const failed = chooser.slice(chooser.indexOf('  } catch {\n    // No WebGL'), chooser.indexOf('root.appendChild(preview);'));
+    expect(failed).toContain('if (renderer) releaseRenderer(renderer);');
+    const release = chooser.slice(chooser.indexOf('export function releaseRenderer'), chooser.indexOf('export interface FoxChooser'));
+    expect(release).toContain('r.forceContextLoss()');
   });
 });
