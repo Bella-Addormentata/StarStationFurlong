@@ -72,6 +72,20 @@ describe('firstRunSteps: the Phone Book and its wallet', () => {
     expect(line(lines, 'wallet')).toMatchObject({ mark: 'done' });
   });
 
+  it('claims for a wallet that is on only what LIST ME allows it to write', () => {
+    const wallet = (listing?: FirstRunFacts['listing']) => line(firstRunSteps(up({ chiaOff: false, wallet: 'on', listing }), ROOM), 'wallet');
+    // LIST ME on: the listing and the knocks.
+    expect(wallet('all')).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock and list itself.' });
+    // On, with the listing held off by the node's environment: the knocks alone.
+    expect(wallet('knocks')).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock. Its listing is held off on this computer.' });
+    // LIST ME off (as it starts where the coins are real money): nothing is written.
+    expect(wallet('none')).toEqual({ key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes nothing in it.' });
+    // A node that says nothing of LIST ME: the wallet's state and no more.
+    const bare = wallet(undefined);
+    expect(bare).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on.' });
+    expect(bare?.text).not.toMatch(/knock|list/i);
+  });
+
   it('says a wallet that can be turned on is not on, and where to turn it on', () => {
     const l = line(firstRunSteps(up({ chiaOff: false, wallet: 'ready' }), ROOM), 'wallet');
     expect(l?.mark).toBe('off');

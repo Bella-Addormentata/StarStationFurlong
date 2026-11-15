@@ -23,6 +23,25 @@
  *  `ChiaWalletState`), repeated here so this module imports nothing. */
 export type WalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
+/** What LIST ME allows of the Phone Book's writes (listMe.ts says the same
+ *  in the Network settings). */
+export type ListingReach = 'all' | 'knocks' | 'none';
+
+/** The wallet line where the wallet is on: what the computer can then write
+ *  is LIST ME's to say, so the line claims no more than the node reported. */
+function walletOnLine(listing: ListingReach | undefined): StepLine {
+  switch (listing) {
+    case 'all':
+      return { key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock and list itself.' };
+    case 'knocks':
+      return { key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock. Its listing is held off on this computer.' };
+    case 'none':
+      return { key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes nothing in it.' };
+    default:
+      return { key: 'wallet', mark: 'done', text: 'The SSF wallet is on.' };
+  }
+}
+
 /** What the title knows of the search. */
 export interface FirstRunFacts {
   /** The player's own node: not asked yet, answering, or asked and silent. */
@@ -32,6 +51,12 @@ export interface FirstRunFacts {
   chiaOff?: boolean;
   /** The SSF wallet switch, when the node sends one. */
   wallet?: WalletState;
+  /** What LIST ME lets a wallet that is on write (the fingerprint's
+   *  `chia_listing`): the listing and the knocks, the knocks alone
+   *  (`SSF_CHIA_FINDABLE=0` holds the listing off), or nothing (LIST ME is
+   *  off, as it starts where the coins are real money). `undefined`: the
+   *  node has not said. */
+  listing?: ListingReach;
   /** Computers the node is dialing for the room now. */
   dialing: number;
   /** Computers whose dial has failed and is not running again. */
@@ -100,11 +125,7 @@ export function firstRunSteps(f: FirstRunFacts, roomName: string): StepLine[] {
         text: 'The Phone Book (Chia) is on: your computer can read the beacons other players lit.',
       });
       if (f.wallet === 'on') {
-        lines.push({
-          key: 'wallet',
-          mark: 'done',
-          text: 'The SSF wallet is on: your computer can knock and list itself.',
-        });
+        lines.push(walletOnLine(f.listing));
       } else if (f.wallet === 'ready') {
         lines.push({
           key: 'wallet',

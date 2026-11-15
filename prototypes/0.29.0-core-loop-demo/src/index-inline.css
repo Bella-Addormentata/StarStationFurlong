@@ -431,6 +431,13 @@
       #welcome-content {
         text-align: center;
         animation: welcomeSlideUp 1s cubic-bezier(0.4, 0.0, 0.2, 1);
+        /* 🛰️ The first-run steps can make the title taller than a short or
+           zoomed window. The screen centres it and the page hides overflow,
+           so what did not fit could not be reached: it now scrolls inside
+           the window instead. */
+        max-height: 100%;
+        overflow-x: hidden;
+        overflow-y: auto;
       }
       
       #welcome h1 {

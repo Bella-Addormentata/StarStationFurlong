@@ -892,6 +892,9 @@ function firstRunFactsNow(): FirstRunFacts {
     node: fp ? "up" : firstRunNodeSilent ? "down" : "unknown",
     chiaOff: fp?.chia_lane ? fp.chia_lane.off : undefined,
     wallet: fp?.chia_wallet?.state,
+    // What the wallet may write is LIST ME's to say (listMe.ts): on, with
+    // the listing held off by the node's environment, or off.
+    listing: fp?.chia_listing ? (fp.chia_listing.on ? (fp.chia_listing.held ? "knocks" : "all") : "none") : undefined,
     dialing: firstRunDial.dialing.size,
     failed: firstRunDial.failed.size,
     linked: firstRunDial.linked,
@@ -12401,7 +12404,10 @@ function setupClickToEnter() {
       steps.setAttribute("aria-live", "polite");
       steps.style.cssText =
         "display:none; flex-direction:column; gap:4px; margin-top:6px; width:380px; " +
-        "max-width:86vw; text-align:left; font:400 12px/1.45 inherit;";
+        "max-width:86vw; text-align:left; " +
+        // Not the `font` shorthand: it takes no `inherit` for the family, and
+        // a browser drops the whole declaration.
+        "font-family:inherit; font-size:12px; font-weight:400; line-height:1.45;";
       const btnEnter = document.createElement("button");
       btnEnter.type = "button";
       btnEnter.id = "first-run-enter";
