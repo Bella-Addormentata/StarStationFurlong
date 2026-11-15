@@ -75,7 +75,7 @@ import {
 import type { ComputedCrapsState, ComputedFairOnlyView, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
 import {
   FAIR_ONLY_OFF_LABEL, FAIR_ONLY_ON_CONFIRM, FAIR_ONLY_ON_LABEL, FAIR_ONLY_SETTING, fairOnlyBadge, fairOnlyCardLines, fairOnlyClosedLine,
-  fairOnlyFeltLine, fairOnlyOffNotice, fairOnlyOnNotice,
+  cardFocusAfter, fairOnlyFeltLine, fairOnlyOffNotice, fairOnlyOnNotice,
 } from './computedFairOnlyLines';
 import type { FairOnlyLine } from './computedFairOnlyLines';
 import type { Decision } from './computedFold';
@@ -1454,6 +1454,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  next press of the same goes through. */
   let foConfirming = false;
   let foArmed: 'on' | 'off' | null = null;
+  /** The game the way back's warning was given at: it holds for that game
+   *  only (another page of this key may have ended it and opened another). */
+  let foArmedInc: string | null = null;
   /** 🏠 The house as the open card last drew it: a heartbeat isn't a casino
    *  change, and going quiet is no change at all, so the frame redraws the
    *  card when it differs. */
@@ -3013,7 +3016,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const act = (document.activeElement as HTMLElement | null)?.closest?.('[data-act]');
     const focusedAct = act && card.contains(act) ? (act as HTMLElement).dataset.act : null;
     card.innerHTML = rows.join('');
-    if (focusedAct) card.querySelector<HTMLElement>(`[data-act="${focusedAct}"]`)?.focus();
+    // (A press that replaced its own control hands the focus to the one that
+    // took its place: cardFocusAfter.)
+    const drawn = card;
+    const next = focusedAct ? cardFocusAfter(focusedAct, (a) => drawn.querySelector(`[data-act="${a}"]`) !== null) : null;
+    if (next) card.querySelector<HTMLElement>(`[data-act="${next}"]`)?.focus();
   };
 
   const onCardClick = (e: MouseEvent): void => {
@@ -3147,8 +3154,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (act === 'fair-only-off') {
       foConfirming = false;
       if (!fairOnlyMine()) return;
-      const r = switchFairOnlyOff(itemId, game, Date.now(), armed === 'off');
-      if (r === 'contract') foArmed = 'off';
+      const inc = fairOnlyViewFor(itemId, game)?.inc ?? null;
+      const r = switchFairOnlyOff(itemId, game, Date.now(), armed === 'off' && foArmedInc === inc);
+      if (r === 'contract') {
+        foArmed = 'off';
+        foArmedInc = inc;
+      }
       say(fairOnlyOffNotice(r, game) ?? refused[r as keyof typeof refused]);
       return;
     }

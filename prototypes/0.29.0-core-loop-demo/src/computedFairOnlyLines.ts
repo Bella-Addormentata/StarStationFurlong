@@ -129,3 +129,20 @@ export function fairOnlyOffNotice(r: FairOnlyOffResult, game: Game): string | nu
     default: return null;
   }
 }
+
+/** Where the keyboard's focus goes when the card is drawn again and the
+ *  control it was on may be gone: the same control while it is there, else
+ *  the one that took its place. A question opened puts it on CANCEL, never on
+ *  CONFIRM (a second Enter must not confirm); a question answered or
+ *  cancelled puts it back on the row's own press. Null: nowhere. */
+const FOCUS_NEXT: Readonly<Record<string, readonly string[]>> = {
+  'fair-only-on': ['fair-only-cancel'],
+  'fair-only-cancel': ['fair-only-on'],
+  'fair-only-confirm': ['fair-only-on', 'fair-only-off'],
+  'computed-on': ['computed-cancel'],
+  'computed-cancel': ['computed-on'],
+  'computed-confirm': ['computed-off', 'computed-on'],
+};
+export function cardFocusAfter(act: string, has: (act: string) => boolean): string | null {
+  return [act, ...(FOCUS_NEXT[act] ?? [])].find(has) ?? null;
+}

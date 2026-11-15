@@ -20,7 +20,7 @@ import { black, ComputedKit, red } from './computedTestKit';
 import { HOUSE_HEARD_MS } from './computedHouse';
 import {
   FAIR_ONLY_SETTING, FAIR_ONLY_UPDATE, FAIR_ONLY_WAITS, fairOnlyBadge, fairOnlyCardLines, fairOnlyClosedLine, fairOnlyFeltLine,
-  fairOnlyOffNotice, fairOnlyOnNotice,
+  cardFocusAfter, fairOnlyOffNotice, fairOnlyOnNotice,
 } from './computedFairOnlyLines';
 import type { ComputedFairOnlyView } from './computedTable';
 
@@ -172,6 +172,24 @@ describe("what the card says at the owner's presses (fairOnlyOnNotice, fairOnlyO
     expect(fairOnlyOffNotice('ending', 'craps')).toBe('THIS GAME ENDS ONCE ITS ROLL IS DECIDED · NO NEW ROLL STARTS');
     expect(fairOnlyOffNotice('theirs', 'craps')).toBe("ONLY THE GAME'S HOLDER ENDS IT");
     for (const r of ['asleep', 'reconnecting', 'contract'] as const) expect(fairOnlyOffNotice(r, 'craps')).toBeNull();
+  });
+});
+
+describe('where the focus goes when a press replaced its own control (cardFocusAfter)', () => {
+  const on = (...acts: string[]) => (a: string): boolean => acts.includes(a);
+  it('stays on a control that is still there; a question opened puts it on CANCEL, never CONFIRM; answered or cancelled, back on the row\'s press', () => {
+    expect(cardFocusAfter('house-fair', on('house-fair', 'fair-only-on'))).toBe('house-fair');
+    expect(cardFocusAfter('fair-only-on', on('fair-only-cancel', 'fair-only-confirm'))).toBe('fair-only-cancel');
+    expect(cardFocusAfter('fair-only-cancel', on('fair-only-on'))).toBe('fair-only-on');
+    // (refused: the row is back; gone through: the way back is what is there)
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-cancel', 'fair-only-confirm'))).toBe('fair-only-confirm');
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-on'))).toBe('fair-only-on');
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-off'))).toBe('fair-only-off');
+    expect(cardFocusAfter('computed-on', on('computed-cancel', 'computed-confirm'))).toBe('computed-cancel');
+    expect(cardFocusAfter('computed-cancel', on('computed-on'))).toBe('computed-on');
+    expect(cardFocusAfter('computed-confirm', on('computed-off'))).toBe('computed-off');
+    expect(cardFocusAfter('fair-only-off', on('house-fair'))).toBeNull();
+    expect(cardFocusAfter('close', on())).toBeNull();
   });
 });
 

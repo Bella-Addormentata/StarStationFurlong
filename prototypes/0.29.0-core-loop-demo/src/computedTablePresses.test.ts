@@ -1906,6 +1906,48 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     expect(a.casino.readChips(a.pid)).toBe(1_000);
   });
 
+  it('the way back\'s warning holds for the game it was given at: ended elsewhere and another opened with a bet riding, END warns again', () => {
+    const body = { v: 1 as const, h: FO_HOUSE.pub, k: a.pub };
+    const dl = { ...body, g: a.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) };
+    const riding = { p: 6, w: { [a.pid]: [{ type: 'pass', amount: 10 }] } };
+    /** A craps game this page's key holds, counted from a house's checkpoint with this player's pass riding. */
+    const gameOf = (j: string) => {
+      const name = { ...FO_NAME, ok: a.pub, j };
+      const Q = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('q', PAGE_ROOM, TABLE, name) };
+      const qroot = sealCk(Q, { v: 1, ...name, b: 'g', u: 0, l: NO_CLOSE, n: {}, s: { p: 0, w: {} }, dl, k: a.pub } as never, a.keypair.signIdentity);
+      const trim = trimOf(Q, 'q', { ok: a.pub, j, b: nextSid3(Q, qroot.value), n: {}, s: riding, dl });
+      return { Q, qroot, trim };
+    };
+    const open = (g: ReturnType<typeof gameOf>): void => a.doc.transact(() => {
+      top(a).set(g.qroot.key, g.qroot.value);
+      top(a).set(g.trim.key, g.trim.value);
+      top(a).set(`ses:${TABLE}:${g.Q.inc}:${nextSid3(g.Q, g.trim.value)}`, new Y.Map());
+    });
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+    const first = gameOf('0123456789abcdef');
+    open(first);
+    at(a, T0);
+    const t = atTable(a, { game: 'craps', house: true });
+    t.update();
+    const WARN = 'PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH';
+    t.press('fair-only-off');
+    expect(t.said()).toBe(WARN);
+    // Another page of this key ends that game, its riders handed back (the same write, made past the card), and
+    // opens another, a pass riding there too.
+    expect(a.table.switchFairOnlyOff(TABLE, 'craps', at(a, T0 + 100), true)).toBe('ok');
+    const second = gameOf('fedcba9876543210');
+    open(second);
+    at(a, T0 + 200);
+    t.update();
+    expect(a.casino.computedResolutionOf(TABLE, first.Q.inc)).toMatchObject({ live: false });
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ inc: second.Q.inc, mine: true, ended: false });
+    t.press('fair-only-off');
+    expect(t.said()).toBe(WARN);
+    expect(a.casino.computedResolutionOf(TABLE, second.Q.inc)).toMatchObject({ live: true, fin: null });
+    t.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, second.Q.inc)).toMatchObject({ live: false });
+  });
+
   it('a refusal is said in words and leaves the house table as it was: the house away at the confirm', () => {
     offered();
     const t = atTable(a, { house: true });
