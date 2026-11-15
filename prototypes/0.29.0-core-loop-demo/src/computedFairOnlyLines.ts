@@ -2,9 +2,10 @@
  * 🔒 The words a FAIR ONLY table shows (design §8.3 "Display at p/q", §8.4
  * "The paused felt"; PR 6c-4c): the plaque, the felt's status line, and the
  * ⚙ card's rows, from what the page reads of the game (computedTable
- * computedFairOnlyView). Pure, and display only: nothing counts by a line.
+ * computedFairOnlyView), and what the card says at the owner's press of FAIR
+ * ONLY and of the way back. Pure, and display only: nothing counts by a line.
  */
-import type { ComputedFairOnlyView } from './computedTable';
+import type { ComputedFairOnlyView, FairOnlyOffResult, FairOnlyOnResult } from './computedTable';
 
 export interface FairOnlyLine { text: string; color: string }
 
@@ -87,4 +88,44 @@ export function fairOnlyCardLines(v: ComputedFairOnlyView, game: Game, names: Fa
   }
   if (v.checking) out.push({ text: "CHECKING THIS GAME'S RECORDS", color: DIM });
   return out;
+}
+
+// ── The owner's presses (§8.1 the setting, §8.6 the end, §8.7) ────────────────
+
+/** The button that offers FAIR ONLY at a house table, under FAIRNESS. */
+export const FAIR_ONLY_ON_LABEL = 'SET FAIR ONLY';
+/** What the card says before the move (the press asks first): what changes
+ *  for the players, and who is left out. */
+export const FAIR_ONLY_ON_CONFIRM: readonly string[] = [
+  "FAIR ONLY: EVERY ROUND TAKES THE HOUSE'S SEED · WHILE THE HOUSE IS AWAY THE TABLE WAITS",
+  'BETS ON THE FELT GO BACK TO THEIR PLAYERS',
+  "PLAYERS ON OLDER BUILDS DON'T SEE THIS TABLE",
+];
+/** The button of the way back, for the page that holds the game. */
+export const FAIR_ONLY_OFF_LABEL = 'END FAIR ONLY · BACK TO THE OWNER';
+
+/** What the card says of a press of FAIR ONLY, for the answers that are its
+ *  own (null: a switch's answer, said in the switch's words). */
+export function fairOnlyOnNotice(r: FairOnlyOnResult): string | null {
+  switch (r) {
+    case 'ok': return 'THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE';
+    case 'owner': return "ONLY THE ROOM'S OWNER SETS FAIR ONLY";
+    case 'off': return "PLAYERS' TABLES ARE OFF ON THIS DEVICE";
+    case 'no-house': return "THIS ROOM HAS NO HOUSE OF YOUR NODE'S YET";
+    case 'no-engine': return 'YOUR NODE DOES NOT RUN FAIR ONLY TABLES · UPDATE IT';
+    case 'not-house': return 'ONLY A HOUSE TABLE CAN GO FAIR ONLY';
+    case 'theirs': return "THIS TABLE PLAYS ANOTHER HOLDER'S FAIR ONLY GAME";
+    case 'house-away': return 'THE HOUSE IS OFFLINE · FAIR ONLY STARTS WHEN IT IS BACK';
+    default: return null;
+  }
+}
+
+/** …and of a press of the way back. */
+export function fairOnlyOffNotice(r: FairOnlyOffResult, game: Game): string | null {
+  switch (r) {
+    case 'ok': return 'THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN';
+    case 'ending': return `THIS GAME ENDS ONCE ITS ${roundOf(game)} IS DECIDED · NO NEW ${roundOf(game)} STARTS`;
+    case 'theirs': return "ONLY THE GAME'S HOLDER ENDS IT";
+    default: return null;
+  }
 }

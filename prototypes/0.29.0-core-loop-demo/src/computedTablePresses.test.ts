@@ -24,7 +24,7 @@ import {
   clockOf, deleteIn, keysIn, loadPage, PAGE_CTX as CTX, PAGE_TABLE as TABLE, putIn, switchOn, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { faironlyInc, sealFin } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, NO_CLOSE, sealCk, sealFin } from './computedFairOnly';
 import { delegation, hex, house as FO_HOUSE, NAME as FO_NAME, owner as FO_OWNER, rootOf, trimOf } from './computedFairOnlyKit';
 import { nextSid3 } from './computedFold';
 import { beatOf, crapsBet, PAGE_ROOM } from './computedPageKit';
@@ -1638,6 +1638,190 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     expect(a.table.computedRoundCheck(TABLE)?.houseDropped).toEqual([]);
     t.unmount();
   });
+
+  // ── 🔒 The owner's FAIR ONLY press and the way back (PR 6c-4c, second half) ──
+
+  /** Page a's node is the room's house and says it runs FAIR ONLY games; the house heard. */
+  function offered(): void {
+    houseTable();
+    a.table.setLocalHouse(H.pub);
+    a.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+    beat(T0 + 100);
+    at(a, T0 + 200);
+  }
+
+  it('FAIR ONLY is offered under FAIRNESS only on the page it is offered to: the deed holder whose node is the house and runs such games', () => {
+    houseTable();
+    beat(T0 + 100);
+    const t = atTable(a, { house: true });
+    t.update();
+    expect(t.card()).toContain('data-act="house-fair"');
+    expect(t.card()).not.toContain('data-act="fair-only-on"');
+    // (a press with no row does nothing)
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    expect(a.casino.computedIncOf(TABLE)).toBe(RINC);
+    expect(t.said()).not.toContain('NODE');
+    // The node is the house, but does not say it runs FAIR ONLY games.
+    a.table.setLocalHouse(H.pub);
+    at(a, T0 + 200);
+    t.update();
+    expect(a.table.fairOnlyOfferRefusal()).toBe('no-engine');
+    expect(t.card()).not.toContain('data-act="fair-only-on"');
+    // It says so: the open card gains the row at the next frame.
+    a.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+    at(a, T0 + 400);
+    t.update();
+    expect(t.card()).toContain('>SET FAIR ONLY</button>');
+    expect(t.card()).toContain('FAIR ONLY · THE TABLE WAITS FOR THE HOUSE');
+    t.unmount();
+    // A guest's card never has it.
+    const g = atTable(a, { house: false });
+    g.update();
+    expect(g.card()).not.toContain('data-act="fair-only-on"');
+    g.press('fair-only-on');
+    expect(g.card()).not.toContain('data-act="fair-only-confirm"');
+    g.unmount();
+  });
+
+  it('the press asks first; CANCEL leaves the house table, CONFIRM opens the game, and the card is the FAIR ONLY one with the way back and no players\' switch', () => {
+    offered();
+    const t = atTable(a, { house: true });
+    t.update();
+    t.press('fair-only-on');
+    expect(a.casino.computedIncOf(TABLE)).toBe(RINC);
+    expect(t.card()).toContain("FAIR ONLY: EVERY ROUND TAKES THE HOUSE'S SEED · WHILE THE HOUSE IS AWAY THE TABLE WAITS");
+    expect(t.card()).toContain('BETS ON THE FELT GO BACK TO THEIR PLAYERS');
+    expect(t.card()).toContain("PLAYERS ON OLDER BUILDS DON'T SEE THIS TABLE");
+    expect(t.card()).not.toContain('data-act="fair-only-on"');
+    t.press('fair-only-cancel');
+    expect(t.card()).toContain('data-act="fair-only-on"');
+    expect(t.card()).not.toContain('data-act="fair-only-confirm"');
+    // (a confirm with no question up does nothing)
+    t.press('fair-only-confirm');
+    expect(a.casino.computedIncOf(TABLE)).toBe(RINC);
+    // Another press of the card drops the question.
+    t.press('fair-only-on');
+    t.press('house-fair');
+    expect(t.card()).not.toContain('data-act="fair-only-confirm"');
+    t.press('house-fair');
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    const inc = a.casino.computedIncOf(TABLE)!;
+    expect(inc[0]).toBe('p');
+    expect(t.said()).toBe('THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE');
+    at(a, T0 + 400);
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ inc, mine: true, ended: false });
+    expect(t.card()).toContain('FAIRNESS · FAIR ONLY · THE TABLE WAITS FOR THE HOUSE');
+    expect(t.card()).toContain('>END FAIR ONLY · BACK TO THE OWNER</button>');
+    expect(t.card()).not.toContain('data-act="computed-off"');
+    expect(t.card()).not.toContain('data-act="house-fair"');
+    expect(t.card()).not.toContain('data-act="fair-only-on"');
+    // (the players' switch has no row there: its press does nothing)
+    t.press('computed-off');
+    expect(a.casino.computedIncOf(TABLE)).toBe(inc);
+    expect(t.said()).toBe('THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE');
+    expect(a.doc.getMap('casino').get(`cfg:computed:${TABLE}`)).toMatchObject({ inc });
+    t.unmount();
+  });
+
+  it('the way back ends the game at once when no round is in flight: the table is the owner\'s again; only the holder\'s own card has the press', () => {
+    offered();
+    const t = atTable(a, { house: true });
+    t.update();
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    const inc = a.casino.computedIncOf(TABLE)!;
+    at(a, T0 + 400);
+    t.update();
+    // A guest looking at the same game has no press, and one made anyway does nothing.
+    const g = atTable(a, { house: false });
+    g.update();
+    expect(g.card()).toContain('FAIRNESS · FAIR ONLY');
+    expect(g.card()).not.toContain('data-act="fair-only-off"');
+    g.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true, fin: null });
+    g.unmount();
+    t.press('fair-only-off');
+    expect(t.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
+    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    at(a, T0 + 600);
+    t.update();
+    expect(t.card()).not.toContain('data-act="fair-only-off"');
+    expect(t.card()).not.toContain('FAIR ONLY · THIS GAME HAS ENDED');
+    t.unmount();
+  });
+
+  it('a game another key holds has no way back on this page\'s card', () => {
+    pinOn(a, FO_OWNER);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', FO_OWNER.pid));
+    const G = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, FO_NAME) };
+    const root = rootOf(G, 'p', { dl: delegation(FO_OWNER, FO_HOUSE.pub, PAGE_ROOM) });
+    a.doc.transact(() => {
+      top(a).set(root.key, root.value);
+      top(a).set(`ses:${TABLE}:${G.inc}:${nextSid3(G, root.value)}`, new Y.Map());
+    });
+    at(a, T0);
+    const t = atTable(a, { house: true });
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ mine: false });
+    expect(t.card()).toContain('FAIRNESS · FAIR ONLY');
+    expect(t.card()).not.toContain('data-act="fair-only-off"');
+    t.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: true, fin: null });
+    // (with no row there, the press says nothing either)
+    expect(t.said()).not.toContain('HOLDER');
+    t.unmount();
+  });
+
+  it('at craps with a contract bet riding the way back warns first; the next press of it hands the bet back and ends the game, and any other press between takes the warning back', () => {
+    // A craps game this page's key holds, counted from a house's checkpoint: the point is 6 and this player's pass rides.
+    const name = { ...FO_NAME, ok: a.pub };
+    const Q = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('q', PAGE_ROOM, TABLE, name) };
+    const body = { v: 1 as const, h: FO_HOUSE.pub, k: a.pub };
+    const dl = { ...body, g: a.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) };
+    const qroot = sealCk(Q, { v: 1, ...name, b: 'g', u: 0, l: NO_CLOSE, n: {}, s: { p: 0, w: {} }, dl, k: a.pub } as never, a.keypair.signIdentity);
+    const trim = trimOf(Q, 'q', { ok: a.pub, b: nextSid3(Q, qroot.value), n: {}, s: { p: 6, w: { [a.pid]: [{ type: 'pass', amount: 10 }] } }, dl });
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+    a.doc.transact(() => {
+      top(a).set(qroot.key, qroot.value);
+      top(a).set(trim.key, trim.value);
+      top(a).set(`ses:${TABLE}:${Q.inc}:${nextSid3(Q, trim.value)}`, new Y.Map());
+    });
+    at(a, T0);
+    const t = atTable(a, { game: 'craps', house: true });
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ inc: Q.inc, mine: true, ended: false });
+    expect(t.card()).toContain('data-act="fair-only-off"');
+    t.press('fair-only-off');
+    expect(t.said()).toBe('PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH');
+    expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: true, fin: null });
+    // Another press between: the warning is given again.
+    t.press('fair-only-cancel');
+    t.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: true, fin: null });
+    t.press('fair-only-off');
+    expect(t.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
+    expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: false });
+  });
+
+  it('a refusal is said in words and leaves the house table as it was: the house away at the confirm', () => {
+    offered();
+    const t = atTable(a, { house: true });
+    t.update();
+    t.press('fair-only-on');
+    // The house falls silent before the confirm.
+    wait(a, T0 + 400, T0 + 200 + HOUSE_HEARD_MS + 2 * STEP, t);
+    expect(a.casino.houseOnline()).toBe(false);
+    t.press('fair-only-confirm');
+    expect(t.said()).toBe('THE HOUSE IS OFFLINE · FAIR ONLY STARTS WHEN IT IS BACK');
+    expect(a.casino.computedIncOf(TABLE)).toBe(RINC);
+    expect(t.card()).toContain('data-act="fair-only-on"');
+    t.unmount();
+  });
+
 });
 
 describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ card', () => {
