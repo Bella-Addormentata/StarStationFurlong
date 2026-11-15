@@ -2256,6 +2256,21 @@ mod tests {
         matches!(lane.store.blobs().status(hash).await, Ok(iroh_blobs::api::proto::BlobStatus::Complete { .. }))
     }
 
+    /// Whether the store's collection lets `hash` go, waited for and not
+    /// timed: a collection starts every `gc_interval` and takes as long as
+    /// the machine gives it. A fixed 400 ms was not one collection on a busy
+    /// CI runner (2026-11-15: the test passed in two feature sets and failed
+    /// in the third of the same job).
+    async fn the_store_lets_go(lane: &BlobLane, hash: Hash) -> bool {
+        for _ in 0..600 {
+            if !whole(lane, hash).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn kept_files_come_back_after_a_restart() {
         let dir = std::env::temp_dir().join(format!("ssf-blob-keep-{}", std::process::id()));
@@ -2311,8 +2326,9 @@ mod tests {
         // A, used longest ago, went; B stayed.
         assert_eq!(lane.status_json(&a), r#"{"state":"none"}"#);
         assert!(lane.status_json(&b).contains("complete") && lane.status_json(&c).contains("complete"));
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(!whole(&lane, a).await, "the store let A go");
+        // The store lets A go at a collection of its own, and that same
+        // collection keeps what is still held.
+        assert!(the_store_lets_go(&lane, a).await, "the store let A go");
         assert!(whole(&lane, b).await && whole(&lane, c).await);
         // A file in use (read just now) never goes: then nothing fits.
         lane.touch(&b);
