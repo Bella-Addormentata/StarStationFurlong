@@ -82,6 +82,15 @@ const OLD_PLANET_NAMES = ['ambientPlanet', 'ambientPlanetGlow', 'deckPlanet'];
 /** How far behind the viewer the far camera sits, in compressed km. Frames
  *  the nearest rings and the planet's limb around the station. */
 const EYE_DISTANCE = 14_000;
+/** 🎬 The arrival's approach (arrivalSequence.ts) sets the eye farther out
+ *  for a while; null is EYE_DISTANCE. Station sizes stay set by
+ *  EYE_DISTANCE, so a station far off looks small, as it should. */
+let eyeDistanceOverride: number | null = null;
+function eyeDistance(): number {
+  return eyeDistanceOverride ?? EYE_DISTANCE;
+}
+/** 🎬 The arrival's first shot: the sky alone, nothing in front of it. */
+let skyOnly = false;
 const FOV_DEG = 40;
 /** On-screen sizes, CSS px. */
 const SHIP_PX = 9;
@@ -947,15 +956,15 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
   if (layout?.planet && frame) {
     const c = frame.position;
     const r = clearanceRadiusKm(layout.planet.radiusKm, c.length());
-    const clear = forwardClearOf(forward, { x: c.x, y: c.y, z: c.z }, r, EYE_DISTANCE);
+    const clear = forwardClearOf(forward, { x: c.x, y: c.y, z: c.z }, r, eyeDistance());
     if (clear !== forward) {
       forward.set(clear.x, clear.y, clear.z);
-      cam.position.copy(forward).multiplyScalar(-EYE_DISTANCE);
+      cam.position.copy(forward).multiplyScalar(-eyeDistance());
       cam.up.set(0, 1, 0);
       cam.lookAt(0, 0, 0);
     }
   }
-  cam.position.copy(forward).multiplyScalar(-EYE_DISTANCE);
+  cam.position.copy(forward).multiplyScalar(-eyeDistance());
   cam.updateProjectionMatrix();
   cam.updateMatrixWorld();
   frame?.updateMatrixWorld(true);
@@ -968,7 +977,12 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
 /** exteriorView turns the far pass on and off with the space view. */
 export function setFarPassActive(on: boolean): void {
   active = on;
-  if (!on) orbit = false;
+  if (!on) {
+    orbit = false;
+    // 🎬 The arrival's settings never outlive the space view.
+    skyOnly = false;
+    eyeDistanceOverride = null;
+  }
   source = null;
   oldPlanets = null;
   if (!on || !orbit) clearFrame();
@@ -980,6 +994,18 @@ export function setFarPassOrbit(on: boolean): void {
   orbit = on && active;
   source = null;
   if (!orbit) clearFrame();
+}
+
+/** 🎬 The arrival's approach: the far camera this far behind the viewer
+ *  (compressed km), or null for the planet view's own distance. */
+export function setFarEyeDistance(km: number | null): void {
+  eyeDistanceOverride = km !== null && Number.isFinite(km) && km > 0 ? km : null;
+}
+
+/** 🎬 The arrival's first shot: the sky alone (pass 1 only), while the
+ *  space view is up. */
+export function setFarPassSkyOnly(on: boolean): void {
+  skyOnly = on;
 }
 
 /** Re-read what is out there on the next frame (room swapped, stations
@@ -1013,7 +1039,7 @@ export function renderWithFarPass(
   const cameraLayers = camera.layers.mask;
   const autoClear = renderer.autoClear;
   try {
-    if (orbit) update(renderer, camera);
+    if (orbit && !skyOnly) update(renderer, camera);
     // 1. The sky alone (clears with the scene background as usual). A room
     //    shows its nebula only on a deck, so the sky is shown for this pass.
     for (const o of sky) o.visible = true;
@@ -1021,6 +1047,8 @@ export function renderWithFarPass(
     renderer.render(scene, camera);
     camera.layers.mask = cameraLayers;
     renderer.autoClear = false;
+    // 🎬 The arrival's sky shot: nothing in front of the sky.
+    if (skyOnly) return;
     // 2. The planet view: the far scene, this station among the others.
     if (orbit) {
       if (farScene && farCamera && frame) {

@@ -336,6 +336,16 @@
       body.exterior-active #phone-tip-indicator {
         display: none;
       }
+      /* 🎬 The arrival (arrivalSequence.ts) shows the game alone: nothing of
+         the HUD over it until it is over or skipped. */
+      body.arrival-playing #exterior-enter-bubble,
+      body.arrival-playing #camera-rotate-hud,
+      body.arrival-playing #dev-menu-btn,
+      body.arrival-playing #spacephone-container,
+      body.arrival-playing #phone-tip-indicator,
+      body.arrival-playing #zoom-hud-indicator {
+        visibility: hidden !important;
+      }
       #phone-tip-indicator::after {
         content: '';
         position: absolute;

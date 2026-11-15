@@ -7810,6 +7810,13 @@ export class World {
     return null;
   }
 
+  /** 🎬 Where the vat a spawn would use stands (the arrival frames it,
+   *  arrivalSequence.ts), or null in a room without one. */
+  public getSpawnVatCentre(): { x: number; z: number } | null {
+    const found = this.findSpawnVat();
+    return found ? { x: found.item.pos.x, z: found.item.pos.z } : null;
+  }
+
   /**
    * Run the full spawn ceremony at the room's clone vat: the avatar is held
    * inside the tube (squeezed to fit it — vatGauge.ts), the nutrient bath
