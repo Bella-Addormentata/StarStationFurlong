@@ -272,35 +272,7 @@ jobs:
           script: |
             const fs = require('fs');
             const tag = process.env.RELEASE_TAG;
-            let body = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
-
-            // GitHub refuses a release body over 125,000 characters (v0.51.0's
-            // 106 entries were about 185,000, and the run stopped here with the
-            // tag already made). Keep whole lines from the top, newest first,
-            // while they fit, then say how many entries were left out and link
-            // the full section. Counted in UTF-8 bytes, which is never less
-            // than the count in characters, so the cut is safe either way.
-            const MAX_BODY_BYTES = 120000;
-            if (Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES) {
-              const lines = body.split('\n');
-              const isEntry = (l) => l.startsWith('- ');
-              const tail = (left) => `\n\n_${left} more ${left === 1 ? 'entry is' : 'entries are'} in `
-                + `[CHANGELOG.md](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/${tag}/CHANGELOG.md) `
-                + `under ${tag}: the notes of this release are longer than a release page may be._\n`;
-              const room = MAX_BODY_BYTES - Buffer.byteLength(tail(lines.length), 'utf8');
-              let used = 0, kept = 0;
-              while (kept < lines.length) {
-                const cost = Buffer.byteLength(lines[kept], 'utf8') + 1;
-                if (used + cost > room) break;
-                used += cost;
-                kept++;
-              }
-              // Never end inside an entry: step back to the last line before an entry starts.
-              while (kept > 0 && kept < lines.length && !isEntry(lines[kept])) kept--;
-              const left = lines.slice(kept).filter(isEntry).length;
-              body = lines.slice(0, kept).join('\n').trimEnd() + tail(left);
-              core.warning(`Release notes cut to fit GitHub's limit: ${left} entries left to CHANGELOG.md`);
-            }
+            const body = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
 
             // Clean up stale DRAFT releases for this tag left by earlier
             // partial/failed runs. Published releases are never touched.

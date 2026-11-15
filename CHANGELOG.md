@@ -9,7 +9,6 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- **🚀 A release with very long notes can be published ([#453](https://github.com/Bella-Addormentata/StarStationFurlong/pull/453); the release workflow only).** GitHub refuses a release page whose notes are over 125,000 characters. v0.51.0's 106 entries are about 185,000, so its first run stopped at the draft, with the tag already made and nothing built. The draft step now keeps whole entries from the top, newest first, while they fit in 120,000 bytes, then says how many were left out and links `CHANGELOG.md` at the tag. Shorter notes go through as before. v0.51.0's release page shows 64 of its entries and names the other 42.
 ## v0.51.0 — 2026-11-15
 
 - **🧪 A node test that failed now and then on a busy machine no longer does ([#452](https://github.com/Bella-Addormentata/StarStationFurlong/pull/452)).** Nothing changes for a player or an operator: only test code in `blob_lane.rs` changed. The test of which files go first to make room slept 400 ms and then expected the store to have let a file go; the store removes a file at a collection of its own, and on a busy CI runner 400 ms was not always one collection (2026‑11‑15: it passed in two feature sets and failed in the third of the same job, on a docs-only PR). It now waits for the file to go, up to 30 s, and then checks what it checked before.
