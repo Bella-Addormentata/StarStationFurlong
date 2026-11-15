@@ -511,6 +511,25 @@ export function holderHintsHere(roomId: string, ownerPub: string | undefined, no
   return holdersHere(roomId, ownerPub, now, MAX_HOLDER_HINTS).map(hintOf);
 }
 
+/**
+ * Whether a session that reaches its node at `wtUrl` runs through this
+ * computer's own node: a loopback address. A game can also join through
+ * another computer's node (a pass that names that node's own address, for a
+ * browser with no node beside it). The room is then in the browser alone:
+ * this computer's node, running or started later, never bound it and has no
+ * copy to serve. Such a game files no holder and notes none, since a holder
+ * is a node that has the room.
+ */
+export function sessionOnOwnNode(wtUrl: string | undefined | null): boolean {
+  if (!wtUrl) return false;
+  try {
+    const host = new URL(wtUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return host === 'localhost' || host === '::1' || host.startsWith('127.');
+  } catch {
+    return false;
+  }
+}
+
 /** What a game knows of itself when it files. */
 export interface FilingFacts {
   /** The switch: this computer may be listed (listsThisComputer). */
@@ -526,11 +545,15 @@ export interface FilingFacts {
 /**
  * A game files (or refreshes) its computer's node in the bound room once it
  * holds the room, and takes its record down when the player has switched
- * listing off: the player's own, and any other that names this computer. A
- * filing also clears a few stale records (staleHolderKeys). Returns what it
- * did to this player's own record ('removed' too when only another key's
- * record of this computer came down). Listed or not, a game that holds the
- * room notes so on its own computer (noteRoomHeld, `held`).
+ * listing off: every record that names this computer, under the player's key
+ * or another. A filing also clears a few stale records (staleHolderKeys).
+ * Returns what it did to this player's own record ('removed' too when only
+ * another key's record of this computer came down, 'kept' when the record
+ * under the player's key is another computer's). Listed or not, a game that
+ * holds the room notes so on its own computer (noteRoomHeld, `held`).
+ *
+ * `hint` is this computer's node, and null for a game whose session does not
+ * run through it (sessionOnOwnNode): that node has not got the room.
  */
 export function fileMyHolderNode(
   roomId: string,
@@ -541,20 +564,29 @@ export function fileMyHolderNode(
   held: SwitchStore | null = ownStore(),
 ): 'filed' | 'removed' | 'kept' {
   if (!docAlive() || !roomId || !signer.pub) return 'kept';
+  // The node this install noted for the room at an earlier visit, read
+  // before this visit's note replaces it.
+  const noted = roomHeldBy(held, roomId);
   if (me.holds && hint) noteRoomHeld(held, roomId, hint.irohNodeId);
   const storedRaw = nodesMap!.get(signer.pub);
   if (!me.listed) {
     filedAs = null; // switched on again, it files afresh
     // The switch is the computer's, so every record that names this computer
-    // comes down with the player's own: one filed under another identity that
-    // played here (Contacts → Restore identity) would keep it listed, and its
-    // key is no longer here to take it down.
-    const mine = hint?.irohNodeId ?? localNode;
-    const keys: string[] = storedRaw === undefined ? [] : [signer.pub];
-    if (mine) {
-      for (const [pub, raw] of nodesMap!.entries()) {
-        if (pub !== signer.pub && holderNodeFromWire(raw)?.node === mine) keys.push(pub);
-      }
+    // comes down: the player's own, and one filed under another identity
+    // that played here (Contacts → Restore identity), which would keep it
+    // listed with its key no longer here to take it down. This computer is
+    // the node the game reads now and the one this install noted when the
+    // room last reached it (a node replaced since). A record under the
+    // player's key that names any other node is another computer's, where
+    // the same identity plays under a switch of its own: it stays, and so
+    // does every record while nothing here says which node this computer's
+    // is. What stands under the player's key and is no record at all goes.
+    const mine = new Set<string>();
+    for (const node of [hint?.irohNodeId, localNode, noted]) if (node) mine.add(node);
+    const keys: string[] = [];
+    for (const [pub, raw] of nodesMap!.entries()) {
+      const record = holderNodeFromWire(raw);
+      if (record ? mine.has(record.node) : pub === signer.pub) keys.push(pub);
     }
     if (keys.length === 0) return 'kept';
     boundDoc!.transact(() => {

@@ -7,6 +7,8 @@ import * as ed from '@noble/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
 import { utf8ToBytes } from '@noble/hashes/utils';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
@@ -37,6 +39,7 @@ import {
   resetRoomHoldersForTest,
   roomHeldBy,
   roomStateIn,
+  sessionOnOwnNode,
   setListsThisComputer,
   setLocalHolderNode,
   signHolderNode,
@@ -504,6 +507,42 @@ describe('the bound store', () => {
     expect(records().size).toBe(0);
   });
 
+  it('leaves the record of another computer the same identity plays on, and takes down its own', () => {
+    // Ann plays on computer A, listed there, and with the same identity
+    // restored on this one, where listing is off.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW, ann));
+    const off: FilingFacts = { ...holder, listed: false };
+    expect(fileMyHolderNode(ROOM, off, hint(node('b')), NOW + 1000, ann)).toBe('kept');
+    expect(holdersHere(ROOM, undefined, NOW + 1000).map((h) => h.record.node)).toEqual([node('a')]);
+    // A record of this computer under the same key, filed before the switch went off, comes down.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('b')), NOW + 2000, ann));
+    expect(fileMyHolderNode(ROOM, off, hint(node('b')), NOW + 3000, ann)).toBe('removed');
+    expect(records().size).toBe(0);
+  });
+
+  it('takes no record down while nothing says which node is this computer’s, and knows it by its own note of the room', () => {
+    const s = memStore();
+    const off: FilingFacts = { listed: false, holds: false, owner: false };
+    // What stands under the player's key and is no record at all goes, with
+    // nothing known of this computer.
+    records().set(ann.pub, { v: 1, node: 'not a node' });
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ann, s)).toBe('removed');
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW, ann));
+    // No node read and no note of the room: the record may be another computer's.
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ann, s)).toBe('kept');
+    expect(records().has(ann.pub)).toBe(true);
+    // This install loaded the room on node a at an earlier visit: the record is its own.
+    noteRoomHeld(s, ROOM, node('a'));
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ann, s)).toBe('removed');
+    expect(records().size).toBe(0);
+    // A computer whose node was replaced since: the note still names the old
+    // one at this visit, so the old record goes with the switch off, and the
+    // note moves on to the new node.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW, ann));
+    expect(fileMyHolderNode(ROOM, { ...holder, listed: false }, hint(node('b')), NOW + 1000, ann, s)).toBe('removed');
+    expect(roomHeldBy(s, ROOM)).toBe(node('b'));
+  });
+
   it('does not file again in a visit where a full list cleared its record, and does in the next', () => {
     expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann)).toBe('filed');
     records().delete(ann.pub); // another filer's clearing arrived
@@ -663,5 +702,27 @@ describe('the bound store', () => {
     doc.destroy();
     expect(fileMyHolderNode(ROOM, holder, hint(node('c')), NOW + 2000, ann)).toBe('kept');
     expect(holdersHere(ROOM, undefined, NOW)).toEqual([]);
+  });
+});
+
+describe('the node a session runs through', () => {
+  it('is this computer’s own for a loopback address, and nobody’s for anything else', () => {
+    for (const own of ['https://127.0.0.1:4443', 'https://127.0.0.1:4444/', 'https://localhost:4443', 'https://[::1]:4443', 'https://127.8.9.1:4443']) {
+      expect(sessionOnOwnNode(own), own).toBe(true);
+    }
+    for (const other of ['https://192.168.1.20:4443', 'https://203.0.113.9:4443', 'https://example.org:4443', 'https://[2001:db8::1]:4443', 'https://1270.0.0.1:4443', 'not a url', '', undefined, null]) {
+      expect(sessionOnOwnNode(other), String(other)).toBe(false);
+    }
+  });
+
+  it('main.ts files this computer’s node only for a session that runs through it', () => {
+    const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+    const at = main.indexOf('function refileHolderNode(): void {');
+    expect(at).toBeGreaterThan(0);
+    const body = main.slice(at, main.indexOf('\n}\n', at));
+    expect(body).toMatch(/const hint =\s+localFingerprint && sessionOnOwnNode\(activeBootstrap\?\.wtUrl\) \? getLocalNodeHint\(localFingerprint\) : null;/);
+    // The one hint the filing is given: nothing else hands it the node.
+    expect(body.match(/getLocalNodeHint\(/g)).toHaveLength(1);
+    expect(body).toMatch(/hint \? routeHint\(hint\) : null,/);
   });
 });

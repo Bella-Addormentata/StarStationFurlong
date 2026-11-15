@@ -423,6 +423,7 @@ import {
   holdersHere,
   listsThisComputer,
   roomStateIn,
+  sessionOnOwnNode,
   setListsThisComputer,
   setLocalHolderNode,
   subscribeHolderNodes,
@@ -1899,7 +1900,12 @@ function refileHolderNode(): void {
   const roomId = activeBootstrap?.roomId ?? "";
   if (!sync || !roomId) return;
   const ownerPub = roomOwnerInfo(roomId).ownerPub;
-  const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
+  // Only the node this session runs through has the room. A game that
+  // joined through another computer's node (a pass that names its address)
+  // files nothing for its own, which never bound the room, running already
+  // or started since.
+  const hint =
+    localFingerprint && sessionOnOwnNode(activeBootstrap?.wtUrl) ? getLocalNodeHint(localFingerprint) : null;
   const did = fileMyHolderNode(
     roomId,
     {
