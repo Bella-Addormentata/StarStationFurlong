@@ -85,6 +85,9 @@ export class NetworkProvider implements NetworkProviderPort {
   #passPrefetch = false;
   /** Last cap `seq` sent (see roomCap.ts): caps ride separate streams. */
   #capSeq = 0;
+  /** Settles when the live session's transport closes under it (whenLinkLost);
+   *  pending for good with no session, and after our own disconnect(). */
+  #linkLost: Promise<void> = new Promise<void>(() => {});
 
   async connect(boot: RoomBootstrap): Promise<void> {
     if (this.#isActive) {
@@ -135,6 +138,20 @@ export class NetworkProvider implements NetworkProviderPort {
       
       console.log(`⚡ handshake accepted dynamically by yrs Tauri node!`);
       this.#mode = 'direct-unreliable'; // UDP WT active
+
+      // The node going away (a restart, a crash) closes this transport under
+      // the session, cleanly or not. Nothing here reconnects: whoever waits on
+      // this session's link is told (whenLinkLost), and decides. Our own
+      // disconnect() forgets the transport before closing it, so it never
+      // counts, nor does a transport a newer session has replaced.
+      const closed = (wt as { closed?: unknown }).closed as PromiseLike<unknown> | undefined;
+      this.#linkLost = new Promise<void>((resolve) => {
+        if (!closed || typeof closed.then !== 'function') return;
+        const lost = (): void => {
+          if (this.#wt === wt && this.#isActive) resolve();
+        };
+        closed.then(lost, lost);
+      });
 
       // The datagram lane's single writer (see #datagramWriter) — taken once,
       // here, before anything can want to send.
@@ -189,6 +206,7 @@ export class NetworkProvider implements NetworkProviderPort {
     this.#mode = 'offline';
     this.#connectedAt = 0;
     this.#boot = null;
+    this.#linkLost = new Promise<void>(() => {});
     // Forget the writer FIRST: a tick sent from here on is a silent no-op, and
     // a write still in flight knows its rejection is expected (see sendTick).
     this.#datagramWriter = null;
@@ -202,6 +220,13 @@ export class NetworkProvider implements NetworkProviderPort {
 
   getBootRecord(): RoomBootstrap | null {
     return this.#boot;
+  }
+
+  /** Settles once the transport of the session live at this call has closed
+   *  by itself: the node it reached went away. Never for our own
+   *  disconnect(), and pending for good when no session is live. */
+  whenLinkLost(): Promise<void> {
+    return this.#linkLost;
   }
 
   mode(): TransportMode {

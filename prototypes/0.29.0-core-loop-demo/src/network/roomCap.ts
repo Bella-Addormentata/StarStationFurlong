@@ -337,6 +337,18 @@ export function bridgeMemberHints(imported: RoomBootstrap, localBoot: RoomBootst
   return mergeMemberHints(collectMemberHints(imported), collectMemberHints(localBoot).map(routeHint));
 }
 
+/** 🛰️ A pass the player holds with another pass's routes beside its own: one
+ *  hint per node, routes unioned, the held pass's first (`mergeMemberHints`).
+ *  For a docking where the player supplied a pass to the very room a bundled
+ *  pass names (welcomeOnly.ts): the supplied pass stands as it is — its key,
+ *  its bridge to the local node, its hints, which may name a holder the
+ *  bundled pass does not — and the bundled pass's holders are dialed too.
+ *  Routes only: a pass for another room adds nothing. */
+export function withPassRoutes(held: RoomBootstrap, extra: RoomBootstrap): RoomBootstrap {
+  if (held.roomId !== extra.roomId) return held;
+  return { ...held, memberHints: mergeMemberHints(collectMemberHints(held), collectMemberHints(extra)) };
+}
+
 /** #231 P6b: the hints a PASS carries, card-wise. A pass to a PUBLIC room
  *  carries no card at all (N8 extends to `ck`). A pass to a private room
  *  carries every card known — except this station's own while the room's

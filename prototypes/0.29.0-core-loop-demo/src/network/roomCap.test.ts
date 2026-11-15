@@ -28,6 +28,7 @@ import {
   roomPosture,
   roomPostureProbe,
   routeHint,
+  withPassRoutes,
   setShareCard,
   type PostureSources,
   verifyContactCard,
@@ -492,6 +493,39 @@ describe('room cap payload (N8 / D3)', () => {
     expect(roomIsPublicSpace(false, true)).toBe(true);
     expect(roomIsPublicSpace(false, undefined)).toBe(true);
     expect(roomIsPublicSpace(false, false)).toBe(false);
+  });
+});
+
+describe('a held pass with another pass\'s routes beside it (withPassRoutes)', () => {
+  const nodeOf = (c: string) => c.repeat(64).slice(0, 64);
+  const held = {
+    v: 2 as const, roomId: 'W', roomKeyB64: 'aGVsZA==', wtUrl: 'https://127.0.0.1:4443', certHashesB64: ['local'],
+    memberHints: [{ irohNodeId: nodeOf('a'), irohDirectAddrs: ['198.51.100.7:4000'] }, { irohNodeId: nodeOf('b'), irohRelayUrls: ['https://relay-b'] }],
+  };
+  const bundled = {
+    v: 2 as const, roomId: 'W', roomKeyB64: 'YnVuZGxlZA==', wtUrl: 'https://host.example:4443', certHashesB64: ['host'],
+    memberHints: [{ irohNodeId: nodeOf('b'), irohDirectAddrs: ['203.0.113.4:4000'] }],
+    irohNodeId: nodeOf('c'), irohDirectAddrs: ['203.0.113.5:4000'],
+  };
+
+  it('keeps the held pass as it is and adds the other pass\'s holders, its own hints first', () => {
+    const out = withPassRoutes(held, bundled);
+    // The pass the player supplied stands: its key and its bridge to the local node.
+    expect(out).toMatchObject({ roomId: 'W', roomKeyB64: 'aGVsZA==', wtUrl: 'https://127.0.0.1:4443', certHashesB64: ['local'] });
+    expect(out.memberHints).toEqual([
+      { irohNodeId: nodeOf('a'), irohRelayUrls: undefined, irohDirectAddrs: ['198.51.100.7:4000'], nodeCard: undefined },
+      // One hint per node, both passes' routes to it.
+      { irohNodeId: nodeOf('b'), irohRelayUrls: ['https://relay-b'], irohDirectAddrs: ['203.0.113.4:4000'], nodeCard: undefined },
+      // A holder only the bundled pass names (its legacy single-peer fields) is dialed too.
+      { irohNodeId: nodeOf('c'), irohRelayUrls: undefined, irohDirectAddrs: ['203.0.113.5:4000'], nodeCard: undefined },
+    ]);
+    expect(held.memberHints).toHaveLength(2); // nothing written to the pass handed in
+  });
+
+  it('adds nothing from a pass to another room, and is idempotent', () => {
+    expect(withPassRoutes(held, { ...bundled, roomId: 'X' })).toBe(held);
+    const once = withPassRoutes(held, bundled);
+    expect(withPassRoutes(once, bundled).memberHints).toEqual(once.memberHints);
   });
 });
 

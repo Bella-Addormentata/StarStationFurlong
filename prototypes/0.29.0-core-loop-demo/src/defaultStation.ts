@@ -5,12 +5,16 @@
  * A first run used to mint an empty home module and drop the player in it,
  * alone. Now a first run docks at the DEFAULT STATION's welcome room instead —
  * the owner's SSF-WELCOME — so a new player's first sight is a whole station
- * from space and their first room has people in it. Their own home module
- * (identity.getDefaultRoomId) is unchanged: it is where the boot falls back to
- * when the station cannot be reached, and PROVISION NEW MODULE still mints
- * rooms on their own node. Returning installs are untouched — an explicit
- * ?seed=, a resume target (ssf-last-room) and the ordinary home boot all take
- * precedence (main.ts bootstrapNetworking).
+ * from space and their first room has people in it. Since 2026-11-12 (owner
+ * direction, welcomeOnly.ts) that is the ONLY place a new install starts:
+ * until the welcome room's state has reached it once, every start docks
+ * there, and a station that does not answer is waited for and asked again —
+ * the boot no longer falls back to the install's own home module
+ * (identity.getDefaultRoomId). PROVISION NEW MODULE still mints rooms on
+ * their own node, when they ask. An explicit ?seed= to another room wins for
+ * that start; installs that have reached the welcome room are untouched — a
+ * resume target (ssf-last-room) and the ordinary home boot (main.ts
+ * bootstrapNetworking).
  *
  * ── Changing the default station ──────────────────────────────────────────
  * Edit WELCOME_ROOM_LINK below — ONE constant. It is an ordinary room pass:
@@ -23,7 +27,9 @@
  * OWN local node, and the node bridges to the pass's iroh member hints
  * (main.ts resolveBridgeBootstrap). An empty link ships without a default
  * station — first runs boot home, as before, and nothing is seeded whatever
- * the atlas file holds.
+ * the atlas file holds. The node this pass names is what a new install's
+ * first room depends on while it is the only holder a build knows: keep it
+ * running (docs/TDD/ExternalInfrastructureRegister.md §2).
  *
  * defaultStation.atlas.json beside this file is the station's LAYOUT —
  * geometry, names and the connection graph, never seeds — exported from a
