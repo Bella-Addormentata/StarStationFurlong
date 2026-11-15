@@ -31,7 +31,7 @@ import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
-import { keeperNodeTrust } from './coHostNodes';
+import { holderNodeTrust } from './roomHolders';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
 import { dockPortFlagIn, fitDockPortIn, gateAccessIn, gatesInUseIn, mayNumberNewPort } from './doorPolicy';
 import { freeGateNumber, readAtlas, roomIdFromSeed, withSharedAtlasOf } from './stationAtlas';
@@ -384,7 +384,7 @@ async function session(
       roomId: boot.roomId,
       channel,
       ...ysyncSigner(),
-      ...keeperNodeTrust, // 🤝 C3: the room's keeper nodes count as its own state
+      ...holderNodeTrust, // 🤝 a holder's node counts as the room's own state
       // THIS room's dial hints on our envelopes — never the active room's
       // (the same review-HIGH trap roomPasses documents).
       bootRecord: () => p.getBootRecord(),

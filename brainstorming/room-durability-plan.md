@@ -6,6 +6,14 @@ Repo root for prototype paths: `prototypes/0.29.0-core-loop-demo/` (browser: `sr
 
 > **Companions:** [module-wallets-chia-funding-plan.md](module-wallets-chia-funding-plan.md) (chia cost model + the addr-trust invariant this plan inherits) · [keyed-identity-contacts-plan.md](keyed-identity-contacts-plan.md) (reachability ladder; chia presence is rung 6) · [module-transform-docking-adapters-plan.md](module-transform-docking-adapters-plan.md) (module = room = Yjs doc) · `ssf-p2p-node/src/chia_lane.rs` (shipped seal/open/derive_hint — the crypto half of Tier D already exists) · `src/network/protocol.ts` (~54 `DurabilityState{replicas, sealedEpoch, pinned}` and kind `'asset'` — both reserved for exactly this plan).
 
+> **Update, 2026-11-12: nobody is picked any more.** Owner direction: "remove the 'co-host' selection functionality and simply let room passes get module data from anyone with the data". Tier C's designation layer (§4.1, slice C1) had shipped as a request / accept / revoke flow in the room doc; it is removed. What ships instead (`src/roomHolders.ts`):
+>
+> - every game in a room files its computer's node in the room doc once the room's own state has reached it: signed by the player's key and bound to the room, carrying the node id and relay URLs (direct addresses only in the owner's own record). One switch in the ACCESS app, on by default, keeps a computer off every room's list;
+> - passes and the node's dial hints name the owner's node and the seven most recent holders, and a copy that a listed holder's node proves it built counts as the room's own state unless that copy is empty (the list is the freshest 64; a filer clears what lies past it);
+> - nothing is granted, so nothing is revoked: §4.1's owner signature, the tombstones and the "Make co-host" UX do not exist.
+>
+> What that changes below: §4.5's guard against a stale or dishonest only-replica ("co-hosts are owner-signed trusted members") is gone. Any player who loaded the room may be the only holder a visitor reaches, and may hand over an old or altered copy; copies merge, so an old one is repaired by the first fresher holder, and an altered one is Tier D's job as before (§7 item 8 now reads for any holder). Tier D's publisher trust is untouched: it rests on the owner key in pass v3, not on a co-host list. Where the text below says "co-host", read "a computer that holds the room".
+
 ---
 
 ## 1. Executive summary
@@ -112,6 +120,8 @@ Risks: corrupt blob → `Y.applyUpdate` throws → delete blob, proceed empty (t
 ## 4. Tier C — co-host replication set (`DurabilityState.replicas` realized)
 
 ### 4.1 Designation — where the set lives, how it's authorized
+
+*Removed 2026-11-12: nobody is designated; see the update at the top of this document.*
 
 **A `coHosts` Y.Map inside the room doc itself**, keyed by co-host identity pubkey. The co-host set *is* room state: it replicates to every member via the T0 bind seam, pass-minting reads it synchronously, and it survives via the very replication it configures. Grant value: `{ identityPubB64, nodeId, relayUrls, grantedAt, ownerSigB64 }` — owner sig over domain-tagged canonical bytes (`ssf-cohost:v1:<roomId>:<identityPubB64>:<nodeId>:<grantedAt>`), same pattern as `nameCertBytes`. Revocation is a signed **tombstone record** (`ssf-cohost-revoke:v1:...`), never a map delete — so it replicates and can't be un-merged by a stale replica. The `nodeId` binding is load-bearing: it authorizes a *dial target*, not just a person.
 

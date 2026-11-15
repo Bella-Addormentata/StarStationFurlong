@@ -4197,7 +4197,7 @@ describe('the put-back duty, at the switch and the table', () => {
     expect(layoutOf(c).get(TABLE)).toEqual(PLACED);
   });
 
-  it('a page stays awake for a game with no table in the room: its frames are ones that run tables (tableFrame, World\'s condition and the page kit\'s) while the put-back duty has a game to look at or the page has something at stake in a live game; not for a game it only looked at, nor for one whole again or ended', async () => {
+  it('a page stays awake for a game with no table in the room: its frames are ones that run tables (tableFrame, World\'s condition and the page kit\'s) while the put-back duty has a game to look at or the page has something at stake in a live game; not for a game it only looked at, nor for one whole again, nor for one that ended once it is compacted (PR 6c-4b-3b: what the doc holds of an ended game beside its end is work owed)', async () => {
     const [a, b] = await gameRoom(['A', 'B']);
     place(a);
     let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
@@ -4237,9 +4237,13 @@ describe('the put-back duty, at the switch and the table', () => {
     endGame(a);
     expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: false });
     expect(a.casino.computedFairOnlyRecoveries()).toEqual([]);
-    expect(a.table.computedFairOnlyPending()).toBe(false);
+    // (…but what the doc holds of the game beside its end is compaction's, until it is gone)
+    expect(a.casino.computedFairOnlyEnded()).toMatchObject([{ t: TABLE, inc: G.inc }]);
+    expect(a.table.computedFairOnlyPending()).toBe(true);
     T = run([a, b], T, T + STEP);
     expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: false });
+    T = run([a, b], T, T + 30_000, { until: () => a.casino.computedFairOnlyEnded().length === 0 && b.casino.computedFairOnlyEnded().length === 0 });
+    T = run([a, b], T, T + STEP);
     expect(a.table.computedFairOnlyPending()).toBe(false);
     expect(b.table.computedFairOnlyPending()).toBe(false);
   });

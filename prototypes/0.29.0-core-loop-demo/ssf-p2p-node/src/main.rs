@@ -55,6 +55,11 @@ mod chia_strict;
 // player's switch for this station's Phone Book writes on one Chia network,
 // off where the coins are real money until the player turns it on.
 mod chia_listing;
+// 🔦 The beacon switch (#231 D7): the player's switch for this node's
+// welcome-room beacon on one Chia network, in the SpacePhone's Network
+// settings. Never turned, it is lit on a test network and off where the
+// coins are real money (or held either way by SSF_CHIA_BEACON).
+mod chia_beacon_switch;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
@@ -84,6 +89,12 @@ mod chia_watch;
 /// #231 P6b: the knock book (knocks sent and read, the rendezvous schedule).
 #[cfg(feature = "chia-read")]
 mod chia_knock;
+// 🚪 The DHT knock (dht_knock.rs): a dial that is not answered at once leaves
+// a knock on the Mainline DHT, and the computer it dials opens its router
+// toward the knocker. No coin and no chain; it needs a room's key, which the
+// node holds in the read build.
+#[cfg(feature = "chia-read")]
+mod dht_knock;
 // The faucet dish's coin (#231 onboarding phase): per-room address, status,
 // and — in a publish build — the keyless claim and the give spend.
 #[cfg(feature = "chia-read")]
@@ -199,9 +210,10 @@ pub struct SsfEnvelope {
 /// 🤝 C3 (#332 review): a node's signature, with its iroh key, over a stamp
 /// and a frame's canonical bytes (`node_state_sign_bytes`), proving the node
 /// built that frame for that room and sequence. A visitor's tab counts such
-/// a SyncStep2 as the room's own state when the node is one the room's owner
-/// or a co-host filed as theirs (src/network/nodeProof.ts), so a room whose
-/// owner's game is closed still counts as synced from the nodes that keep it.
+/// a SyncStep2 as the room's own state when the node is one a holder of the
+/// room filed as theirs and the copy is not empty (src/roomHolders.ts,
+/// src/network/nodeProof.ts), so a room whose owner's game is closed still
+/// counts as synced from any computer that holds it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeProof {
     /// Unix milliseconds when the node signed.
@@ -431,6 +443,18 @@ pub struct Fingerprint {
     /// from an older node. Loopback only, like the address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_listing: Option<chia_listing::ListingView>,
+    /// 🔦 The beacon on this node's network (chia_beacon_switch.rs): whether
+    /// it is lit (`on`), whether the player turned the switch (`chosen`),
+    /// `held` when `SSF_CHIA_BEACON` in the node's environment decides
+    /// instead, `damaged` when its file cannot be read, and while it is lit
+    /// and a publisher has looked, what that look found (`status`: the
+    /// edition, whether this node was reached from outside in it, whether
+    /// it serves the welcome room, and whether this edition's beacon was
+    /// sent and read back). Read live per request; absent from a read-only
+    /// build, which writes nothing, and from an older node. Loopback only,
+    /// like the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_beacon: Option<chia_beacon_switch::BeaconView>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -745,6 +769,12 @@ pub struct HubState {
     /// Written and pruned by `release_dial`, read and pruned by `dialed_lately`.
     #[cfg(feature = "chia-read")]
     pub recent_dials: Mutex<HashMap<PublicKey, std::time::Instant>>,
+    /// 🚪 The DHT knock (dht_knock.rs): the node's own DHT client for knocks
+    /// and the holder's book of opening holds. `None` with the DHT off
+    /// (`SSF_NO_DHT=1`), the knock off (`SSF_DHT_KNOCK=0`), or a client that
+    /// could not start: no knock is then sent and none is looked for.
+    #[cfg(feature = "chia-read")]
+    pub dht_knock: Option<dht_knock::KnockDht>,
     /// #231 P6a: serializes contact-card sends with room-posture changes. The
     /// maintenance loop holds it from reading a room's posture through ONE
     /// send (bounded by `CARD_SEND_TIMEOUT`), card by card; the local browser's
@@ -800,6 +830,17 @@ pub struct HubState {
     /// in the SpacePhone's Network settings holds within the run.
     #[cfg(feature = "chia-publish")]
     pub list_me: chia_listing::ListMe,
+    /// 🔦 The beacon switch for the process's network
+    /// (chia_beacon_switch.rs): whether the publisher's beacon arm may
+    /// write. The heartbeat asks it at every tick, so a turn in the
+    /// SpacePhone's Network settings holds within the run.
+    #[cfg(feature = "chia-publish")]
+    pub beacon: chia_beacon_switch::BeaconSwitch,
+    /// 🔦 What the beacon arm's last look found, mirrored here for the
+    /// loopback fingerprint (`None` until a lit beacon's first look, and
+    /// again once it is put out).
+    #[cfg(feature = "chia-publish")]
+    pub beacon_status: Mutex<Option<chia_beacon_switch::BeaconStatus>>,
     /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
     /// per era) and knocks read from our inbox, each with the confirmation
     /// height both sides dial by.
@@ -1094,6 +1135,7 @@ pub fn compute_fingerprint(
         chia_network: None,
         chia_lane: None,
         chia_listing: None,
+        chia_beacon: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -1232,6 +1274,7 @@ mod fingerprint_json_tests {
             chia_network: None,
             chia_lane: None,
             chia_listing: None,
+            chia_beacon: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -1287,7 +1330,7 @@ mod fingerprint_json_tests {
     #[test]
     fn the_wallet_switch_rides_with_its_words_flags_and_never_the_words() {
         use crate::chia_wallet_switch::{view, Backup, EnvSwitch, KeyFacts, SwitchMemo, WalletSwitch};
-        let memo = SwitchMemo { remembered: true, error: None };
+        let memo = SwitchMemo { remembered: true, error: None, auto: false };
         let cases = [
             (
                 view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }, Backup::Page),
@@ -1307,6 +1350,11 @@ mod fingerprint_json_tests {
                     Backup::Page,
                 ),
                 r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true,"backup":"page"}"#,
+            ),
+            (
+                // 🆕 A wallet the node turned on by itself says so (`auto`).
+                view(true, EnvSwitch::Unset, true, &SwitchMemo { auto: true, ..memo.clone() }, &KeyFacts { mnemonic: true, ..KeyFacts::default() }, Backup::Page),
+                r#""chia_wallet":{"state":"on","stays":true,"auto":true,"mnemonic":true,"at_rest":"none","backup":"page"}"#,
             ),
             (
                 view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
@@ -1330,7 +1378,7 @@ mod fingerprint_json_tests {
         }
         // An older node's switch, with none of the flags, still parses.
         let older: WalletSwitch = serde_json::from_str(r#"{"state":"on","stays":true}"#).unwrap();
-        assert!(!older.mnemonic && !older.backed_up && !older.reminted && !older.legacy);
+        assert!(!older.mnemonic && !older.backed_up && !older.reminted && !older.legacy && !older.auto);
     }
 
     /// 📖 The Phone Book listing rides the same way: absent while the node
@@ -1436,7 +1484,7 @@ mod fingerprint_json_tests {
     fn a_mainnet_wallet_rides_as_ready_then_on_with_its_address() {
         use crate::chia_network::{ChiaNet, NetSource, NetworkView};
         use crate::chia_wallet_switch::{backup_of, view, EnvSwitch, KeyFacts, SwitchMemo};
-        let memo = SwitchMemo { remembered: true, error: None };
+        let memo = SwitchMemo { remembered: true, error: None, auto: false };
         for (channel, word) in [(true, "native"), (false, "none")] {
             let backup = backup_of(ChiaNet::Mainnet.is_test(), channel);
             let mut some = fp();
@@ -1475,6 +1523,33 @@ mod fingerprint_json_tests {
             let back: Fingerprint = serde_json::from_str(&json).unwrap();
             assert_eq!(back.chia_wallet.unwrap().backup, backup_of(test_net, channel));
         }
+    }
+}
+
+/// The DHT bootstrap hosts an operator named in `SSF_DHT_BOOTSTRAP`
+/// (`host:port`, comma-separated), or `None` for the library's own four (the
+/// External Infrastructure Register §3). Blank entries are dropped; a value
+/// with none left counts as unset, so an empty variable never leaves the node
+/// with no way into the DHT.
+fn dht_bootstrap_of(raw: Option<&str>) -> Option<Vec<String>> {
+    let hosts: Vec<String> = raw?.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect();
+    (!hosts.is_empty()).then_some(hosts)
+}
+
+#[cfg(test)]
+mod dht_bootstrap_tests {
+    use super::dht_bootstrap_of;
+
+    #[test]
+    fn the_override_takes_hosts_and_an_empty_one_is_no_override() {
+        assert_eq!(dht_bootstrap_of(None), None);
+        assert_eq!(dht_bootstrap_of(Some("")), None);
+        assert_eq!(dht_bootstrap_of(Some(" , ,")), None);
+        assert_eq!(dht_bootstrap_of(Some("10.0.0.1:6881")), Some(vec!["10.0.0.1:6881".to_string()]));
+        assert_eq!(
+            dht_bootstrap_of(Some(" 10.0.0.1:6881 ,, 10.0.0.2:25401 ")),
+            Some(vec!["10.0.0.1:6881".to_string(), "10.0.0.2:25401".to_string()])
+        );
     }
 }
 
@@ -2007,14 +2082,25 @@ async fn node_main() -> Result<()> {
     // resolves remote node IDs the same way: no DNS, no registration, no n0 infra.
     // AddrFilter::unfiltered is REQUIRED: the default (relay_only) would publish
     // nothing at all in our relay-less posture.
-    if std::env::var("SSF_NO_DHT").ok().as_deref() == Some("1") {
+    // The DHT's way in is the library's own four bootstrap hosts (External
+    // Infrastructure Register §3) unless the operator names others
+    // (`SSF_DHT_BOOTSTRAP=host:port,host:port`): then those alone, for both
+    // of the node's DHT clients (this lookup and the knock's, dht_knock.rs).
+    let dht_bootstrap = dht_bootstrap_of(std::env::var("SSF_DHT_BOOTSTRAP").ok().as_deref());
+    let dht_on = std::env::var("SSF_NO_DHT").ok().as_deref() != Some("1");
+    if !dht_on {
         println!("🕳️ Mainline DHT lookup DISABLED (SSF_NO_DHT=1)");
     } else {
-        match iroh_mainline_address_lookup::DhtAddressLookup::builder()
+        let mut lookup = iroh_mainline_address_lookup::DhtAddressLookup::builder()
             .secret_key(secret_key.clone())
-            .addr_filter(iroh::endpoint_info::AddrFilter::unfiltered())
-            .build()
-        {
+            .addr_filter(iroh::endpoint_info::AddrFilter::unfiltered());
+        if let Some(hosts) = &dht_bootstrap {
+            let mut dht_builder = n0_mainline::DhtBuilder::default();
+            dht_builder.bootstrap(hosts);
+            lookup = lookup.dht_builder(dht_builder);
+            println!("🕳️ Mainline DHT bootstrap: {} host(s) from SSF_DHT_BOOTSTRAP, in place of the built-in ones", hosts.len());
+        }
+        match lookup.build() {
             Ok(dht) => {
                 builder = builder.address_lookup(dht);
                 println!("🕳️ Mainline DHT lookup ENABLED — publishing + resolving via BitTorrent Mainline (set SSF_NO_DHT=1 to disable)");
@@ -2158,6 +2244,32 @@ async fn node_main() -> Result<()> {
         .map(|s| s.port())
         .unwrap_or(DEFAULT_IROH_PORT);
 
+    // 🚪 The DHT knock (dht_knock.rs), on with the DHT: a client of its own on
+    // the Mainline DHT (the address lookup keeps its client to itself), by
+    // the same way in. `SSF_DHT_KNOCK=0` holds the knock alone off.
+    #[cfg(feature = "chia-read")]
+    let dht_knock = if !dht_on {
+        None
+    } else if dht_knock::knock_off(std::env::var("SSF_DHT_KNOCK").ok().as_deref()) {
+        println!("🚪 DHT knock OFF (SSF_DHT_KNOCK=0): no knock is sent and none is looked for");
+        None
+    } else {
+        let mut dht_builder = n0_mainline::DhtBuilder::default();
+        if let Some(hosts) = &dht_bootstrap {
+            dht_builder.bootstrap(hosts);
+        }
+        match dht_knock::KnockDht::start(&dht_builder) {
+            Ok(knock) => {
+                println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)");
+                Some(knock)
+            }
+            Err(e) => {
+                eprintln!("⚠️ DHT knock: its DHT client could not start ({e}); no knock is sent and none is looked for");
+                None
+            }
+        }
+    };
+
     // 🔄 Dynamic public-IP advertising (default `auto` since R1; also
     // auto:<port>): resolve now, then re-check every AUTO_ADDR_RECHECK_SECS.
     // On ISP rotation the stale address is swapped LIVE via
@@ -2248,6 +2360,12 @@ async fn node_main() -> Result<()> {
     // the environment (`SSF_CHIA_LANE=1` on, any other value off), else the
     // switch the SpacePhone's Bank remembered beside the wallet, on every
     // network. An unreadable switch file starts the wallet off and says why.
+    // 🆕 With no switch file at all, on a test network, the wallet starts
+    // by itself (`starts_unasked`): the load below mints one when none is
+    // on disk, and the switch is then saved on with the mark that says the
+    // node did it. A raw seed from before the 24 words, with no identity
+    // beside it, is left to the Bank's CREATE (a file that cannot be looked
+    // at counts as there).
     // Off a test network a load with no identity on disk mints one only
     // while the desktop app's channel is live (`load_wallet`), which it
     // never is at this startup load: there a new wallet waits for the
@@ -2264,15 +2382,27 @@ async fn node_main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
+    let mut wallet_unasked = false;
+    #[cfg(feature = "chia-publish")]
     let wallet_starts = {
-        match chia_wallet_switch::remembered_at_start(&chia_net.path(chia_wallet_switch::SWITCH_FILE), chia_off) {
-            Ok(on) => wallet_memo.remembered = on,
+        match chia_wallet_switch::chosen_at_start(&chia_net.path(chia_wallet_switch::SWITCH_FILE), chia_off) {
+            Ok(file) => {
+                wallet_unasked = chia_wallet_switch::starts_unasked(
+                    chia_net.is_test(),
+                    chia_off,
+                    chia_wallet_switch::env_switch(),
+                    file.as_ref(),
+                    wallet_legacy_only(chia_net),
+                );
+                wallet_memo.remembered = file.as_ref().is_some_and(|f| f.on);
+                wallet_memo.auto = file.is_some_and(|f| f.on && f.auto);
+            }
             Err(why) => {
                 eprintln!("🏦 SSF wallet: {why} — the Bank's switch counts as off until it is turned again");
                 wallet_memo.error = Some(why);
             }
         }
-        chia_wallet_switch::starts_on(true, chia_off, chia_wallet_switch::env_switch(), wallet_memo.remembered)
+        chia_wallet_switch::starts_on(true, chia_off, chia_wallet_switch::env_switch(), wallet_memo.remembered || wallet_unasked)
     };
     #[cfg(feature = "chia-publish")]
     if let Some(line) = chia_strict::wins_line(chia_off_source, chia_wallet_switch::env_switch() == chia_wallet_switch::EnvSwitch::On) {
@@ -2306,16 +2436,24 @@ async fn node_main() -> Result<()> {
 
     // ⛓️ ChiaHub lane C1 SLICE 2 (chia-publish feature): load/mint the node's
     // 24-word Chia identity and print its receive address to fund.
-    // ONLY when the SSF wallet starts on (above): a node whose wallet was
-    // never turned on never mints `chia_identity.json` (D3, as amended by
-    // #335), and a raw `chia_identity.seed` from before the words is retired
-    // only then (a node remembered on re-mints at this start, with no tap).
+    // ONLY when the SSF wallet starts on (above): a node whose wallet is
+    // switched off, or held off, never mints `chia_identity.json` (D3, as
+    // amended by #335; on a test network a node with no choice saved starts
+    // it on by itself), and a raw `chia_identity.seed` from before the words
+    // is retired only then (a node remembered on re-mints at this start,
+    // with no tap; an unasked start never does, `starts_unasked`).
     // The identity persists beside the iroh key (bare CWD-relative path, same
     // convention). The Bank's TURN ON runs the same steps later
     // (`turn_wallet`) when the wallet did not start on.
     // The wallet key outlives this block so the publisher's heartbeat
     // (spawned after HubState exists: it reads the hub) can be handed its
     // keys (`start_publisher`).
+    // 🔦 The beacon switch for this network (chia_beacon_switch.rs), read
+    // before the wallet loads, whose lines say whether the beacon is lit,
+    // and kept by the hub for the run. A build that only reads the chain
+    // has no switch.
+    #[cfg(feature = "chia-publish")]
+    let beacon = chia_beacon_switch::BeaconSwitch::read(chia_net, chia_net.path(chia_beacon_switch::BEACON_FILE), chia_beacon_switch::env_switch());
     #[cfg(feature = "chia-publish")]
     let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-publish")]
@@ -2355,7 +2493,21 @@ async fn node_main() -> Result<()> {
         match load_wallet() {
             Ok((id, meta)) => {
                 let chia_sk = id.wallet.clone();
-                announce_wallet(chia_net, &id);
+                announce_wallet(chia_net, &id, beacon.on());
+                // 🆕 A start that turned the wallet on unasked says so, and
+                // saves the switch on with its mark, so that the Bank can
+                // say how the wallet came on and every later start reads a
+                // choice. A save that fails is said; the memo then takes
+                // what the file holds, read back (`unasked_memo`).
+                if wallet_unasked {
+                    println!("{}", chia_wallet_switch::unasked_line(chia_net.name(), id.minted));
+                    let switch_file = chia_net.path(chia_wallet_switch::SWITCH_FILE);
+                    let saved = chia_wallet_switch::remember_unasked(&switch_file, chia_resolve::unix_now()).map_err(|e| e.to_string());
+                    if let Err(e) = &saved {
+                        eprintln!("🏦 SSF wallet: on for this run, but {} could not be saved ({e})", switch_file.display());
+                    }
+                    wallet_memo = chia_wallet_switch::unasked_memo(saved, || chia_wallet_switch::chosen(&switch_file));
+                }
                 startup_wallet_meta = Some(meta);
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
@@ -2442,6 +2594,11 @@ async fn node_main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     if !chia_off {
         if let Some(line) = list_me.start_line() {
+            println!("{line}");
+        }
+        // 🔦 And the beacon switch's, where the player turned it or the
+        // environment holds it.
+        if let Some(line) = beacon.start_line() {
             println!("{line}");
         }
     }
@@ -2612,6 +2769,8 @@ async fn node_main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         recent_dials: Mutex::new(HashMap::new()),
         #[cfg(feature = "chia-read")]
+        dht_knock,
+        #[cfg(feature = "chia-read")]
         card_gate: tokio::sync::Mutex::new(()),
         #[cfg(feature = "chia-read")]
         chia_peak: Mutex::new(chia_resolve::ChainPeak::default()),
@@ -2625,6 +2784,10 @@ async fn node_main() -> Result<()> {
         knock_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-publish")]
         list_me,
+        #[cfg(feature = "chia-publish")]
+        beacon,
+        #[cfg(feature = "chia-publish")]
+        beacon_status: Mutex::new(None),
         #[cfg(feature = "chia-read")]
         knocks: Mutex::new(chia_knock::KnockBook::at_start(&chia_network::net().path(chia_knock::KNOCKS_FILE), chia_off)),
         #[cfg(feature = "chia-publish")]
@@ -2825,6 +2988,13 @@ async fn node_main() -> Result<()> {
     tokio::spawn(async move {
         start_http_api_server(hub_http, iroh_http).await;
     });
+
+    // 🚪 The DHT knock's holder side: look this node's knock points up and
+    // open toward whoever knocked (dht_knock.rs).
+    #[cfg(feature = "chia-read")]
+    if hub.dht_knock.is_some() {
+        tokio::spawn(dht_knock::run_holder(hub.clone(), iroh_endpoint.clone()));
+    }
 
     // Start background Iroh Inbound connection acceptance loop
     let hub_iroh = hub.clone();
@@ -3403,6 +3573,14 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         let connection = match accepting.await {
             Ok(conn) => conn,
             Err(e) => {
+                // 🚪 While a DHT knock of ours is out, the computer we knocked
+                // on opens its router with a dial that cannot finish
+                // (dht_knock.rs `opening_dial`): it ends here, as it must.
+                #[cfg(feature = "chia-read")]
+                if hub.dht_knock.as_ref().is_some_and(|knock| knock.knock_out()) {
+                    println!("🚪 DHT knock: an inbound dial ended before it linked, as an opening dial does (a knock of ours is out); still listening");
+                    continue;
+                }
                 eprintln!("⚠️ Iroh handshake failed — still listening: {:?}", e);
                 continue;
             }
@@ -3411,6 +3589,11 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
         #[cfg(feature = "chia-read")]
         note_inbound_verified(&hub, remote_id, &inbound_path);
+        // 🚪 A knocker's dial that lands ends the opening hold toward it.
+        #[cfg(feature = "chia-read")]
+        if let (Some(knock), iroh::endpoint::IncomingAddr::Ip(from)) = (hub.dht_knock.as_ref(), &inbound_path.0) {
+            knock.note_landed(*from);
+        }
 
         // 📦 A blob-lane connection is answered by the lane, under its serving
         // rule (a connected member of the blob's room), and never enters the
@@ -3427,7 +3610,17 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
+        // 🚪 For as long as this connection stands, no opening hold begins
+        // toward the address it came from: the DHT goes on listing a knock
+        // long after the knocker linked (dht_knock.rs).
+        #[cfg(feature = "chia-read")]
+        let live_from = match &inbound_path.0 {
+            iroh::endpoint::IncomingAddr::Ip(from) => dht_knock::KnockDht::live_from(&hub, *from),
+            _ => None,
+        };
         tokio::spawn(async move {
+            #[cfg(feature = "chia-read")]
+            let _live_from = live_from;
             // Inbound-accepted: learn the room from the peer's first ysync stream.
             if let Err(e) = handle_iroh_connection(hub_clone, connection, iroh_clone, None).await {
                 eprintln!("⚠️ Swarm connection error with peer ({}): {:?}", remote_id, e);
@@ -3438,7 +3631,8 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
 
 /// #231 P6a: an accepted connection whose Initial came DIRECTLY (no relay) from
 /// a PUBLIC address, with that address validated, from a peer we were not
-/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`] — is proof that this
+/// dialing — nor had dialed within [`DIAL_PINHOLE_GRACE`], nor sent an opening
+/// dial toward (the DHT knock, dht_knock.rs) — is proof that this
 /// node is reachable inbound on that address family — the only thing a
 /// presence record's flag may claim. A connection that arrived through a relay,
 /// from a LAN peer, or after our own dial Initials opened the pinhole (a dial
@@ -3458,7 +3652,15 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
         std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
         std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
     };
-    if !public || dialed_lately(hub, &remote_id, std::time::Instant::now()) {
+    let now_mono = std::time::Instant::now();
+    if !public || dialed_lately(hub, &remote_id, now_mono) {
+        return;
+    }
+    // 🚪 Nor is one from an address an opening dial of ours went to lately
+    // (dht_knock.rs): our own packets made the way in for it. The opening dial
+    // names no peer (the DHT gave an address, not a node id), so this one is
+    // judged by address.
+    if hub.dht_knock.as_ref().is_some_and(|knock| knock.opened_lately(sa.ip(), now_mono)) {
         return;
     }
     let now = chia_resolve::unix_now();
@@ -3576,9 +3778,32 @@ async fn dial_peer_with_retry(
     release_dial(&hub, target_pub_key);
 }
 
+/// Whether a dial's status goes to EVERY page of the room, whichever page's
+/// envelope began the dial: `connected` does. A page asks the room for its
+/// state when it hears `connected` (it sends SyncStep1 again), and that
+/// question is also what tells the dialed node which room the new connection
+/// is for: until a frame names the room, the dialed node says nothing on it,
+/// and this node drops it as silent after three missed heartbeats.
+///
+/// The pages hear dial statuses on the streams the NODE opens toward them.
+/// On the stream a page opened itself, the one its envelope came in on, the
+/// game's page reads sync frames only, so a `connected` written there alone
+/// was never heard. It went unnoticed because a page also asks again by
+/// itself every 2 s for its first 30 s in a room, and a dial to a reachable
+/// computer lands inside that. One that lands later did not link: a dial
+/// opened by a DHT knock landed 46 s after it began (two home routers,
+/// 2026-11-14), the two nodes connected, and 16 s later the connection was
+/// dropped as silent with the page never having asked.
+fn dial_status_is_for_every_page(status: &str) -> bool {
+    status == "connected"
+}
+
 /// Report a dial's status to the browser: to the specific `send` stream when the
 /// dial was triggered by a local tab's envelope, or broadcast to every tab in the
 /// room when it came from a node-side path (gossip/graft) with no single stream.
+/// A status every page must hear ([`dial_status_is_for_every_page`]) is
+/// broadcast in both cases, and first: the broadcast waits on no page, while
+/// the write to `send` waits for that stream's lock and for its page to read.
 async fn report_dial_status(
     hub: &SharedHub,
     send: &Option<std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>>,
@@ -3589,10 +3814,29 @@ async fn report_dial_status(
 ) {
     match send {
         Some(s) => {
+            if dial_status_is_for_every_page(status) {
+                broadcast_bridge_status(hub, room_id, target, status, detail).await;
+            }
             let mut g = s.lock().await;
             let _ = write_bridge_status(&mut *g, room_id, target, status, detail).await;
         }
         None => broadcast_bridge_status(hub, room_id, target, status, detail).await,
+    }
+}
+
+#[cfg(test)]
+mod dial_status_tests {
+    use super::dial_status_is_for_every_page;
+
+    /// Only a dial that landed is told to every page of the room: the
+    /// statuses of a dial still going, or given up, stay with the page whose
+    /// envelope began it. The real binary's side is tests/dial_landed.rs.
+    #[test]
+    fn only_a_landed_dial_is_told_to_every_page() {
+        assert!(dial_status_is_for_every_page("connected"));
+        for other in ["dialing", "failed", "", "Connected", "connected ", "linked"] {
+            assert!(!dial_status_is_for_every_page(other), "{other:?}");
+        }
     }
 }
 
@@ -3675,6 +3919,15 @@ async fn dial_peer_inner(
     send: Option<std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>>,
 ) {
     report_dial_status(&hub, &send, &room_id, &target_str, "dialing", None).await;
+    // 🚪 While this dial runs, a knock through the DHT (dht_knock.rs): a
+    // target behind a router that answers nobody sees it and opens toward us,
+    // and one of the attempts below then lands. Nothing is sent for a target
+    // that answers at once. Dropped, and the knocking stopped, the moment an
+    // attempt lands, and otherwise when the dial ends, however it ends (the
+    // chain's rung 6 below is still this dial, and its holds are helped by a
+    // knock as the ladder's attempts are).
+    #[cfg(feature = "chia-read")]
+    let knocking = dht_knock::knock_while_dialing(&hub, &iroh_ep, &room_id, target_pub_key);
     let mut delay = std::time::Duration::from_millis(DIAL_BACKOFF_START_MS);
     for attempt in 1..=MAX_DIAL_ATTEMPTS {
         let still_needs = {
@@ -3704,6 +3957,10 @@ async fn dial_peer_inner(
 
         match iroh_ep.connect(addr, b"ssf").await {
             Ok(iroh_conn) => {
+                // The dial landed: the knocking ends here, before anything is
+                // waited for (the report below waits on the page's stream).
+                #[cfg(feature = "chia-read")]
+                drop(knocking);
                 println!(
                     "🎯 Iroh connection secured to peer node (attempt {}/{}).",
                     attempt, MAX_DIAL_ATTEMPTS
@@ -3727,7 +3984,9 @@ async fn dial_peer_inner(
                         room.candidates.remove(&target_pub_key);
                     }
                 }
-                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
+                // The connection is read from before the pages are told: what
+                // the peer answers to a page's question must find its reader,
+                // however long the report below waits on a page's stream.
                 let hub_out = hub.clone();
                 let iroh_out = iroh_ep.clone();
                 let room_out = room_id.clone();
@@ -3738,6 +3997,7 @@ async fn dial_peer_inner(
                         eprintln!("⚠️ Outbound P2P peer loop closed: {:?}", e);
                     }
                 });
+                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
                 return;
             }
             Err(e) => {
@@ -3952,7 +4212,7 @@ async fn dial_peer_inner(
                 }
             }
             // The WELCOME room (the bundled key): no inbox, no knock (N8). Dial
-            // the newest BEACONS instead (D7): nodes that opted into being its
+            // the newest BEACONS instead (D7): nodes whose beacon is lit, its
             // public entry points this era, by node id through the DHT, so the
             // room is reached through any of them and its relay — additive,
             // only after the pass's own hints failed, since the beacon hint is
@@ -4145,7 +4405,7 @@ pub(crate) async fn hold_dial(
                         room.candidates.remove(&target_pub_key);
                     }
                 }
-                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
+                // Read from first, reported second, as in `dial_peer_inner`.
                 let hub_out = hub.clone();
                 let iroh_out = iroh_ep.clone();
                 let room_out = room_id.clone();
@@ -4154,6 +4414,7 @@ pub(crate) async fn hold_dial(
                         eprintln!("⚠️ ChiaHub-introduced peer loop closed: {:?}", e);
                     }
                 });
+                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
                 return true;
             }
             Ok(Err(e)) => {
@@ -4675,7 +4936,7 @@ fn handle_iroh_connection(
                                         let seq = envelope.seq.wrapping_add(1);
                                         // 🤝 C3: signed as built by this node, so a visitor's
                                         // tab can count it as the room's own state when the
-                                        // room names this node as its owner's or a co-host's.
+                                        // room lists this node among its holders.
                                         let proof = node_proof(&hub_clone.secret_key, room_id, seq, &payload);
                                         let reply_env = SsfEnvelope {
                                             v: 1,
@@ -5334,7 +5595,7 @@ async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>, acke
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
-        // A sync update, not the SyncStep2 a keeper proves it built.
+        // A sync update, not the SyncStep2 a holder proves it built.
         node_proof: None,
     };
     let Ok(bytes) = serde_json::to_vec(&env) else { return Vec::new() };
@@ -6416,10 +6677,10 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             encoder.write_buf(&missing_diff);
 
             // 🤝 C3 (#338 review): signed as built by this node, as for a
-            // peer, so a tab whose own node keeps the room (its owner's or a
-            // co-host's) counts this copy as the room's state with nobody
-            // else online. Any other tab's node is no keeper: it gains
-            // nothing from the proof.
+            // peer, so a tab whose own node holds the room (its player
+            // filed it among the room's holders) counts this copy as the
+            // room's state with nobody else online. A node that only
+            // registered the room proves an empty copy, which no tab counts.
             let payload = encoder.to_vec();
             let seq = envelope.seq.wrapping_add(1);
             let proof = node_proof(&hub.secret_key, room_id, seq, &payload);
@@ -6645,23 +6906,20 @@ mod test_hook_tests {
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address, with the
-/// beacon on the beacon's line (which names no address, [`beacon_lines`]),
+/// beacon lit (`beacon_on`: the hub's switch, chia_beacon_switch.rs) the
+/// beacon's line (which names no address, [`beacon_lines`]),
 /// on a test network what burner keys do, a note where the retired
 /// SSF_CHIA_BURNERS is still set, and with SSF_CHIA_AUDIT set to `1`, the
 /// audit's notice and the beacon key's address
 /// (`chia_publish::audit_wallet_lines`). Never the words.
 #[cfg(feature = "chia-publish")]
-fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
+fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity, beacon_on: bool) {
     chia_wallet::log_receive_address(net, id);
     // #231 P6b/D7: the beacon role pays from a key of its own, derived from
     // the wallet key (so it changes with a re-mint). The lobby dish funds
     // it, and its line names no address (stage 4 design §4.5 (8)).
-    if chia_publish::beacon_enabled() {
-        let (line, warning) = beacon_lines(net);
-        println!("{line}");
-        if let Some(warning) = warning {
-            eprintln!("{warning}");
-        }
+    if beacon_on {
+        say_beacon(net);
     }
     // Stage 4 design §8 (2), §13 row 12: on a test network, what burner
     // keys do there (off one, the money line says it once). And where the
@@ -6677,8 +6935,20 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
     // Stage 4 design §11: the sign-off review's audit, with SSF_CHIA_AUDIT
     // set to `1` alone: its notice, and with the beacon on the address of
     // the beacon's key. Nothing is said otherwise.
-    for line in chia_publish::audit_wallet_lines(net, chia_publish::audit(), chia_publish::beacon_enabled(), &id.wallet) {
+    for line in chia_publish::audit_wallet_lines(net, chia_publish::audit(), beacon_on, &id.wallet) {
         println!("{line}");
+    }
+}
+
+/// ⛓️ Say the beacon's line, and off a test network its warning
+/// ([`beacon_lines`]): where a wallet loads with the beacon lit, and where
+/// a beacon is lit with the wallet loaded ([`turn_beacon`]).
+#[cfg(feature = "chia-publish")]
+fn say_beacon(net: chia_network::ChiaNet) {
+    let (line, warning) = beacon_lines(net);
+    println!("{line}");
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
     }
 }
 
@@ -6691,13 +6961,13 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
 /// (8)).
 #[cfg(feature = "chia-publish")]
 fn beacon_lines(net: chia_network::ChiaNet) -> (String, Option<String>) {
-    let line = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding".to_string();
+    let line = "⛓️ ChiaHub beacon: on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding".to_string();
     // The warning is of the link the node id makes. The beacon guard keeps
     // one data folder's two beacons 14 days apart (§4.5 (7)); it is no
     // promise that the two chains are never linked, so the warning stays.
     let warning = (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
+            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave the beacon out here to keep them apart.",
             net.name(),
             chia_network::ChiaNet::Testnet11.name(),
             chia_network::ChiaNet::Testnet11.name(),
@@ -6711,7 +6981,7 @@ mod beacon_line_tests {
     use super::beacon_lines;
     use crate::chia_network::ChiaNet;
 
-    const DISH: &str = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding";
+    const DISH: &str = "⛓️ ChiaHub beacon: on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding";
 
     /// Stage 4 design §4.5 (8): the beacon is written from a key of its own
     /// that the lobby dish funds, on every network, so its line names no
@@ -6741,7 +7011,7 @@ mod beacon_line_tests {
         let warning = warning.expect("mainnet warns");
         assert_eq!(
             warning,
-            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
+            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave the beacon out here to keep them apart."
         );
         assert!(!warning.contains("once it writes"), "it writes there now: {warning}");
         assert!(!warning.contains("xch1") && !warning.contains("fund"), "{warning}");
@@ -7037,6 +7307,16 @@ mod bank_on_line_tests {
 
 /// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
 ///
+/// 🆕 Whether the only wallet on this network's disk is a raw seed from
+/// before the 24 words: no start turns that one on unasked
+/// (chia_wallet_switch::starts_unasked). A file that cannot be probed counts
+/// as there.
+#[cfg(feature = "chia-publish")]
+fn wallet_legacy_only(net: chia_network::ChiaNet) -> bool {
+    let there = |name: &str| net.path(name).try_exists().unwrap_or(true);
+    there(chia_wallet_switch::LEGACY_SEED_FILE) && !there(chia_wallet_switch::IDENTITY_FILE)
+}
+
 /// On, when the wallet is not loaded: mint or load the 24-word identity
 /// (retiring a raw seed from before the words), restore the wallet lease
 /// (under its gate, before anything can spend), remember the switch, and
@@ -7070,31 +7350,40 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         Err(why)
     };
     // A save that failed: the memo takes what the file now holds, read back,
-    // and the words say so (chia_wallet_switch::after_failed_save).
+    // and the words say so. With no file there, where a start turns the
+    // wallet on unasked, the memo and the words say on: the next start with
+    // Chia on brings it back (chia_wallet_switch::after_failed_turn).
     let failed_save = |target: bool, e: std::io::Error, lead: &str| -> String {
-        let previous = hub.wallet_switch.lock().unwrap().remembered;
-        let (remembered, why) =
-            chia_wallet_switch::after_failed_save(
-                target,
-                &e.to_string(),
-                chia_wallet_switch::remembered(switch_path),
-                previous,
-                chia_strict::strict(),
-                env,
-            );
+        let previous = {
+            let memo = hub.wallet_switch.lock().unwrap();
+            (memo.remembered, memo.auto)
+        };
+        let unasked_without = chia_wallet_switch::starts_unasked(net.is_test(), false, env, None, wallet_legacy_only(net));
+        let (remembered, auto, why) = chia_wallet_switch::after_failed_turn(
+            target,
+            &e.to_string(),
+            chia_wallet_switch::chosen(switch_path),
+            previous,
+            chia_strict::strict(),
+            env,
+            unasked_without,
+        );
         let why = format!("{lead}{why}");
         eprintln!("🏦 SSF wallet: {why}");
-        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()) };
+        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()), auto };
         why
     };
     if !on {
-        // While Chia is off no switch file is created, but one an earlier
-        // run left is saved off, on purpose (`remember_off`).
+        // While Chia is off, off a test network, no switch file is created,
+        // but one an earlier run left is saved off, on purpose. On a test
+        // network the off is always saved: with no file there the next
+        // start with Chia on would turn the wallet on unasked
+        // (`remember_off`).
         let strict = chia_strict::strict();
-        if let Err(e) = chia_wallet_switch::remember_off(switch_path, strict, now) {
+        if let Err(e) = chia_wallet_switch::remember_off(switch_path, strict, net.is_test(), now) {
             return Err(failed_save(false, e, ""));
         }
-        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
+        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None, auto: false };
         // The words follow starts_on at the next start with Chia on:
         // SSF_CHIA_LANE=1 turns the wallet on there whatever the switch
         // says. A wallet stays on until the node stops only where one is
@@ -7111,7 +7400,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             Ok(Err(e)) => return fail(format!("the wallet could not be loaded: {e:#}")),
             Err(e) => return fail(format!("the wallet could not be loaded ({e})")),
         };
-        announce_wallet(net, &id);
+        announce_wallet(net, &id, hub.beacon.on());
         let chia_sk = id.wallet.clone();
         drop(id);
         // The lease's parking outlives the process (see startup): restored
@@ -7126,7 +7415,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         // answer is one wallet state.
         let saved = match chia_wallet_switch::remember(switch_path, true, now) {
             Ok(()) => {
-                *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
+                *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None, auto: false };
                 true
             }
             Err(e) => {
@@ -7145,7 +7434,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     if let Err(e) = chia_wallet_switch::remember(switch_path, true, now) {
         return Err(failed_save(true, e, ""));
     }
-    *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
+    *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None, auto: false };
     println!("🏦 SSF wallet: kept on in the Bank — it is back on at the next start");
     Ok(())
 }
@@ -7206,6 +7495,45 @@ fn turn_listing(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) 
     {
         let _ = (hub, on);
         ("409 Conflict", serde_json::json!({ "ok": false, "error": chia_listing::UNBUILT_WORDS }))
+    }
+}
+
+/// 🔦 One turn of the beacon switch for the SpacePhone's Network settings
+/// (chia_beacon_switch.rs): the switch saves it and answers, and the node
+/// says its line. Put out, the arm's last look is shown no longer. Lit with
+/// a wallet already loaded, the node says what that wallet's load says
+/// where the beacon is lit at the start: the beacon's own line (and off a
+/// test network its warning), and with SSF_CHIA_AUDIT set to `1` the
+/// beacon key's address. With no wallet loaded yet, the load says them. A
+/// build that only reads the chain has no switch.
+fn turn_beacon(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) {
+    #[cfg(feature = "chia-publish")]
+    {
+        let net = chia_network::net();
+        let turned = hub.beacon.turn(on, chia_listing::unix_now(), chia_strict::strict());
+        match &turned.line {
+            Some(line) if turned.failed => eprintln!("{line}"),
+            Some(line) => println!("{line}"),
+            None => {}
+        }
+        if !hub.beacon.on() {
+            hub.beacon_status.lock().unwrap().take();
+        }
+        if turned.newly_lit {
+            let wallet = hub.chia_wallet.lock().unwrap().clone();
+            if let Some(wallet) = wallet {
+                say_beacon(net);
+                if let Some(line) = chia_publish::audit_beacon_lit_line(net, chia_publish::audit(), &wallet) {
+                    println!("{line}");
+                }
+            }
+        }
+        (turned.status, turned.body)
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = (hub, on);
+        ("409 Conflict", serde_json::json!({ "ok": false, "error": chia_beacon_switch::UNBUILT_WORDS }))
     }
 }
 
@@ -7537,6 +7865,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                         // 📖 LIST ME on this network, live too: a turn in
                         // the Network settings shows at the next read.
                         fp.chia_listing = Some(hub_clone.list_me.view());
+                        // 🔦 The beacon switch, live too, with what the
+                        // publisher's last look at a lit beacon found.
+                        fp.chia_beacon = Some(hub_clone.beacon.view().with(*hub_clone.beacon_status.lock().unwrap()));
                         // 📖 And the Phone Book listing state the publisher
                         // mirrored on its last tick, for the top bar's icon.
                         fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
@@ -7720,6 +8051,33 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
                 let (status, body) = match chia_listing::listing_gate(local, target, chia_network::net(), &node_id) {
                     Ok(on) => turn_listing(&hub_clone, on),
+                    Err(refused) => refused,
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/chia/beacon?") || req.starts_with("POST /api/chia/beacon ") {
+                // 🔦 The SpacePhone's beacon switch (chia_beacon_switch.rs):
+                // `on=1` lets this node write its welcome-room beacon on its
+                // network from the publisher's next tick, `on=0` stops it,
+                // and either is remembered for that network alone. Behind
+                // the wallet switch's gate: only this machine's own game
+                // page may ask.
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
+                // An on names the network and the node it was confirmed
+                // for, and is taken only by that node on that network.
+                let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
+                let (status, body) = match chia_beacon_switch::beacon_gate(local, target, chia_network::net(), &node_id) {
+                    Ok(on) => turn_beacon(&hub_clone, on),
                     Err(refused) => refused,
                 };
                 let body = body.to_string();

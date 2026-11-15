@@ -300,6 +300,7 @@ import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
+import { BEACON_BUTTON_ID, beaconRow, beaconStands, beaconTarget, beaconTurnOf, turnBeacon, type BeaconTarget } from "./beaconSwitch";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
@@ -415,18 +416,21 @@ import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import { bindAirHockeyThemeDoc } from "./airHockeyThemeDoc";
 import {
-  bindRoomRoles,
-  subscribeRoomRoles,
-  readCoHostRequests,
-  readCoHosts,
-  writeCoHostRequest,
-  removeCoHostRequest,
-  writeCoHost,
-  removeCoHost,
-  isCoHost,
-  hasCoHostRequest,
-} from "./roomRoles";
-import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust, setLocalKeeperNode, subscribeCoHostNodes } from "./coHostNodes";
+  MAX_HOLDER_HINTS,
+  bindHolderNodes,
+  fileMyHolderNode,
+  holderHintsHere,
+  holderIsThisComputer,
+  holderNodeTrust,
+  holdersHere,
+  listsThisComputer,
+  roomStateIn,
+  sessionOnOwnNode,
+  setListsThisComputer,
+  setLocalHolderNode,
+  subscribeHolderNodes,
+  type SwitchStore,
+} from "./roomHolders";
 import {
   bindVentures,
   subscribeVentures,
@@ -1235,6 +1239,85 @@ function renderListMeRow(): void {
   }
 }
 
+/** 🔦 The BEACON row's switch (beaconSwitch.ts): armed and waiting for
+ *  CONFIRM (for the network and the node whose warning was read, and no
+ *  other: a fingerprint that names another disarms it), a turn in flight,
+ *  and the last turn's failure. Opening the Network view disarms it and
+ *  clears the failure; the node's own memory of the switch rides on its
+ *  fingerprint. */
+let beaconArmed: BeaconTarget | null = null;
+let beaconTurning: "on" | "off" | null = null;
+let beaconError: string | null = null;
+/** When the switch last changed what it does (the CHIA switch's rule: a tap
+ *  within BANK_SETTLE_MS of that is no decision). */
+let beaconChangedAt = 0;
+/** What the switch did at the last render. */
+let beaconShownAct: string | null = null;
+
+/** 🔦 Is the Network view on screen? A phone that is put away is only slid
+ *  offscreen: its views keep their classes and a control in it keeps the
+ *  focus, so it still takes Enter and Space (treasuryViewOnScreen). */
+function networkViewOnScreen(): boolean {
+  const view = document.getElementById("phone-app-settings-network");
+  return Boolean(view && treasuryViewOnScreen(view));
+}
+
+/** 🔦 Drop an armed CONFIRM: the warning it stands under is no longer being
+ *  read (the phone was put away, or a tap came from a phone that is). */
+function disarmBeacon(): void {
+  if (beaconArmed === null) return;
+  beaconArmed = null;
+  renderBeaconRow();
+}
+
+/** 🔦 The BEACON row of the Network rows and the note, switch, warning and
+ *  error under it, from the node that answered the last probe (none while
+ *  it does not). Written with textContent, hidden and attributes only,
+ *  never innerHTML, so focus stays on the one button from LIGHT BEACON to
+ *  CONFIRM to LIGHTING. */
+function renderBeaconRow(): void {
+  const fp = localNodeLive ? localFingerprint : null;
+  const row = beaconRow(fp, { armed: beaconStands(beaconArmed, fp), turning: beaconTurning, error: beaconError });
+  setNetworkRow("network-beacon", row.value, row.colour);
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("beacon-note", row.note);
+  line("beacon-warning", row.warning);
+  line("beacon-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== beaconShownAct) {
+    beaconShownAct = b?.act ?? null;
+    beaconChangedAt = performance.now();
+  }
+  const btn = document.getElementById(BEACON_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went hands focus to its view, not to the page behind
+    // the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
 /** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
  *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
  *  the address override, the two room switches and the override's text box.
@@ -1338,6 +1421,26 @@ async function turnListMeSwitch(on: boolean): Promise<void> {
   await refreshLocalFingerprint();
   listMeChangedAt = performance.now();
   renderListMeRow();
+}
+
+/** 🔦 Ask the node to light its beacon or put it out for its network, then
+ *  read its fingerprint again so the row and the switch show what the node
+ *  now holds, not what the page hoped. */
+async function turnBeaconSwitch(on: boolean): Promise<void> {
+  if (beaconTurning) return;
+  // An on goes out for what CONFIRM was armed for, not for whatever node
+  // answers when it arrives: the node refuses another's.
+  const armedFor = beaconArmed;
+  beaconTurning = on ? "on" : "off";
+  beaconArmed = null;
+  beaconError = null;
+  renderBeaconRow();
+  const turned = await turnBeacon(localNodeOrigin, on, on ? armedFor : null);
+  beaconTurning = null;
+  beaconError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  beaconChangedAt = performance.now();
+  renderBeaconRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -1872,33 +1975,31 @@ function roomStateArrivedNow(): boolean {
   return !!sync && !!roomId && routeRoomReady(sync, roomHostedHere(roomId));
 }
 
-/** 🤝 C3: the route hints of the active room's co-hosts, from the records
- *  each co-host's own key signed for this room (coHostNodes.ts); a grant the
- *  room lists under another key counts for nothing. Kept for a few seconds:
- *  every outgoing sync envelope asks. */
-let coHostHintMemo: { roomId: string; at: number; hints: RoomMemberHint[] } | null = null;
-function coHostRouteHints(roomId: string): RoomMemberHint[] {
+/** 🤝 The route hints of the active room's holders (roomHolders.ts): the
+ *  owner's node first, then the computers that most recently filed theirs,
+ *  each record signed by its own player's key for this room. Kept for a few
+ *  seconds: every outgoing sync envelope asks. */
+let holderHintMemo: { roomId: string; at: number; hints: RoomMemberHint[] } | null = null;
+function holderRouteHints(roomId: string): RoomMemberHint[] {
   const now = Date.now();
-  if (coHostHintMemo && coHostHintMemo.roomId === roomId && now - coHostHintMemo.at < 5_000) return coHostHintMemo.hints;
-  // The owner's node first (its record, when it filed one), then the co-hosts'.
-  const ownerPub = roomOwnerInfo(roomId).ownerPub;
-  const keepers = [...(ownerPub ? [{ pub: ownerPub, grantedAt: 0 }] : []), ...readCoHosts().filter((g) => isCoHost(g.pub) && g.pub !== ownerPub)];
-  const hints = coHostHintsHere(roomId, keepers, now);
-  coHostHintMemo = { roomId, at: now, hints };
+  if (holderHintMemo && holderHintMemo.roomId === roomId && now - holderHintMemo.at < 5_000) return holderHintMemo.hints;
+  const hints = holderHintsHere(roomId, roomOwnerInfo(roomId).ownerPub, now);
+  holderHintMemo = { roomId, at: now, hints };
   return hints;
 }
 
-/** 🤝 C3: the keepers' records changed (or the room's state that judges
- *  them arrived): drop the hint memo, and mint the displayed MY PASS again
- *  (#338 review: the join mints it before the records are read). Not over
- *  a pass the player generated themselves. Debounced: records land in
- *  bursts. */
+/** 🤝 The holders' records changed (or the room's state that names its owner
+ *  arrived): drop the hint memo, repaint the ACCESS app's list, and mint the
+ *  displayed MY PASS again (#338 review: the join mints it before the records
+ *  are read). Not over a pass the player generated themselves. Debounced:
+ *  records land in bursts. */
 let passHintsTimer: ReturnType<typeof setTimeout> | null = null;
 function refreshPassHints(): void {
-  coHostHintMemo = null;
+  holderHintMemo = null;
   if (passHintsTimer) clearTimeout(passHintsTimer);
   passHintsTimer = setTimeout(() => {
     passHintsTimer = null;
+    renderRoomHoldersSection();
     const out = document.getElementById("access-pass-output") as HTMLInputElement | null;
     if (!out) return;
     const playersOwn = out.value !== "" && out.value !== lastAutoPass && /^(ssf|https?):/.test(out.value);
@@ -1906,13 +2007,13 @@ function refreshPassHints(): void {
   }, 1_000);
 }
 
-/** 🤝 C3: a boot record with the room's co-hosts among its dial hints, after
- *  the record's own; the same record when the room has none. */
-function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBootstrap | null {
+/** 🤝 A boot record with the room's holders among its dial hints, after the
+ *  record's own; the same record when the room lists none. */
+function withHolderHints(record: RoomBootstrap | null, roomId: string): RoomBootstrap | null {
   if (!record || record.roomId !== roomId) return record;
-  const coHosts = coHostRouteHints(roomId);
-  if (coHosts.length === 0) return record;
-  return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), coHosts) };
+  const holders = holderRouteHints(roomId);
+  if (holders.length === 0) return record;
+  return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), holders) };
 }
 
 /** 🛰️ A welcome-room session's dial record with the routes of the pass the
@@ -1929,19 +2030,49 @@ function withHeldWelcomeRoutes(record: RoomBootstrap | null): RoomBootstrap | nu
   return welcomeRecordWithHeld(record, roomId, heldWelcomeMemo.boot, withPassRoutes);
 }
 
-/** 🤝 C3: a keeper's game (the owner's, or a co-host's) files its node's
- *  route in the room, signed with its key (and refreshes it as its node's
- *  routes change); a former keeper's takes its record down. A visitor's tab
- *  then counts that node's copy of the room as the room's own state
- *  (nodeProof.ts), and passes name it. Only once the room's own state has
- *  arrived: a cached copy may not list the grant or the owner yet. */
-function refileCoHostNode(): void {
+/** 🤝 Where the one LIST MY COMPUTER switch is kept; null where storage is
+ *  closed (the switch then reads on, and a tap lasts this page only). */
+function holderSwitchStore(): SwitchStore | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+/** The switch as tapped on this page where storage is closed. */
+let listComputerHere: boolean | null = null;
+function listsMyComputer(): boolean {
+  return listComputerHere ?? listsThisComputer(holderSwitchStore());
+}
+
+/** 🤝 This game files its computer's node among the room's holders
+ *  (roomHolders.ts), signed with the player's key, and refreshes it as the
+ *  node's routes change; with the switch off it takes the record down. A
+ *  visitor's tab then counts that node's copy of the room as the room's own
+ *  state (nodeProof.ts), and passes name it. Only once the room's own state
+ *  has arrived and is not empty: a filed node is one that held the room. */
+function refileHolderNode(): void {
+  const sync = yjsSync;
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !roomStateArrivedNow()) return;
-  const me = getIdentityPub();
-  const keeper = isCoHost(me) || roomOwnerInfo(roomId).ownerPub === me;
-  const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
-  if (fileMyCoHostNode(roomId, keeper, hint ? routeHint(hint) : null) !== "kept") coHostHintMemo = null;
+  if (!sync || !roomId) return;
+  const ownerPub = roomOwnerInfo(roomId).ownerPub;
+  // Only the node this session runs through has the room. A game that
+  // joined through another computer's node (a pass that names its address)
+  // files nothing for its own, which never bound the room, running already
+  // or started since.
+  const hint =
+    localFingerprint && sessionOnOwnNode(activeBootstrap?.wtUrl) ? getLocalNodeHint(localFingerprint) : null;
+  const did = fileMyHolderNode(
+    roomId,
+    {
+      listed: listsMyComputer(),
+      holds: roomStateArrivedNow() && roomStateIn(sync.doc),
+      owner: ownerPub !== undefined && ownerPub === getIdentityPub(),
+      ownerPub,
+    },
+    hint ? routeHint(hint) : null,
+  );
+  if (did !== "kept") holderHintMemo = null;
 }
 
 /**
@@ -2429,16 +2560,16 @@ async function joinRoomAtEpoch(
     roomId: boot.roomId,
     channel,
     ...ysyncSigner(), // Slice 2: sign outgoing + verify-before-apply on inbound
-    // 🤝 C3: a node the room's owner or a co-host keeps it on counts as
-    // the room's own state (nodeProof.ts), with the owner's game closed.
-    ...keeperNodeTrust,
-    // 🤝 C3: the node dials the room's co-hosts beside the pass's own
-    // hints, so a returning visitor reaches the room through a co-host's
-    // node while the owner's is off.
+    // 🤝 A node that holds the room counts as the room's own state
+    // (nodeProof.ts, roomHolders.ts), with the owner's game closed.
+    ...holderNodeTrust,
+    // 🤝 The node dials the room's holders beside the pass's own hints, so
+    // a returning visitor reaches the room through any of them while the
+    // owner's computer is off.
     // 🛰️ And, in the welcome room, the holders the player's own pass to it
     // names (MY ROOMS): a pass added while the session waits is asked at
     // the next handshake.
-    bootRecord: () => withHeldWelcomeRoutes(withCoHostHints(networkProvider.getBootRecord(), boot.roomId)),
+    bootRecord: () => withHeldWelcomeRoutes(withHolderHints(networkProvider.getBootRecord(), boot.roomId)),
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
@@ -2802,10 +2933,9 @@ async function joinRoomAtEpoch(
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);
 
-  // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
-  bindRoomRoles(sync.doc);
-  // 🤝 C3: and the nodes the co-hosts run, each signed by its co-host.
-  bindCoHostNodes(sync.doc);
+  // 🤝 The nodes that hold this room ride its doc, each signed by its own
+  // player (roomHolders.ts; T0 seam).
+  bindHolderNodes(sync.doc);
 
   // 🧱 #66 S1: the floor plan (door placements) rides the doc; re-derive the
   // door anchors from the fresh doc immediately (joiners see slid doors).
@@ -2866,9 +2996,9 @@ async function joinRoomAtEpoch(
       refreshWarmNeighbours();
       // 📌 A board view the node sent before the host's state arrived.
       retryBoardView();
-      // 🤝 C3: a keeper's node, filed now the room's owner and grants are known,
-      // and the pass's hints read again.
-      refileCoHostNode();
+      // 🤝 This computer's node, filed now the room's state is here, and the
+      // pass's hints read again.
+      refileHolderNode();
       refreshPassHints();
       void networkProvider.refreshRoomCap();
     });
@@ -2995,17 +3125,9 @@ async function joinRoomAtEpoch(
     // ⚓🚦 A port fitted, removed or renumbered changes the station's gates; a
     // rights request or grant changes none, so it harvests nothing.
     subscribeDoorPolicyRecords(() => harvestStationAtlas());
-    // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
-    // appearing while the owner has the app open, an accept while the
-    // volunteer watches).
-    subscribeRoomRoles(() => {
-      renderCoHostsSection();
-      // 🤝 C3: a grant just landed (or went): file, or take down, our node.
-      refreshPassHints();
-      refileCoHostNode();
-    });
-    // 🤝 C3: a keeper's node record landed, moved or went: the pass's hints.
-    subscribeCoHostNodes(refreshPassHints);
+    // 🤝 A holder's node record landed, moved or went: the pass's hints and
+    // the ACCESS app's list (refreshPassHints repaints it).
+    subscribeHolderNodes(refreshPassHints);
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
@@ -3649,19 +3771,12 @@ async function joinRoomAtEpoch(
     }
     // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
     // (This also repaints the access-mode selector, whose enabled state is the
-    // deed check — same live dependency as the co-host section below.)
+    // deed check: it reads roomInfo.owner AND players[owner].keyB64, both maps
+    // this function observes.)
     refreshAccessRoomRow();
-    // 🔒 #142: the co-host controls gate on `currentRoomDeedIsMine()`, which
-    // reads roomInfo.owner AND players[owner].keyB64 — so it now depends on
-    // BOTH maps this function observes, where the old shareholder gate
-    // compared against our player id alone and needed neither. Without this
-    // line the section repainted only on a roles-map change or on opening the
-    // app, so a deed hand-over — or the owner's players entry simply landing
-    // late, which is the ordinary join order — left the new holder with no
-    // controls and the old holder with REVOKE buttons the handler silently
-    // refuses. Exactly the treasury's OWNER UNKNOWN → OWNER-SIGNED flip noted
-    // on the players observer below, on a surface that had not needed it.
-    renderCoHostsSection();
+    // 🤝 The holders list names players through the same two maps (the owner
+    // leads it, and each row shows a players-entry name).
+    renderRoomHoldersSection();
     // Recategorise the room list: owner (roomInfo) and the owner's pubkey (its
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
@@ -3685,9 +3800,10 @@ async function joinRoomAtEpoch(
     // 📌 A new owner is a new notice-case author (#315).
     if (_event.keysChanged.has("owner")) {
       refreshBoards();
-      // 🤝 C3: a new owner's game files its node; a former owner's takes its down.
+      // 🤝 A new owner's record leads the list and carries its addresses; a
+      // former owner's goes back to its id alone.
       refreshPassHints();
-      refileCoHostNode();
+      refileHolderNode();
     }
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
@@ -5273,7 +5389,7 @@ function resolveOwnerLabel(owner: string): string {
  *
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
  *    · the deed hand-over          · the sole-croupier election
- *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *    · the room ACCESS MODE
  *    · 🔧 #192 taking a module apart (a Disassemble job's pick and its end:
  *      a module off the station can't be put back) — setRoomDeedCheck
  *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
@@ -7715,7 +7831,7 @@ function syncDeedsLedgerFromCurrentRoom(): void {
  *  (the charter holds that deed — sell shares instead), and the recipient
  *  must hold a KEYED players entry in THIS doc (they've been here; every
  *  owner surface resolves their pub through that entry). All the room's
- *  standing records — passes, policies, co-hosts, a venture property link —
+ *  standing records — passes, policies, a venture property link —
  *  ride along; the new owner can change them. */
 function executeDeedHandover(toPlayerId: string): boolean {
   if (!yjsSync || !activeBootstrap?.roomId) return false;
@@ -8453,7 +8569,7 @@ function renderVenturesApp(): void {
                <button type="button" data-venture-action="deed-transfer" style="${pill}${armed ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}">${armed ? "⚠ CONFIRM" : "🖋 HAND OVER"}</button>
              </div>
              <div id="deed-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ""}</div>
-             <div style="font-size:9px; color:rgba(212,168,75,0.65);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ""} ride along. You cannot take a deed back.</div>`
+             <div style="font-size:9px; color:rgba(212,168,75,0.65);">The new owner takes the module as it stands — passes, door policies${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ""} ride along. You cannot take a deed back.</div>`
           : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
       }
     } else if (!here) {
@@ -8879,110 +8995,89 @@ function renderVenturesApp(): void {
 }
 const CHARTER_TOTAL_SHARES_LABEL = 100;
 
-// ── 🤝 CO-HOSTS section (durability C1) — lives in the ACCESS app ────────────
-// Members volunteer; the owner accepts into a standing, revocable designation
-// keyed to identity pubkeys. v1 is DESIGNATION ONLY (the doc record later
-// slices consume: node retention/serving C4, pass hints C3, roomProof C6) —
-// co-hosts do NOT pass owner gates.
+// ── 🤝 ROOM HOLDERS section (roomHolders.ts) — lives in the ACCESS app ───────
+// Nobody is picked: every computer that has loaded this room holds a copy and
+// serves it. The section shows who the room lists and carries the one switch
+// that keeps this computer off the list. It grants nothing and gates nothing.
 
-function renderCoHostsSection(): void {
+/** A holder's display name: the players entry whose key filed the record. */
+function holderNameOf(pub: string): string {
+  const players = yjsSync?.doc.getMap("players");
+  if (players) {
+    for (const raw of players.values()) {
+      const entry = raw as { keyB64?: unknown; name?: unknown } | null;
+      if (entry && entry.keyB64 === pub && typeof entry.name === "string" && entry.name) return entry.name;
+    }
+  }
+  return "Unknown-Clone";
+}
+
+function renderRoomHoldersSection(): void {
   const accessView = document.getElementById("phone-app-access");
   if (!accessView) return;
-  let section = document.getElementById("access-cohosts-section");
+  let section = document.getElementById("access-holders-section");
   if (!section) {
     section = document.createElement("div");
-    section.id = "access-cohosts-section";
+    section.id = "access-holders-section";
     section.style.cssText =
       "margin-top:14px; padding-top:10px; border-top:1px solid rgba(212,168,75,0.14); font-size:10px;";
     accessView.appendChild(section);
-    // Delegated actions (bound once; survives re-renders).
+    // Delegated (bound once; survives re-renders).
     section.addEventListener("click", (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>(
-        "[data-cohost-action]",
-      );
-      if (!el) return;
-      const pub = el.dataset.pub ?? "";
-      const action = el.dataset.cohostAction;
-      // 🔒 #142: the RAW deed holder, not the shareholder-extended gate.
-      // Accept/deny/revoke decide who keeps the room alive, so they sit with
-      // the deed like the hand-over and the croupier election — see the note
-      // on currentRoomDeedIsMine.
-      const amOwner = currentRoomDeedIsMine();
-      if (action === "volunteer") {
-        writeCoHostRequest(getIdentityPub(), getPlayerName());
-      } else if (action === "withdraw") {
-        removeCoHostRequest(getIdentityPub());
-      } else if (!amOwner) {
-        return; // accept/deny/revoke are owner-only (UI gate, dev-phase posture)
-      } else if (action === "accept" && pub) {
-        writeCoHost(pub, el.dataset.name ?? "Unknown-Clone");
-      } else if (action === "deny" && pub) {
-        removeCoHostRequest(pub);
-      } else if (action === "revoke" && pub) {
-        removeCoHost(pub);
-        forgetCoHostNode(pub); // 🤝 C3: its node leaves the passes with it
-      }
-      renderCoHostsSection();
+      const el = (e.target as HTMLElement).closest<HTMLElement>("[data-holder-action]");
+      if (!el || el.dataset.holderAction !== "toggle") return;
+      const on = !listsMyComputer();
+      setListsThisComputer(holderSwitchStore(), on);
+      // Storage that took the word is the word; where it is closed, this page keeps it.
+      listComputerHere = listsThisComputer(holderSwitchStore()) === on ? null : on;
+      refileHolderNode(); // files, or takes down, this computer's record now
+      holderHintMemo = null;
+      renderRoomHoldersSection();
     });
   }
 
-  // 🔒 #142: matches the handler's gate above — the render must not offer a
-  // REVOKE button the click handler will refuse.
-  const amOwner = currentRoomDeedIsMine();
-  const myPub = getIdentityPub();
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   const pill =
     "display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;";
-  const rowStyle =
-    "display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:5px;";
-  const coHosts = readCoHosts();
-  const requests = readCoHostRequests();
+  const roomId = activeBootstrap?.roomId ?? "";
+  const listed = listsMyComputer();
+  const holders = roomId ? holdersHere(roomId, roomOwnerInfo(roomId).ownerPub) : [];
+  // By the node a record names, not by the key that filed it: one identity
+  // can play on two computers, and the other one's record is not this one's.
+  const mine = holders.some(holderIsThisComputer);
 
-  const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 CO-HOSTS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· room keepers</span></div>
-    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Their nodes keep the room, and every pass names them, so visitors can still load it while the owner's machine is off.</div>`;
+  const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 ROOM HOLDERS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· who serves this room</span></div>
+    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Every computer that has loaded this room keeps a copy and hands it to visitors, so the room still loads while the owner's computer is off. Nobody is picked. Passes name the owner's computer and the ${MAX_HOLDER_HINTS - 1} most recent others.</div>`;
 
-  const coHostRows = coHosts
+  const shown = holders.slice(0, MAX_HOLDER_HINTS);
+  const rows = shown
     .map(
-      (c) => `
-    <div style="${rowStyle}">
-      <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(c.pub)}">✔ ${esc(c.name)} <span style="color:rgba(212,168,75,0.4);">${esc(c.pub.slice(0, 8))}</span>${c.pub === myPub ? ' <span style="color:rgba(0,230,118,0.6);">(you)</span>' : ""}</span>
-      ${amOwner ? `<button type="button" data-cohost-action="revoke" data-pub="${esc(c.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>` : ""}
-    </div>`,
+      (h) => `
+    <div style="margin-top:5px; color:#00e676; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(h.pub)}">✔ ${esc(holderNameOf(h.pub))} <span style="color:rgba(212,168,75,0.4);">${esc(h.pub.slice(0, 8))}</span>${holderIsThisComputer(h) ? ' <span style="color:rgba(0,230,118,0.6);">(your computer)</span>' : ""}</div>`,
     )
     .join("");
-
-  const requestRows = amOwner
-    ? requests
-        .map(
-          (r) => `
-    <div style="${rowStyle}">
-      <span style="color:#ffb300; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(r.pub)}">⚠ ${esc(r.name)} <span style="color:rgba(212,168,75,0.4);">${esc(r.pub.slice(0, 8))}</span></span>
-      <span style="flex-shrink:0; display:flex; gap:4px;">
-        <button type="button" data-cohost-action="accept" data-pub="${esc(r.pub)}" data-name="${esc(r.name)}" style="${pill} background:rgba(0,230,118,0.15); border-color:rgba(0,230,118,0.4); color:#00e676;">ACCEPT</button>
-        <button type="button" data-cohost-action="deny" data-pub="${esc(r.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DENY</button>
-      </span>
-    </div>`,
-        )
-        .join("")
-    : "";
-
-  let memberLine = "";
-  if (!amOwner) {
-    memberLine = isCoHost(myPub)
-      ? '<div style="margin-top:6px; color:#00e676;">✔ You are a co-host of this room.</div>'
-      : hasCoHostRequest(myPub)
-        ? `<div style="${rowStyle}"><span style="color:#ffb300;">⏳ Volunteer request pending…</span><button type="button" data-cohost-action="withdraw" style="${pill}">WITHDRAW</button></div>`
-        : `<div style="margin-top:6px;"><button type="button" data-cohost-action="volunteer" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;">🤝 VOLUNTEER AS CO-HOST</button></div>`;
-  }
-
-  const emptyState =
-    amOwner && coHosts.length === 0 && requests.length === 0
-      ? '<div style="margin-top:6px; color:rgba(212,168,75,0.4);">No co-hosts yet — members can volunteer from this app.</div>'
+  const more =
+    holders.length > shown.length
+      ? `<div style="margin-top:5px; color:rgba(212,168,75,0.4);">and ${holders.length - shown.length} more</div>`
       : "";
 
-  section.innerHTML =
-    header + coHostRows + requestRows + memberLine + emptyState;
+  let status: string;
+  if (!listed) status = "Your computer is not listed: the switch below is off.";
+  else if (mine) status = holders.length > shown.length && !shown.some(holderIsThisComputer) ? "Your computer is listed too." : "";
+  else if (!localFingerprint?.iroh_node_id) status = "Your game runs without a node of its own here, so it has no copy to hand on.";
+  else if (holders.length === 0) status = "No computer is listed yet. Yours is listed once this room has finished loading.";
+  else status = "Your computer is listed once this room has finished loading.";
+  const statusLine = status
+    ? `<div style="margin-top:6px; color:rgba(212,168,75,0.55);">${esc(status)}</div>`
+    : "";
+
+  const toggle = `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px;">
+      <span style="color:rgba(212,168,75,0.55);">List my computer in the rooms it holds</span>
+      <button type="button" data-holder-action="toggle" aria-label="List my computer in the rooms it holds" aria-pressed="${listed}" style="${pill}${listed ? " background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;" : ""}">${listed ? "ON" : "OFF"}</button>
+    </div>`;
+
+  section.innerHTML = header + rows + more + statusLine + toggle;
 }
 
 // ── 💬 QUICK CHAT (owner request, v2: ON the phone) ──────────────────────────
@@ -9282,7 +9377,7 @@ function setupSpacePhoneOverlay() {
     // offline/pre-join state and the first open).
     if (id === "access") {
       refreshAccessRoomRow();
-      renderCoHostsSection();
+      renderRoomHoldersSection();
     }
     if (id === "ventures") {
       ventureDetailId = "";
@@ -9338,6 +9433,10 @@ function setupSpacePhoneOverlay() {
       listMeArmed = null;
       if (!listMeTurning) listMeError = null;
       renderListMeRow();
+      // 🔦 And for a beacon armed on an earlier visit.
+      beaconArmed = null;
+      if (!beaconTurning) beaconError = null;
+      renderBeaconRow();
       // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
       // and every other control without a pointer (Tab is the app's phone
       // toggle, not a tab stop).
@@ -9638,6 +9737,9 @@ function setupSpacePhoneOverlay() {
         // to hand focus back to.
         const focused = document.activeElement;
         if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        // 🔦 And a beacon CONFIRM armed in the Network view is dropped: its
+        // warning went offscreen with the phone.
+        disarmBeacon();
         // Hand focus back to whatever opened the phone from outside it. The
         // phone is only moved offscreen, never display:none, so a control
         // left focused inside it keeps answering the arrow keys against
@@ -9903,6 +10005,14 @@ function setupSpacePhoneOverlay() {
       autoEnterRoomId = null;
       const seed = passSeed(rid);
       if (seed) {
+        // The phone is put away under the player, mid-read: a control left
+        // focused inside it lets go (togglePhone's rule; the phone is only
+        // moved offscreen, so it would keep taking Enter and Space), and a
+        // beacon CONFIRM armed in the Network view is dropped, its warning
+        // no longer on screen.
+        const focused = document.activeElement;
+        if (container && focused instanceof HTMLElement && container.contains(focused)) focused.blur();
+        disarmBeacon();
         container?.classList.remove("active");
         void enterRoomFromPass(seed);
       }
@@ -10106,6 +10216,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       bankWalletArmed = false;
       chiaLaneArmed = false;
       listMeArmed = null;
+      beaconArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -10118,6 +10229,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // ⛓️ Nor the Chia switch: there is no node to send it to.
     renderChiaLaneRow();
     renderListMeRow();
+    renderBeaconRow();
     return localFingerprint;
   }
   // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
@@ -10131,6 +10243,8 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // node restarted between two probes), is armed no longer: CONFIRM is for
   // the warning that was read.
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
+  // 🔦 The same for a beacon armed on another node or network.
+  if (!beaconStands(beaconArmed, fingerprint)) beaconArmed = null;
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
@@ -10150,12 +10264,13 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // 🔒 …and what its fold serves: a table moves to a FAIR ONLY game only where
   // the owner's own node says it runs them (computedTable switchFairOnlyOn).
   setLocalHouseFold(fingerprint.house_fold ?? null);
-  setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
+  setLocalHolderNode(fingerprint.iroh_node_id ?? null); // 🤝 a holder's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
   renderChiaLaneRow();
   renderListMeRow();
-  refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
+  renderBeaconRow();
+  refileHolderNode(); // 🤝 this computer's node, or its routes, may have changed
   return fingerprint;
 }
 
@@ -10225,16 +10340,16 @@ function buildOutgoingBootstrap(
     : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
-  // 🤝 C3: the room's co-hosts ride every pass, after our node and the
-  // host's (the pass's first hint), so a visitor's node can load the room
-  // from a co-host's while the owner's machine is off. A pass minted for a
+  // 🤝 The room's holders ride every pass, after our node and the host's
+  // (the pass's first hint), so a visitor's node can load the room from any
+  // computer that holds it while the owner's is off. A pass minted for a
   // fresh room (roomIdOverride) gets none: the records are signed for the
   // room they were filed in.
   const inherited = collectMemberHints(activeBootstrap);
   const allHints = mergeMemberHints(
     localHint ? [localHint] : [],
     inherited.slice(0, 1),
-    coHostRouteHints(roomId),
+    holderRouteHints(roomId),
     inherited.slice(1),
   );
   // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
@@ -10512,7 +10627,7 @@ function setupNetworkDetailsPanel() {
         return;
       }
       localFingerprint = null;
-      setLocalKeeperNode(null);
+      setLocalHolderNode(null);
       if (feedback) feedback.textContent = "Retrying local node handshake...";
       // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
       // its Y.Doc) before reconnecting, instead of a bare disconnect().
@@ -10653,6 +10768,38 @@ function setupNetworkDetailsPanel() {
     });
     // A held Enter or Space repeats its keydown, and each one taps the button.
     listBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
+    });
+  }
+  // 🔦 The beacon switch (beaconSwitch.ts), LIST ME's rules: LIGHT BEACON
+  // arms CONFIRM, and CONFIRM and PUT OUT each take a fresh tap.
+  const beaconBtn = document.getElementById(BEACON_BUTTON_ID) as HTMLButtonElement | null;
+  if (beaconBtn) {
+    beaconBtn.addEventListener("click", (e) => {
+      if (beaconBtn.getAttribute("aria-disabled") === "true") return;
+      // Nothing is armed, lit or put out from a phone that is put away. The
+      // phone is only slid offscreen, so the button may still hold the focus
+      // and take Enter or Space with its warning out of sight: a pass that
+      // finished warming puts the phone away under the player (the
+      // auto-enter). An armed CONFIRM is dropped with the tap.
+      if (!networkViewOnScreen()) {
+        disarmBeacon();
+        return;
+      }
+      const act = beaconBtn.dataset.act;
+      if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), beaconChangedAt)) return;
+      if (act === "arm") {
+        beaconArmed = beaconTarget(localNodeLive ? localFingerprint : null);
+        beaconError = null;
+        beaconChangedAt = performance.now();
+        renderBeaconRow();
+        return;
+      }
+      const lit = beaconTurnOf(act);
+      if (lit !== null) void turnBeaconSwitch(lit);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    beaconBtn.addEventListener("keydown", (e) => {
       if (laneKeyRepeat(e)) e.preventDefault();
     });
   }
@@ -10914,8 +11061,8 @@ function getRoomAccessMode(): AccessMode {
  *  reads the current room's own venture map entry, which is shape-checked and
  *  peer-written with nothing tying it to this room or its owner, so a
  *  fabricated office record used to carry the right to lock the room. It no
- *  longer does. The deed, the croupier election and co-host management already
- *  sit here for the same reason. Cost, accepted deliberately: on a venture
+ *  longer does. The deed and the croupier election already sit here for the
+ *  same reason. Cost, accepted deliberately: on a venture
  *  property only the deed holder sets access mode; shareholders keep room
  *  edits, docking and door policy. */
 function setRoomAccessMode(mode: AccessMode): void {

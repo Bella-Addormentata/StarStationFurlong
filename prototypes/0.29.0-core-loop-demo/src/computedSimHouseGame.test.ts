@@ -4,7 +4,9 @@
  * its resolution, the fold's rules for a game), when it reveals where a house
  * table's house would not (B2), the checkpoint it signs and the trim it
  * applies, its cross-check, and what it puts back. The house table's rules
- * it shares with a game are held by computedSimHouse.test.ts.
+ * it shares with a game are held by computedSimHouse.test.ts. And a game
+ * that changes hands (N1, PR 6c-5c-2): which rounds are the seller's house's
+ * and which the buyer's, and whose checkpoints carry what.
  *
  * The node's house job has no `p`/`q` half yet: this twin is written from the
  * design first, and the node's half is to be held to these rules.
@@ -16,7 +18,7 @@ import { basisOf, canonFelt } from './computedCraps';
 import { ckKey, faironlyInc, readCk, sealCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
-import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, NAME, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, trimOf } from './computedFairOnlyKit';
+import { authEnv, buyer, delegation, DL_HOUSE, hex, house as H, house2 as H2, NAME, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, third, trimOf, xferOf } from './computedFairOnlyKit';
 import { foldGameOf, MAX_HELD_ROUNDS, nextSid3, recHash, TableFold } from './computedFold';
 import type { CloseRec, FoldCtx, FoldResult, SlipRec } from './computedFold';
 import { beatKey, delegationKey, HEARTBEAT_MS } from './computedHouse';
@@ -1384,5 +1386,440 @@ describe("the simulations' house at a FAIR ONLY game: what it puts back", () => 
     const { room } = trimmed();
     expect(room.top().has(ckKey(T, P.inc, '0'.repeat(32)))).toBe(false);
     expect([...room.house.rows.keys()]).toEqual([`${ROOM}|${T}|${P.inc}`]);
+  });
+});
+
+describe("the simulations' houses at a FAIR ONLY game that changes hands (N1)", () => {
+  const DL2 = delegation(buyer, H2.pub);
+  const FIN2 = sealFin(P, buyer.pub, buyer.sign);
+  /** The room with a second house in it, which the buyer delegates at the hand-over. */
+  class HandRoom extends GameRoom {
+    readonly house2 = new SimHouse(H2.secret);
+    on2 = true;
+
+    override tick(after: number): void {
+      super.tick(after);
+      if (this.on2) this.house2.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+    }
+
+    /** The buyer's transfer at round u and its delegation of the second house, in the room. */
+    handOver(u: number) {
+      const xf = xferOf(P, owner, buyer, u);
+      this.doc.transact(() => {
+        this.top().set(xf.key, xf.value);
+        this.top().set(delegationKey(H2.pub), DL2);
+      });
+      return xf;
+    }
+
+    /** Round r closed by alice under q on a commitment of `by`, alice and bob frozen, both seeds in. */
+    seeded(r: number, q: string, by: typeof H): Built<CloseRec> {
+      const [a, b] = [kit.slip(alice, r, [red(5)]), kit.slip(bob, r, [red(5)])];
+      const c = kit.close(alice, r, q, [a, b], kit.houseCommit(by, r));
+      this.put(a, b, c, kit.reveal(r, 'alice'), kit.reveal(r, 'bob'));
+      return c;
+    }
+  }
+  const written = (h: SimHouse) => ({ ...h.wrote, cks: h.trims + h.sweeps + h.ends });
+
+  /** Rounds 1 and 2 on the seller's house, the game handed over at round 2 while it was in flight; the buyer's house settled and joined to round 3. */
+  function midRound(room = new HandRoom().start()) {
+    const r1 = room.played(1, SID);
+    const { c } = room.closed(2, r1.c.hash);
+    room.tick(TICK);
+    expect(room.recs('h:2:')).toEqual([]);
+    const xf = room.handOver(2);
+    room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    room.tick(TICK);
+    const [h2] = room.recs('h:2:');
+    expect(h2).toMatchObject({ x: [c.hash], n: expect.objectContaining({ length: 2 }), k: H.pub });
+    room.run(SETTLE_MS + TICK);
+    return { room, xf, c, h2 };
+  }
+
+  it('the game handed over between rounds: the seller\'s house reveals nothing on the commitment it left for the next round, joins nothing and signs nothing; the round voided, the buyer\'s house plays the one after and its trim carries the transfer', () => {
+    const room = new HandRoom().start();
+    const r1 = room.played(1, SID);
+    expect(r1.h.c).toBe(kit.houseCommit(H, 2));
+    const xf = room.handOver(1);
+    room.tick(TICK);
+    expect(resolved(room)).toMatchObject({ holder: buyer.pub, live: true, pending: false });
+    const before = written(room.house);
+    // A close of round 2 on the seller's house's commitment: nobody's to reveal.
+    const c2 = room.seeded(2, r1.c.hash, H);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(SETTLE_MS + HOUSE_TRIM_AFTER_MS + 3_000);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    expect(room.recs('o:2:')).toHaveLength(0);
+    expect(written(room.house)).toEqual(before);
+    // (The buyer's house, settled, has joined the round after the close it will not reveal; it signs nothing yet.)
+    expect(room.recs('o:3:').map((v) => [v.c, v.k])).toEqual([[kit.houseCommit(H2, 3), H2.pub]]);
+    expect(written(room.house2)).toMatchObject({ joins: 1, reveals: 0, stepDowns: 0, cks: 0 });
+    expect(room.fold()).toMatchObject({ open: 2 });
+    // A frozen bettor's abandon voids it: round 3 is the buyer's house's.
+    room.put(kit.abandon(alice, 2, c2.hash));
+    const c3 = room.seeded(3, c2.hash, H2);
+    room.tick(TICK);
+    const [h3] = room.recs('h:3:');
+    expect(h3).toMatchObject({ x: [c3.hash], c: kit.houseCommit(H2, 4), k: H2.pub });
+    room.run(HOUSE_TRIM_AFTER_MS + 1_200);
+    expect(room.house2).toMatchObject({ trims: 1, crossCheckMismatches: 0 });
+    const cks = room.cks();
+    expect(cks).toHaveLength(1);
+    const { key, ck } = cks[0];
+    expect(readCk(ROOM, key, ck)).toMatchObject({ kind: 'ok' });
+    expect(ck).toMatchObject({ u: 3, l: c3.hash, d: `h:${recHash(h3)}`, h: kit.houseCommit(H2, 4), dl: DL2, k: H2.pub, x: [xf.value] });
+    const res = resolved(room);
+    expect(res).toMatchObject({ live: true, holder: buyer.pub, base: { key }, pending: false });
+    expect(res.invalid).toEqual([]);
+    expect(res.chain.map((h) => [h.k, h.from])).toEqual([[owner.pub, 0], [buyer.pub, 1]]);
+    expect([res.houseAt(H2.pub, 4), res.houseAt(H.pub, 4)]).toEqual([true, false]);
+    // …and the seller's house wrote nothing through all of it.
+    expect(written(room.house)).toEqual(before);
+    // Round 4 plays on the buyer's house.
+    const c4 = room.seeded(4, room.sid(), H2);
+    room.tick(TICK);
+    expect(room.recs('h:4:').map((v) => [v.x, v.k])).toEqual([[[c4.hash], H2.pub]]);
+  });
+
+  it('handed over with a round in flight, at that round: the seller\'s house reveals it with no commitment for the next, which the buyer\'s house joins; no round is lost', () => {
+    const { room, c, h2 } = midRound();
+    expect(h2.c).toBeUndefined();
+    expect(room.recs('o:3:').map((v) => [v.c, v.k])).toEqual([[kit.houseCommit(H2, 3), H2.pub]]);
+    expect(room.house.wrote).toMatchObject({ joins: 1, stepDowns: 0 });
+    const c3 = room.seeded(3, c.hash, H2);
+    room.tick(TICK);
+    expect(room.recs('h:3:').map((v) => [v.x, v.k])).toEqual([[[c3.hash], H2.pub]]);
+    // As a page folds it, each round by a house of its holder (the buyer's delegation is the room's record).
+    const res = resolveGame(authEnv().env, T, P.inc, recordsOf([...room.top().entries()].map(([key, value]) => ({ key, value })), [DL2]));
+    const tf = new TableFold(P, trustAll, undefined, foldGameOf(P), (pub, r) => res.houseAt(pub, r) === true);
+    tf.setFairOnlyBase(room.base());
+    tf.reset([...room.ses().entries()]);
+    expect(tf.result().rounds.map((d) => [d.r, d.decided])).toEqual([[1, 'house'], [2, 'house'], [3, 'house']]);
+    expect([1, 2, 3].map((r) => [res.houseAt(H.pub, r), res.houseAt(H2.pub, r)])).toEqual([[true, false], [true, false], [false, true]]);
+  });
+
+  it('handed over twice with the base still the root: the middle holder\'s house reveals the round in flight as the game left its key, with no commitment for the next, and nothing after', () => {
+    const room = new HandRoom().start();
+    const r1 = room.played(1, SID);
+    room.handOver(1);
+    const c2 = room.seeded(2, r1.c.hash, H);
+    room.put(kit.abandon(alice, 2, c2.hash));
+    room.run(SETTLE_MS + TICK);
+    expect(room.recs('o:3:').map((v) => v.k)).toEqual([H2.pub]);
+    // Round 3 closed on the buyer's house's join; the game goes on to a third key (with no house) at that round.
+    const [a, b] = [kit.slip(alice, 3, [red(5)]), kit.slip(bob, 3, [red(5)])];
+    const c3 = kit.close(alice, 3, c2.hash, [a, b], kit.houseCommit(H2, 3));
+    const on = xferOf(P, buyer, third, 3, { nonce: hex('9', 24) });
+    room.doc.transact(() => room.top().set(on.key, on.value));
+    room.put(a, b, c3, kit.reveal(3, 'alice'), kit.reveal(3, 'bob'));
+    room.tick(TICK);
+    expect(resolved(room).chain.map((h) => [h.k, h.from])).toEqual([[owner.pub, 0], [buyer.pub, 1], [third.pub, 3]]);
+    const [h3] = room.recs('h:3:');
+    expect(h3).toMatchObject({ x: [c3.hash], k: H2.pub });
+    expect(h3.c).toBeUndefined();
+    const wrote = written(room.house2);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 3_000);
+    expect(written(room.house2)).toMatchObject({ joins: wrote.joins, reveals: wrote.reveals, stepDowns: 0, cks: 0 });
+    expect(room.recs('o:4:')).toEqual([]);
+    expect(written(room.house)).toMatchObject({ joins: 1, reveals: 1, stepDowns: 0, cks: 0 });
+  });
+
+  it('a house of a key the game has left joins nothing, not even an unjoined round of its own key\'s', () => {
+    const room = new HandRoom();
+    room.tick(0);
+    // (Still settling: it has not joined round 1, which the transfer leaves with the seller. No page
+    // writes such a transfer: its round is past the last decided only for a close in flight, which names a commitment.)
+    room.handOver(1);
+    room.run(2 * SETTLE_MS + 2_000);
+    expect(resolved(room).chain.map((h) => [h.k, h.from])).toEqual([[owner.pub, 0], [buyer.pub, 1]]);
+    // (Nor does the buyer's house join it: the round is not its own.)
+    expect(room.recs('o:1:')).toEqual([]);
+    expect(room.recs('o:2:')).toEqual([]);
+    for (const h of [room.house, room.house2]) expect(written(h)).toMatchObject({ joins: 0, reveals: 0, stepDowns: 0, cks: 0 });
+  });
+
+  it('a game that has left its key does not hold the room\'s beat off the games the house still serves', () => {
+    const room = new HandRoom().start();
+    room.on2 = false;
+    const second = rootOf(Q, 'q');
+    const ses = `ses:${T}:${Q.inc}:${nextSid3(Q, second.value)}`;
+    room.doc.transact(() => {
+      room.top().set(second.key, second.value);
+      room.top().set(ses, new Y.Map());
+    });
+    room.run(SETTLE_MS + HEARTBEAT_MS);
+    room.played(1, SID);
+    room.handOver(1);
+    room.tick(TICK);
+    expect(resolved(room).holder).toBe(buyer.pub);
+    const beats = room.house.wrote.beats;
+    room.run(3 * HEARTBEAT_MS);
+    expect(room.house.wrote.beats).toBeGreaterThanOrEqual(beats + 2);
+    // (The base is still under the transfer's round: the game is one it reveals for no more, and counts for nothing.)
+    expect(room.cks().map((x) => x.key)).toEqual([ROOT.key]);
+  });
+
+  it('neither house signs a checkpoint at the hand-over round the seller\'s house decided: the seller\'s speaks for the game no more (nor under the seller\'s end order), the buyer\'s did not reveal it', () => {
+    const { room } = midRound();
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_IDLE_MS + 5_000, 1_000);
+    for (const h of [room.house, room.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    expect(room.cks().map((x) => x.key)).toEqual([ROOT.key]);
+    const fin = sealFin(P, owner.pub, owner.sign);
+    room.doc.transact(() => room.top().set(fin.key, fin.value));
+    room.run(5_000, 1_000);
+    for (const h of [room.house, room.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    expect(resolved(room)).toMatchObject({ live: true, holder: buyer.pub, fin: null });
+    expect(room.recs('o:3:')).toHaveLength(1);
+  });
+
+  it('the base under the round its holder has the game from: no sweep there, no trim to a voided round under it, and no end (a checkpoint there would be nobody\'s to sign)', () => {
+    // Nothing decided since the base: junk is not swept.
+    const fresh = new HandRoom().start();
+    fresh.handOver(1);
+    fresh.junk(HOUSE_SWEEP_BYTES);
+    fresh.run(SETTLE_MS + HOUSE_SWEEP_MIN_MS + 5_000);
+    for (const h of [fresh.house, fresh.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    // …nor is the game ended there, under the buyer's order.
+    fresh.doc.transact(() => fresh.top().set(FIN2.key, FIN2.value));
+    fresh.run(10_000);
+    expect(resolved(fresh)).toMatchObject({ live: true, holder: buyer.pub });
+    expect(resolved(fresh).fin).not.toBeNull();
+    for (const h of [fresh.house, fresh.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    expect(fresh.cks().map((x) => x.key)).toEqual([ROOT.key]);
+    // A round a bettor's abandon voided, under the transfer's: no trim to it, and no end at it.
+    const room = new HandRoom().start();
+    const r1 = room.played(1, SID);
+    const { c } = room.closed(2, r1.c.hash);
+    room.put(kit.abandon(alice, 2, c.hash));
+    room.handOver(3);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_IDLE_MS + 5_000, 1_000);
+    for (const h of [room.house, room.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    room.doc.transact(() => room.top().set(FIN2.key, FIN2.value));
+    room.run(10_000);
+    for (const h of [room.house, room.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    expect(room.cks().map((x) => x.key)).toEqual([ROOT.key]);
+  });
+
+  it('the buyer\'s end order with the seller\'s house\'s commitment for the next round outstanding: that house does not step down from a round that is not its own, and neither ends the game (the buyer\'s page does)', () => {
+    const room = new HandRoom().start();
+    room.played(1, SID);
+    room.handOver(1);
+    room.run(SETTLE_MS + TICK);
+    room.doc.transact(() => room.top().set(FIN2.key, FIN2.value));
+    room.run(HOUSE_TRIM_AFTER_MS + 3_000);
+    expect(room.recs('h:2:')).toEqual([]);
+    expect(room.house.wrote.stepDowns).toBe(0);
+    for (const h of [room.house, room.house2]) expect(h).toMatchObject({ trims: 0, sweeps: 0, ends: 0, crossCheckMismatches: 0 });
+    expect(room.recs('o:2:').concat(room.recs('o:3:'))).toEqual([]);
+  });
+
+  it('the buyer\'s end order: its house reveals the round in with no commitment and ends the game at it, the order and the transfer in the end', () => {
+    const { room, xf, c } = midRound();
+    const c3 = room.seeded(3, c.hash, H2);
+    room.doc.transact(() => room.top().set(FIN2.key, FIN2.value));
+    room.tick(TICK);
+    const [h3] = room.recs('h:3:');
+    expect(h3).toMatchObject({ x: [c3.hash], k: H2.pub });
+    expect(h3.c).toBeUndefined();
+    room.run(HOUSE_TRIM_AFTER_MS + 1_200);
+    expect(room.house2).toMatchObject({ ends: 1, trims: 0, crossCheckMismatches: 0 });
+    expect(room.house.ends).toBe(0);
+    const [{ key, ck }] = room.cks();
+    expect(room.cks()).toHaveLength(1);
+    expect(readCk(ROOM, key, ck)).toMatchObject({ kind: 'ok' });
+    expect(ck).toMatchObject({ u: 3, l: c3.hash, d: `h:${recHash(h3)}`, e: 1, f: FIN2.value, dl: DL2, k: H2.pub, x: [xf.value] });
+    expect(Object.keys(ck.n).sort()).toEqual(['alice', 'bob']);
+    expect(resolved(room)).toMatchObject({ live: false, holder: buyer.pub, base: { key }, pending: false, invalid: [] });
+    expect(room.sesKeys()).toEqual([]);
+  });
+
+  it('a sweep after a hand-over carries the transfer too', () => {
+    const { room, xf, c } = midRound();
+    room.seeded(3, c.hash, H2);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 1_400);
+    expect(room.house2).toMatchObject({ trims: 1, sweeps: 0 });
+    // (The cross-check: a sweep that leaves the transfer out, or carries another, is not signed.)
+    const other = xferOf(P, owner, buyer, 1).value;
+    for (const fault of [(body: Record<string, unknown>) => ({ ...body, x: undefined }), (body: Record<string, unknown>) => ({ ...body, x: [other] })]) {
+      const before = room.house2.crossCheckMismatches;
+      room.house2.faultTrim = fault;
+      room.junk(HOUSE_SWEEP_BYTES);
+      room.run(HOUSE_SWEEP_MIN_MS + 1_200);
+      expect(room.house2.sweeps).toBe(0);
+      expect(room.house2.crossCheckMismatches).toBeGreaterThan(before);
+    }
+    room.house2.faultTrim = null;
+    room.run(1_200);
+    expect(room.house2).toMatchObject({ trims: 1, sweeps: 1 });
+    const [{ key, ck }] = room.cks();
+    expect(room.cks()).toHaveLength(1);
+    expect(ck).toMatchObject({ u: 3, w: 1, dl: DL2, k: H2.pub, x: [xf.value] });
+    expect(resolved(room)).toMatchObject({ live: true, holder: buyer.pub, base: { key }, pending: false, invalid: [] });
+  });
+});
+
+describe("the simulations' houses at a FAIR ONLY game with two houses of its holder", () => {
+  const DLB = delegation(owner, H2.pub);
+  /** The room with a second house the game's owner delegated too; either can be stopped. */
+  class TwoRoom extends GameRoom {
+    readonly house2 = new SimHouse(H2.secret);
+    on = true;
+    on2 = true;
+
+    constructor() {
+      super();
+      this.top().set(delegationKey(H2.pub), DLB);
+    }
+
+    override tick(after: number): void {
+      this.now += after;
+      if (this.on) this.house.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+      if (this.on2) this.house2.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+    }
+  }
+  const by2 = (room: TwoRoom, prefix: string) => room.recs(prefix).filter((v) => v.k === H2.pub);
+
+  it('one house to a round: the second house joins nothing where the first has joined, nor where its reveal carried a commitment', () => {
+    const room = new TwoRoom().start();
+    expect(room.recs('o:1:').map((v) => v.k)).toEqual([H.pub]);
+    const r1 = room.played(1, SID);
+    expect(r1.h).toMatchObject({ k: H.pub, c: kit.houseCommit(H, 2) });
+    room.run(2_000);
+    expect(room.house2.wrote).toMatchObject({ joins: 0, reveals: 0, stepDowns: 0 });
+    expect(room.house2.trims + room.house2.sweeps).toBe(0);
+  });
+
+  it('a round that waits on the other house (its close names the commitment that house\'s reveal carried): no join of the round after until a bettor voids it', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c } = room.closed(2, r1.c.hash);
+    room.run(SETTLE_MS + 4_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    expect(room.house2.wrote).toMatchObject({ joins: 0, reveals: 0 });
+    room.put(kit.abandon(alice, 2, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:3:').map((v) => v.c)).toEqual([kit.houseCommit(H2, 3)]);
+    // Round 3 is the second house's: it reveals the close that names its join.
+    const [a, b] = [kit.slip(alice, 3, [red(5)]), kit.slip(bob, 3, [red(5)])];
+    const c3 = kit.close(alice, 3, c.hash, [a, b], kit.houseCommit(H2, 3));
+    room.put(a, b, c3, kit.reveal(3, 'alice'), kit.reveal(3, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:3:').map((v) => [v.x, v.k, v.c])).toEqual([[[c3.hash], H2.pub, kit.houseCommit(H2, 4)]]);
+    expect(room.fold().rounds.map((d) => [d.r, d.decided])).toEqual([[1, 'house'], [2, 'void'], [3, 'house']]);
+  });
+
+  it('two closes of the round that waits on the other house, and only the one the fold chose abandoned: the round is void, and the rival nobody abandons does not hold the join off', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c, b } = room.closed(2, r1.c.hash);
+    const rival = kit.close(bob, 2, r1.c.hash, [b], kit.houseCommit(H, 2));
+    room.put(rival);
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    const tip = room.fold().tip!.close;
+    expect([c.hash, rival.hash]).toContain(tip);
+    room.put(kit.abandon(bob, 2, tip));
+    room.tick(TICK);
+    expect(room.fold()).toMatchObject({ open: 3 });
+    expect(by2(room, 'o:3:').map((v) => v.c)).toEqual([kit.houseCommit(H2, 3)]);
+  });
+
+  it('…and when the other house reveals that round, its reveal carries the next commitment: still no join', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    room.closed(2, r1.c.hash);
+    room.run(2_000);
+    room.on = true;
+    room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    room.run(2_000);
+    expect(room.recs('h:2:').map((v) => [v.k, v.c])).toEqual([[H.pub, kit.houseCommit(H, 3)]]);
+    expect(room.recs('o:3:')).toEqual([]);
+    expect(room.house2.wrote.joins).toBe(0);
+  });
+
+  it('a first round that waits on the other house\'s join: no join of the second round', () => {
+    const room = new TwoRoom().start();
+    room.on = false;
+    const { c } = room.closed(1, SID);
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:2:')).toEqual([]);
+    room.put(kit.abandon(alice, 1, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:2:')).toHaveLength(1);
+  });
+
+  it('an abandon of that close signed for another round voids nothing, and ends no wait', () => {
+    const room = new TwoRoom().start();
+    const r1 = room.played(1, SID);
+    room.on = false;
+    const { c } = room.closed(2, r1.c.hash);
+    room.put(kit.abandon(alice, 3, c.hash));
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    expect(room.recs('o:3:')).toEqual([]);
+  });
+
+  it('both joined the first round, and the house whose join the close does not name steps down from it and starts again: the round still waits on the other, and it joins nothing', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    room.on = false;
+    room.closed(1, SID);
+    room.house2.steppingDown = true;
+    room.tick(TICK);
+    expect(by2(room, 'h:1:').map((v) => v.x)).toEqual([[]]);
+    room.house2.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.fold()).toMatchObject({ open: 1 });
+    expect(room.recs('o:2:')).toEqual([]);
+  });
+
+  it('both joined the first round, each named by a close; the house of the first join reveals its close as it steps down (no commitment carried) and starts again, the other stopped: the round is decided, and the rival close nobody reveals does not hold its next join off', () => {
+    const room = new TwoRoom().start();
+    room.put(kit.houseJoin(H2, 1));
+    // (Of two joins the pages name the lowest, and that house alone reveals: whichever of the two it is.)
+    const first = room.keys('o:1:').map((k) => room.ses().get(k) as { k: string })[0].k === H.pub;
+    const [F, O] = first ? [H, H2] : [H2, H];
+    const [mine, other] = first ? [room.house, room.house2] : [room.house2, room.house];
+    const [a, b] = [kit.slip(alice, 1, [red(5)]), kit.slip(bob, 1, [red(5)])];
+    const c = kit.close(alice, 1, SID, [a, b], kit.houseCommit(F, 1));
+    const rival = kit.close(bob, 1, SID, [b], kit.houseCommit(O, 1));
+    if (first) room.on2 = false;
+    else room.on = false;
+    room.put(a, b, c, rival, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    mine.steppingDown = true;
+    room.run(2_000);
+    const [h1] = room.recs('h:1:');
+    expect(h1).toMatchObject({ k: F.pub, x: [c.hash] });
+    expect(h1.c).toBeUndefined();
+    expect(other.wrote.reveals).toBe(0);
+    expect(room.fold()).toMatchObject({ open: 2 });
+    mine.restart();
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:2:').map((v) => [v.k, v.c])).toEqual([[F.pub, kit.houseCommit(F, 2)]]);
+  });
+
+  it('past a trim by the other house, a round that waits on the commitment its checkpoint carries: no join of the round after', () => {
+    const room = new TwoRoom().start();
+    room.played(1, SID);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 1_200);
+    expect(room.house.trims).toBe(1);
+    expect(room.house2.trims + room.house2.sweeps).toBe(0);
+    expect(room.base()).toMatchObject({ u: 1, h: kit.houseCommit(H, 2), k: H.pub });
+    room.on = false;
+    const { c } = room.closed(2, room.sid());
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('o:3:')).toEqual([]);
+    room.put(kit.abandon(alice, 2, c.hash));
+    room.tick(TICK);
+    expect(by2(room, 'o:3:')).toHaveLength(1);
   });
 });
