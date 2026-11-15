@@ -2297,7 +2297,8 @@ interface FairOnlyState {
    *  takes one back, so one a peer deleted, or wrote something else over, moves
    *  nothing on a page that counted it, and the page puts it back
    *  (computedFairOnlyRecoveries, putBackFairOnlyRecords). */
-  /** Whether the end checkpoint under `key` stands by itself (fairOnlyEndStands). */
+  /** Whether the end checkpoint stands by itself, as last asked (`key`: the
+   *  base's key and the holder the resolution named; fairOnlyEndStands). */
   alone: { key: string; ok: boolean } | null;
   heldXfs: Map<string, unknown>;
   heldFin: unknown;
@@ -2497,6 +2498,11 @@ let foForged = new Set<ComputedInc>();
 /** 🔒 …and the games whose last resolution named a base that ends them, until a
  *  look finds nothing of them left to compact (computedFairOnlyEnded). */
 let foEnded = new Set<ComputedInc>();
+/** …and what fairOnlyLeft last found left of each, until a transaction changes a
+ *  key of the room's computed map or the game is resolved again: the keys of a
+ *  game's sessions are found by a pass over the whole map (sessionKeysOf), which
+ *  a look every frame of the compaction's wait must not repeat. */
+let foLeft = new Map<ComputedInc, string[]>();
 /** 🔒 How many FAIR ONLY games this page tracks: with none, the game a table
  *  plays is its switch's, as it always was (computedIncOf), at no cost. */
 let foGames = 0;
@@ -4750,13 +4756,15 @@ function noteFairOnlyRecord(c: ComputedInc, kind: 'ck' | 'xf' | 'fin', key: stri
   } else {
     const records = kind === 'ck' ? fo.cks : fo.xfs;
     was = records.get(key);
-    if (value === undefined) records.delete(key);
-    else records.set(key, value);
+    // (By the key, not the value: a key a peer set to undefined is in the doc
+    // still, junk like any other, and compaction's to delete.)
+    if (map.has(key)) records.set(key, value);
+    else records.delete(key);
   }
   if (!staleGames.has(c) && (!inertFairOnly(kind, key, was) || !inertFairOnly(kind, key, value))) staleGames.add(c);
   // (Junk under a key of a game that has ended resolves nothing again, and is
   // compaction's all the same.)
-  if (value !== undefined && fo.res?.base?.ck.e === 1) foEnded.add(c);
+  if (map.has(key) && fo.res?.base?.ck.e === 1) foEnded.add(c);
 }
 
 /** Whether a value at a FAIR ONLY record key is nothing to the resolver: none,
@@ -5082,6 +5090,7 @@ function resolveFairOnly(c: ComputedInc): void {
   else foForged.delete(c);
   if (fo.res.base?.ck.e === 1) foEnded.add(c);
   else foEnded.delete(c);
+  foLeft.delete(c);
   let live = foLive.get(c.t);
   if (fo.res.live) {
     if (!live) foLive.set(c.t, live = new Map());
@@ -5336,6 +5345,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   foCheck = new Set();
   foForged = new Set();
   foEnded = new Set();
+  foLeft = new Map();
   foGames = 0;
   foPlayed = new Map();
   foMoved = new Map();
@@ -5408,6 +5418,7 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // A session or checkpoint key moved (one added, replaced or deleted): its
   // incarnation is read whole.
   const top = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
+  if (top && foLeft.size > 0) foLeft.clear();
   let houseMoved = false;
   // 🏠 The room records whose checks waited first, then what came: each
   // delegation that came is checked alone (a flood of them is checked in
@@ -6364,7 +6375,10 @@ function fairOnlyEndStands(c: ComputedInc, map: Y.Map<unknown>): boolean {
   if (!fo.held || fo.held.key !== base.key) return false;
   const cur = map.get(base.key);
   if (cur !== fo.held.value && readCkMemo(base.key, cur).kind !== 'ok') return false;
-  if (fo.alone?.key === base.key) return fo.alone.ok;
+  // (By the base and the holder the answer names: a transfer that comes after
+  // the end, at the round it ends at, leaves the base and moves the holder.)
+  const asked = `${base.key}|${res.holder ?? ''}`;
+  if (fo.alone?.key === asked) return fo.alone.ok;
   const alone = resolveGame(
     { room: boundRoomId, sig: authCheck, read: readCkMemo, xf: readXfMemo },
     c.t, c.inc, { cks: new Map([[base.key, fo.held.value]]), xfs: new Map(), fin: undefined, delegations: [] },
@@ -6372,7 +6386,7 @@ function fairOnlyEndStands(c: ComputedInc, map: Y.Map<unknown>): boolean {
   // (A check put off says nothing yet: asked again at the next look.)
   if (alone.pending) return false;
   const ok = alone.base?.key === base.key && !alone.live && alone.holder === res.holder && !alone.newer;
-  fo.alone = { key: base.key, ok };
+  fo.alone = { key: asked, ok };
   return ok;
 }
 
@@ -6383,12 +6397,15 @@ function fairOnlyEndStands(c: ComputedInc, map: Y.Map<unknown>): boolean {
  *  it has ended). None unless the end stands by itself (fairOnlyEndStands). */
 function fairOnlyLeft(c: ComputedInc, map: Y.Map<unknown>): string[] {
   if (!fairOnlyEndStands(c, map)) return [];
+  const known = foLeft.get(c);
+  if (known) return known;
   const fo = c.fo!;
   const base = fo.res!.base!.key;
   const out = sessionKeysOf(map, c.t, c.inc);
   for (const key of fo.cks.keys()) if (key !== base && map.has(key)) out.push(key);
   for (const key of fo.xfs.keys()) if (map.has(key)) out.push(key);
   if (map.has(finKey(c.t, c.inc))) out.push(finKey(c.t, c.inc));
+  foLeft.set(c, out);
   return out;
 }
 

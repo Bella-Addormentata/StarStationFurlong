@@ -213,15 +213,18 @@ describe('an ended game is compacted (P6)', () => {
     expect(keysOf(c)).toEqual([bend.key]);
   });
 
-  it('what comes after the compaction goes too, after the wait again: a checkpoint a lagging page puts back, a session\'s map a peer writes, junk under a transfer\'s key', async () => {
+  it('what comes after the compaction goes too, after the wait again: a checkpoint a lagging page puts back, a session\'s map a peer writes, junk under a transfer\'s key, a key set to undefined', async () => {
     const [a] = await gameRoom(['A']);
     endGame(T0 + STEP, [a]);
     let T = run([a], T0 + 2 * STEP, T0 + 60_000, { step: STEP, until: () => keysOf(a).length === 1 });
-    for (const rec of [older, { key: sesKey, value: null }, { key: forgedXf(2, 1).key, value: 'junk' }]) {
+    const UNSET = Symbol('undefined');
+    const after = [older, { key: sesKey, value: null }, { key: forgedXf(2, 1).key, value: 'junk' }, { key: forgedXf(2, 2).key, value: UNSET }, { key: older.key, value: UNSET }];
+    for (const rec of after) {
       // (a second on: the page has seen the game with nothing left meanwhile)
       T = run([a], T + STEP, T + 1_000, { step: STEP });
       clockOf(a, T);
-      a.doc.transact(() => top(a).set(rec.key, rec.value ?? new Y.Map()), 'peer');
+      a.doc.transact(() => top(a).set(rec.key, rec.value === UNSET ? undefined : rec.value ?? new Y.Map()), 'peer');
+      expect(top(a).has(rec.key)).toBe(true);
       const wrote = T;
       T = run([a], wrote, wrote + 60_000, { step: STEP, until: () => keysOf(a).length === 1 });
       expect(keysOf(a), rec.key).toEqual([end.key]);
@@ -282,6 +285,47 @@ describe('an ended game is compacted (P6)', () => {
     expect(a.casino.computedFairOnlyEnded()).toEqual([]);
     expect(keysOf(a)).toEqual([later.key, end.key, fin.key, laterSes].sort());
     expect(top(a).get(fin.key)).toEqual(fin.value);
+  });
+
+  it('a transfer at the round the game ended at that comes after the compaction moves the holder and not the base: the end no longer says it all, and the transfer stays for the pages that come after', async () => {
+    const [a] = await gameRoom(['A']);
+    endGame(T0 + STEP, [a]);
+    let T = run([a], T0 + 2 * STEP, T0 + 60_000, { step: STEP, until: () => keysOf(a).length === 1 });
+    expect(resolved(a).holder).toBe(owner.pub);
+    const xf = xferOf(G, owner, buyer, 5, { asset: DEED });
+    clockOf(a, T + STEP);
+    a.doc.transact(() => {
+      top(a).set(xf.key, xf.value);
+      top(a).set(sesKey, new Y.Map());
+    }, 'peer');
+    T = run([a], T + STEP, T + 60_000, { step: STEP });
+    expect(resolved(a)).toMatchObject({ live: false, pending: false, holder: buyer.pub });
+    expect(resolved(a).base?.key).toBe(end.key);
+    expect(a.casino.computedFairOnlyEnded()).toEqual([]);
+    expect(a.casino.compactFairOnly(TABLE, G.inc)).toBe(0);
+    expect(keysOf(a)).toEqual([end.key, xf.key, sesKey].sort());
+    const c = await loadPage('C', 3);
+    clockOf(c, T + STEP);
+    sync(T + STEP, a, c);
+    run([a, c], T + STEP, T + 30_000, { step: STEP });
+    expect(c.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: false, holder: buyer.pub });
+    expect(keysOf(c)).toEqual([end.key, xf.key, sesKey].sort());
+  });
+
+  it('what is left of an ended game is found by one pass over the room\'s map, not one a look: the looks of the wait cost nothing more until a record changes', async () => {
+    const [a] = await gameRoom(['A']);
+    endGame(T0 + STEP, [a]);
+    run([a], T0 + 2 * STEP, T0 + 2 * STEP, { step: STEP });
+    expect(a.casino.computedFairOnlyEnded()).toMatchObject([{ left: 4 }]);
+    const passes = vi.spyOn(top(a), 'keys');
+    for (let i = 0; i < 50; i++) expect(a.casino.computedFairOnlyEnded()).toMatchObject([{ left: 4 }]);
+    expect(passes).toHaveBeenCalledTimes(0);
+    // (a record of the game changes: one pass more)
+    clockOf(a, T0 + 3 * STEP);
+    a.doc.transact(() => top(a).set(forgedXf(2, 1).key, 'junk'), 'peer');
+    passes.mockClear();
+    for (let i = 0; i < 50; i++) expect(a.casino.computedFairOnlyEnded()).toMatchObject([{ left: 5 }]);
+    expect(passes).toHaveBeenCalledTimes(1);
   });
 
   it('nothing is compacted while a check of the game waits: a flood of forged transfers is deleted first (P7), then the rest goes', async () => {
