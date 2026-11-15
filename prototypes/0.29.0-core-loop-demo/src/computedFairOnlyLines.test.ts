@@ -85,6 +85,34 @@ const texts = (v: ComputedFairOnlyView, game: 'craps' | 'roulette' = 'roulette',
   fairOnlyCardLines(v, game, names, riders).map((l) => l.text);
 
 describe('the words of a FAIR ONLY table (computedFairOnlyLines)', () => {
+  it("the house's checkpoint against this page's count: nothing while they agree or none was compared, amber when the page can't check, a flag for another close alone, and flags for the chips, the craps table handed on and the outcome", () => {
+    const cp = (patch: Partial<NonNullable<ComputedFairOnlyView['checkpoint']>> = {}) => ({ covered: 'same' as const, chips: 0, carry: false, counted: null, ...patch });
+    const rows = (v: ComputedFairOnlyView, game: 'craps' | 'roulette' = 'roulette') => fairOnlyCardLines(v, game, { holder: 'OLA', deed: null }, 0).filter((l) => l.text.includes('CHECK') || l.text.includes('🚩'));
+    expect(rows(view({ round: 4, o: 7 }))).toEqual([]);
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp() }))).toEqual([]);
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp({ covered: 'unseen', chips: 9, counted: 3 }) }))).toEqual([
+      { text: "THIS PAGE DIDN'T SEE ROUND 4 DECIDED · IT CAN'T CHECK THE HOUSE'S CHECKPOINT", color: '#F5C26B' },
+    ]);
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp({ covered: 'split', chips: 9, carry: true, counted: 3 }) }))).toEqual([
+      { text: "🚩 THE HOUSE'S CHECKPOINT NAMES ANOTHER CLOSE FOR ROUND 4 THAN THIS PAGE COUNTED", color: '#FF8A80' },
+    ]);
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp({ chips: 1 }) })).map((l) => l.text)).toEqual(["🚩 THE HOUSE'S CHECKPOINT DIFFERS FROM THIS PAGE BY 1 CHIP"]);
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp({ chips: 12, counted: 3 }) }))).toEqual([
+      { text: "🚩 THE HOUSE'S CHECKPOINT DIFFERS FROM THIS PAGE BY 12 CHIPS", color: '#FF8A80' },
+      { text: "🚩 THE HOUSE'S CHECKPOINT SIGNS ANOTHER OUTCOME FOR ROUND 4 · THIS PAGE COUNTED POCKET 3", color: '#FF8A80' },
+    ]);
+    // (pocket 0 is an outcome)
+    expect(rows(view({ round: 4, o: 7, checkpoint: cp({ counted: 0 }) })).map((l) => l.text)).toEqual(["🚩 THE HOUSE'S CHECKPOINT SIGNS ANOTHER OUTCOME FOR ROUND 4 · THIS PAGE COUNTED POCKET 0"]);
+    expect(rows(view({ game: 'craps', round: 9, o: [3, 4], checkpoint: cp({ carry: true, counted: [6, 1] }) }), 'craps').map((l) => l.text)).toEqual([
+      "🚩 THE HOUSE'S CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S",
+      "🚩 THE HOUSE'S CHECKPOINT SIGNS ANOTHER OUTCOME FOR ROLL 9 · THIS PAGE COUNTED DICE 6 AND 1",
+    ]);
+    // the checkpoint that ended a game is named as that
+    expect(rows(view({ ended: true, round: 4, o: 7, checkpoint: cp({ chips: 2 }) })).map((l) => l.text)).toEqual(["🚩 THE GAME'S LAST CHECKPOINT DIFFERS FROM THIS PAGE BY 2 CHIPS"]);
+    // nothing of a game whose rules this build does not know
+    expect(rows(view({ newer: true, round: 4, checkpoint: cp({ chips: 2 }) }))).toEqual([]);
+  });
+
   it('the plaque never reads Friendly: Fair while rounds close, the wait while they do not, the end, and the update for rules this build does not know', () => {
     expect(fairOnlyBadge(view())).toEqual({ text: '✔ FAIR ONLY · THE HOUSE AND EVERY BETTOR ADD A SEED', color: '#7CF5B0', fair: true });
     for (const waits of ['house', 'full'] as const) expect(fairOnlyBadge(view({ waits }))).toMatchObject({ text: FAIR_ONLY_SETTING, fair: true });

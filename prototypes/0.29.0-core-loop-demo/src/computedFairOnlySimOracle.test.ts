@@ -81,6 +81,8 @@ describe("the checkpoint oracle names a house's wrong checkpoint", () => {
     expect(hit, sim.label).toBe(true);
     const problems = sim.gameProblems();
     expect(problems.some((p) => /holding .* the honest pages folded/.test(p)), problems.join('\n')).toBe(true);
+    // (and a page that counted the round shows the flag on its ⚙ card: the outcome the house signs is not the one it counted)
+    expect(sim.pages.some((sp) => (sp.flipKinds.checkpoint ?? 0) > 0), sim.label).toBe(true);
   }, TIMEOUT);
 
   it("a close it did not reveal for: the house's own cross-check refuses to sign it, and no page counts from it", async () => {

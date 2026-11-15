@@ -2756,9 +2756,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       // (At craps the nets apart from the table the checkpoint hands on. A
       // split close — the checkpoint names another close for round u — shows
       // its own 🚩 below; the nets of two different decisions mean nothing.)
-      const chips = craps ? c.checkpointNets ?? 0 : c.checkpointDiff;
+      // (🔒 At a FAIR ONLY game the checkpoint is its house's: the game's own
+      // rows say how it stands, fairOnlyCheckpointLines.)
+      const chips = fairOnlyViewFor(itemId, game) ? 0 : craps ? c.checkpointNets ?? 0 : c.checkpointDiff;
       if (chips > 0 && c.covered !== 'split') out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${many(chips, 'CHIP', 'CHIPS')}`, color: '#FF8A80' });
-      if (craps && c.checkpointCarry && c.covered !== 'split') out.push({ text: "🚩 THE CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S", color: '#FF8A80' });
+      if (craps && c.checkpointCarry && c.covered !== 'split' && !fairOnlyViewFor(itemId, game)) out.push({ text: "🚩 THE CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S", color: '#FF8A80' });
       if (c.pinMismatch.length > 0) out.push({ text: "🚩 A FROZEN SLIP'S KEY ISN'T ITS PLAYER'S", color: '#FF8A80' });
       if (c.replaced !== undefined) {
         out.push({ text: `🚩 ${craps ? 'ROLL' : 'ROUND'} ${c.replaced} REPLACED AFTER ITS SEEDS WERE OUT`, color: '#FF8A80' });
