@@ -361,20 +361,29 @@ describe('the fox rig in a look', () => {
     expect(r.masterGroup.scale.toArray()).toEqual([1, 1, 1]);
   });
 
-  it('is drawn as first drawn while the clone vat has it, then eases to its own size', () => {
+  it('is drawn in the shape first drawn while the clone vat has it, then eases to its own size', () => {
     const r = rig();
     (r as unknown as { clock: { getDelta: () => number; getElapsedTime: () => number } }).clock = { getDelta: () => 0.02, getElapsedTime: () => 0 };
     const visual = (r as unknown as { visualGroup: THREE.Group }).visualGroup;
     const tall = SIZES[SIZES.findIndex((s) => s.id === 'tall')].scale;
-    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4 }));
+    const [left, right] = ears(r);
+    const ears0 = [left.scale.toArray(), right.scale.toArray(), left.rotation.z, right.rotation.z];
+    const big = EAR_STYLES.findIndex((s) => s.id === 'big');
+    const droopy = EAR_STYLES.findIndex((s) => s.id === 'droopy');
+    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4, ears: big }));
     expect(r.getDrawnSize()).toBe(tall);
-    r.holdStandardSize(true);
+    r.holdStandardShape(true);
     expect([r.getDrawnSize(), visual.scale.y]).toEqual([1, 1]);
+    // Its ears too, big as they are: the vat is measured for the first ones.
+    expect([left.scale.toArray(), right.scale.toArray(), left.rotation.z, right.rotation.z]).toEqual(ears0);
+    expect(r.getLookSize()).toBe(tall);
     // A look put on in the vat waits for it to let go.
-    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4, fur: 2 }));
+    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4, ears: droopy }));
     for (let i = 0; i < 20; i++) r.update();
     expect([r.getDrawnSize(), visual.scale.y]).toEqual([1, 1]);
-    r.holdStandardSize(false);
+    expect([left.rotation.z, right.rotation.z]).toEqual(ears0.slice(2));
+    r.holdStandardShape(false);
+    expect(right.rotation.z).toBeCloseTo(ears0[3] as number - EAR_STYLES[droopy].lean);
     r.update();
     expect(r.getDrawnSize()).toBeGreaterThan(1);
     expect(r.getDrawnSize()).toBeLessThan(tall);
@@ -402,9 +411,14 @@ describe('the wiring', () => {
 
   it('holds our fox at the vat\'s size while the vat has it, and squishes every fox by its drawn size', () => {
     const player = readFileSync(fileURLToPath(new URL('./player.ts', import.meta.url)), 'utf8');
-    expect(player).toContain('this.character.holdStandardSize(this.isVatBound());');
+    const hold = player.slice(player.indexOf('private _holdShapeInVat(): void {'), player.indexOf('private _updatePallor(): void {'));
+    expect(hold).toContain('if (vatClearOfDoorAt(distance, this.character.getLookSize())) this.shapeHeldTillClear = false;');
+    expect(hold).toContain('this.character.holdStandardShape(this.isVatBound() || this.shapeHeldTillClear);');
+    const update = player.slice(player.indexOf('update(deltaTime: number, inputManager: InputManager): void {'));
+    expect(update.slice(0, 800)).toContain('this._holdShapeInVat();');
     const spawn = player.slice(player.indexOf('public beginVatSpawn('), player.indexOf('public walkOutOfVat('));
-    expect(spawn).toContain('this.character.holdStandardSize(true);');
+    expect(spawn).toContain('this.shapeHeldTillClear = true;');
+    expect(spawn).toContain('this.character.holdStandardShape(true);');
     expect(world).toContain('foxSquish(at, facing, foxes.filter((f) => f.rig !== rig), size);');
     expect(world).toContain('squishOf(null, me.position, this.player.getDrawnFacing(), this.player.getDrawnSize());');
     expect(world).toContain('squishOf(avatar.rig, pos, avatar.rig.getFacing(), avatar.rig.getDrawnSize());');
