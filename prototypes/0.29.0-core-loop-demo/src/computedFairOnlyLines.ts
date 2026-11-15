@@ -74,7 +74,8 @@ export function fairOnlyCardLines(v: ComputedFairOnlyView, game: Game, names: Fa
       : v.waits === 'house' ? { text: FAIR_ONLY_WAITS, color: AMBER }
         : v.waits === 'full' ? { text: "THE TABLE WAITS FOR THE HOUSE'S CHECKPOINT · BETS STAY ON THE FELT", color: AMBER }
           : v.waiting === 'offline' ? { text: `THE HOUSE IS NOT HEARD · THIS ${roundOf(game)} GOES VOID UNLESS IT COMES BACK`, color: AMBER }
-            : { text: 'THE HOUSE IS ONLINE', color: GREEN };
+            : v.heard ? { text: 'THE HOUSE IS ONLINE', color: GREEN }
+              : { text: 'THE HOUSE IS NOT HEARD', color: AMBER };
   out.push(state);
   out.push({ text: `FAIRNESS · ${FAIR_ONLY_SETTING}`, color: DIM });
   if (game === 'craps' && riders > 0 && (v.waits === 'house' || v.waits === 'full')) {

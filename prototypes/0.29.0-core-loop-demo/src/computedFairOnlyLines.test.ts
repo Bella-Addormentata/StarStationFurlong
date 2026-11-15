@@ -77,8 +77,8 @@ function pin(p: Page, who: typeof owner, holder?: typeof owner): void {
 
 /** A view as the reader gives one of a game that plays, `patch` laid over it. */
 const view = (patch: Partial<ComputedFairOnlyView> = {}): ComputedFairOnlyView => ({
-  inc: G.inc, newer: false, checking: false, holder: owner.pub, holderPid: owner.pid, mine: false, ended: false, waits: null, waiting: null,
-  round: 0, o: null, moved: false, ...patch,
+  inc: G.inc, game: 'roulette', newer: false, checking: false, holder: owner.pub, holderPid: owner.pid, mine: false, ended: false, waits: null, waiting: null,
+  heard: true, round: 0, o: null, moved: false, ...patch,
 });
 const texts = (v: ComputedFairOnlyView, game: 'craps' | 'roulette' = 'roulette', riders = 0, names: { holder: string | null; deed: string | null } = { holder: 'OLA', deed: null }) =>
   fairOnlyCardLines(v, game, names, riders).map((l) => l.text);
@@ -116,6 +116,9 @@ describe('the words of a FAIR ONLY table (computedFairOnlyLines)', () => {
     expect(texts(view({ waits: 'ending' }))[1]).toBe('THIS GAME IS ENDING · NO NEW ROUND STARTS');
     expect(texts(view({ waiting: 'offline' }))[1]).toBe('THE HOUSE IS NOT HEARD · THIS ROUND GOES VOID UNLESS IT COMES BACK');
     expect(texts(view({ ended: true, waits: 'house' }))[1]).toBe('THIS GAME HAS ENDED');
+    // (rounds that close say nothing of the house: online only when the house the round depends on is heard)
+    expect(texts(view({ heard: false }))[1]).toBe('THE HOUSE IS NOT HEARD');
+    expect(texts(view({ heard: false, waiting: 'house' }))[1]).toBe('THE HOUSE IS NOT HEARD');
     // (a holder nobody can name yet gets no line of its own)
     expect(texts(view({ holder: null, holderPid: null }), 'roulette', 0, { holder: null, deed: null })).toEqual(['THE HOUSE IS ONLINE', `FAIRNESS · ${FAIR_ONLY_SETTING}`]);
   });
@@ -155,7 +158,7 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     const [a] = await gameRoom(['A'], []);
     expect(viewOf(a, T0)).toBeNull();
     const [b] = await gameRoom(['B']);
-    expect(viewOf(b, T0)).toMatchObject({ inc: G.inc, newer: false, ended: false });
+    expect(viewOf(b, T0)).toMatchObject({ inc: G.inc, game: 'roulette', newer: false, ended: false, heard: false });
     expect(b.table.computedHouseState(TABLE, clockOf(b, T0))).toBeNull();
   });
 
@@ -179,13 +182,13 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     const beat = new Beating(a, H);
     beating = [beat];
     T = run([a], T, T + 2_000, { step: STEP });
-    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: null });
+    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: null, heard: true });
     beat.muted = true;
     const last = beat.lastAt!;
     T = run([a], T, last + HOUSE_HEARD_MS - STEP, { step: STEP });
     expect(viewOf(a, T)!.waits).toBeNull();
     T = run([a], T, last + HOUSE_HEARD_MS + 2 * STEP, { step: STEP });
-    expect(viewOf(a, T)!.waits).toBe('house');
+    expect(viewOf(a, T)).toMatchObject({ waits: 'house', heard: false });
   });
 
   it('a round closed waits on its house: for its seed once the bettors\' are in, and offline once the house is not heard', async () => {
@@ -199,10 +202,10 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     let T = run([a, b], T0 + STEP, T0 + 120_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
     expect(keysIn(a, 'c', 1).length).toBe(1);
     T = run([a, b], T, T + 10_000, { step: STEP, until: () => viewOf(a, T0)!.waiting === 'house' });
-    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'house' });
+    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'house', heard: true });
     beat.muted = true;
     T = run([a, b], T, beat.lastAt! + HOUSE_HEARD_MS + 2 * STEP, { step: STEP });
-    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'offline' });
+    expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'offline', heard: false });
   });
 
   it('an end order makes the game ending, and its end makes it ended while the switch still names it', async () => {
@@ -228,6 +231,9 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     a.doc.transact(() => top(a).set(xf.key, xf.value));
     let T = run([a], T0 + STEP, T0 + 2 * STEP, { step: STEP });
     expect(viewOf(a, T)).toMatchObject({ holder: buyer.pub, holderPid: buyer.pid, deedPid: owner.pid });
+    // (no house of the buyer's has joined, and none is heard: whatever closes, the house does not read as online)
+    expect(viewOf(a, T)!.heard).toBe(false);
+    expect(fairOnlyCardLines(viewOf(a, T)!, 'roulette', { holder: 'B', deed: 'O' }, 0).map((l) => l.text)).not.toContain('THE HOUSE IS ONLINE');
     pin(a, buyer, buyer);
     T = run([a], T + STEP, T + 2 * STEP, { step: STEP });
     expect('deedPid' in viewOf(a, T)!).toBe(false);

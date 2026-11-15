@@ -5168,6 +5168,7 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
 /** 🔒 What the ⚙ card, the plaque and the felt show of the FAIR ONLY game
  *  table t plays (design §8.3 "Display at p/q", §8.4 "The paused felt"; PR
  *  6c-4c). Display only: nothing counts by it.
+ *  - `game`: the game its name is of (`p` roulette, `q` craps).
  *  - `newer`: the game's rules are a version this build does not know, and
  *    nothing of it counts here (UPDATE TO PLAY THIS TABLE).
  *  - `checking`: a check of the game's records waits, so the rest can change.
@@ -5185,6 +5186,11 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
  *  - `waiting`: what a round closed and undecided waits on, as at a house
  *    table (ComputedHouseState): 'house' once every bettor's seed is in,
  *    'offline' when its house is not heard (an abandon will void it).
+ *  - `heard`: the house the round at hand depends on is one this page can
+ *    tell and has heard lately: the one whose commitment the next close
+ *    would name, or the closed round's close names. Not the same as rounds
+ *    closing: a close goes ahead on a commitment whose house the page cannot
+ *    tell (a hand-over moved the game from its holder), to be voided.
  *  - `round`, `o`: the round the checkpoint the page counts from is at, and
  *    that round's outcome as the checkpoint signs it (a pocket, or the dice;
  *    null: it carries none).
@@ -5193,6 +5199,7 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
  *  Null at a table that plays no FAIR ONLY game. */
 export interface ComputedFairOnlyView {
   inc: string;
+  game: GameName;
   newer: boolean;
   checking: boolean;
   holder: string | null;
@@ -5202,6 +5209,7 @@ export interface ComputedFairOnlyView {
   ended: boolean;
   waits: 'ending' | 'house' | 'full' | null;
   waiting: 'house' | 'offline' | null;
+  heard: boolean;
   round: number;
   o: number | [number, number] | null;
   moved: boolean;
@@ -5216,6 +5224,7 @@ export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairO
   const deed = computedDeedHolder();
   const view: ComputedFairOnlyView = {
     inc,
+    game: gameOfInc(inc),
     newer: resolved?.newer ?? false,
     checking: resolved?.pending ?? false,
     holder,
@@ -5224,6 +5233,7 @@ export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairO
     ended: resolved !== null && resolved.base !== null && !resolved.live,
     waits: null,
     waiting: null,
+    heard: false,
     round: resolved?.base?.ck.u ?? 0,
     o: resolved?.base?.ck.o ?? null,
     moved: computedGameMovedOf(t)?.to === inc,
@@ -5235,12 +5245,13 @@ export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairO
   if (!at) return view;
   const { st, res } = at;
   const tip = res.tip;
+  const h = tip ? tip.closeRec.h : res.required ?? res.joins[0]?.rec.c;
+  const house = h === undefined ? undefined : computedCommitHouse(st.t, st.inc, h);
+  view.heard = house !== undefined && houseHeardFrom(house, now);
   if (tip) {
-    const h = tip.closeRec.h;
     if (h !== undefined) view.waiting = houseAway(st, h, now) ? 'offline' : tip.revealed.length === tip.present.length ? 'house' : null;
     return view;
   }
-  const h = res.required ?? res.joins[0]?.rec.c;
   if (resolved.fin !== null) view.waits = 'ending';
   else if (fairClosePaused(res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, false)) view.waits = 'full';
   else if (h === undefined || (houseAway(st, h, now) && !computedStandInHeard(st.t, st.inc, h, now))) view.waits = 'house';
