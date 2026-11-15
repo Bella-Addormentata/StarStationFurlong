@@ -164,6 +164,13 @@ export interface Resolution {
   fin: FinRec | null;
   /** S7: there is a base and it isn't an end. */
   live: boolean;
+  /** A checkpoint that would be the base were it good, by S3's whole order,
+   *  was not looked at for want of a place (MAX_CK_CANDIDATES): a reader that
+   *  looks in another order (another live session, S3's preference) can name
+   *  another base from the same records. Nothing waits on it (`pending` says
+   *  what waits); what must hold for every reader asks it (the compaction of
+   *  an ended game, PR 6c-4b-3b). */
+  unlooked: boolean;
   /** Doc keys of records that are whole (their shape is right and their id is
    *  the one in the key) and whose signature fails under the key they claim
    *  (`ck:` and `xf:` only): delete them. A record whose shape or id is wrong is
@@ -232,7 +239,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   }
   const name: FairOnlyName | null = readable.length === 0 ? null : { rv: readable[0].ck.rv, ok: readable[0].ck.ok, j: readable[0].ck.j, ts: readable[0].ck.ts };
   const none = (): Resolution => ({
-    t, inc, letter, newer, name, chain: [], holder: null, base: null, fin: null, live: false, invalid: [], pending: false,
+    t, inc, letter, newer, name, chain: [], holder: null, base: null, fin: null, live: false, unlooked: false, invalid: [], pending: false,
     houseAt: () => false,
     houseBy: () => null,
   });
@@ -368,10 +375,9 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   // an end, the sweeps, the id): one that ranks under the base changes nothing. Two kinds can: one put
   // off, and (while any is put off) one left unlooked at for want of a place. A checkpoint put off counts
   // as looked at, so it can hold a place of the cap, and its failing would free that place for the next.
-  if (waiting.length > 0) {
-    const beats = (cd: Counted): boolean => !base || byBest(cd, base) < 0;
-    if (waiting.some(beats) || plausible.slice(cut).some(beats)) pending = true;
-  }
+  const beats = (cd: Counted): boolean => !base || byBest(cd, base) < 0;
+  const unlooked = plausible.slice(cut).some(beats);
+  if (waiting.length > 0 && (waiting.some(beats) || unlooked)) pending = true;
 
   // S5: the end order that stands: one the game's holder now signed, or, of a game that has
   // ended, one a key that held it at the round it ended signed (the order its end carries).
@@ -432,7 +438,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   };
 
   return {
-    t, inc, letter, newer: false, name, chain, holder: chain[chain.length - 1].k, base, fin, live: base !== null && base.ck.e !== 1,
+    t, inc, letter, newer: false, name, chain, holder: chain[chain.length - 1].k, base, fin, live: base !== null && base.ck.e !== 1, unlooked,
     invalid: [...invalid].sort(), pending, houseAt, houseBy,
   };
 }
