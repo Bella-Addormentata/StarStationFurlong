@@ -275,3 +275,50 @@ export function noteDial(t: DialTally, target: string | undefined, status: strin
     t.linked = true;
   }
 }
+
+/**
+ * How long after a dial report the same report for the same computer counts
+ * as the node's second copy of it.
+ *
+ * The node tells every page of a room when a dial ends, on a stream it opens
+ * to each: a page that came to the room while another page's dial was running
+ * has no dial of its own to hear from. The page whose question began the dial
+ * is told on its own stream as well, so it hears the end twice, a moment
+ * apart. A dial cannot end the same way twice this fast: each takes seconds
+ * at the least.
+ */
+export const REPORT_ECHO_MS = 2_000;
+
+/** How many computers' last reports are remembered ({@link isReportEcho}). */
+export const REPORT_LOG_MAX = 256;
+
+/** The last report heard for each computer. */
+export type ReportLog = Map<string, { what: string; at: number }>;
+
+/**
+ * Whether this report is the node's second copy of the one just heard: the
+ * same computer, status and detail within {@link REPORT_ECHO_MS}. Notes the
+ * report either way, so the next one is measured against it. A report that
+ * names no computer or no status is never a copy, and is not noted.
+ */
+export function isReportEcho(
+  log: ReportLog,
+  target: string | undefined,
+  status: string | undefined,
+  detail: string | undefined,
+  nowMs: number,
+): boolean {
+  if (!target || !status) return false;
+  const what = `${status}\n${detail ?? ''}`;
+  const last = log.get(target);
+  // Re-set, so the most lately heard computers are the ones kept.
+  log.delete(target);
+  log.set(target, { what, at: nowMs });
+  if (log.size > REPORT_LOG_MAX) {
+    const oldest = log.keys().next().value;
+    if (oldest !== undefined) log.delete(oldest);
+  }
+  if (!last || last.what !== what) return false;
+  const since = nowMs - last.at;
+  return since >= 0 && since < REPORT_ECHO_MS;
+}

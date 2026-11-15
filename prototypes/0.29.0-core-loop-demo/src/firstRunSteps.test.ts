@@ -3,16 +3,20 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   ENTER_PATIENCE_MS,
+  REPORT_ECHO_MS,
+  REPORT_LOG_MAX,
   STEP_COLOR,
   TITLE_BACKGROUND,
   enterMode,
   enterNote,
   firstRunSteps,
+  isReportEcho,
   newDialTally,
   noFacts,
   noteDial,
   stepGlyph,
   type FirstRunFacts,
+  type ReportLog,
   type StepKey,
   type StepLine,
 } from './firstRunSteps';
@@ -237,6 +241,74 @@ describe('noteDial: one computer, one place', () => {
   });
 });
 
+describe('a dial that gave up is told to every page of the room', () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+
+  it('a page that began no dial of its own leaves "Dialing" when the node says the dial failed', () => {
+    // The page counted the computer from its session's record; another
+    // page's dial was running, so no report came on this page's own stream.
+    const t = newDialTally();
+    noteDial(t, A, 'dialing');
+    expect(line(firstRunSteps(up({ dialing: t.dialing.size, failed: t.failed.size, linked: t.linked }), ROOM), 'dial')?.text).toMatch(/^Dialing 1 computer\b/);
+    // The node's word to every page of the room.
+    noteDial(t, A, 'failed');
+    const dial = line(firstRunSteps(up({ dialing: t.dialing.size, failed: t.failed.size, linked: t.linked }), ROOM), 'dial');
+    expect(dial?.text).toContain('No answer from 1 computer yet');
+    expect(dial?.text).not.toContain('Dialing');
+  });
+
+  it('the page that began the dial hears its end twice, and the second copy is known for one', () => {
+    const log: ReportLog = new Map();
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', 1_000)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', 1_004)).toBe(true);
+    // A third copy inside the window is one too: it is measured from the second.
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', 1_010)).toBe(true);
+  });
+
+  it('a later dial that fails the same way is a new report', () => {
+    const log: ReportLog = new Map();
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', 0)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', REPORT_ECHO_MS)).toBe(false);
+    // No dial gives up twice inside the window: the fastest takes seconds.
+    expect(REPORT_ECHO_MS).toBeLessThanOrEqual(5_000);
+    expect(REPORT_ECHO_MS).toBeGreaterThanOrEqual(500);
+  });
+
+  it('another computer, another status or another detail is never a copy', () => {
+    const log: ReportLog = new Map();
+    expect(isReportEcho(log, A, 'failed', 'no route after 8 attempts', 0)).toBe(false);
+    expect(isReportEcho(log, B, 'failed', 'no route after 8 attempts', 1)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', 'no route; knocking through the chain', 2)).toBe(false);
+    expect(isReportEcho(log, A, 'dialing', undefined, 3)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', undefined, 4)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', undefined, 5)).toBe(true);
+  });
+
+  it('a report that names nobody, or no status, is never a copy and is not noted; a clock that ran back is not one either', () => {
+    const log: ReportLog = new Map();
+    expect(isReportEcho(log, undefined, 'failed', 'x', 0)).toBe(false);
+    expect(isReportEcho(log, undefined, 'failed', 'x', 1)).toBe(false);
+    expect(isReportEcho(log, '', 'failed', 'x', 2)).toBe(false);
+    expect(isReportEcho(log, A, undefined, 'x', 3)).toBe(false);
+    expect(log.size).toBe(0);
+    expect(isReportEcho(log, A, 'failed', 'x', 10_000)).toBe(false);
+    expect(isReportEcho(log, A, 'failed', 'x', 9_000)).toBe(false);
+  });
+
+  it('remembers the most lately heard computers, and no more of them than the limit', () => {
+    const log: ReportLog = new Map();
+    for (let i = 0; i < REPORT_LOG_MAX + 10; i++) isReportEcho(log, `node-${i}`, 'failed', 'x', i);
+    expect(log.size).toBe(REPORT_LOG_MAX);
+    expect(log.has('node-0')).toBe(false);
+    expect(log.has(`node-${REPORT_LOG_MAX + 9}`)).toBe(true);
+    // Heard again, a computer is among the latest once more.
+    isReportEcho(log, 'node-10', 'failed', 'x', 10_000);
+    for (let i = 0; i < 5; i++) isReportEcho(log, `late-${i}`, 'failed', 'x', 10_001 + i);
+    expect(log.has('node-10')).toBe(true);
+  });
+});
+
 describe('stepGlyph', () => {
   it('has a mark of its own for each state', () => {
     const glyphs = (['done', 'busy', 'wait', 'off'] as const).map(stepGlyph);
@@ -344,6 +416,24 @@ describe('main.ts: the title is wired to the search', () => {
     const handler = between('function noteBridgeEnvelope(', '\n}\n');
     expect(handler).toContain('if (env.kind !== "bridge" || typeof env.payload !== "string") return;');
     expect(handler).toContain('noteDial(firstRunDial, status.target, status.status);');
+  });
+
+  it('a failed dial counts for the title whichever copy brings it, and its second copy is not said again on the phone', () => {
+    const handler = main.slice(main.indexOf('function noteBridgeEnvelope('), main.indexOf('/** 🛰️ Where the welcome mark is kept'));
+    const tally = handler.indexOf('noteDial(firstRunDial, status.target, status.status);');
+    const failed = handler.indexOf('} else if (status.status === "failed") {');
+    const echo = handler.indexOf('isReportEcho(', failed);
+    const said = handler.indexOf('logToPhoneSystem(', failed);
+    expect(tally).toBeGreaterThan(-1);
+    // The tally is kept before any copy is told apart: both copies count the same.
+    expect(tally).toBeLessThan(failed);
+    expect(echo).toBeGreaterThan(failed);
+    expect(said).toBeGreaterThan(echo);
+    // Only a failure is told apart: a `connected` is acted on every time it
+    // comes (it marks the link and asks the room again).
+    const connected = handler.slice(handler.indexOf('} else if (status.status === "connected") {'), failed);
+    expect(connected).toContain('yjsSync?.resync();');
+    expect(connected).not.toContain('isReportEcho(');
   });
 
   it('the title reads only a node that answers now, and is told of one that stopped', () => {

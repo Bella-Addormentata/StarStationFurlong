@@ -3796,7 +3796,17 @@ async fn dial_peer_with_retry(
 }
 
 /// Whether a dial's status goes to EVERY page of the room, whichever page's
-/// envelope began the dial: `connected` does. A page asks the room for its
+/// envelope began the dial: its end does, `connected` and `failed`; `dialing`
+/// stays with the page that began it.
+///
+/// `failed`: a computer is dialed once for all the pages of a room (the
+/// single-flight claim, `hub.dialing`), so a page that came to the room while
+/// another page's dial was running begins none of its own and has no stream
+/// that dial reports on. Told nothing, it went on showing the computer as
+/// being dialed after the dial had given up (the first-run title's "Dialing 1
+/// computer…").
+///
+/// `connected`: a page asks the room for its
 /// state when it hears `connected` (it sends SyncStep1 again), and that
 /// question is also what tells the dialed node which room the new connection
 /// is for: until a frame names the room, the dialed node says nothing on it,
@@ -3813,7 +3823,7 @@ async fn dial_peer_with_retry(
 /// 2026-11-14), the two nodes connected, and 16 s later the connection was
 /// dropped as silent with the page never having asked.
 fn dial_status_is_for_every_page(status: &str) -> bool {
-    status == "connected"
+    status == "connected" || status == "failed"
 }
 
 /// Report a dial's status to the browser: to the specific `send` stream when the
@@ -3938,15 +3948,36 @@ mod dial_status_tests {
         assert!(!named.first_naming_of_a_linked(computer(0), true));
     }
 
-    /// Only a dial that landed is told to every page of the room: the
-    /// statuses of a dial still going, or given up, stay with the page whose
-    /// envelope began it. The real binary's side is tests/dial_landed.rs.
+    /// A dial's end is told to every page of the room, landed or given up:
+    /// a page that began no dial of its own (another page's was running)
+    /// hears it nowhere else. A dial still going stays with the page whose
+    /// envelope began it. The real binary's side, for both ends, is
+    /// tests/dial_landed.rs.
     #[test]
-    fn only_a_landed_dial_is_told_to_every_page() {
+    fn a_dials_end_is_told_to_every_page() {
         assert!(dial_status_is_for_every_page("connected"));
-        for other in ["dialing", "failed", "", "Connected", "connected ", "linked"] {
+        assert!(dial_status_is_for_every_page("failed"));
+        for other in ["dialing", "", "Connected", "connected ", "Failed", "failed ", "linked"] {
             assert!(!dial_status_is_for_every_page(other), "{other:?}");
         }
+    }
+
+    /// Every `failed` the dial writes goes through `report_dial_status`,
+    /// which is where the rule above is asked: a `failed` written straight
+    /// to one page's stream would reach that page alone.
+    #[test]
+    fn every_failed_dial_is_reported_through_the_one_reporter() {
+        let src = include_str!("main.rs");
+        let reporter = src.find("async fn report_dial_status(").expect("the reporter");
+        let body_end = reporter + src[reporter..].find("\n}\n").expect("the reporter's end");
+        let body = &src[reporter..body_end];
+        assert!(body.contains("if dial_status_is_for_every_page(status) {"), "the reporter asks the rule");
+        assert!(body.contains("broadcast_bridge_status(hub, room_id, target, status, detail).await;"), "and broadcasts");
+        // Outside the reporter and the once-per-stream `connected`
+        // (`tell_already_linked`), nothing writes a status to a page's stream.
+        // (The words are joined here so that this test is not a third.)
+        let direct = src.matches(&["write_bridge_status(", "&mut"].concat()).count();
+        assert_eq!(direct, 2, "the reporter's own write and the already-linked answer");
     }
 }
 

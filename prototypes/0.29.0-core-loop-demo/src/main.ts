@@ -504,11 +504,12 @@ import {
   enterMode,
   enterNote,
   firstRunSteps,
+  isReportEcho,
   newDialTally,
   noteDial,
   stepGlyph,
 } from "./firstRunSteps";
-import type { FirstRunFacts } from "./firstRunSteps";
+import type { FirstRunFacts, ReportLog } from "./firstRunSteps";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -883,6 +884,10 @@ let welcomeDialFailureSaid = false;
  *  silent; and the title's own repaint, set only while the title shows the
  *  steps. */
 const firstRunDial = newDialTally();
+/** The last dial report heard for each computer: the node says a dial's end
+ *  to the page that began it twice (firstRunSteps.ts `isReportEcho`), and the
+ *  second copy of a failure is not said again on the phone. */
+const dialReportLog: ReportLog = new Map();
 let firstRunNodeSilent = false;
 let firstRunRepaint: (() => void) | null = null;
 
@@ -957,6 +962,20 @@ function noteBridgeEnvelope(env: { kind?: string; payload?: string; room?: strin
         `FAILED → ${shortTarget} (see node log)`,
         "#ff1744",
       );
+      // The node tells every page of the room that a dial gave up, and the
+      // page that began it on its own stream too: the second copy changes
+      // nothing above and is not said again below.
+      if (
+        isReportEcho(
+          dialReportLog,
+          status.target,
+          status.status,
+          status.detail,
+          Date.now(),
+        )
+      ) {
+        return;
+      }
       // 🛰️ While this install waits at the welcome room its node dials
       // again at every ask (seekWelcome): the advice is said for
       // the first failure, and the seek's own line says the rest. The
