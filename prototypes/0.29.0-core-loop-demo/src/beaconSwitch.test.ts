@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   BEACON_AT_ITS_TURN, BEACON_BUTTON_ID, BEACON_NO_SWITCH, BEACON_NO_WALLET, BEACON_NOT_CONFIRMED, BEACON_NOT_LOOKED, BEACON_ON_CHAIN, BEACON_SENT, BEACON_TIMEOUT_MS,
-  BEACON_UNKNOWN_NETWORK, beaconChiaOffLitNote, beaconChiaOffNote, beaconDamagedNote, beaconDefaultOutNote, beaconHeldLitNote, beaconHeldOutNote, beaconLitNote,
+  BEACON_UNKNOWN_NETWORK, beaconChiaOffLitNote, beaconChiaOffNote, beaconDamagedNote, beaconDefaultLitNote, beaconDefaultOutNote, beaconHeldLitNote, beaconHeldOutNote,
+  beaconLitNote,
   beaconOutNote, beaconRow, beaconStands, beaconState, beaconTarget, beaconTurnOf, beaconWaitsFor, beaconWarning, turnBeacon, type BeaconUi,
 } from './beaconSwitch';
 import { LANE_NO_NODE_COLOUR, LANE_OFF_COLOUR, LANE_ON_COLOUR, LANE_UNKNOWN_COLOUR } from './chiaLane';
@@ -30,6 +31,8 @@ const PUTTING_OUT: typeof LIGHT = { act: 'confirm', label: 'PUTTING OUT…', dan
 const OUT_DEFAULT: ChiaBeacon = { on: false, chosen: false };
 const OUT: ChiaBeacon = { on: false, chosen: true };
 const LIT: ChiaBeacon = { on: true, chosen: true };
+/** Lit by the network's default: the player never turned the switch. */
+const LIT_DEFAULT: ChiaBeacon = { on: true, chosen: false };
 const DAMAGED: ChiaBeacon = { on: false, chosen: false, damaged: true };
 const LOOKED: ChiaBeaconStatus = { era: 2900, reachable: true, serves_welcome: true, sent: false, confirmed: false };
 
@@ -59,8 +62,9 @@ describe.each([TESTNET11, MAINNET])('beaconRow on $name', (net) => {
   const fp = (chia_beacon: ChiaBeacon, over: Partial<LocalFingerprint> = {}): LocalFingerprint => ({ ...BASE, chia_net: net, chia_beacon, ...over });
   const out = { value: 'OUT', colour: LANE_UNKNOWN_COLOUR, warning: null, error: null };
 
-  it('is out on every network until the player lights it: LIGHT BEACON, then CONFIRM with what a beacon shows, then LIGHTING', () => {
-    // D7: opt-in, and the same on a test network as where the coins are real.
+  it('where the node says it is out: LIGHT BEACON, then CONFIRM with what a beacon shows, then LIGHTING', () => {
+    // The node decides the default (out where the coins are real, D7; lit on
+    // a test network); the row reads the same for whatever it says.
     expect(beaconRow(fp(OUT_DEFAULT), IDLE)).toEqual({ ...out, note: beaconDefaultOutNote(net), button: LIGHT });
     expect(beaconRow(fp(OUT), IDLE)).toEqual({ ...out, note: beaconOutNote(net), button: LIGHT });
     expect(beaconRow(fp(DAMAGED), IDLE)).toEqual({ ...out, note: beaconDamagedNote(net), button: LIGHT });
@@ -98,6 +102,21 @@ describe.each([TESTNET11, MAINNET])('beaconRow on $name', (net) => {
     expect(beaconRow(fp(LIT), { armed: false, turning: 'off', error: null }).button).toEqual(PUTTING_OUT);
   });
 
+  it('says so where it is lit by the network\'s default, with what the beacon shows, and offers PUT OUT', () => {
+    // Nobody tapped CONFIRM here, so the note carries what the warning would have said.
+    const lit = (status?: ChiaBeaconStatus, over: Partial<LocalFingerprint> = {}) => beaconRow(fp(status ? { ...LIT_DEFAULT, status } : LIT_DEFAULT, over), IDLE);
+    expect(lit()).toEqual({ value: 'WAITING', colour: LANE_OFF_COLOUR, note: beaconDefaultLitNote(net, BEACON_NOT_LOOKED), warning: null, error: null, button: PUT_OUT });
+    expect(lit(undefined, { chia_wallet: { state: 'ready' } })).toMatchObject({ value: 'WAITING', note: beaconDefaultLitNote(net, BEACON_NO_WALLET), button: PUT_OUT });
+    const unreachable = { ...LOOKED, reachable: false };
+    expect(lit(unreachable)).toMatchObject({ value: 'WAITING', note: beaconDefaultLitNote(net, beaconWaitsFor(unreachable)), button: PUT_OUT });
+    expect(lit({ ...LOOKED, sent: true, confirmed: true })).toMatchObject({ value: 'ON THE CHAIN', colour: LANE_ON_COLOUR, note: beaconDefaultLitNote(net, BEACON_ON_CHAIN), button: PUT_OUT });
+    // PUT OUT takes no CONFIRM, armed or not, and a turn in flight says so.
+    expect(beaconRow(fp(LIT_DEFAULT), { ...IDLE, armed: true })).toMatchObject({ warning: null, button: PUT_OUT });
+    expect(beaconRow(fp(LIT_DEFAULT), { armed: false, turning: 'off', error: null }).button).toEqual(PUTTING_OUT);
+    // Once the player lights it themselves the note is the plain one.
+    expect(beaconRow(fp(LIT), IDLE).note).toBe(beaconLitNote(net, BEACON_NOT_LOOKED));
+  });
+
   it("offers no button where the node's environment decides", () => {
     // SSF_CHIA_BEACON=1 holds it lit: the switch cannot put it out.
     const heldLit = beaconRow(fp({ on: true, chosen: false, held: true, status: { ...LOOKED, sent: true, confirmed: true } }), IDLE);
@@ -113,7 +132,9 @@ describe.each([TESTNET11, MAINNET])('beaconRow on $name', (net) => {
 
   it('takes a put-out, and offers no light, while Chia is off on this computer', () => {
     const chia_lane = { off: true, source: 'setting', setting: 'off' } as const;
-    expect(beaconRow(fp(LIT, { chia_lane }), IDLE)).toEqual({ value: 'WAITING', colour: LANE_OFF_COLOUR, note: beaconChiaOffLitNote(net), warning: null, error: null, button: PUT_OUT });
+    for (const lit of [LIT, LIT_DEFAULT]) {
+      expect(beaconRow(fp(lit, { chia_lane }), IDLE)).toEqual({ value: 'WAITING', colour: LANE_OFF_COLOUR, note: beaconChiaOffLitNote(net), warning: null, error: null, button: PUT_OUT });
+    }
     // Held lit by the environment, the switch has nothing to offer.
     expect(beaconRow(fp({ ...LIT, held: true }, { chia_lane }), IDLE).button).toBeNull();
     for (const saved of [OUT_DEFAULT, OUT, DAMAGED]) {
@@ -161,14 +182,17 @@ describe('the beacon texts, whole', () => {
   });
 
   it('reads so where it is out, and where it is lit', () => {
-    expect(beaconDefaultOutNote(TESTNET11)).toBe(
-      "The beacon is out for testnet11, where it starts out. Lit, your node becomes a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node.",
+    expect(beaconDefaultOutNote(MAINNET)).toBe(
+      "The beacon is out for Chia mainnet, where it starts out. Lit, your node becomes a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node.",
     );
     expect(beaconOutNote(MAINNET)).toBe(
       'The beacon is out for Chia mainnet: your node starts no new beacon there. One it wrote before stays on the chain, and one already sent when it was put out may still land there; readers stop finding it once its edition and the next have passed.',
     );
     expect(beaconLitNote(TESTNET11, BEACON_ON_CHAIN)).toBe(
       "The beacon is lit for testnet11. Your node is a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node. This edition's beacon is on the chain.",
+    );
+    expect(beaconDefaultLitNote(TESTNET11, BEACON_SENT)).toBe(
+      "The beacon is lit for testnet11, where it starts lit. Your node is a public door into the welcome room: when a new player's game has nobody else to load the welcome room from, it dials your node. Once an edition (about a week), while it can be reached from outside and serves the welcome room, your node writes its node id in the clear, where anyone can read it and look up its network addresses from it. PUT OUT stops new beacons; what is written stays on the chain. This edition's beacon is sent, and your node waits to read it back from the chain.",
     );
     expect(beaconHeldOutNote(MAINNET)).toBe("SSF_CHIA_BEACON in your node's environment holds the beacon out for Chia mainnet, and the switch here cannot light it.");
   });
@@ -180,7 +204,7 @@ describe('the beacon texts, whole', () => {
       beaconWaitsFor({ reachable: false, serves_welcome: false }),
       ...[TESTNET11, MAINNET, null].flatMap((net) => [
         beaconWarning(net), beaconDefaultOutNote(net), beaconOutNote(net), beaconDamagedNote(net), beaconHeldOutNote(net), beaconLitNote(net, ''), beaconHeldLitNote(net, ''),
-        beaconChiaOffLitNote(net), beaconChiaOffNote(net),
+        beaconDefaultLitNote(net, ''), beaconChiaOffLitNote(net), beaconChiaOffNote(net),
       ]),
     ];
     // The game's own name aside ("update Star Station").
@@ -196,6 +220,7 @@ describe('the beacon texts, whole', () => {
     }
     // A beacon already lit there can still be put out: an off names no network.
     expect(beaconRow({ ...unknown, chia_beacon: LIT }, IDLE).button).toEqual(PUT_OUT);
+    expect(beaconRow({ ...unknown, chia_beacon: LIT_DEFAULT }, IDLE)).toMatchObject({ note: beaconDefaultLitNote(null, BEACON_NOT_LOOKED), button: PUT_OUT });
   });
 });
 

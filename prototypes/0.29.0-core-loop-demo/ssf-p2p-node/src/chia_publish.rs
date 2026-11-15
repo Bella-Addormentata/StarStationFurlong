@@ -3958,7 +3958,7 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 ///
 /// `None` off a test network: there [`money_memo_line`] says once what the
 /// node writes, the beacon is the player's to light (chia_beacon_switch.rs,
-/// off on every network until then), and the listing and the knocks are
+/// off there until then), and the listing and the knocks are
 /// the player's too (LIST ME, `chia_listing`, §4.5 (6), off there until
 /// turned on). It reads no environment.
 pub fn burners_line(net: crate::chia_network::ChiaNet) -> Option<String> {
@@ -6280,12 +6280,13 @@ pub async fn heartbeat_loop(
             }
         );
     }
-    // #231 P6b/D7: the beacon role, when opted into — its own payer, its own
+    // #231 P6b/D7: the beacon role, where it is lit — its own payer, its own
     // mark. Its key B is the key and payer the beacon wallet had before
     // burner keys, so a mark and the lease's records from then carry over.
     // B is the keys' own ([`PublisherKeys::beacon`]), made when the
     // publisher starts. Whether it is lit is the hub's switch
-    // (chia_beacon_switch.rs: the player's, or `SSF_CHIA_BEACON=1`), asked
+    // (chia_beacon_switch.rs: the player's, the network's default where it
+    // was never turned, or `SSF_CHIA_BEACON=1`), asked
     // at each tick below, so the mark is read here whatever it says now: a
     // beacon lit later in the run is judged by the mark of its era.
     let beacon_mark_file = crate::chia_network::net().path(BEACON_MARK_FILE);
