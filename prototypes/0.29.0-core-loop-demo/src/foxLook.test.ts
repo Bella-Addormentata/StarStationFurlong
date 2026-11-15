@@ -11,11 +11,9 @@ import {
   FUR_COLOURS,
   SIZES,
   cleanLook,
-  loadSavedLook,
   lookParts,
   randomLook,
   sameLook,
-  saveLook,
   type FoxLook,
 } from './foxLook';
 import { OUTFITS, getOutfitById, tintFur } from './outfits';
@@ -42,7 +40,7 @@ function fakeCanvas() {
 }
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { VoxelCharacter } = await import('./voxelCharacter');
+const { VoxelCharacter, shadeOf } = await import('./voxelCharacter');
 
 const LISTS = { fur: FUR_COLOURS, cream: CREAM_COLOURS, eyes: EYE_SHAPES, eyeColour: EYE_COLOURS, ears: EAR_STYLES, size: SIZES } as const;
 
@@ -99,18 +97,27 @@ describe('a look', () => {
       vi.stubGlobal('window', { location: { search: '' } });
     });
 
-    it('comes back as it was saved, and as none when nothing was', () => {
+    /** foxLook.ts as a page that just loaded has it: nothing kept yet. */
+    const freshPage = async () => {
+      vi.resetModules();
+      return import('./foxLook');
+    };
+
+    it('comes back as it was saved, and as none when nothing was', async () => {
       const store = new Map<string, string>();
       vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
-      expect(loadSavedLook()).toBeNull();
-      saveLook({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
+      const page = await freshPage();
+      expect(page.loadSavedLook()).toBeNull();
+      page.saveLook({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
       expect(store.get('ssf-fox-look')).toBe(JSON.stringify({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 }));
-      expect(loadSavedLook()).toEqual({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
+      expect(page.loadSavedLook()).toEqual({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
+      // The next page load reads it from the computer; a broken value is none.
+      expect((await freshPage()).loadSavedLook()).toEqual({ fur: 4, cream: 2, eyes: 1, eyeColour: 3, ears: 4, size: 1 });
       store.set('ssf-fox-look', '{not json');
-      expect(loadSavedLook()).toBeNull();
+      expect((await freshPage()).loadSavedLook()).toBeNull();
     });
 
-    it('is none, and saving does nothing, where the browser keeps nothing', () => {
+    it('is none until chosen, and then this page\'s choice, where the browser keeps nothing', async () => {
       vi.stubGlobal('localStorage', {
         getItem: () => {
           throw new Error('denied');
@@ -119,9 +126,38 @@ describe('a look', () => {
           throw new Error('denied');
         },
       });
-      expect(loadSavedLook()).toBeNull();
-      expect(() => saveLook(DEFAULT_LOOK)).not.toThrow();
+      const page = await freshPage();
+      expect(page.loadSavedLook()).toBeNull();
+      expect(() => page.saveLook({ ...DEFAULT_LOOK, fur: 7, ears: 2 })).not.toThrow();
+      // Still there to draw and to write into the players entry.
+      expect(page.loadSavedLook()).toEqual({ ...DEFAULT_LOOK, fur: 7, ears: 2 });
     });
+
+    it('is this page\'s latest choice even where an older one is on the computer and the save fails', async () => {
+      const store = new Map<string, string>([['ssf-fox-look', JSON.stringify({ ...DEFAULT_LOOK, fur: 2 })]]);
+      vi.stubGlobal('localStorage', {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: () => {
+          throw new Error('full');
+        },
+      });
+      const page = await freshPage();
+      expect(page.loadSavedLook()).toEqual({ ...DEFAULT_LOOK, fur: 2 });
+      page.saveLook({ ...DEFAULT_LOOK, fur: 9 });
+      expect(page.loadSavedLook()).toEqual({ ...DEFAULT_LOOK, fur: 9 });
+    });
+  });
+});
+
+describe('a shade of a colour', () => {
+  it('scales each channel as the shade is against its base', () => {
+    expect(shadeOf(0x808080, 0xdfcfae, 0xdfcfae)).toBe(0x808080);
+    expect(shadeOf(0xf2e6cd, 0xdfcfae, 0xf2e6cd)).toBe(0xdfcfae);
+    expect(shadeOf(0x804020, 0x402010, 0x804020)).toBe(0x402010);
+    expect(shadeOf(0x646464, 0x323232, 0x646464)).toBe(0x323232);
+    // Never past full, and a zero base leaves the channel as it is.
+    expect(shadeOf(0xffffff, 0xffffff, 0x808080)).toBe(0xffffff);
+    expect(shadeOf(0x123456, 0x101010, 0x000000)).toBe(0x123456);
   });
 });
 
@@ -170,6 +206,18 @@ describe('the fox rig in a look', () => {
     const box = new THREE.Box3().setFromObject(r.masterGroup);
     return box.max.y - box.min.y;
   };
+  /** Every colour each palette role is drawn in, each once, in order. */
+  const allColours = (r: InstanceType<typeof VoxelCharacter>) => {
+    const out: Record<string, number[]> = {};
+    r.masterGroup.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      const role = mesh.userData?.paletteRole as string | undefined;
+      if (!mesh.isMesh || !role) return;
+      const hex = (mesh.material as THREE.MeshToonMaterial).color.getHex();
+      if (!(out[role] ??= []).includes(hex)) out[role].push(hex);
+    });
+    return out;
+  };
   const SNOW_SMOKE = { ...DEFAULT_LOOK, fur: 1, cream: 4 };
 
   it('takes the look\'s fur, markings and inner ears, and keeps its paws', () => {
@@ -183,6 +231,25 @@ describe('the fox rig in a look', () => {
     expect(after.accent).toBe(before.accent);
     r.setLook(null);
     expect(colours(r)).toEqual(before);
+  });
+
+  it('in the default look is every material as first drawn, both ear-cavity shades too', () => {
+    const r = rig();
+    const before = allColours(r);
+    expect(before.furDeep.length, 'the ear cavity is drawn in two shades').toBe(2);
+    r.setLook(lookParts(DEFAULT_LOOK));
+    expect(allColours(r)).toEqual(before);
+    // Only the fur changed: the cavity keeps both its shades.
+    r.setLook(lookParts({ ...DEFAULT_LOOK, fur: 6 }));
+    expect(allColours(r).furDeep).toEqual(before.furDeep);
+  });
+
+  it('keeps the ear cavity\'s two shades, each in its place against the look\'s inner ear', () => {
+    const r = rig();
+    const [shade, shadeLo] = allColours(r).furDeep;
+    r.setLook(lookParts(SNOW_SMOKE));
+    const inner = CREAM_COLOURS[4].innerEar;
+    expect(allColours(r).furDeep).toEqual([inner, shadeOf(inner, shadeLo, shade)]);
   });
 
   it('worn with an outfit keeps its own colours, and the outfit its paws and accessory, either way round', () => {

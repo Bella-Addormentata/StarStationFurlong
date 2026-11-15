@@ -181,8 +181,15 @@ export function lookParts(look: FoxLook): FoxLookParts {
 
 const LOOK_STORAGE_KEY = 'ssf-fox-look';
 
-/** The look saved on this computer, or null when none was ever chosen. */
+/** The look this page last saved, kept here too: a browser that keeps
+ *  nothing (privacy mode, a full or denied store) still has this page's
+ *  choice to draw and to write into the players entry. */
+let lookThisPage: FoxLook | null = null;
+
+/** The look this page saved, else the one saved on this computer, or null
+ *  when none was ever chosen. */
 export function loadSavedLook(): FoxLook | null {
+  if (lookThisPage) return { ...lookThisPage };
   try {
     const raw = localStorage.getItem(LOOK_STORAGE_KEY);
     return raw ? cleanLook(JSON.parse(raw)) : null;
@@ -192,9 +199,10 @@ export function loadSavedLook(): FoxLook | null {
 }
 
 export function saveLook(look: FoxLook): void {
+  lookThisPage = cleanLook(look);
   try {
-    localStorage.setItem(LOOK_STORAGE_KEY, JSON.stringify(cleanLook(look)));
+    localStorage.setItem(LOOK_STORAGE_KEY, JSON.stringify(lookThisPage));
   } catch {
-    /* privacy mode: the look holds for this session only */
+    /* privacy mode: the look holds for this page only */
   }
 }
