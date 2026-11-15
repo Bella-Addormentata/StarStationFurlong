@@ -66,8 +66,10 @@ to the welcome room that another player hands a newcomer (`?seed=`) is used as
 given, with the bundled pass's routes beside its own, so the newcomer's computer
 also dials the node that link names, and on arrival it is that pass, with both
 sets of routes, that MY ROOMS keeps for the room. It no
-longer falls back to a module of its own, so today a new player's first room
-depends on that one node: the
+longer falls back to a module of its own, so a new player's first room depends
+on a computer that holds the room being in reach: the one the bundled pass
+names and, on a test network, a holder found by its beacon (that path has not
+been run on two real computers yet). The
 [External Infrastructure Register](docs/TDD/ExternalInfrastructureRegister.md)
 §2 lists it with the work that ends it. Once reached, the station stays one tap
 away in SpacePhone → ACCESS → DEFAULT STATION.
