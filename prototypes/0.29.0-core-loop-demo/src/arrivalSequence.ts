@@ -389,18 +389,66 @@ function setZoom(cam: THREE.Camera, zoom: number): void {
   }
 }
 
+/** How long after a press that skipped the arrival its click may still
+ *  come, ms. A press held longer lets its click through. */
+export const PAIRED_CLICK_MS = 1000;
+
+/** A press that skips the arrival ends it before the press lifts, and the
+ *  click it makes then lands on the world, whose window click handlers the
+ *  skip has just armed (a device, or a walk). So the first click after it is
+ *  the skip's own and is swallowed, on the window before anything else sees
+ *  it. A fresh press, or `ms` with no click, ends the swallow, so the next
+ *  real click goes through. Returns the way to end it early. */
+export function swallowPairedClick(
+  target: EventTarget,
+  ms = PAIRED_CLICK_MS,
+  setTimer: (fn: () => void, ms: number) => unknown = (fn, t) => setTimeout(fn, t),
+  clearTimer: (h: unknown) => void = (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+): () => void {
+  // An options object, not a bare `true`: Node's EventTarget reads only
+  // `options.capture` when removing, so a bare `true` would never come off.
+  const capture = { capture: true };
+  let done = false;
+  const onClick = (e: Event) => {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    end();
+  };
+  const end = () => {
+    if (done) return;
+    done = true;
+    target.removeEventListener('click', onClick, capture);
+    target.removeEventListener('pointerdown', end, capture);
+    clearTimer(timer);
+  };
+  target.addEventListener('click', onClick, capture);
+  target.addEventListener('pointerdown', end, capture);
+  const timer = setTimer(end, ms);
+  return end;
+}
+
+/** What a screen reader hears when the skip line shows: the line itself, after
+ *  a word that an arrival is playing (the HUD is hidden and every key is the
+ *  skip's, so nothing else says so). */
+export const SKIP_LINE = 'Click or press any key to skip';
+export const SKIP_SPOKEN_PREFIX = 'The arrival is playing. ';
+
 /** The overlay in the page: a black layer the arrival fades, a quiet line
- *  saying how to skip, and a surface that takes every click and tap (the
- *  keys are caught on the window by `onSkip`'s listener). */
+ *  saying how to skip (a polite status, so screen readers say it too), and a
+ *  surface that takes every click and tap (the keys are caught on the window
+ *  by `onSkip`'s listener). */
 export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
   const root = document.createElement('div');
   root.id = 'arrival-screen';
-  root.setAttribute('aria-hidden', 'true');
   root.style.cssText = 'position:fixed; inset:0; z-index:9000; pointer-events:auto; cursor:default; background:transparent;';
   const black = document.createElement('div');
+  black.setAttribute('aria-hidden', 'true');
   black.style.cssText = 'position:absolute; inset:0; background:#000; opacity:0; pointer-events:none;';
+  // The words go in when the line first shows, so the status is announced
+  // then rather than missed while the line was still invisible.
   const hint = document.createElement('div');
-  hint.textContent = 'Click or press any key to skip';
+  hint.setAttribute('role', 'status');
+  hint.setAttribute('aria-live', 'polite');
   hint.style.cssText =
     'position:absolute; left:0; right:0; bottom:28px; text-align:center; pointer-events:none; ' +
     'font:500 12px/1.4 system-ui, sans-serif; letter-spacing:0.5px; color:rgba(220,230,255,0.55); ' +
@@ -410,6 +458,7 @@ export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
   const onPointer = (e: Event) => {
     e.preventDefault();
     e.stopPropagation();
+    swallowPairedClick(window);
     onSkip();
   };
   const onKey = (e: KeyboardEvent) => {
@@ -431,6 +480,13 @@ export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
     setHint(visible) {
       if (visible === hinted) return;
       hinted = visible;
+      if (visible && !hint.hasChildNodes()) {
+        const spoken = document.createElement('span');
+        spoken.textContent = SKIP_SPOKEN_PREFIX;
+        spoken.style.cssText =
+          'position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap;';
+        hint.append(spoken, SKIP_LINE);
+      }
       hint.style.opacity = visible ? '1' : '0';
     },
     remove() {

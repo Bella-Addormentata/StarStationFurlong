@@ -22,6 +22,7 @@ import {
   FAR_EYE_KM,
   HINT_FROM_SECONDS,
   MAX_STEP_SECONDS,
+  PAIRED_CLICK_MS,
   SHOTS,
   VAT_FADE_IN_SECONDS,
   VAT_LOOK_Y,
@@ -33,6 +34,7 @@ import {
   hintShownAt,
   shotAt,
   spaceLook,
+  swallowPairedClick,
   vatFrame,
   type ArrivalDeps,
 } from './arrivalSequence';
@@ -339,6 +341,68 @@ describe('skipping', () => {
 
 // ── The wiring ─────────────────────────────────────────────────────────────
 
+describe('the click a skipping press makes', () => {
+  // In the page the swallow sits on the window in the capture phase, ahead of
+  // the world's handlers. Here the target is a plain EventTarget, where
+  // listeners run in the order they were added, so the world's listener is
+  // added after the swallow, as the skip arms it.
+  const stage = () => {
+    const target = new EventTarget();
+    let timer: (() => void) | null = null;
+    const cleared: unknown[] = [];
+    const end = swallowPairedClick(
+      target,
+      PAIRED_CLICK_MS,
+      (fn) => {
+        timer = fn;
+        return 'timer';
+      },
+      (h) => cleared.push(h),
+    );
+    const world = vi.fn();
+    target.addEventListener('click', world);
+    const click = () => {
+      const e = new Event('click', { cancelable: true });
+      target.dispatchEvent(e);
+      return e;
+    };
+    return { target, end, world, click, fireTimer: () => timer?.(), cleared };
+  };
+
+  it('never reaches the world, and the next click does', () => {
+    const { world, click, cleared } = stage();
+    expect(click().defaultPrevented).toBe(true);
+    expect(world).not.toHaveBeenCalled();
+    expect(click().defaultPrevented).toBe(false);
+    expect(world).toHaveBeenCalledTimes(1);
+    expect(cleared).toEqual(['timer']);
+  });
+
+  it('ends at a fresh press, so that press\'s click goes through', () => {
+    const { target, world, click } = stage();
+    target.dispatchEvent(new Event('pointerdown'));
+    click();
+    expect(world).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends when no click comes in time', () => {
+    const { world, click, fireTimer } = stage();
+    fireTimer();
+    click();
+    expect(world).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends once however it ends', () => {
+    const { end, fireTimer, click, world, cleared } = stage();
+    end();
+    end();
+    fireTimer();
+    click();
+    expect(world).toHaveBeenCalledTimes(1);
+    expect(cleared).toEqual(['timer']);
+  });
+});
+
 const src = (f: string) => readFileSync(fileURLToPath(new URL(f, import.meta.url)), 'utf8');
 
 describe('the wiring', () => {
@@ -370,6 +434,15 @@ describe('the wiring', () => {
     for (const id of ['exterior-enter-bubble', 'camera-rotate-hud', 'dev-menu-btn', 'spacephone-container']) {
       expect(css).toContain(`body.arrival-playing #${id}`);
     }
+  });
+
+  it('a skipping press swallows its own click, and the skip line is spoken', () => {
+    const own = src('./arrivalSequence.ts');
+    const screen = own.slice(own.indexOf('export function domArrivalScreen('));
+    expect(screen).toMatch(/swallowPairedClick\(window\);\s*onSkip\(\);/);
+    expect(screen).toContain("hint.setAttribute('role', 'status');");
+    expect(screen).toContain("black.setAttribute('aria-hidden', 'true');");
+    expect(screen).not.toContain("root.setAttribute('aria-hidden'");
   });
 
   it('the far pass takes the arrival\'s eye distance in both places it places the far camera', () => {
