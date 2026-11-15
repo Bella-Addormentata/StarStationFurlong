@@ -4983,9 +4983,9 @@ export class World {
         return { rig: a.rig as VoxelCharacter | null, x: p.x, y: p.y, z: p.z };
       }),
     ];
-    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number) =>
-      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig));
-    const mine = squishOf(null, me.position, this.player.getDrawnFacing());
+    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number, size: number) =>
+      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig), size);
+    const mine = squishOf(null, me.position, this.player.getDrawnFacing(), this.player.getDrawnSize());
     this.player.squishTo(mine.width, mine.shift);
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
@@ -4994,7 +4994,7 @@ export class World {
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
       avatar.rig.masterGroup.visible = !views.some((v) => blocksSight(v.eye, v.anchor, pos));
-      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing());
+      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing(), avatar.rig.getDrawnSize());
       avatar.rig.squishTo(squish.width, squish.shift);
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the

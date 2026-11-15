@@ -867,6 +867,9 @@ export class Player {
     // fresh clone's colours ease back from the pallor grey.
     this._sealVatWhenClear();
     this._updatePallor();
+    // 🦊 The fox as first drawn while the vat has it or its door is still to
+    // shut (the squeeze and the door are measured for it); then its own size.
+    this.character.holdStandardSize(this.isVatBound());
 
     // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
     //    tube while it drains/opens, then the straight walk-out). Input is
@@ -2832,6 +2835,7 @@ export class Player {
     this.vatOnClear = onSeal ?? null;
     this.logicalAngle = faceAngle;
     this._applyVatPose(VAT_HOLD_ALONG);
+    this.character.holdStandardSize(true); // from this frame on (update() keeps it)
     this.character.setState("idle", faceAngle);
     // 🧬 A fresh clone decants almost-white grey; its own colours come back
     // over VAT_PALLOR_FADE_S once it is out (_releaseVat starts the fade).
@@ -2911,6 +2915,11 @@ export class Player {
   /** 🦊🦊 #345: the yaw this fox is drawn at (eight ways). */
   public getDrawnFacing(): number {
     return this.character.getFacing();
+  }
+
+  /** 🦊 How big this fox is drawn now (its look's size; 1 in the vat). */
+  public getDrawnSize(): number {
+    return this.character.getDrawnSize();
   }
 
   /** 🦊🦊 #345: squish this fox to fit beside others (foxSquish.ts); full
