@@ -1899,6 +1899,25 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     t.press('fair-only-confirm');
     expect(t.said()).toBe(WARN);
     expect(a.casino.computedIncOf(TABLE)).toBe(DINC);
+    // The warning is for the table as it stood: switched off and on past the card (the bet back), with a pass
+    // riding on a new point there, CONFIRM warns again.
+    expect(a.table.switchComputedOff(TABLE, at(a, T + 200), true)).toBe('ok');
+    expect(a.casino.readChips(a.pid)).toBe(1_000);
+    expect(a.table.switchComputedOn(TABLE, 'craps', at(a, T + 400))).toBe('ok');
+    const again = a.casino.computedIncOf(TABLE)!;
+    expect(again[0]).toBe('d');
+    expect(again).not.toBe(DINC);
+    rigRoll([a], 1, 6, [], { ...DCTX, inc: again });
+    expect(crapsBet(a, [{ type: 'pass', amount: 10 }], T + 600, TABLE)).toBe('ok');
+    const T2 = run([a], T + 700, T + 60_000, { tables: [REF], each: heard, until: decided });
+    expect((a.casino.computedFoldOf(TABLE)!.carry as { p: number }).p).toBe(6);
+    const shown2 = a.table.readComputedCraps(TABLE, clockOf(a, T2))!.resultAt + a.croupier.CRAPS_SHOW_MS + STEP;
+    beat(run([a], T2 + 100, shown2, { tables: [REF], each: heard }));
+    t.update();
+    expect(t.card()).toContain('data-act="fair-only-confirm"');
+    t.press('fair-only-confirm');
+    expect(t.said()).toBe(WARN);
+    expect(a.casino.computedIncOf(TABLE)).toBe(again);
     // Warned, the next CONFIRM goes: the bet is back and the game open.
     t.press('fair-only-confirm');
     expect(t.said()).toBe('THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE');

@@ -50,7 +50,7 @@
 import * as THREE from 'three';
 import {
   casinoDocEpoch, casinoWhole, clearMySeat, computedCheckpointBroken, computedGaveUp, computedIncEnded, computedSettled, computedThrowSeenAt,
-  isComputedFor, readAllBets,
+  computedIncOf, isComputedFor, readAllBets,
   readAllCrapsBets, readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   subscribeCasino, tableIncOf, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -1454,8 +1454,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  next press of the same goes through. */
   let foConfirming = false;
   let foArmed: 'on' | 'off' | null = null;
-  /** The game the way back's warning was given at: it holds for that game
-   *  only (another page of this key may have ended it and opened another). */
+  /** What the table played when the warning was given: it holds for that
+   *  game, or that house table, only (another page of this key may have ended
+   *  it, or switched the table off and on, with other bets riding since). */
   let foArmedInc: string | null = null;
   /** 🏠 The house as the open card last drew it: a heartbeat isn't a casino
    *  change, and going quiet is no change at all, so the frame redraws the
@@ -3171,11 +3172,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (act === 'fair-only-on') foConfirming = true;
     else if (act === 'fair-only-cancel') foConfirming = false;
     else if (foConfirming) {
-      const r = switchFairOnlyOn(itemId, game, Date.now(), armed === 'on');
+      const inc = computedIncOf(itemId);
+      const r = switchFairOnlyOn(itemId, game, Date.now(), armed === 'on' && foArmedInc === inc);
       // (The warning for contract bets leaves the question up for the press
       // that goes through.)
       foConfirming = r === 'contract';
-      if (r === 'contract') foArmed = 'on';
+      if (r === 'contract') {
+        foArmed = 'on';
+        foArmedInc = inc;
+      }
       say(fairOnlyOnNotice(r) ?? refused[r as keyof typeof refused]);
     }
   };
