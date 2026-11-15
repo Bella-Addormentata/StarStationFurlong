@@ -13,19 +13,19 @@ pub(crate) const T: &str = "roulette-1";
 pub(crate) const INC: &str = "r0123456789abcdef01234567";
 const NODE: [u8; 32] = [7u8; 32];
 
-struct Who {
-    pid: String,
-    key: SecretKey,
-    public: String,
+pub(super) struct Who {
+    pub(super) pid: String,
+    pub(super) key: SecretKey,
+    pub(super) public: String,
 }
 
-fn who(pid: &str) -> Who {
+pub(super) fn who(pid: &str) -> Who {
     let key = SecretKey::from_bytes(&hb::sha256(format!("ssf-house-test|{pid}").as_bytes()));
     let public = hb::b64url(key.public().as_bytes());
     Who { pid: pid.into(), key, public }
 }
 
-fn sign(w: &Who, bytes: &[u8; 32]) -> String {
+pub(super) fn sign(w: &Who, bytes: &[u8; 32]) -> String {
     hb::b64url(&w.key.sign(bytes).to_bytes())
 }
 
@@ -33,15 +33,15 @@ fn ctx() -> Ctx {
     Ctx { room: ROOM.into(), t: T.into(), inc: INC.into() }
 }
 
-fn obj(fields: Vec<(&str, CVal)>) -> CVal {
+pub(super) fn obj(fields: Vec<(&str, CVal)>) -> CVal {
     CVal::Obj(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
-fn s(v: &str) -> CVal {
+pub(super) fn s(v: &str) -> CVal {
     CVal::Str(v.into())
 }
 
-fn with(rec: &CVal, k: &str, v: CVal) -> CVal {
+pub(super) fn with(rec: &CVal, k: &str, v: CVal) -> CVal {
     let CVal::Obj(mut fields) = rec.clone() else { unreachable!() };
     fields.retain(|(name, _)| name != k);
     fields.push((k.into(), v));
@@ -62,7 +62,7 @@ fn room_signed(kind: &str, t: &str, w: &Who, body: CVal) -> CVal {
     with(&body, "g", s(&g))
 }
 
-fn seed_of(pid: &str, r: i64) -> String {
+pub(super) fn seed_of(pid: &str, r: i64) -> String {
     hex::encode(hb::sha256(format!("seed|{pid}|{r}").as_bytes()))
 }
 
@@ -74,7 +74,7 @@ pub(crate) struct Room {
     dir: PathBuf,
 }
 
-fn scratch(name: &str) -> PathBuf {
+pub(super) fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ssf-house-test-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -267,11 +267,11 @@ impl Drop for Room {
     }
 }
 
-fn strs(v: &CVal, k: &str) -> Vec<String> {
+pub(super) fn strs(v: &CVal, k: &str) -> Vec<String> {
     v.get(k).and_then(CVal::as_arr).unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
 }
 
-fn sorted(mut v: Vec<String>) -> Vec<String> {
+pub(super) fn sorted(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v
 }
@@ -386,6 +386,43 @@ fn a_close_already_abandoned_when_first_seen_is_never_revealed() {
         room.tick(1_000);
     }
     assert!(room.records("h:").is_empty());
+}
+
+#[test]
+fn a_house_table_is_not_settled_at_again_after_a_gap_between_ticks() {
+    // (Settling again after the node was cut off is a FAIR ONLY game's rule: there nobody but the house decides a
+    // round. At a house table the pages void a close the house is late for, and the cutoff sees to the rest.)
+    let mut room = Room::new("gap", true);
+    room.house.settle_ms = SETTLE_MS;
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    room.tick(SETTLE_MS);
+    assert_eq!(room.records("o:1:").len(), 1);
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(HOUSE_HEARD_MS + 1_000);
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    assert_eq!(room.records("h:1:").len(), 1);
+}
+
+#[test]
+fn an_abandon_of_another_round_than_its_closes_is_none() {
+    // (The fold counts an abandon only at its close's round, computedFold decide: one signed for another round
+    // is no reason to take the close as abandoned when it is first seen.)
+    let mut room = Room::new("abandon-round", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    room.abandon(&bob, 2, &c);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    assert_eq!(room.records("h:1:").len(), 1);
 }
 
 #[test]
@@ -2299,7 +2336,7 @@ fn the_first_house_never_joins_a_round_whose_seed_its_step_down_published() {
 /// `v` as the doc holds it with a `__proto__` field `pad` as well: a peer's
 /// write (no page's encoder makes one from an object it signed), which a
 /// page decodes as `o.__proto__ = pad`.
-fn padded(v: &CVal, pad: Any) -> Any {
+pub(super) fn padded(v: &CVal, pad: Any) -> Any {
     let Any::Map(m) = to_any(v) else { unreachable!() };
     let mut m = (*m).clone();
     m.insert("__proto__".to_string(), pad);
@@ -4463,4 +4500,32 @@ fn what_a_peer_sent_is_a_few_words_that_change_with_who_wrote_how_far_and_not_wi
     }
     assert_eq!(seen(&doc_of(&[(6, 1), (7, 2)])), seen(&doc_of(&[(7, 2), (6, 1)])), "(in whatever order they came)");
     assert_eq!(seen(&all[3]).clients, 2);
+}
+
+#[test]
+fn a_strangers_abandon_counts_at_a_house_table() {
+    // (Only a FAIR ONLY game takes an abandon from a frozen bettor alone, computedFold S6 d: at a house table any
+    // player's abandon voids the close.)
+    let mut room = Room::new("stranger-abandon", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    room.abandon(&who("carol"), 1, &c);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    assert!(room.records("h:").is_empty(), "abandoned when first seen: never revealed");
+    assert_eq!(room.records("o:2:").len(), 1);
+    // Round 2 under round 1's close: on the chain, since carol's abandon decided round 1.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    let c2 = room.close(&alice, 2, &c, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    let reveals = room.records("h:2:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c2]);
 }
