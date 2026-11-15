@@ -27,7 +27,7 @@ import type { Page } from './computedPageKit';
 import { FAIR_ONLY_RV, faironlyInc, NO_CLOSE, sealCk, sealFin } from './computedFairOnly';
 import { delegation, hex, house as FO_HOUSE, NAME as FO_NAME, owner as FO_OWNER, rootOf, trimOf } from './computedFairOnlyKit';
 import { nextSid3 } from './computedFold';
-import { beatOf, crapsBet, PAGE_ROOM } from './computedPageKit';
+import { beatOf, crapsBet, PAGE_ROOM, rigRoll, run, standAt } from './computedPageKit';
 import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
 
@@ -1853,6 +1853,57 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     t.press('fair-only-off');
     expect(t.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
     expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: false });
+  });
+
+  it('SET FAIR ONLY at a craps house table with a contract bet riding: CONFIRM warns and keeps the question, CANCEL or closing the card takes the warning back, and the next CONFIRM after a warning hands the bet back and opens the game', () => {
+    const DINC = 'd' + '5a'.repeat(12);
+    const DCTX: FoldCtx = { room: PAGE_ROOM, t: TABLE, inc: DINC };
+    const REF = { id: TABLE, game: 'craps' as const };
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+    switchOn(a, TABLE, DINC);
+    at(a, T0);
+    const body = { v: 1 as const, h: H.pub, k: a.pub };
+    a.doc.transact(() => top(a).set(delegationKey(H.pub), { ...body, g: a.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) }));
+    a.table.setLocalHouse(H.pub);
+    a.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
+    beat(T0 + 100);
+    // Set Friendly, the player's seed alone decides the roll: a 6 on the come-out, and the pass rides on the point.
+    expect(a.table.setComputedFairness(TABLE, 'friendly', at(a, T0 + 100))).toBe('ok');
+    standAt(a, 1, TABLE);
+    rigRoll([a], 1, 6, [], DCTX);
+    expect(crapsBet(a, [{ type: 'pass', amount: 10 }], T0 + 200, TABLE)).toBe('ok');
+    const heard = (T: number): void => { if ((T - T0) % 5_000 === 0) beat(T); };
+    const decided = (): boolean => a.casino.computedFoldOf(TABLE)?.rounds[0]?.decided === 'reveals';
+    const decidedAt = run([a], T0 + 300, T0 + 60_000, { tables: [REF], each: heard, until: decided });
+    expect((a.casino.computedFoldOf(TABLE)!.carry as { p: number }).p).toBe(6);
+    const shown = a.table.readComputedCraps(TABLE, clockOf(a, decidedAt))!.resultAt + a.croupier.CRAPS_SHOW_MS + STEP;
+    const T = run([a], decidedAt + 100, shown, { tables: [REF], each: heard });
+    beat(T);
+    expect(a.casino.readChips(a.pid)).toBe(990);
+    const t = atTable(a, { game: 'craps', house: true });
+    t.update();
+    const WARN = 'PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH';
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    expect(t.said()).toBe(WARN);
+    expect(a.casino.computedIncOf(TABLE)).toBe(DINC);
+    expect(t.card()).toContain('data-act="fair-only-confirm"');
+    // CANCEL takes the warning back with the question.
+    t.press('fair-only-cancel');
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    expect(a.casino.computedIncOf(TABLE)).toBe(DINC);
+    // So does closing the card.
+    t.press('close');
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    expect(t.said()).toBe(WARN);
+    expect(a.casino.computedIncOf(TABLE)).toBe(DINC);
+    // Warned, the next CONFIRM goes: the bet is back and the game open.
+    t.press('fair-only-confirm');
+    expect(t.said()).toBe('THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE');
+    expect(a.casino.computedIncOf(TABLE)![0]).toBe('q');
+    expect(a.casino.readChips(a.pid)).toBe(1_000);
   });
 
   it('a refusal is said in words and leaves the house table as it was: the house away at the confirm', () => {
