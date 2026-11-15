@@ -7,9 +7,10 @@
  * rig's original PAL colors, so switching outfits never leaves stale colors
  * behind and re-applying the same outfit is idempotent (no drift).
  *
- * LOCAL ONLY (sync honesty, plan §3 TR3): the saved outfit dresses the local
- * rig; remote avatars keep #27's per-peer hue tint until phone-plan S2 lands
- * an identity lane that can carry an outfit id.
+ * The saved outfit dresses the local rig and goes into the player's entry in
+ * the room doc (`outfitId`). The room's other pages dress the player's fox in
+ * it once the entry also names the lane the fox's ticks carry (peerLooks.ts);
+ * a remote fox no entry claims keeps #27's per-peer hue tint.
  */
 
 /** Swappable color slots on the fox rig. Mirrors the PAL entries that are

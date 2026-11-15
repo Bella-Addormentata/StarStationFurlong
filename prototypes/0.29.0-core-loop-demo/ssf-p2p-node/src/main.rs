@@ -3157,6 +3157,9 @@ async fn handle_wt_connection_inner(
                     // already linked in the room is answered `connected` here,
                     // once (NamedOnStream).
                     let mut named = NamedOnStream::default();
+                    // 🦊 Whether this stream was told the lane its page's ticks
+                    // go out on (`write_lane_envelope`): once, at its first sync.
+                    let mut lane_told = false;
                     let mut length_buf = [0u8; 4];
                     loop {
                         if let Err(_) = recv.read_exact(&mut length_buf).await {
@@ -3312,6 +3315,16 @@ async fn handle_wt_connection_inner(
                                 let _ = s.finish().await;
                             }
                             continue;
+                        }
+
+                        // 🦊 The page is told, once, the lane id its own ticks carry to
+                        // the room's other pages, so it can say in the room doc which
+                        // fox on the wire is its player's. On the sync stream only:
+                        // a `cap` or `faucet` stream reads its one reply and closes.
+                        if envelope.kind == "ysync" && !lane_told {
+                            lane_told = true;
+                            let mut s = send.lock().await;
+                            let _ = write_lane_envelope(&mut *s, &envelope.room, &tab_lane_id).await;
                         }
 
                         // Dial a newly-advertised peer OFF this reader loop (issue #60
@@ -3906,7 +3919,7 @@ fn tell_already_linked(send: &std::sync::Arc<tokio::sync::Mutex<wtransport::Send
 
 #[cfg(test)]
 mod dial_status_tests {
-    use super::{dial_status_is_for_every_page, NamedOnStream, NAMED_ON_STREAM_MAX};
+    use super::{dial_status_is_for_every_page, is_local_lane_kind, lane_body, tick_lane_id, NamedOnStream, NAMED_ON_STREAM_MAX};
     use iroh::SecretKey;
 
     fn computer(n: u16) -> iroh::PublicKey {
@@ -3981,6 +3994,49 @@ mod dial_status_tests {
         // (The words are joined here so that this test is not a third.)
         let direct = src.matches(&["write_bridge_status(", "&mut"].concat()).count();
         assert_eq!(direct, 2, "the reporter's own write and the already-linked answer");
+    }
+
+    /// 🦊 A `lane` envelope names the lane in the hex the page reads off an
+    /// addressed tick: two lowercase digits a byte, in wire order.
+    #[test]
+    fn a_lane_is_told_in_the_hex_a_tick_carries() {
+        let body: serde_json::Value =
+            serde_json::from_str(&lane_body(&[0x00, 0x01, 0x0a, 0x7f, 0x80, 0xab, 0xcd, 0xff])).expect("json");
+        assert_eq!(body["lane"], "00010a7f80abcdff");
+        assert_eq!(body.as_object().map(|o| o.len()), Some(1), "the lane and nothing else");
+        let lane = tick_lane_id(&[b"a node".as_slice(), b"127.0.0.1:50000".as_slice()]);
+        let hex = serde_json::from_str::<serde_json::Value>(&lane_body(&lane)).expect("json")["lane"].clone();
+        assert_eq!(hex.as_str().map(str::len), Some(16));
+    }
+
+    /// 🦊 Only this node tells its pages their lane: one coming from a peer is
+    /// dropped at the iroh ingress like the other node-local kinds, so no
+    /// peer can hand a page someone else's lane as its own.
+    #[test]
+    fn a_lane_is_node_local() {
+        assert!(is_local_lane_kind("lane"));
+        for kind in ["cap", "faucet", "bridge", "card", "board"] {
+            assert!(is_local_lane_kind(kind), "{kind}");
+        }
+        assert!(!is_local_lane_kind("ysync"));
+        assert!(!is_local_lane_kind("Lane"));
+    }
+
+    /// 🦊 The lane is told on a page's sync stream, once, and it is the id
+    /// the page's own ticks are tagged with (`tab_lane_id`); a `cap` or
+    /// `faucet` stream reads one reply and closes, so it is never told. The
+    /// real binary's side is tests/dial_landed.rs.
+    #[test]
+    fn the_lane_is_told_once_on_the_sync_stream() {
+        let src = include_str!("main.rs");
+        let told = src.find(&["if envelope.kind == \"ysync\" && !lane_", "told {"].concat()).expect("the once-per-stream check");
+        let block = &src[told..told + 400];
+        assert!(block.contains("lane_told = true;"));
+        assert!(block.contains(&["write_lane_", "envelope(&mut *s, &envelope.room, &tab_lane_id)"].concat()));
+        let cap = src.find("if envelope.kind == \"cap\" {").expect("the cap branch");
+        let faucet = src.find("if envelope.kind == \"faucet\" {").expect("the faucet branch");
+        assert!(cap < told && faucet < told, "after the one-reply streams have gone their way");
+        assert_eq!(src.matches(&["write_lane_", "envelope(&mut"].concat()).count(), 1, "told nowhere else");
     }
 }
 
@@ -5858,6 +5914,42 @@ async fn write_bridge_status<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// 🦊 What a `lane` envelope says: the lane id, in the hex the page reads off
+/// an addressed tick (protocol.ts `unpackAddressedTick`).
+fn lane_body(lane: &[u8; 8]) -> String {
+    let hex: String = lane.iter().map(|b| format!("{b:02x}")).collect();
+    serde_json::json!({ "lane": hex }).to_string()
+}
+
+/// 🦊 Tell a page the lane id its own movement ticks carry: this node tags
+/// every tick a page sends with it before the room's other pages see it, and
+/// the page cannot work it out (the id hashes this node's id with the page's
+/// address as the node sees it). The page writes it into its players entry,
+/// so the room's other pages can dress that fox in its player's outfit.
+/// Local lane only (`is_local_lane_kind`): a peer cannot send one.
+async fn write_lane_envelope<W: AsyncWriteExt + Unpin>(writer: &mut W, room_id: &str, lane: &[u8; 8]) -> Result<()> {
+    let env = SsfEnvelope {
+        v: 1,
+        room: room_id.to_string(),
+        kind: "lane".to_string(),
+        seq: 0,
+        author: vec![],
+        payload: lane_body(lane).into_bytes(),
+        sig: None,
+        iroh_node_id: None,
+        iroh_relay_urls: None,
+        iroh_direct_addrs: None,
+        trust_tier: None,
+        iroh_member_hints: None,
+        node_proof: None,
+    };
+    let bytes = serde_json::to_vec(&env)?;
+    let len_bytes = (bytes.len() as u32).to_le_bytes();
+    writer.write_all(&len_bytes).await?;
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
+
 // ── Mesh control plane (M5.0/M5.1/M5.3/M5.4) ─────────────────────────────────
 
 /// A member/candidate advertised in a `roster` / `px` / `mesh-join` control
@@ -5894,12 +5986,12 @@ fn is_control_kind(kind: &str) -> bool {
 }
 
 /// Kinds this node speaks only with its own browser tabs (`cap` and `faucet`
-/// in from the loopback browser, `faucet` and `bridge` out to the tabs). They
+/// in from the loopback browser, `faucet`, `bridge` and `lane` out to the tabs). They
 /// are consumed or authored locally and never relayed, so one arriving from a
 /// remote peer is dropped at the iroh ingress before it can be forwarded to
 /// the tabs as if the node had said it.
 fn is_local_lane_kind(kind: &str) -> bool {
-    matches!(kind, "cap" | "faucet" | "bridge" | "card" | "board")
+    matches!(kind, "cap" | "faucet" | "bridge" | "card" | "board" | "lane")
 }
 
 /// M5.0 STRICT admission: a control envelope must be sig-Valid. Unlike

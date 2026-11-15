@@ -52,6 +52,14 @@
 //! second names it while that dial runs, and both hear `failed`, each on a
 //! stream the node opened.
 //!
+//! A third test holds what a page is told of its own ticks: the lane id its
+//! node puts before each of them for the room's other pages. A page cannot
+//! work it out (it hashes the node's id with the page's address as the node
+//! sees it), and the game's page writes it into its players entry so the
+//! room's other pages can dress its fox in its player's outfit. There, one
+//! node and two pages: each is told its lane, once, on the stream its sync
+//! went out on, and a tick from one reaches the other behind that lane.
+//!
 //! Nothing outside this computer is spoken to: no Chia (`SSF_NO_CHIA_LANE=1`),
 //! no Mainline DHT, no mDNS, no public-address echo and no relay, and the
 //! dial's one address is loopback. iroh's port mapper stays on, since no
@@ -323,6 +331,15 @@ impl Heard {
         self.envelope["payload"].as_str().and_then(|b64| BASE64_STANDARD.decode(b64).ok()).unwrap_or_default()
     }
 
+    /// A `lane` envelope's lane id: the hex the page reads off an addressed tick.
+    fn lane(&self) -> Option<String> {
+        if self.kind() != "lane" {
+            return None;
+        }
+        let body: Value = serde_json::from_slice(&self.payload()).ok()?;
+        body["lane"].as_str().map(str::to_string)
+    }
+
     /// A `bridge` envelope's dial status and the node it is about.
     fn dial_status(&self) -> Option<(String, String)> {
         if self.kind() != "bridge" {
@@ -387,7 +404,7 @@ async fn read_stream(mut recv: wtransport::RecvStream, own: bool, heard: mpsc::U
 struct Page {
     who: &'static str,
     _endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
-    _connection: wtransport::Connection,
+    connection: wtransport::Connection,
     own: wtransport::SendStream,
     heard: mpsc::UnboundedReceiver<Heard>,
     /// What was heard and passed over while waiting for something else.
@@ -418,7 +435,7 @@ impl Page {
                 tokio::spawn(read_stream(recv, false, tx.clone()));
             }
         });
-        Self { who, _endpoint: endpoint, _connection: connection, own, heard, passed: Vec::new(), seq: 0 }
+        Self { who, _endpoint: endpoint, connection, own, heard, passed: Vec::new(), seq: 0 }
     }
 
     /// Ask the room for its state (SyncStep1) on the page's own stream, with
@@ -466,6 +483,20 @@ impl Page {
                 Ok(Some(heard)) => self.passed.push(heard),
                 Ok(None) | Err(_) => return None,
             }
+        }
+    }
+
+    /// Send one movement tick, as the game's page does: a datagram of its
+    /// 13 bytes, which the node tags with this page's lane for the others.
+    fn tick(&self, tick: &[u8; 13]) {
+        self.connection.send_datagram(tick).unwrap_or_else(|e| panic!("{}: the tick was not sent: {e}", self.who));
+    }
+
+    /// The first datagram the node sends this page within `bound`.
+    async fn hear_datagram(&self, bound: Duration) -> Option<Vec<u8>> {
+        match tokio::time::timeout(bound, self.connection.receive_datagram()).await {
+            Ok(Ok(datagram)) => Some(datagram.to_vec()),
+            _ => None,
         }
     }
 
@@ -739,6 +770,65 @@ fn a_dial_that_gives_up_is_told_to_every_page_of_the_room() {
             "{}",
             failure(&format!("the second page named a computer already being dialed, and a dial reported on its own stream: {own_reports:?}"), &node_dir)
         );
+    });
+    node.must_run(&node_dir);
+}
+
+/// 🦊 A page is told the lane its own ticks carry, once, on the stream its
+/// sync went out on: the id the room's other pages see before each of its
+/// ticks, which is what lets the game match a fox on the wire to a player.
+#[test]
+fn a_page_is_told_the_lane_its_ticks_carry() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let node_dir = Scratch::new("lane");
+    let mut node = Node::start(&node_dir, "the node");
+    let node_http = node.http_port(&node_dir);
+    let node_fp = fingerprint(node_http, "the node");
+    let failure = |what: &str, node_dir: &Scratch| -> String { format!("{what}\n── the node, last lines ──\n{}", tail(&node_dir.log())) };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime");
+    runtime.block_on(async {
+        // Two pages in the room, each asking for its state as the game's
+        // page does when it joins: each is told its lane on that stream.
+        let mut walker = Page::open("the walking page", &node_fp).await;
+        let mut watcher = Page::open("the watching page", &node_fp).await;
+        walker.ask(None).await;
+        watcher.ask(None).await;
+        let mut lanes = Vec::new();
+        for page in [&mut walker, &mut watcher] {
+            let told = page.hear(LINK_BOUND, |h| h.lane().is_some()).await;
+            let told = told.unwrap_or_else(|| {
+                panic!("{}", failure(&format!("{} was not told its lane within {LINK_BOUND:?}. It heard:\n{}", page.who, page.passed()), &node_dir))
+            });
+            assert!(told.own, "{}: its lane came on a stream the node opened, not on the stream its sync went out on", page.who);
+            let lane = told.lane().expect("a lane");
+            assert!(lane.len() == 16 && lane.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{}: {lane:?}", page.who);
+            lanes.push(lane);
+        }
+        assert_ne!(lanes[0], lanes[1], "two pages, two lanes");
+
+        // A tick from the walking page reaches the watching page behind the
+        // walking page's lane. A datagram can be lost, so a few are sent.
+        let tick: [u8; 13] = [7, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut heard = None;
+        for _ in 0..10 {
+            walker.tick(&tick);
+            if let Some(datagram) = watcher.hear_datagram(Duration::from_millis(500)).await {
+                heard = Some(datagram);
+                break;
+            }
+        }
+        let heard = heard.unwrap_or_else(|| panic!("{}", failure("the watching page heard none of ten ticks the walking page sent", &node_dir)));
+        assert_eq!(heard.len(), 8 + tick.len(), "an addressed tick: the sender's lane, then the tick");
+        let sender: String = heard[..8].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(sender, lanes[0], "the lane the walking page was told is the one its ticks carry");
+        assert_eq!(&heard[8..], &tick[..]);
+
+        // Once: the walking page asks again on the same stream and is told
+        // nothing more about its lane.
+        walker.ask(None).await;
+        let again = walker.hear(SECOND_WORD, |h| h.lane().is_some()).await;
+        assert!(again.is_none(), "{}", failure("the walking page was told its lane a second time on the same stream", &node_dir));
     });
     node.must_run(&node_dir);
 }

@@ -70,6 +70,7 @@ import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
+import { laneFromEnvelope, laneOfPeerId, outfitsByLane } from "./peerLooks";
 import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
 import { wheelPixels, wheelTargetZooms, type FovZoom } from "./firstPersonZoom";
 import {
@@ -813,6 +814,13 @@ listenToRoom();
     ),
 };
 let yjsSync: YjsSync | null = null;
+/** 🦊 The lane id this page's own ticks carry in the current session, as its
+ *  node told it (peerLooks.ts), or null until told: written into our players
+ *  entry so the room's other pages can dress our fox in our outfit. */
+let myTickLane: string | null = null;
+/** 🦊 The current room's players entries, by the lane each claims: the
+ *  outfit a remote fox wears (peerLooks.ts `outfitsByLane`). */
+let peerOutfits: Map<string, string> = new Map();
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
 let roomCacheHandle: RoomCacheHandle | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
@@ -2685,6 +2693,8 @@ async function joinRoomAtEpoch(
     }
     return;
   }
+  // 🦊 A new session has a lane of its own; its node tells it on this stream.
+  myTickLane = null;
   const sync = new YjsSync({
     roomId: boot.roomId,
     channel,
@@ -2704,6 +2714,15 @@ async function joinRoomAtEpoch(
     // long as this is the page's session.
     onOtherEnvelope: (env) => {
       if (env.kind === "bridge" && yjsSync === sync) noteBridgeEnvelope(env);
+      // 🦊 The lane our ticks carry, once per session: into our players
+      // entry, so the room's other pages know which fox is ours.
+      if (env.kind === "lane" && yjsSync === sync) {
+        const lane = laneFromEnvelope(env);
+        if (lane && lane !== myTickLane) {
+          myTickLane = lane;
+          updateLocalPlayerEntry();
+        }
+      }
     },
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
@@ -2885,6 +2904,10 @@ async function joinRoomAtEpoch(
   // player id so a Use-link rejoin overwrites instead of duplicating.
   const playersMap = sync.doc.getMap("players");
   (window as any).__players = playersMap; // debug handle (permanent, like __setOutfit)
+  // 🦊 Remote foxes wear the outfit of the players entry that claims their
+  // lane (peerLooks.ts); read afresh for this room, and on every change.
+  peerOutfits = outfitsByLane(playersMap.entries());
+  if (world) world.refreshPeerLooks();
 
   // Bind the shared games map (issue #45): per-table game state (checkers
   // v1) in the room doc, keyed by game-table furniture item id. Rebinds per
@@ -3931,6 +3954,8 @@ async function joinRoomAtEpoch(
   playersMap.observe((_event) => {
     renderPhonePlayersList();
     updateRoomUI();
+    peerOutfits = outfitsByLane(playersMap.entries());
+    if (world) world.refreshPeerLooks();
     harvestRoomPlayersIntoMesh(playersMap);
     // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
     // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
@@ -5439,6 +5464,11 @@ interface PlayerEntry {
    *  valid. */
   keyB64?: string;
   keySig?: string;
+  /** 🦊 The lane id this player's ticks carry in their current session, as
+   *  their node told their page (peerLooks.ts): what lets the room's other
+   *  pages dress that fox in `outfitId`. Absent until told, and from older
+   *  games, whose foxes keep their hue tint. */
+  lane?: string;
 }
 
 /**
@@ -5463,6 +5493,7 @@ function updateLocalPlayerEntry(): void {
     // claims this name. Re-signed on every upsert so a name edit re-certs.
     keyB64: getIdentityPub(),
     keySig: signNameCert(name),
+    ...(myTickLane ? { lane: myTickLane } : {}),
   };
   sync.doc.transact(() => {
     players.set(id, entry);
@@ -5563,10 +5594,8 @@ function ownerGateRefusal(owner: string, action: string): string {
  * presence lands heartbeat/lastSeen semantics.
  *
  * v1 scope note (S2): this list IS the visual surface for the players map.
- * Name tags over remote rigs and outfit application on remote rigs are
- * deferred to S3 — the tick lane keys peers by per-connection lane id and
- * there is no lane-id → player-id mapping yet, so any rig↔entry pairing here
- * would be a guess for 2+ remote players.
+ * Outfits on remote rigs come from the entry that claims the rig's lane
+ * (peerLooks.ts); name tags over remote rigs are not drawn yet.
  */
 function renderPhonePlayersList(): void {
   const countEl = document.getElementById("phone-players-count");
@@ -12272,6 +12301,13 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
+  // 🦊 A remote fox wears the outfit of the players entry that claims the
+  // lane its ticks carry (peerLooks.ts); one no entry claims keeps its tint.
+  world.setPeerLooks((peerId) => {
+    const lane = laneOfPeerId(peerId);
+    const outfitId = lane ? peerOutfits.get(lane) : undefined;
+    return outfitId ? (getOutfitById(outfitId) ?? null) : null;
+  });
 
   // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
   // requests go to the LOCAL node over the faucet lane, one stream each, and
@@ -12401,11 +12437,10 @@ async function init() {
   });
 
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
-  // expose a debug console handle. LOCAL rig only — S2 now carries outfitId in
-  // the room doc's players map (data foundation), but remote avatars keep
-  // #27's per-peer hue tint until S3 lands the lane-id → player-id mapping
-  // (tick-lane peers key by per-connection lane id; pairing rigs to players
-  // map entries without that mapping would be a guess for 2+ remotes).
+  // expose a debug console handle. The players entry carries outfitId and,
+  // once our node has told us, the lane our ticks carry (peerLooks.ts), so
+  // the room's other pages dress our fox in it; a remote fox no entry claims
+  // keeps #27's per-peer hue tint.
   const applyOutfitById = (id: string): boolean => {
     const outfit = getOutfitById(id);
     if (!outfit) {
