@@ -103,6 +103,37 @@ export function nextTabStop(count: number, at: number, back: boolean): number {
   return (at + (back ? count - 1 : 1)) % count;
 }
 
+/** What `focusInView` needs of an element: a focus and a place on screen. */
+export interface Focusable {
+  focus(options?: FocusOptions): void;
+  getBoundingClientRect(): { top: number; bottom: number };
+  closest(selector: string): Scrollable | null;
+}
+/** …and of the box it scrolls in. */
+export interface Scrollable {
+  getBoundingClientRect(): { top: number; bottom: number };
+  scrollTop: number;
+}
+
+/** Room kept above or below an element brought into view (pixels). */
+const IN_VIEW_MARGIN = 8;
+
+/**
+ * Focus `el` and bring it into view in the title's own scrolling box
+ * (#welcome-content, which scrolls on a short or zoomed window), and only
+ * there: a plain focus would also scroll the page behind the title, whose
+ * overflow is hidden but still scrolls for a focus.
+ */
+export function focusInView(el: Focusable): void {
+  el.focus({ preventScroll: true });
+  const box = el.closest('#welcome-content');
+  if (!box) return;
+  const r = el.getBoundingClientRect();
+  const b = box.getBoundingClientRect();
+  if (r.top < b.top + IN_VIEW_MARGIN) box.scrollTop -= b.top + IN_VIEW_MARGIN - r.top;
+  else if (r.bottom > b.bottom - IN_VIEW_MARGIN) box.scrollTop += r.bottom - (b.bottom - IN_VIEW_MARGIN);
+}
+
 export interface FoxChooser {
   /** The chooser's element, to put on the title. */
   element: HTMLElement;
@@ -247,7 +278,7 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
       e.stopPropagation();
       look = withChoice(look, row.key, to);
       paint();
-      list[to].focus({ preventScroll: true });
+      focusInView(list[to]);
     });
     buttons.set(row.key, list);
     line.append(label, choices);
@@ -273,8 +304,8 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
     element: root,
     look: () => ({ ...look }),
     focus: () => {
-      const first = buttons.get(CHOICE_ROWS[0].key);
-      first?.[look[CHOICE_ROWS[0].key]]?.focus({ preventScroll: true });
+      const first = buttons.get(CHOICE_ROWS[0].key)?.[look[CHOICE_ROWS[0].key]];
+      if (first) focusInView(first);
     },
     tabStops: () => [
       ...CHOICE_ROWS.map((row) => buttons.get(row.key)?.[look[row.key]]).filter((b): b is HTMLButtonElement => !!b),

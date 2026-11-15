@@ -7,7 +7,7 @@ import { CREAM_COLOURS, DEFAULT_LOOK, EAR_STYLES, EYE_COLOURS, EYE_SHAPES, FUR_C
 // canvas as it loads: a canvas that draws nothing will do here.
 vi.stubGlobal('document', { createElement: () => ({ width: 0, height: 0, style: {}, getContext: () => new Proxy({}, { get: () => () => ({ addColorStop: () => undefined }) }) }) });
 vi.stubGlobal('window', { location: { search: '' } });
-const { CHOICE_ROWS, arrowChoice, cssHex, nextTabStop, startingLook, withChoice } = await import('./foxChooser');
+const { CHOICE_ROWS, arrowChoice, cssHex, focusInView, nextTabStop, startingLook, withChoice } = await import('./foxChooser');
 
 describe('the chooser\'s rows', () => {
   it('set every choice of a look, each once', () => {
@@ -81,6 +81,33 @@ describe('a keyboard in the chooser', () => {
   });
 });
 
+describe('a choice brought into view', () => {
+  /** An element at `top`..`bottom` on screen, in a box at 100..300 scrolled
+   *  `scrollTop`, or in no scrolling box. */
+  const at = (top: number, bottom: number, inBox = true) => {
+    const box = { getBoundingClientRect: () => ({ top: 100, bottom: 300 }), scrollTop: 50 };
+    const focused: FocusOptions[] = [];
+    const el = {
+      focus: (o?: FocusOptions) => void focused.push(o ?? {}),
+      getBoundingClientRect: () => ({ top, bottom }),
+      closest: (sel: string) => (inBox && sel === '#welcome-content' ? box : null),
+    };
+    focusInView(el);
+    return { box, focused };
+  };
+
+  it('is focused without scrolling the page behind the title', () => {
+    expect(at(150, 170).focused).toEqual([{ preventScroll: true }]);
+    expect(at(150, 170, false).focused).toEqual([{ preventScroll: true }]);
+  });
+
+  it('scrolls the title\'s box just enough to show it, with a little room, and not when it shows', () => {
+    expect(at(150, 170).box.scrollTop).toBe(50);
+    expect(at(320, 340).box.scrollTop).toBe(50 + 340 - 292);
+    expect(at(60, 80).box.scrollTop).toBe(50 - (108 - 60));
+  });
+});
+
 describe('cssHex', () => {
   it('writes a colour as six hex digits', () => {
     expect(cssHex(0x0a0b0c)).toBe('#0a0b0c');
@@ -125,7 +152,8 @@ describe('the chooser on the title (main.ts)', () => {
 
   it('puts the focus on the first row\'s chosen option', () => {
     const focus = chooser.slice(chooser.indexOf('focus: () => {'), chooser.indexOf('dispose: () => {'));
-    expect(focus).toContain('.focus({ preventScroll: true });');
+    expect(focus).toContain('const first = buttons.get(CHOICE_ROWS[0].key)?.[look[CHOICE_ROWS[0].key]];');
+    expect(focus).toContain('if (first) focusInView(first);');
   });
 
   it('lets Tab go round the chooser and ENTER, not the phone, while it is open', () => {
@@ -133,6 +161,7 @@ describe('the chooser on the title (main.ts)', () => {
     expect(tab).toContain('if (e.key !== "Tab" || !chooser) return;');
     expect(tab).toContain('e.stopPropagation();');
     expect(tab).toContain('const stops = [...chooser.tabStops(), btnEnter];');
+    expect(tab).toContain('if (to) focusInView(to);');
     // The listener is on the title, so it runs before the window's Tab.
     expect(main.indexOf('wrap.addEventListener("keydown"')).toBeGreaterThan(main.indexOf('const wrap = document.createElement("div");'));
   });
@@ -142,6 +171,10 @@ describe('the chooser on the title (main.ts)', () => {
     expect(chooser).toContain("b.setAttribute('role', 'radio');");
     expect(chooser).toContain('b.tabIndex = on ? 0 : -1;');
     expect(chooser).toContain('const to = arrowChoice(e.key, look[row.key], list.length);');
+    // Each focus is brought into the title's view: a short window scrolls it.
+    expect(chooser).toContain('focusInView(list[to]);');
+    expect(chooser).toContain('if (first) focusInView(first);');
+    expect(chooser.slice(chooser.indexOf('export function mountFoxChooser'))).not.toContain('preventScroll');
   });
 
   it('sways the preview after the rig\'s update, which sets the same rotation', () => {

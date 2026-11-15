@@ -513,7 +513,7 @@ import {
   stepGlyph,
 } from "./firstRunSteps";
 import type { FirstRunFacts, ReportLog } from "./firstRunSteps";
-import { mountFoxChooser, nextTabStop, startingLook, type FoxChooser } from "./foxChooser";
+import { focusInView, mountFoxChooser, nextTabStop, startingLook, type FoxChooser } from "./foxChooser";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -12772,7 +12772,8 @@ function setupClickToEnter() {
         e.stopPropagation();
         const stops = [...chooser.tabStops(), btnEnter];
         const at = stops.indexOf(document.activeElement as HTMLElement);
-        stops[nextTabStop(stops.length, at, e.shiftKey)]?.focus({ preventScroll: true });
+        const to = stops[nextTabStop(stops.length, at, e.shiftKey)];
+        if (to) focusInView(to); // scrolled into the title's view, a short window too
       });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
