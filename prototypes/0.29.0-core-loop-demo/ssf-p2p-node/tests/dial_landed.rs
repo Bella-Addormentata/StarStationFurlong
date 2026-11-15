@@ -1,8 +1,8 @@
 //! 🎯 A dial that lands is told to every page of the room, through the real
 //! binary: two `ssf-p2p-node` processes on this computer, the holder and the
-//! newcomer, each in a directory of its own, and one stand-in page on each,
-//! which is a WebTransport client that reads and asks as the game's page
-//! does.
+//! newcomer, each in a directory of its own, and stand-in pages, each a
+//! WebTransport client that reads and asks as the game's page does: one on
+//! the holder, two on the newcomer.
 //!
 //! What it guards: a page's question (a sync frame, SyncStep1) is what tells
 //! a dialed node which room a new connection is for. Until a frame names the
@@ -17,14 +17,19 @@
 //! linked the room: a dial opened by a DHT knock between two home routers
 //! landed after 46 s and was dropped as silent 16 s later (2026-11-14).
 //!
-//! The newcomer's stand-in page asks once, which starts the dial, and then
+//! The newcomer's first page asks once, which starts the dial, and then
 //! only when it hears `connected` on a stream its node opened, which is the
-//! game's page after its first 30 s. The test passes when:
+//! game's page after its first 30 s. Its second page is in the same room and
+//! started no dial, as a background session of the game is whose room
+//! another session's envelope dialed for: a `connected` that went to the
+//! page that began the dial alone would leave it waiting. The test passes
+//! when:
 //!
-//! 1. that page hears `connected` for the holder on a stream its node opened;
-//! 2. its next question reaches the holder's page, and the holder's node
-//!    answers it from the room it keeps, so the link carries the room both
-//!    ways;
+//! 1. both of the newcomer's pages hear `connected` for the holder, each on
+//!    a stream its node opened;
+//! 2. the first page's next question reaches the holder's page, and the
+//!    holder's node answers it from the room it keeps, to both of the
+//!    newcomer's pages, so the link carries the room both ways;
 //! 3. neither node has dropped the other as silent once the time a silent
 //!    connection is given has passed.
 //!
@@ -456,9 +461,20 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
             failure("the holder's node did not answer its own page's question", &holder_dir, &newcomer_dir)
         );
 
-        // The newcomer's page asks once, with the holder's dial hints. Its
-        // node has no link yet, so the question goes to no one but the node,
-        // and the node dials.
+        // The newcomer's second page enters the room first and names no one
+        // to dial. Its node's answer on its own stream says the node has it
+        // down as a page of the room.
+        let mut second_page = Page::open("the newcomer's second page", &newcomer_fp).await;
+        second_page.ask(None).await;
+        assert!(
+            second_page.hear(LINK_BOUND, |h| h.own && h.sync_subtype() == Some(1)).await.is_some(),
+            "{}",
+            failure("the newcomer's node did not answer its second page's question", &holder_dir, &newcomer_dir)
+        );
+
+        // The newcomer's first page asks once, with the holder's dial hints.
+        // Its node has no link yet, so the question goes to no one but the
+        // node, and the node dials.
         let mut newcomer_page = Page::open("the newcomer's page", &newcomer_fp).await;
         newcomer_page.ask(Some((&holder_fp.node_id, holder_addr.clone()))).await;
 
@@ -495,10 +511,26 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
                 &newcomer_dir
             )
         );
+        // Every page of the room, and not the one that began the dial alone.
+        assert!(
+            second_page.hear(AFTER_OWN_STREAM, |h| !h.own && connected(h)).await.is_some(),
+            "{}",
+            failure(
+                &format!(
+                    "the dial landed and the page that began it was told, but the newcomer's second page, in the same room, heard no `connected` \
+                     on a stream the node opened within {AFTER_OWN_STREAM:?}. It heard:\n{}",
+                    second_page.passed()
+                ),
+                &holder_dir,
+                &newcomer_dir
+            )
+        );
 
-        // (2) Told, the page asks again, as the game's page does. The
+        // (2) Told, the first page asks again, as the game's page does. The
         // question crosses the link: the holder's page hears it, and the
-        // holder's node answers it from the room it keeps.
+        // holder's node answers it from the room it keeps. One question is
+        // enough for both pages: an answer that comes over the link goes to
+        // every page of the room.
         newcomer_page.ask(None).await;
         assert!(
             holder_page.hear(LINK_BOUND, |h| !h.own && h.sync_subtype() == Some(0) && h.from_node() == newcomer_fp.node_id).await.is_some(),
@@ -509,15 +541,17 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
                 &newcomer_dir
             )
         );
-        assert!(
-            newcomer_page.hear(LINK_BOUND, |h| !h.own && h.sync_subtype() == Some(1) && h.from_node() == holder_fp.node_id).await.is_some(),
-            "{}",
-            failure(
-                &format!("the holder's node did not answer the newcomer's question within {LINK_BOUND:?}. The newcomer's page heard:\n{}", newcomer_page.passed()),
-                &holder_dir,
-                &newcomer_dir
-            )
-        );
+        for page in [&mut newcomer_page, &mut second_page] {
+            assert!(
+                page.hear(LINK_BOUND, |h| !h.own && h.sync_subtype() == Some(1) && h.from_node() == holder_fp.node_id).await.is_some(),
+                "{}",
+                failure(
+                    &format!("the holder's node's answer to the newcomer's question did not reach {} within {LINK_BOUND:?}. It heard:\n{}", page.who, page.passed()),
+                    &holder_dir,
+                    &newcomer_dir
+                )
+            );
+        }
 
         // (3) The pages stay, saying nothing more, for as long as a silent
         // connection is given.
