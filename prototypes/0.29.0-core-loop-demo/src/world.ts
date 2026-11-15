@@ -387,6 +387,9 @@ interface RemoteAvatar {
   seatSince: number;
   /** 🪑 The peer's latest movement-tick counter — breaks a seat clash. */
   seq: number;
+  /** 🦊 What the rig wears: the id of the outfit its player's entry names
+   *  (peerLooks.ts), null for the hue tint, undefined before it is dressed. */
+  look?: string | null;
 }
 
 /** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
@@ -4647,6 +4650,43 @@ export class World {
 
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
 
+  // ── 🦊 Remote foxes in their players' outfits (peerLooks.ts) ───────────────
+  /** The outfit a remote rig's player wears, by rig id (main.ts sets it). */
+  private peerLook: (id: string) => OutfitDef | null = () => null;
+  /** The colours a rig had before its hue tint, so the tint can be lifted
+   *  exactly (offsetHSL is cumulative) when its player's outfit is known. */
+  private peerTintOriginals = new WeakMap<
+    VoxelCharacter,
+    Map<THREE.Material, { color: number | null; emissive: number | null }>
+  >();
+
+  /** Where the outfit of a remote rig's player is read from. */
+  public setPeerLooks(look: (id: string) => OutfitDef | null): void {
+    this.peerLook = look;
+  }
+
+  /** Dress every remote rig again: a players entry came, went or changed. */
+  public refreshPeerLooks(): void {
+    for (const [id, avatar] of this.remotePlayers) this.dressPeer(avatar, id);
+  }
+
+  /** A remote rig wears its player's outfit when an entry claims its lane,
+   *  and the per-peer hue tint otherwise. Nothing changes when the look is
+   *  the one it already wears. */
+  private dressPeer(avatar: RemoteAvatar, id: string): void {
+    const outfit = this.peerLook(id);
+    const look = outfit ? outfit.id : null;
+    if (avatar.look === look) return;
+    avatar.look = look;
+    if (outfit) {
+      this.removePeerTint(avatar.rig);
+      avatar.rig.setOutfit(outfit);
+    } else {
+      avatar.rig.clearOutfit();
+      this.applyPeerTint(avatar.rig, id);
+    }
+  }
+
   // ── 🪑 One person per seat (seatOccupancy.ts) ──────────────────────────────
   /** The seat the local player is in or sliding onto, as last seen. */
   private localSeatId: string | null = null;
@@ -4729,6 +4769,10 @@ export class World {
    * reused by many meshes within a rig and offsetHSL is cumulative.
    */
   private applyPeerTint(rig: VoxelCharacter, id: string): void {
+    // 🦊 Tinted once: the colours before it are kept to lift it again.
+    if (this.peerTintOriginals.has(rig)) return;
+    const originals = new Map<THREE.Material, { color: number | null; emissive: number | null }>();
+    this.peerTintOriginals.set(rig, originals);
     const hueShift = World.peerHue01(id) * 0.9 - 0.45;
     const seen = new Set<THREE.Material>();
     rig.masterGroup.traverse((obj) => {
@@ -4741,12 +4785,28 @@ export class World {
         if (!mat || mat === OUTLINE_MAT || seen.has(mat)) continue;
         seen.add(mat);
         const colored = mat as THREE.MeshToonMaterial;
+        originals.set(mat, {
+          color: colored.color ? colored.color.getHex() : null,
+          emissive: colored.emissive ? colored.emissive.getHex() : null,
+        });
         if (colored.color) colored.color.offsetHSL(hueShift, 0, 0);
         // Toon materials carry a matching emissive tint — shift it too so the
         // recolor holds up in dim light.
         if (colored.emissive) colored.emissive.offsetHSL(hueShift, 0, 0);
       }
     });
+  }
+
+  /** 🦊 Lift a rig's hue tint: every colour back to what it was before. */
+  private removePeerTint(rig: VoxelCharacter): void {
+    const originals = this.peerTintOriginals.get(rig);
+    if (!originals) return;
+    for (const [mat, was] of originals) {
+      const colored = mat as THREE.MeshToonMaterial;
+      if (colored.color && was.color !== null) colored.color.setHex(was.color);
+      if (colored.emissive && was.emissive !== null) colored.emissive.setHex(was.emissive);
+    }
+    this.peerTintOriginals.delete(rig);
   }
 
   public updateRemotePlayer(
@@ -4826,7 +4886,6 @@ export class World {
       // edge. Accepted ~1 s degradation; no extra protocol.
       const rig = new VoxelCharacter(this.scene);
       rig.masterGroup.position.set(x, 0, z);
-      this.applyPeerTint(rig, id);
       this.remotePlayers.set(id, {
         rig,
         targetX: x,
@@ -4847,6 +4906,8 @@ export class World {
         seatSince: performance.now(),
         seq,
       });
+      // 🦊 In its player's outfit when an entry claims its lane, else tinted.
+      this.dressPeer(this.remotePlayers.get(id)!, id);
       this.settleSeatClash(this.remotePlayers.get(id)!);
       return;
     }
