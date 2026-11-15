@@ -11,6 +11,11 @@
  * the room doc (`outfitId`). The room's other pages dress the player's fox in
  * it once the entry also names the lane the fox's ticks carry (peerLooks.ts);
  * a remote fox no entry claims keeps #27's per-peer hue tint.
+ *
+ * 🦊 A fox drawn in its player's own look (foxLook.ts) keeps its own fur,
+ * markings and inner ears in any outfit: the outfit brings its paws and its
+ * accessory, and may ask for a tint over the fur (`furTint`). A fox with no
+ * look wears the outfit's whole palette, as before there were looks.
  */
 
 /** Swappable color slots on the fox rig. Mirrors the PAL entries that are
@@ -28,6 +33,10 @@ export interface OutfitDef {
   /** Absolute hex per role. Missing roles restore the rig's original color. */
   paletteOverrides: Partial<Record<PaletteRole, number>>;
   accessory?: AccessoryKind;
+  /** 🦊 A tint over a fox's own fur (a look's fur colour): the colour, and
+   *  how far toward it the fur goes, 0 to 1. Only a fox drawn in a look
+   *  takes it; one with no look wears `paletteOverrides.fur`. */
+  furTint?: { color: number; amount: number };
 }
 
 /** Preset catalogue. 'default' = the pristine fox (no overrides, no accessory). */
@@ -43,6 +52,8 @@ export const OUTFITS: OutfitDef[] = [
     name: 'Midnight Courier',
     paletteOverrides: { fur: 0x4a5a70, furDeep: 0x323f52, cream: 0xe4ebf2, accent: 0x1a2430 },
     accessory: 'cap',
+    // A light cool-blue cast over a player's own fur colour.
+    furTint: { color: 0x5f7fb4, amount: 0.3 },
   },
   {
     // Deep red flight-crew fox — richer rust fur, warm parchment cream.
@@ -62,6 +73,19 @@ export const OUTFITS: OutfitDef[] = [
 
 export function getOutfitById(id: string): OutfitDef | undefined {
   return OUTFITS.find((o) => o.id === id);
+}
+
+/** 🦊 A fur colour with an outfit's tint laid over it: each channel moved
+ *  `amount` of the way to the tint's (clamped to 0..1, rounded). */
+export function tintFur(fur: number, tint: { color: number; amount: number }): number {
+  const t = Math.min(1, Math.max(0, Number.isFinite(tint.amount) ? tint.amount : 0));
+  let out = 0;
+  for (const shift of [16, 8, 0]) {
+    const a = (fur >> shift) & 0xff;
+    const b = (tint.color >> shift) & 0xff;
+    out |= Math.round(a + (b - a) * t) << shift;
+  }
+  return out;
 }
 
 // ── Local persistence ───────────────────────────────────────────────────────

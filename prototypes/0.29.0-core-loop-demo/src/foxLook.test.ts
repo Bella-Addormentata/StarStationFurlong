@@ -18,7 +18,7 @@ import {
   saveLook,
   type FoxLook,
 } from './foxLook';
-import { getOutfitById } from './outfits';
+import { OUTFITS, getOutfitById, tintFur } from './outfits';
 
 /** Every colour the fake face canvas was handed, in order. */
 const painted: string[] = [];
@@ -125,6 +125,30 @@ describe('a look', () => {
   });
 });
 
+describe('an outfit\'s fur tint', () => {
+  it('moves each channel of the fur the asked way toward the tint', () => {
+    const tint = (amount: number) => tintFur(0x204060, { color: 0x6080a0, amount });
+    expect(tint(0)).toBe(0x204060);
+    expect(tint(1)).toBe(0x6080a0);
+    expect(tint(0.5)).toBe(0x406080);
+    // Out of range, or not a number, it goes no further than either end.
+    expect(tint(7)).toBe(0x6080a0);
+    expect(tint(-1)).toBe(0x204060);
+    expect(tint(NaN)).toBe(0x204060);
+    expect(tintFur(0xff0000, { color: 0x000000, amount: 0.5 })).toBe(0x800000);
+  });
+
+  it('is asked for with a colour and an amount in range', () => {
+    const tinted = OUTFITS.filter((o) => o.furTint);
+    expect(tinted.map((o) => o.id)).toEqual(['midnight']);
+    for (const o of tinted) {
+      expect(o.furTint!.amount).toBeGreaterThan(0);
+      expect(o.furTint!.amount).toBeLessThanOrEqual(1);
+      expect(Number.isInteger(o.furTint!.color) && o.furTint!.color >= 0 && o.furTint!.color <= 0xffffff).toBe(true);
+    }
+  });
+});
+
 describe('the fox rig in a look', () => {
   const rig = () => new VoxelCharacter(new THREE.Scene());
   /** The colour of the first material of each palette role. */
@@ -189,6 +213,26 @@ describe('the fox rig in a look', () => {
     r.setOutfit(midnight);
     const c = colours(r);
     for (const role of ['fur', 'furDeep', 'cream', 'accent'] as const) expect(c[role]).toBe(midnight.paletteOverrides[role]);
+  });
+
+  it('in an outfit that asks for a tint, lays it over its own fur and nowhere else', () => {
+    const midnight = getOutfitById('midnight')!;
+    expect(midnight.furTint).toBeDefined();
+    for (const order of ['look first', 'outfit first']) {
+      const r = rig();
+      if (order === 'look first') r.setLook(lookParts(SNOW_SMOKE));
+      r.setOutfit(midnight);
+      if (order === 'outfit first') r.setLook(lookParts(SNOW_SMOKE));
+      const c = colours(r);
+      expect(c.fur, order).toBe(tintFur(FUR_COLOURS[1].fur, midnight.furTint!));
+      expect(c.fur, order).not.toBe(FUR_COLOURS[1].fur);
+      expect(c.cream, order).toBe(CREAM_COLOURS[4].cream);
+      expect(c.furDeep, order).toBe(CREAM_COLOURS[4].innerEar);
+      expect(c.accent, order).toBe(midnight.paletteOverrides.accent);
+      // Out of the outfit, the fur is its own again.
+      r.clearOutfit();
+      expect(colours(r).fur, order).toBe(FUR_COLOURS[1].fur);
+    }
   });
 
   it('comes out of the clone vat\'s pallor in its own colours', () => {

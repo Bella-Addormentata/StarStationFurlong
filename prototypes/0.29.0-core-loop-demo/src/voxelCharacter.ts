@@ -53,7 +53,7 @@
  */
 
 import * as THREE from 'three';
-import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
+import { tintFur, type OutfitDef, type PaletteRole, type AccessoryKind } from './outfits';
 import type { EyeShape, FoxLookParts } from './foxLook';
 import { vatPallorHex } from './vatGauge';
 
@@ -175,8 +175,9 @@ const PAL = {
 
 /** 🦊 The palette roles a look (foxLook.ts) holds: the fox's own fur, its
  *  markings and its inner ears. An outfit worn with a look leaves these to
- *  it, so a fur colour the player picked shows whatever they wear; an
- *  outfit on a fox with no look recolours them as before. */
+ *  it, so a fur colour the player picked shows whatever they wear (an
+ *  outfit may only lay its `furTint` over that fur); an outfit on a fox
+ *  with no look recolours them as before. */
 const LOOK_ROLES: ReadonlySet<PaletteRole> = new Set<PaletteRole>(['fur', 'furDeep', 'cream']);
 /** The drawn ears' height squash and outward lean (buildEar), which a
  *  look's ears scale and add to. */
@@ -1805,7 +1806,7 @@ export class VoxelCharacter {
     const outfit = this.currentOutfit;
     const look = this.look;
     const lookColour: Partial<Record<PaletteRole, number>> = look
-      ? { fur: look.fur, furDeep: look.innerEar, cream: look.cream }
+      ? { fur: outfit?.furTint ? tintFur(look.fur, outfit.furTint) : look.fur, furDeep: look.innerEar, cream: look.cream }
       : {};
     const seen = new Set<THREE.Material>();
     this.visualGroup.traverse((obj) => {
