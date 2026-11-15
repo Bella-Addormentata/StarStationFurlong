@@ -312,6 +312,52 @@ describe('an ended game is compacted (P6)', () => {
     expect(keysOf(c)).toEqual([end.key, xf.key, sesKey].sort());
   });
 
+  it('transfers at the round the game ended at that give the game and bring it back leave the base and the holder as they were, and the end still does not say it all: nothing of the game goes, and a page that comes after reads the same chain', async () => {
+    const out = xferOf(G, owner, buyer, 5, { asset: DEED });
+    const back = xferOf(G, buyer, owner, 5, { asset: DEED, nonce: 'fedcba9876543210fedcba98' });
+    const [a] = await gameRoom(['A']);
+    endGame(T0 + STEP, [a], [older, fin, end, out, back]);
+    const T = run([a], T0 + 2 * STEP, T0 + 60_000, { step: STEP });
+    expect(resolved(a)).toMatchObject({ live: false, pending: false, holder: owner.pub });
+    expect(resolved(a).base?.key).toBe(end.key);
+    expect(resolved(a).chain.map((h) => h.k)).toEqual([owner.pub, buyer.pub, owner.pub]);
+    expect(a.casino.computedFairOnlyEnded()).toEqual([]);
+    expect(a.casino.compactFairOnly(TABLE, G.inc)).toBe(0);
+    expect(keysOf(a)).toEqual(expect.arrayContaining([end.key, out.key, back.key]));
+    const c = await loadPage('C', 3);
+    clockOf(c, T + STEP);
+    sync(T + STEP, a, c);
+    run([a, c], T + STEP, T + 30_000, { step: STEP });
+    expect(c.casino.computedResolutionOf(TABLE, G.inc)!.chain.map((h) => h.k)).toEqual([owner.pub, buyer.pub, owner.pub]);
+    expect(keysOf(c)).toEqual(expect.arrayContaining([end.key, out.key, back.key]));
+  });
+
+  it('nothing of the game goes while a checkpoint that could outrank the end lies past the places the resolver looks at: a page that looks in another order would count from it', async () => {
+    // Eight good ends of round 5 close the session the page counts, and a good checkpoint of round 7 closes another.
+    const ends = Array.from({ length: 8 }, (_, i) => trimOf(G, 'p', { b: SID, u: 5, l: hex('e', 32), n: { alice: `${7 + i}`, bob: `-${7 + i}` }, e: 1, f: fin.value, s: undefined, h: undefined, k: owner.pub, dl: undefined }));
+    const seven = trimOf(G, 'p', { u: 7, l: hex('f', 32), n: { alice: '9', bob: '-9' }, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const [a] = await gameRoom(['A']);
+    endGame(T0 + STEP, [a], [...ends, seven]);
+    run([a], T0 + 2 * STEP, T0 + 60_000, { step: STEP });
+    expect(resolved(a)).toMatchObject({ live: false, pending: false, unlooked: true });
+    expect(a.casino.computedFairOnlyEnded()).toEqual([]);
+    expect(a.casino.compactFairOnly(TABLE, G.inc)).toBe(0);
+    expect(keysOf(a)).toEqual(expect.arrayContaining([seven.key, ...ends.map((e) => e.key)]));
+  });
+
+  it('what is written under the game\'s keys in the tick of the last write of the compaction waits its own COMPACT_MS: the wait that ran out is not kept for it', async () => {
+    const [a] = await gameRoom(['A']);
+    endGame(T0 + STEP, [a]);
+    const T = run([a], T0 + 2 * STEP, T0 + 60_000, { step: STEP, until: () => keysOf(a).length === 1 });
+    expect(keysOf(a)).toEqual([end.key]);
+    // (before the page looks again)
+    a.doc.transact(() => top(a).set(older.key, older.value), 'peer');
+    const gone = run([a], T + STEP, T + 60_000, { step: STEP, until: () => keysOf(a).length === 1 });
+    expect(keysOf(a)).toEqual([end.key]);
+    expect(gone).toBeGreaterThanOrEqual(T + COMPACT_MS);
+    expect(gone).toBeLessThan(T + COMPACT_MS + 8_000);
+  });
+
   it('what is left of an ended game is found by one pass over the room\'s map, not one a look: the looks of the wait cost nothing more until a record changes', async () => {
     const [a] = await gameRoom(['A']);
     endGame(T0 + STEP, [a]);

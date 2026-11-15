@@ -2298,7 +2298,7 @@ interface FairOnlyState {
    *  nothing on a page that counted it, and the page puts it back
    *  (computedFairOnlyRecoveries, putBackFairOnlyRecords). */
   /** Whether the end checkpoint stands by itself, as last asked (`key`: the
-   *  base's key and the holder the resolution named; fairOnlyEndStands). */
+   *  base's key and the chain of holders the resolution named; fairOnlyEndStands). */
   alone: { key: string; ok: boolean } | null;
   heldXfs: Map<string, unknown>;
   heldFin: unknown;
@@ -6358,7 +6358,9 @@ export const COMPACT_DELETE_MAX = 256;
  *  checkpoint as its base, the page counts from that one and the doc holds it
  *  whole at its key (one the doc lacks is put back first: fairOnlyLacks), and
  *  the resolver gives the same answer with nothing but that record: the same
- *  base, held by the same key, not live, no check waiting. An end the game's
+ *  base, the same chain of holders, not live, no check waiting; and no
+ *  checkpoint that could outrank the end was left unlooked at (Resolution
+ *  unlooked). An end the game's
  *  holder's page writes carries its end order, its house's delegation and the
  *  transfers of its chain (computedTable fairEndOf), and the resolver takes
  *  no checkpoint that leans on a record beside it for these (S2: a transfer
@@ -6370,14 +6372,18 @@ export const COMPACT_DELETE_MAX = 256;
 function fairOnlyEndStands(c: ComputedInc, map: Y.Map<unknown>): boolean {
   const fo = c.fo!;
   const res = fo.res;
-  if (!res || res.pending || res.newer || res.live || res.base?.ck.e !== 1) return false;
+  // (A checkpoint left unlooked at that could outrank the end: a page that
+  // looks in another order may count from it, so nothing of the game goes.)
+  if (!res || res.pending || res.newer || res.live || res.unlooked || res.base?.ck.e !== 1) return false;
   const base = res.base;
   if (!fo.held || fo.held.key !== base.key) return false;
   const cur = map.get(base.key);
   if (cur !== fo.held.value && readCkMemo(base.key, cur).kind !== 'ok') return false;
-  // (By the base and the holder the answer names: a transfer that comes after
-  // the end, at the round it ends at, leaves the base and moves the holder.)
-  const asked = `${base.key}|${res.holder ?? ''}`;
+  // (By the base and the chain the answer names: transfers that come after the
+  // end, at the round it ends at, leave the base and move the holder, or move
+  // it and bring it back, and a page that came after would read no such chain.)
+  const chainOf = (r: Resolution): string => r.chain.map((h) => `${h.k}@${h.from}@${h.step?.id ?? ''}`).join(',');
+  const asked = `${base.key}|${chainOf(res)}`;
   if (fo.alone?.key === asked) return fo.alone.ok;
   const alone = resolveGame(
     { room: boundRoomId, sig: authCheck, read: readCkMemo, xf: readXfMemo },
@@ -6385,7 +6391,7 @@ function fairOnlyEndStands(c: ComputedInc, map: Y.Map<unknown>): boolean {
   );
   // (A check put off says nothing yet: asked again at the next look.)
   if (alone.pending) return false;
-  const ok = alone.base?.key === base.key && !alone.live && alone.holder === res.holder && !alone.newer;
+  const ok = alone.base?.key === base.key && !alone.live && chainOf(alone) === chainOf(res) && !alone.newer;
   fo.alone = { key: asked, ok };
   return ok;
 }

@@ -4873,7 +4873,9 @@ function fairCompactDuty(pub: string, now: number): void {
     // (Not ready, or a clock gone back: the wait starts again.)
     if (at === undefined || at > now || !ready) fairEndedAt.set(key, at = now);
     if (!ready || now < at + COMPACT_MS + compactTurn(r, pub)) continue;
-    compactFairOnly(r.t, r.inc);
+    // (The last of it gone: what is written under the game's keys after this
+    // waits its own COMPACT_MS, were it written before this page looks again.)
+    if (compactFairOnly(r.t, r.inc) >= r.left) fairEndedAt.delete(key);
   }
   for (const key of [...fairEndedAt.keys()]) if (!listed.has(key)) fairEndedAt.delete(key);
 }

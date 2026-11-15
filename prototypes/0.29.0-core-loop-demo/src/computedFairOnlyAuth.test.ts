@@ -757,11 +757,17 @@ describe('what is not yet checked (pending)', () => {
       const low = resolve('p', [root, ...threes, forged, past], { liveSid: live, hold: [hashOf(forged)] });
       expect(low.res.base?.ck.u, what).toBe(3);
       expect(low.res.pending, what).toBe(false);
+      expect(low.res.unlooked, what).toBe(false);
     }
     // And with nothing put off, a full set of good ones is the limit S3 documents: nothing frees a place, so nothing waits.
     const full = resolve('p', [root, ...threes, trimOf(P, 'p', { b: live, w: 1, l: hex('d', 32) }), five], { liveSid: live });
     expect(full.res).toMatchObject({ pending: false, invalid: [] });
     expect(full.res.base?.ck.u).toBe(3);
+    // It says so all the same (unlooked): a reader that prefers no session looks at the round 5 first and names it.
+    expect(full.res.unlooked).toBe(true);
+    const plain = resolve('p', [root, ...threes, trimOf(P, 'p', { b: live, w: 1, l: hex('d', 32) }), five]);
+    expect(plain.res.base?.key).toBe(five.key);
+    expect(plain.res.unlooked).toBe(false);
   });
 
   it('a checkpoint that failed is not one left unlooked at: with another put off under the base, the pass is settled', () => {
