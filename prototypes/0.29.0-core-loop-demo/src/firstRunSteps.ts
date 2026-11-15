@@ -23,8 +23,10 @@
  *  `ChiaWalletState`), repeated here so this module imports nothing. */
 export type WalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
-/** What LIST ME allows of the Phone Book's writes (listMe.ts says the same
- *  in the Network settings). */
+/** What LIST ME allows of the Phone Book's listing and knocks (listMe.ts
+ *  says the same in the Network settings). The beacon is not LIST ME's to
+ *  allow: it has a switch of its own (the BEACON row), so `none` is no
+ *  listing and no knock, never "nothing written". */
 export type ListingReach = 'all' | 'knocks' | 'none';
 
 /** The wallet line where the wallet is on: what the computer can then write
@@ -36,7 +38,9 @@ function walletOnLine(listing: ListingReach | undefined): StepLine {
     case 'knocks':
       return { key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock. Its listing is held off on this computer.' };
     case 'none':
-      return { key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes nothing in it.' };
+      // No more than listMe.ts `listMeOffNote` says: a lit beacon is still
+      // written with LIST ME off.
+      return { key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes no listing and no knock in it.' };
     default:
       return { key: 'wallet', mark: 'done', text: 'The SSF wallet is on.' };
   }
@@ -53,7 +57,7 @@ export interface FirstRunFacts {
   wallet?: WalletState;
   /** What LIST ME lets a wallet that is on write (the fingerprint's
    *  `chia_listing`): the listing and the knocks, the knocks alone
-   *  (`SSF_CHIA_FINDABLE=0` holds the listing off), or nothing (LIST ME is
+   *  (`SSF_CHIA_FINDABLE=0` holds the listing off), or neither (LIST ME is
    *  off, as it starts where the coins are real money). `undefined`: the
    *  node has not said. */
   listing?: ListingReach;

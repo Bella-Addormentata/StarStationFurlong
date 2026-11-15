@@ -78,8 +78,12 @@ describe('firstRunSteps: the Phone Book and its wallet', () => {
     expect(wallet('all')).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock and list itself.' });
     // On, with the listing held off by the node's environment: the knocks alone.
     expect(wallet('knocks')).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on: your computer can knock. Its listing is held off on this computer.' });
-    // LIST ME off (as it starts where the coins are real money): nothing is written.
-    expect(wallet('none')).toEqual({ key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes nothing in it.' });
+    // LIST ME off (as it starts where the coins are real money): no listing
+    // and no knock. The beacon has its own switch, so the line never says
+    // that nothing is written.
+    const none = wallet('none');
+    expect(none).toEqual({ key: 'wallet', mark: 'off', text: 'The SSF wallet is on, but LIST ME is off: your computer reads the Phone Book and writes no listing and no knock in it.' });
+    expect(none?.text).not.toMatch(/nothing/i);
     // A node that says nothing of LIST ME: the wallet's state and no more.
     const bare = wallet(undefined);
     expect(bare).toEqual({ key: 'wallet', mark: 'done', text: 'The SSF wallet is on.' });
