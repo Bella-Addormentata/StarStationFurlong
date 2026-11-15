@@ -443,10 +443,41 @@ mod tests {
         for gone in ["burners_enabled", "burner_paths", "burners_of", "BurnerPaths", "paths.", "burner_path", "wallet_refusal", "money_refused", "listing_refused"] {
             assert_eq!(code_lines(publish, gone), [""; 0], "chia_publish.rs: {gone}");
         }
-        assert_eq!(code_lines(publish, "env::var"), [
-            "std::env::var(\"SSF_CHIA_FINDABLE\").ok().as_deref() != Some(\"0\")",
-            "std::env::var(\"SSF_CHIA_BEACON\").ok().as_deref() == Some(\"1\")",
+        assert_eq!(code_lines(publish, "env::var"), ["std::env::var(\"SSF_CHIA_FINDABLE\").ok().as_deref() != Some(\"0\")"]);
+        // 🔦 The beacon is lit by the hub's switch (chia_beacon_switch.rs,
+        // which reads `SSF_CHIA_BEACON` itself, once), asked once a tick:
+        // every read of its word in the loop, and nothing else lights the
+        // arm. The mark is read at the start whatever the switch says, so a
+        // beacon lit later in the run is judged by the mark of its era.
+        assert_eq!(code_lines(publish, "beacon_enabled"), [""; 0]);
+        assert_eq!(code_lines(heartbeat, "hub.beacon.on()"), ["if let (true, Some(m)) = (hub.beacon.on(), &beacon_mark) {", "let beacon_on = hub.beacon.on();"]);
+        assert_eq!(code_lines(heartbeat, "beacon_on"), [
+            "let beacon_on = hub.beacon.on();",
+            "if !beacon_on {",
+            "if peak == 0 && (findable.is_some() || knock_waiting || beacon_on) {",
+            "if beacon_on {",
+            "if beacon_on && peak > 0 && !era_guard(peak) {",
         ]);
+        assert_eq!(code_lines(heartbeat, "BeaconMark::load("), ["let mut beacon_mark: Option<BeaconMark> = BeaconMark::load(beacon_mark_path);"]);
+        // What the page is shown of the arm's last look: dropped while the
+        // beacon is out; dropped at the first tick of another era, before
+        // any arm can take the tick (#440 review: the listing's or a knock's
+        // `continue` would leave the last era's look standing as this
+        // one's); written at each look of the arm and again after a write.
+        assert_eq!(code_lines(heartbeat, "hub.beacon_status"), [
+            "hub.beacon_status.lock().unwrap().take();",
+            "drop_other_eras_look(&mut hub.beacon_status.lock().unwrap(), chia_lane::era_of(peak));",
+            "*hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));",
+            "*hub.beacon_status.lock().unwrap() = Some(beacon_status(era, reachable, serves_welcome, beacon_mark.as_ref(), &self_id));",
+        ]);
+        // The drop sits beside the beacon clock's own look at the tick's
+        // peak, above the listing's arm: no `continue` lies between the
+        // peak's read and it.
+        let drop_at = heartbeat.find("drop_other_eras_look(&mut hub.beacon_status").expect("the drop");
+        let clock_at = heartbeat.find("beacon_sees_peak(&mut beacon_clock, root, peak").expect("the clock's look");
+        let listing_at = heartbeat.find("if let Some(listed) = findable {").expect("the listing's arm");
+        assert!(clock_at < drop_at && drop_at < listing_at, "the drop comes with the clock's look, before the first arm");
+        assert_eq!(code_lines(&heartbeat[clock_at..drop_at], "continue"), [""; 0]);
         assert_eq!(code_lines(publish, "BURNERS_ENV").len(), 2, "the variable's name, and the note that it is no longer read");
         assert_eq!(code_lines(publish, "pub const BURNERS_ENV"), ["pub const BURNERS_ENV: &str = \"SSF_CHIA_BURNERS\";"]);
         assert_eq!(code_lines(&main, "BURNERS"), ["if let Some(note) = chia_publish::burners_env_note(std::env::var_os(chia_publish::BURNERS_ENV).as_deref()) {"]);
@@ -501,7 +532,7 @@ mod tests {
         // saved bundle stops going to the peers again when the switch is
         // turned off. The slot's rule says which: the listing's first write
         // and a knock are LIST ME's, and a rewrite and the beacon, which
-        // has its own setting, are not. The lease leaves LIST ME's spends
+        // has its own switch, are not. The lease leaves LIST ME's spends
         // out of its liveness question by the switch it is told to ask.
         assert_eq!(code_lines(publish, "Resend::WhileListed"), ["if resend == Resend::WhileListed {"]);
         assert_eq!(code_lines(publish, "Resend::Always"), [

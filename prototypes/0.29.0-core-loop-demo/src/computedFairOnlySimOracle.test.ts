@@ -20,7 +20,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { sealCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
-import { houseSign } from './computedHouse';
+import { delegationKey, houseSign, roomSignBytes } from './computedHouse';
+import { PAGE_ROOM } from './computedPageKit';
 import { RUN_MS as CRAPS_RUN_MS, T as CRAPS, TIMEOUT as CRAPS_TIMEOUT } from './computedCrapsSimKit';
 import { HEAVY_BOT, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET } from './computedSim';
 import type { PageSpec } from './computedSim';
@@ -318,6 +319,166 @@ describe('the checkpoint oracle and an end', () => {
 });
 
 describe("the oracle's own base rule", () => {
+  it('does not hold a delegation that came and went with no record of its house in the game: that key is a house while the record is in the doc, and none after', async () => {
+    const sim = await Sim.open({ name: 'fair-only-unused-key', seed: seed(1235), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    await sim.run(30_000);
+    const T = 'roulette-1';
+    const D = sim.pages[3];
+    const owner = sim.house;
+    const top = D.p.doc.getMap<unknown>('casinoComputed');
+    const inc = D.p.casino.computedIncOf(T)!;
+    // (What the oracle holds on for this load of the page: its own notes, read as they are.)
+    const heldKeys = (): string[] => ((sim as unknown as { foDls: WeakMap<object, Map<string, { dls: { h: string }[] }>> }).foDls
+      .get(D.p)?.get(`${T}|${inc}`)?.dls ?? []).map((d) => d.h);
+    // (A key the holder delegates and that writes nothing a fold takes: page D's own, as good a key as any.)
+    const h = D.p.pub;
+    const body = { v: 1, h, k: owner.p.pub };
+    const dl = { ...body, g: owner.p.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) };
+    sim.enter(D);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).toEqual([sim.node!.pub]);
+    D.cheats = true;
+    const ses = D.p.casino.computedSessionForWrite(T)!;
+    D.p.doc.transact(() => {
+      top.set(delegationKey(h), dl);
+      // (And a record under a house's key prefix that names it, which no fold reads as a record.)
+      ses.set('o:garbage', { k: h });
+    });
+    await sim.run(2_000);
+    sim.enter(D);
+    expect(top.has(delegationKey(h)), sim.label).toBe(true);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).not.toContain(h);
+    D.p.doc.transact(() => top.delete(delegationKey(h)));
+    await sim.run(1_000);
+    sim.enter(D);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    expect(heldKeys(), sim.label).not.toContain(h);
+    expect(heldKeys(), sim.label).toContain(sim.node!.pub);
+  }, TIMEOUT);
+
+  it('the harness: a machine that comes later brings its node, and a node that went with the room runs on the buyer\'s page only, through a second hand-over too', async () => {
+    const sim = await Sim.open({ name: 'fair-only-harness-nodes', seed: seed(1241), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    await sim.run(10_000);
+    const E = await sim.add({ name: 'E', pid: 'player-A', identity: 'A', node: true, bot: null });
+    expect(sim.also.map((m) => m.sp), sim.label).toEqual([E]);
+    expect(sim.nodes, sim.label).toHaveLength(2);
+    expect(E.p.pub, sim.label).toBe(sim.house.p.pub);
+    await sim.run(20_000);
+    expect(sim.also[0].node.wrote.beats, sim.label).toBeGreaterThan(0);
+    // Its page asleep with its doc syncing: the node runs on (as the owner's does), and stops with the doc cut off.
+    let beats = sim.also[0].node.wrote.beats;
+    sim.sleep(E, true);
+    await sim.run(15_000);
+    expect(sim.also[0].node.wrote.beats, sim.label).toBeGreaterThan(beats);
+    sim.wake(E);
+    // A third machine named by the second's page: the same key again.
+    const F = await sim.add({ name: 'F', pid: 'player-A', identity: 'E', bot: null });
+    expect(F.p.pub, sim.label).toBe(sim.house.p.pub);
+    beats = sim.also[0].node.wrote.beats;
+    expect(beats, sim.label).toBeGreaterThan(0);
+    const [, B, C] = sim.pages;
+    expect(await sim.handOver(B, { node: 'same' }), sim.label).toEqual({ ok: true });
+    expect(sim.node2, sim.label).toBe(sim.node);
+    sim.runs(sim.node!, false);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, false]);
+    sim.runs(sim.node!, true);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, true]);
+    await sim.run(10_000);
+    // The next buyer keeps the node the last one ran.
+    const was = sim.node2;
+    expect(await sim.handOver(C, { node: 'same' }), sim.label).toEqual({ ok: true });
+    expect(sim.node2, sim.label).toBe(was);
+    expect([sim.nodeUp, sim.node2Up], sim.label).toEqual([false, true]);
+    expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
+
+  it("holds every holder's delegation of a house it used: the buyer's delegation of the seller's node from the first look that reads a round the node revealed for the seller, before the node has done anything for the buyer", async () => {
+    const sim = await Sim.open({ name: 'fair-only-one-node-two-holders', seed: seed(1239), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    const T = 'roulette-1';
+    const [, buyer, , D] = sim.pages;
+    const top = D.p.doc.getMap<unknown>('casinoComputed');
+    const quiet = (): boolean => {
+      sim.enter(buyer);
+      const res = buyer.p.casino.computedFoldOf(T);
+      return !!res && !res.pending && res.tip === null && res.openCloses.length === 0 && res.rounds.some((d) => d.decided === 'house');
+    };
+    // A round or more the node revealed since the base, and the table quiet: then nobody bets on.
+    await sim.run(30_000);
+    while (sim.elapsed < RUN_MS && !quiet()) await sim.run(200);
+    expect(quiet(), sim.label).toBe(true);
+    for (const sp of sim.pages) sp.betting = false;
+    const was = { ...sim.node!.wrote };
+    expect(await sim.handOver(buyer, { node: 'same' }), sim.label).toEqual({ ok: true });
+    const key = delegationKey(sim.node!.pub);
+    const byBuyer = (): boolean => (top.get(key) as { k?: string } | undefined)?.k === buyer.p.pub;
+    const from = sim.elapsed;
+    while (sim.elapsed < from + 30_000 && !byBuyer()) await sim.run(200);
+    expect(byBuyer(), sim.label).toBe(true);
+    await sim.run(1_000);
+    // (The node wrote nothing at the game for the buyer: no join, no reveal.)
+    expect([sim.node!.wrote.joins, sim.node!.wrote.reveals], sim.label).toEqual([was.joins, was.reveals]);
+    sim.enter(D);
+    const inc = D.p.casino.computedIncOf(T)!;
+    expect(D.p.casino.computedResolutionOf(T, inc)?.holder, sim.label).toBe(buyer.p.pub);
+    expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+    const held = ((sim as unknown as { foDls: WeakMap<object, Map<string, { dls: { h: string; k: string }[] }>> }).foDls.get(D.p)?.get(`${T}|${inc}`)?.dls ?? [])
+      .filter((d) => d.h === sim.node!.pub).map((d) => d.k);
+    expect(held, sim.label).toContain(buyer.p.pub);
+    expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
+
+  for (const what of ['delegation', 'transfer', 'same'] as const) {
+    it(what === 'same'
+      ? "holds the buyer's delegation of the seller's node (one house key, delegated by each holder in turn) while the doc has lost the record: the rounds the node revealed for the buyer stay counted"
+      : what === 'delegation'
+      ? "holds the buyer's house's delegation its count uses while the doc has lost the record (as a page does, casinoDoc keepHouses): the rounds that house revealed stay counted"
+      : "holds the transfer its chain stands on while the doc has lost the record (as a page does, casinoDoc keepStanding): the game stays the buyer's, and its house's rounds counted", async () => {
+      const sim = await Sim.open({ name: `fair-only-lost-${what}`, seed: seed(what === 'delegation' ? 1231 : what === 'same' ? 1237 : 1233), pages: named('ABCD'), houseNode: true, fairOnly: true });
+      await sim.run(30_000);
+      const [, buyer, , D] = sim.pages;
+      const was = { reveals: sim.node!.wrote.reveals, joins: sim.node!.wrote.joins };
+      expect(await sim.handOver(buyer, what === 'same' ? { node: 'same' } : {}), sim.label).toEqual({ ok: true });
+      if (what === 'same') {
+        // (The one node: a round it joined as the buyer's house, then revealed.)
+        expect(sim.node2, sim.label).toBe(sim.node);
+        while (sim.elapsed < RUN_MS && !(sim.node!.wrote.joins > was.joins && sim.node!.wrote.reveals > was.reveals + 1)) await sim.run(200);
+        expect(sim.node!.wrote.reveals, sim.label).toBeGreaterThan(was.reveals + 1);
+      } else {
+        while (sim.elapsed < RUN_MS && sim.node2!.wrote.reveals === 0) await sim.run(200);
+        expect(sim.node2!.wrote.reveals, sim.label).toBeGreaterThan(0);
+      }
+      // (Its house has signed no checkpoint yet: the record in the room is the only copy. The one node
+      // may have signed one for the buyer by now, which carries the delegation: the doc's record goes all the same.)
+      if (what !== 'same') {
+        expect(sim.node2!.trims + sim.node2!.sweeps + sim.node2!.ends, sim.label).toBe(0);
+        expect(sim.adoptionsWritten, sim.label).toBe(0);
+      }
+      await sim.run(1_000);
+      const top = D.p.doc.getMap<unknown>('casinoComputed');
+      const keys = what !== 'transfer' ? [delegationKey(sim.node2!.pub)] : [...top.keys()].filter((k) => k.startsWith('xf:'));
+      expect(keys, sim.label).toHaveLength(1);
+      const [key] = keys;
+      expect(top.has(key), sim.label).toBe(true);
+      // (The buyer's page asleep: neither it nor its node can put the record back.)
+      sim.sleep(buyer, false);
+      await sim.run(1_000);
+      // The record goes from page D's doc (by its own hand, so the moment is exact: a page that holds it
+      // puts it back within the second): the oracle's count of that doc, read at once, stands as it stood.
+      // (No look of the spec's own before it goes: what the oracle holds is what its looks of the run gave it.)
+      D.cheats = true;
+      D.p.doc.transact(() => top.delete(key));
+      expect(top.has(key), sim.label).toBe(false);
+      expect(sim.ledgerProblems(D), sim.label).toEqual([]);
+      expect(sim.cageProblems(D), sim.label).toEqual([]);
+      sim.wake(buyer);
+      await sim.run(10_000);
+      await sim.syncAll();
+      expect(top.has(key), sim.label).toBe(true);
+      expect(sim.violations, sim.label).toEqual([]);
+    }, TIMEOUT);
+  }
+
   it("holds no checkpoint that came and went while the page's doc held part of an update (the page never counted from it), and holds one that was there when the rest came", async () => {
     const sim = await Sim.open({ name: 'fair-only-parked-ck', seed: seed(1219), pages: named('ABCD'), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
     const T = 'roulette-1';
@@ -436,10 +597,15 @@ describe("the oracle's own base rule", () => {
       top.set(old![0], old![1]);
       top.set(forged.key, forged.value);
     });
-    await sim.run(2_000);
     await sim.syncAll();
     const held = A.p.doc.getMap<unknown>('casinoComputed');
     expect(held.has(old![0]) && held.has(forged.key) && held.has(realKey), sim.label).toBe(true);
+    sim.enter(A);
+    expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(realKey);
+    // The pages delete the forged one (PR 6c-4b-3a); the old one, below the base, is not looked at and stays.
+    await sim.run(8_000);
+    await sim.syncAll();
+    expect([held.has(old![0]), held.has(forged.key), held.has(realKey)], sim.label).toEqual([true, false, true]);
     sim.enter(A);
     expect(A.p.casino.computedResolutionOf(T, inc)?.base?.key, sim.label).toBe(realKey);
     expect(sim.ledgerProblems(A), sim.label).toEqual([]);
