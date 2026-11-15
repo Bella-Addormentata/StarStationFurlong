@@ -2796,6 +2796,9 @@ export class Player {
     this.vatPhase = "NONE";
     this._sealVat();
     this.mesh.scale.set(1, 1, 1);
+    // 🦊 Beamed away from the vat: its own shape again (beginVatSpawn, which
+    // beams first, holds it afresh).
+    this.shapeHeldTillClear = false;
 
     this.mesh.position.x = x;
     this.mesh.position.z = z;
@@ -2943,6 +2946,9 @@ export class Player {
    * retries.
    */
   public abortVatSpawn(): void {
+    // 🦊 The vat is going: no door left to clear. The standard shape still
+    // holds while the clone is held (isVatBound), until it is released.
+    this.shapeHeldTillClear = false;
     if (!this.isVatBound()) return;
     this._sealVat();
     if (this.vatPhase === "NONE") return; // already released: nothing to hold

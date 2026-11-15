@@ -419,6 +419,12 @@ describe('the wiring', () => {
     expect(update.slice(0, 800)).toContain('this._holdShapeInVat();');
     const spawn = player.slice(player.indexOf('public beginVatSpawn('), player.indexOf('public walkOutOfVat('));
     expect(spawn).toContain('this.shapeHeldTillClear = true;');
+    // Beamed away, or the vat removed: no door left to clear.
+    const beam = player.slice(player.indexOf('  beamTo(x: number, z: number): void {'), player.indexOf('public beginVatSpawn('));
+    expect(beam).toContain('this.shapeHeldTillClear = false;');
+    expect(spawn.indexOf('this.beamTo(centre.x, centre.z);')).toBeLessThan(spawn.indexOf('this.shapeHeldTillClear = true;'));
+    const abort = player.slice(player.indexOf('public abortVatSpawn(): void {'), player.indexOf('private _releaseVat(): void {'));
+    expect(abort.indexOf('this.shapeHeldTillClear = false;')).toBeLessThan(abort.indexOf('if (!this.isVatBound()) return;'));
     expect(spawn).toContain('this.character.holdStandardShape(true);');
     expect(world).toContain('foxSquish(at, facing, foxes.filter((f) => f.rig !== rig), size);');
     expect(world).toContain('squishOf(null, me.position, this.player.getDrawnFacing(), this.player.getDrawnSize());');
