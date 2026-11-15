@@ -712,7 +712,7 @@ struct TableMem {
     /// ([`House::own_from_before`]).
     kept_in: bool,
     /// When it first read the table this run ([`SETTLE_MS`]). 🔒 At a FAIR ONLY game, when it first read the game's
-    /// session after it was last away from it: cut off for [`HOUSE_HEARD_MS`], or not serving it.
+    /// session after it was last away from it: cut off for [`HOUSE_HEARD_MS`], or not serving the games.
     first_read: Option<u64>,
     /// 🔒 At a FAIR ONLY game, as the last pass that knew whether this house serves it found it: whether it served
     /// it, and whether it had settled there (none: no pass of this run has; [`House::remembered`]).
@@ -722,7 +722,8 @@ struct TableMem {
     /// are over counts as there since then for [`REVEAL_CUTOFF_MS`], which
     /// so still bounds how long a close it reveals has been there (the
     /// pages void it). Its grace still runs from when the house saw it: a
-    /// hold never cuts a seed's time.
+    /// hold never cuts a seed's time. 🔒 At a FAIR ONLY game, also when the spell it last served none of the game's
+    /// rounds began.
     held_since: Option<u64>,
 }
 
@@ -2140,16 +2141,17 @@ impl House {
             }
             // (Only a game it serves now counts for the room's beat: a game that has left its key never settles here.)
             let current = matches!(by_now, ha::HouseBy::Yes { .. });
-            // 🔒 A game it serves again after a spell it did not (handed on, or its delegation gone, and back): it
-            // settles there anew from the next pass that reads its session, as it read no close made meanwhile as the
-            // house of its round (design B2).
-            if current && !self.remembered(room, &key).0 {
-                if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
-                    table.first_read = None;
-                }
-            }
             match by {
-                ha::HouseBy::No => through!(false, false),
+                // 🔒 A house of none of the game's rounds to come or in flight (handed on, or its delegation gone): it
+                // reads no close made from now on as their house, so one it first reads once it serves the game again
+                // counts as there since now, for the cutoff, as after a hold; a spell of a tick (a delegation deleted,
+                // and put back) costs nothing. (Only at a game it holds memory of.)
+                ha::HouseBy::No => {
+                    if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
+                        table.held_since.get_or_insert(now);
+                    }
+                    through!(false, false)
+                }
                 ha::HouseBy::Pending => short!(None),
                 ha::HouseBy::Yes { .. } => {}
             }

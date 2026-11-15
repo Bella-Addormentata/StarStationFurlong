@@ -1194,33 +1194,64 @@ fn a_house_the_holder_delegates_later_settles_at_the_game_first() {
 }
 
 #[test]
-fn a_house_serving_a_game_again_after_a_spell_away_settles_there_anew() {
+fn a_close_made_while_the_house_served_none_of_the_games_rounds_counts_as_there_since_that_began() {
     // 🔒 Settled at the game and joined at round 1, the house is handed off it at its base (no round to come is its
-    // own), and then the buyer delegates it: a close on its join made while it did not serve the game it first reads
-    // while it settles there anew, and never reveals. One made once it has settled again it reveals.
-    for later in [false, true] {
-        let mut game = Game::new(&format!("served-again-{later}"));
+    // own), and then the buyer delegates it. A close on its join made in between it first reads once it serves the
+    // game again, and counts as there since the spell began, for the cutoff, as after a hold: after a spell longer
+    // than the cutoff it never reveals it, after a short one it does; and one made after the spell it reveals.
+    let long = REVEAL_CUTOFF_MS + 1_000;
+    for (spell, made_after, revealed) in [(long, false, false), (2_000, false, true), (long, true, true)] {
+        let mut game = Game::new(&format!("served-again-{spell}-{made_after}"));
         game.house.settle_ms = SETTLE_MS;
         game.settle();
         assert_eq!(game.records("o:1:").len(), 1);
         let buyer = who("buyer");
         game.transfer(&buyer, 0);
-        game.settle();
-        if !later {
+        game.ticks();
+        if !made_after {
             game.closed(1, &game.sid(), &game.commit(1));
             game.seeds(1);
-            game.settle();
-            assert!(game.records("h:1:").is_empty(), "none of this house's rounds");
         }
+        let began = game.now;
+        while game.now < began + spell {
+            game.tick(200);
+        }
+        assert!(game.records("h:1:").is_empty(), "none of this house's rounds");
         game.put_top(&format!("hk:{}", game.house.public()), &delegation(&buyer, game.house.public()));
-        game.settle();
-        if later {
+        game.ticks();
+        if made_after {
             game.closed(1, &game.sid(), &game.commit(1));
             game.seeds(1);
-            game.settle();
         }
-        assert_eq!(game.records("h:1:").len(), usize::from(later), "made once settled again: {later}");
+        game.settle();
+        assert_eq!(game.records("h:1:").len(), usize::from(revealed), "a spell of {spell} ms, the close made after: {made_after}");
     }
+}
+
+#[test]
+fn a_house_whose_delegation_goes_for_a_tick_reveals_the_closes_made_on_the_beat_it_gave_meanwhile() {
+    // 🔒 The root names another house, and this one is a house of the game by the holder's delegation under its key,
+    // which the Fair house table beside runs on too. The delegation deleted, a tick finds the game none of this
+    // house's, beats for the house table, and puts the delegation back: a close made on that beat it reveals, for
+    // the spell lasted a tick (it does not settle at the game again).
+    let mut game = Game::new("deleg-blink");
+    game.house.settle_ms = SETTLE_MS;
+    let other = House::open(&[9u8; 32], None).unwrap();
+    let key = game.ck_key(&game.base.clone());
+    game.delete_top(&key);
+    let root = game.root(other.public(), "f1");
+    game.lay(&root);
+    game.add_house_table();
+    game.settle();
+    assert_eq!(game.records("o:1:").len(), 1, "a house of the game by the room's delegation");
+    let hk = format!("hk:{}", game.house.public());
+    game.delete_top(&hk);
+    game.tick(HEARTBEAT_MS);
+    assert!(game.top(&hk).is_some(), "put back");
+    game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    assert_eq!(game.records("h:1:").len(), 1);
 }
 
 #[test]
