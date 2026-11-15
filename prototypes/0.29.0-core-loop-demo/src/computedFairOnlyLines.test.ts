@@ -231,6 +231,26 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'offline', heard: false });
   });
 
+  it('a closed round whose house has revealed waits on no house, heard or not: only a bettor\'s seed is missing', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    putIn(a, [[kit.houseJoin(H, 1).key, kit.houseJoin(H, 1).rec]]);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    sync(T0, a, b);
+    const beat = new Beating(a, H);
+    beating = [beat];
+    let T = run([a, b], T0 + STEP, T0 + 120_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    // (B's seed never reaches A; the house's reveal, which counts both slips, does.)
+    const tip = a.casino.computedFoldOf(TABLE, G.inc)!.tip!;
+    const hr = kit.houseReveal(H, 1, [tip.close], Object.values(tip.frozen));
+    putIn(a, [[hr.key, hr.rec]]);
+    beat.muted = true;
+    T = run([a], T + STEP, beat.lastAt! + HOUSE_HEARD_MS + 2 * STEP, { step: STEP });
+    const now = a.casino.computedFoldOf(TABLE, G.inc)!.tip!;
+    expect(now.houseWaits).toEqual([b.pid]);
+    expect(viewOf(a, T)).toMatchObject({ waiting: null, heard: false });
+  });
+
   it('an end order makes the game ending, and its end makes it ended while the switch still names it', async () => {
     const [a] = await gameRoom(['A']);
     const fin = sealFin(G, owner.pub, owner.sign);

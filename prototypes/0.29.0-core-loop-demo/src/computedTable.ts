@@ -5185,7 +5185,8 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
  *    until the house trims. Null: rounds close.
  *  - `waiting`: what a round closed and undecided waits on, as at a house
  *    table (ComputedHouseState): 'house' once every bettor's seed is in,
- *    'offline' when its house is not heard (an abandon will void it).
+ *    'offline' when its house is not heard (an abandon will void it). Null
+ *    once the house's reveal is in and only a bettor's seed is missing.
  *  - `heard`: the house the round at hand depends on is one this page can
  *    tell and has heard lately: the one whose commitment the next close
  *    would name, or the closed round's close names. Not the same as rounds
@@ -5257,7 +5258,11 @@ export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairO
   const house = h === undefined ? undefined : computedCommitHouse(st.t, st.inc, h);
   view.heard = house !== undefined && houseHeardFrom(house, now);
   if (tip) {
-    if (h !== undefined) view.waiting = houseAway(st, h, now) ? 'offline' : tip.revealed.length === tip.present.length ? 'house' : null;
+    // (The house's reveal is in and waits on a bettor's seed it counted: the
+    // round needs nothing more of the house, heard or not; abandonWait.)
+    if (h !== undefined && tip.houseWaits === undefined) {
+      view.waiting = houseAway(st, h, now) ? 'offline' : tip.revealed.length === tip.present.length ? 'house' : null;
+    }
     return view;
   }
   if (resolved.fin !== null) view.waits = 'ending';
