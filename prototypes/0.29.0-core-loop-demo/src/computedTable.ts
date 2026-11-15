@@ -5196,7 +5196,10 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
  *    null: it carries none).
  *  - `moved`: the table's game moved during this visit to the game shown
  *    (casinoDoc computedGameMovedOf).
- *  Null at a table that plays no FAIR ONLY game. */
+ *  `checking` is true while the resolution or the game's fold still has
+ *  records to check (no chip of the game is spent meanwhile).
+ *  Null at a table that plays no FAIR ONLY game, and for a name the switch
+ *  carries that no game stands behind (never opened, or not yet here). */
 export interface ComputedFairOnlyView {
   inc: string;
   game: GameName;
@@ -5220,27 +5223,32 @@ export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairO
   if (inc === null || !isFairOnlyInc(inc)) return null;
   lookAtClock(now);
   const resolved = computedResolutionOf(t, inc);
-  const holder = resolved?.holder ?? null;
+  // (A name the switch carries with no game behind it: nothing opened it, or
+  // nothing of it has reached this page. The table is owner-run meanwhile and
+  // its card keeps the owner's rows. A game still being checked, or one whose
+  // rules this build does not know, is shown.)
+  if (!resolved || (resolved.base === null && !resolved.pending && !resolved.newer)) return null;
+  const holder = resolved.holder ?? null;
   const deed = computedDeedHolder();
   const view: ComputedFairOnlyView = {
     inc,
     game: gameOfInc(inc),
-    newer: resolved?.newer ?? false,
-    checking: resolved?.pending ?? false,
+    newer: resolved.newer,
+    checking: resolved.pending || (computedFoldOf(t, inc)?.pending ?? false),
     holder,
     holderPid: holder === null ? null : computedPlayerOfKey(holder) ?? null,
     mine: holder !== null && holder === getIdentityPub(),
-    ended: resolved !== null && resolved.base !== null && !resolved.live,
+    ended: resolved.base !== null && !resolved.live,
     waits: null,
     waiting: null,
     heard: false,
-    round: resolved?.base?.ck.u ?? 0,
-    o: resolved?.base?.ck.o ?? null,
+    round: resolved.base?.ck.u ?? 0,
+    o: resolved.base?.ck.o ?? null,
     moved: computedGameMovedOf(t)?.to === inc,
   };
   // (A key still to show up names nobody yet: no line for it.)
   if (holder !== null && deed.key !== undefined && deed.key !== holder) view.deedPid = deed.pid;
-  if (!resolved?.live) return view;
+  if (!resolved.live) return view;
   const at = tableOf(t);
   if (!at) return view;
   const { st, res } = at;

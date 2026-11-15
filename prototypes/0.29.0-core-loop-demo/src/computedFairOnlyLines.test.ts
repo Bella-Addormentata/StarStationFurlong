@@ -162,6 +162,29 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     expect(b.table.computedHouseState(TABLE, clockOf(b, T0))).toBeNull();
   });
 
+  it('a name the switch carries with no game behind it is no FAIR ONLY table: nothing is read of it', async () => {
+    const [a] = await gameRoom(['A'], []);
+    a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    run([a], T0 + STEP, T0 + 3 * STEP, { step: STEP });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(viewOf(a, T0 + 3 * STEP)).toBeNull();
+  });
+
+  it('checking, while a record of the game\'s session waits to be checked though the resolution is done', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(viewOf(a, T0)!.checking).toBe(false);
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    putIn(a, [[kit.houseJoin(H, 1).key, kit.houseJoin(H, 1).rec]]);
+    expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ pending: false });
+    expect(a.casino.computedFoldOf(TABLE, G.inc)).toMatchObject({ pending: true });
+    expect(viewOf(a, T0)!.checking).toBe(true);
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+    // (The slice that checks what waited runs off the frame.)
+    for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    const T = run([a], T0 + STEP, T0 + 3 * STEP, { step: STEP });
+    expect(viewOf(a, T)!.checking).toBe(false);
+  });
+
   it('whose game: the key that holds it, the player this page pinned to it once that player shows the key, and whether it is this page\'s', async () => {
     const [a] = await gameRoom(['A']);
     expect(viewOf(a, T0)).toMatchObject({ holder: owner.pub, holderPid: null, mine: false });
@@ -201,7 +224,7 @@ describe('what a page reads of the FAIR ONLY game its table plays (computedFairO
     beating = [beat];
     let T = run([a, b], T0 + STEP, T0 + 120_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
     expect(keysIn(a, 'c', 1).length).toBe(1);
-    T = run([a, b], T, T + 10_000, { step: STEP, until: () => viewOf(a, T0)!.waiting === 'house' });
+    T = run([a, b], T, T + 10_000, { step: STEP, until: () => a.table.computedFairOnlyView(TABLE)!.waiting === 'house' });
     expect(viewOf(a, T)).toMatchObject({ waits: null, waiting: 'house', heard: true });
     beat.muted = true;
     T = run([a, b], T, beat.lastAt! + HOUSE_HEARD_MS + 2 * STEP, { step: STEP });

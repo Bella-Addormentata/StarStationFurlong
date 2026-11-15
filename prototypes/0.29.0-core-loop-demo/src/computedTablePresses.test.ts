@@ -1801,6 +1801,19 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
     t.unmount();
   });
 
+  it('a name with no game behind it leaves the table the owner\'s: the plaque and the card are the owner-run ones', () => {
+    a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    at(a, T0 + STEP);
+    const t = atTable(a, { house: true });
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toBeNull();
+    expect(t.plaque()).toContain('FAIR TABLE');
+    expect(t.card()).toContain('data-act=');
+    expect(t.plaque()).not.toContain('FAIR ONLY');
+    expect(t.card()).not.toContain('FAIR ONLY');
+    t.unmount();
+  });
+
   it('a craps game under a roulette table is a peer\'s doing: none of its lines show there', () => {
     const Q = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('q', PAGE_ROOM, TABLE, FO_NAME) };
     const qroot = rootOf(Q, 'q', { dl: delegation(FO_OWNER, FO_HOUSE.pub, PAGE_ROOM) });
