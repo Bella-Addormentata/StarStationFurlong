@@ -27,9 +27,10 @@
 //! off on ([`LaneSwitch`]). It never comes back on within a run.
 //!
 //! Off wins over `SSF_CHIA_LANE=1`, the Bank's remembered switch,
-//! `SSF_CHIA_BEACON`, `SSF_CHIA_FINDABLE`, `SSF_CHIA_WATCH`, `SSF_CHIA_PEERS`
-//! and the env test hooks. It does not touch iroh, the Mainline DHT, mDNS or
-//! relays: they keep their own switches.
+//! `SSF_CHIA_BEACON` and the beacon switch, `SSF_CHIA_FINDABLE`,
+//! `SSF_CHIA_WATCH`, `SSF_CHIA_PEERS` and the env test hooks. It does not
+//! touch iroh, the Mainline DHT, mDNS or relays: they keep their own
+//! switches.
 //!
 //! It holds in three layers:
 //!   1. the lane (chia_peer_lane.rs): off at the start, the process's one
