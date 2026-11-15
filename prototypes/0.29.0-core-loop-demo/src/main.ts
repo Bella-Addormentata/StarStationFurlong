@@ -906,7 +906,8 @@ function firstRunFactsNow(): FirstRunFacts {
 /** 🌉 One `bridge` report from this computer's node: where its dial of
  *  another computer stands (dialing / connected / failed). The node sends it
  *  two ways: on the stream of the handshake that asked for the dial (the
- *  record's first computer; YjsSync hands those over, `onOtherEnvelope`), and
+ *  record's first computer, and any computer of the record the node was
+ *  already linked to; YjsSync hands those over, `onOtherEnvelope`), and
  *  on a stream of its own to every page in the room (the record's other
  *  computers, and the dials the node starts by itself). Both end here. */
 function noteBridgeEnvelope(env: { kind?: string; payload?: string; room?: string }): void {
@@ -2701,7 +2702,9 @@ async function joinRoomAtEpoch(
   // counts those computers from the record itself, BEFORE the handshake
   // leaves, so a report that comes back at once (a failure, an answer) is
   // never overwritten by a late "dialing"; the node's reports move each one
-  // on from there (noteBridgeEnvelope).
+  // on from there (noteBridgeEnvelope). One the node is already linked to
+  // has no dial to report: the node answers "connected" for it, once, on
+  // this session's own stream.
   if (boot.roomId === DEFAULT_STATION.welcomeRoomId) {
     const own = localFingerprint?.iroh_node_id;
     const record = withHeldWelcomeRoutes(

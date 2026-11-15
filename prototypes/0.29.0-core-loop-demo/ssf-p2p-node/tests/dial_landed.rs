@@ -2,7 +2,7 @@
 //! binary: two `ssf-p2p-node` processes on this computer, the holder and the
 //! newcomer, each in a directory of its own, and stand-in pages, each a
 //! WebTransport client that reads and asks as the game's page does: one on
-//! the holder, two on the newcomer.
+//! the holder, two on the newcomer from the start, and a third that comes late.
 //!
 //! What it guards: a page's question (a sync frame, SyncStep1) is what tells
 //! a dialed node which room a new connection is for. Until a frame names the
@@ -31,7 +31,16 @@
 //!    holder's node answers it from the room it keeps, to both of the
 //!    newcomer's pages, so the link carries the room both ways;
 //! 3. neither node has dropped the other as silent once the time a silent
-//!    connection is given has passed.
+//!    connection is given has passed;
+//! 4. a page that comes to the room once the link is up, and names the
+//!    holder as the first page did, is told `connected` too: once, on the
+//!    stream its question went out on. Its node has the link and begins no
+//!    dial, so no dial reports to it, and a page that hears nothing cannot
+//!    tell a link that is up from a dial that never began (the game's title
+//!    counts the computers it asked for as still being dialed; the game's
+//!    page hands the dial statuses on its own stream to the same reader as
+//!    the others since that title). Once, because the page asks again when
+//!    it hears the word, and its question names the holder again.
 //!
 //! Nothing outside this computer is spoken to: no Chia (`SSF_NO_CHIA_LANE=1`),
 //! no Mainline DHT, no mDNS, no public-address echo and no relay, and the
@@ -98,6 +107,12 @@ const LINK_BOUND: Duration = Duration::from_secs(15);
 /// in src/main.rs), then up to one more 5 s tick for the check to come round,
 /// and a margin.
 const SILENT_BOUND: Duration = Duration::from_secs(3 * 5 + 5 + 3);
+
+/// How long the late page is listened to at the end for a second `connected`
+/// on its own stream. Its second question went out before the silent wait
+/// began, so whatever answered it is long written; the bound is for a runner
+/// slow enough to have had no wait left.
+const SECOND_WORD: Duration = Duration::from_secs(2);
 
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(100);
@@ -553,9 +568,51 @@ fn a_dial_that_lands_is_told_to_every_page_of_the_room() {
             );
         }
 
+        // (4) A page that comes to the room once the link is up, as the
+        // game's page does when it is loaded again while its node runs on.
+        // Its question names the holder as the first page's did; the node
+        // has the link, begins no dial, and says so on the stream the
+        // question came in on.
+        let mut late_page = Page::open("the newcomer's late page", &newcomer_fp).await;
+        late_page.ask(Some((&holder_fp.node_id, holder_addr.clone()))).await;
+        assert!(
+            late_page.hear(LINK_BOUND, |h| h.own && connected(h)).await.is_some(),
+            "{}",
+            failure(
+                &format!(
+                    "a page that came to the room after the link was up named the holder and heard no `connected` for it on its own stream within {LINK_BOUND:?}: \
+                     its node began no dial, since it has the link, so nothing told the page the holder is linked. It heard:\n{}",
+                    late_page.passed()
+                ),
+                &holder_dir,
+                &newcomer_dir
+            )
+        );
+        // Told, it asks again, as the game's page does, and its question
+        // names the holder again. What that brings is looked at below.
+        late_page.ask(Some((&holder_fp.node_id, holder_addr.clone()))).await;
+
         // (3) The pages stay, saying nothing more, for as long as a silent
         // connection is given.
         tokio::time::sleep(SILENT_BOUND.saturating_sub(landed.elapsed())).await;
+
+        // (4) again: once. A second `connected` would have the page ask
+        // again, and so on for as long as the page is in the room.
+        if let Some(second) = late_page.hear(SECOND_WORD, |h| h.own && connected(h)).await {
+            panic!(
+                "{}",
+                failure(
+                    &format!(
+                        "the late page was told `connected` for the holder a second time ({}), when it named it again: \
+                         the game's page asks again at every `connected`, so the two would go round for ever. Before it, it heard:\n{}",
+                        second.line(),
+                        late_page.passed()
+                    ),
+                    &holder_dir,
+                    &newcomer_dir
+                )
+            );
+        }
         landed
     });
 
