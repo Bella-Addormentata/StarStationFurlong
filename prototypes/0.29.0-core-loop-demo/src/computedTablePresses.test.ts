@@ -2103,6 +2103,127 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
     // (not unmounted: walking off with a bet down shows the leave notice on the page's own body, which this spec has none of)
   });
 
+  // ── The house's checkpoint against what this page counted (§8.3 "A page that disagrees") ──
+
+  /** Round 1 of the game decided by the house on page a (Bob's and Cat's bets), the card open; `trim` puts the house's
+   *  checkpoint of it in the doc with the session it opens (`patch` over the true one) and draws the frame. */
+  function decidedRound() {
+    openGame();
+    const t = atTable(a);
+    const gk = new ComputedKit(G);
+    const sid = nextSid3(G, root.value);
+    const join = gk.houseJoin(FO_HOUSE, 1);
+    const bob = gk.slip(BOB, 1, [red(10)]);
+    const cat = gk.slip(CAT, 1, [black(10)]);
+    put(a, T0 + 500, join, bob, cat);
+    wait(a, T0 + 500, T0 + 18_800, t);
+    const [beat, rec] = beatOf(PAGE_ROOM, FO_HOUSE, 1);
+    at(a, T0 + 18_800);
+    a.doc.transact(() => a.doc.getMap<unknown>('casinoComputed').set(beat, rec));
+    const close = gk.close(BOB, 1, sid, [bob, cat], join.rec.c);
+    const hashOf = (key: string): string => key.slice(key.lastIndexOf(':') + 1);
+    put(a, T0 + 19_000, close);
+    put(a, T0 + 19_200, gk.reveal(1, BOB.pid), gk.reveal(1, CAT.pid));
+    const hr = gk.houseReveal(FO_HOUSE, 1, [hashOf(close.key)], Object.values((close.rec as { f: Record<string, string> }).f).sort());
+    put(a, T0 + 19_400, hr);
+    t.update();
+    const round = foldOf(a).rounds[0];
+    expect(round).toMatchObject({ r: 1, decided: 'house' });
+    const pocket = round.pocket!;
+    const nets = Object.fromEntries([...foldOf(a).nets].filter(([, v]) => v !== 0n).map(([pid, v]) => [pid, v.toString()]));
+    const trim = (patch: Record<string, unknown> = {}): void => {
+      const cp = trimOf(G, 'p', {
+        b: sid, u: 1, l: hashOf(close.key), d: `h:${hashOf(hr.key)}`, o: pocket, n: nets, h: gk.houseCommit(FO_HOUSE, 2),
+        dl: delegation(FO_OWNER, FO_HOUSE.pub, PAGE_ROOM), ...patch,
+      });
+      at(a, T0 + 19_600);
+      a.doc.transact(() => {
+        const top = a.doc.getMap<unknown>('casinoComputed');
+        top.set(cp.key, cp.value);
+        for (const key of [...top.keys()]) if (key.startsWith(`ses:${TABLE}:${G.inc}:`)) top.delete(key);
+        top.set(`ses:${TABLE}:${G.inc}:${nextSid3(G, cp.value)}`, new Y.Map());
+      });
+      at(a, T0 + 19_800);
+      t.update();
+      expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ base: { key: cp.key } });
+    };
+    return { t, trim, pocket, nets, other: (pocket + 1) % 37 };
+  }
+
+  it("the house's checkpoint as this page counted the round: its outcome signed by the house, and no flag", () => {
+    const { t, trim, pocket } = decidedRound();
+    expect(t.card()).not.toContain('CHECKPOINT');
+    trim();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ round: 1, o: pocket, checkpoint: { covered: 'same', chips: 0, carry: false, counted: null } });
+    expect(t.card()).toContain(`ROUND 1 · POCKET ${pocket} · SIGNED BY THE HOUSE`);
+    expect(t.card()).not.toContain('CHECKPOINT');
+    expect(t.card()).not.toContain('🚩');
+    t.unmount();
+  });
+
+  it("the house's checkpoint whose nets differ from what this page counted: the open card gains the flag with the chips, in the game's own words and once", () => {
+    const { t, trim, nets } = decidedRound();
+    trim({ n: { ...nets, [BOB.pid]: (BigInt(nets[BOB.pid] ?? '0') + 7n).toString() } });
+    expect(t.card()).toContain("🚩 THE HOUSE'S CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+    expect(t.card()).not.toContain('🚩 THE CHECKPOINT DIFFERS');
+    expect(t.card()).not.toContain('ANOTHER OUTCOME');
+    t.unmount();
+  });
+
+  it('the house signs another outcome than the round had by the same reveal: flagged with the pocket this page counted, whatever the nets', () => {
+    const { t, trim, pocket, other } = decidedRound();
+    trim({ o: other });
+    expect(t.card()).toContain(`ROUND 1 · POCKET ${other} · SIGNED BY THE HOUSE`);
+    expect(t.card()).toContain(`🚩 THE HOUSE'S CHECKPOINT SIGNS ANOTHER OUTCOME FOR ROUND 1 · THIS PAGE COUNTED POCKET ${pocket}`);
+    expect(t.card()).not.toContain('DIFFERS FROM THIS PAGE BY');
+    t.unmount();
+  });
+
+  it('a round the house decided by a record this page did not count by is shown as the house signs it, with no flag for its outcome', () => {
+    const { t, trim, other } = decidedRound();
+    trim({ o: other, d: `h:${hex('c', 32)}` });
+    expect(t.card()).toContain(`ROUND 1 · POCKET ${other} · SIGNED BY THE HOUSE`);
+    expect(t.card()).not.toContain('ANOTHER OUTCOME');
+    t.unmount();
+  });
+
+  it("a checkpoint that names another close for the round: flagged as that, with no chips counted between two different rounds", () => {
+    const { t, trim, nets } = decidedRound();
+    trim({ l: hex('9', 32), n: { ...nets, [BOB.pid]: '500' } });
+    expect(t.card()).toContain("🚩 THE HOUSE'S CHECKPOINT NAMES ANOTHER CLOSE FOR ROUND 1 THAN THIS PAGE COUNTED");
+    expect(t.card()).not.toContain('DIFFERS FROM THIS PAGE BY');
+    expect(t.card()).not.toContain('ANOTHER OUTCOME');
+    t.unmount();
+  });
+
+  it("the checkpoint that ends the game with nets this page did not count: the flag stays on the ended game's card once the page has let the game's state go", () => {
+    const { t, trim, nets } = decidedRound();
+    a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    trim({ e: 1, f: sealFin(G, FO_OWNER.pub, FO_OWNER.sign).value, h: undefined, k: FO_OWNER.pub, dl: undefined, n: { ...nets, [BOB.pid]: (BigInt(nets[BOB.pid] ?? '0') + 7n).toString() } });
+    expect(t.plaque()).toBe('FAIR ONLY · THIS GAME HAS ENDED');
+    // (the page's pass over its tables lets the ended game's state go)
+    a.table.tickComputedTables([TABLE], T0 + 20_000);
+    at(a, T0 + 20_200);
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ ended: true, checkpoint: { covered: 'same', chips: 7 } });
+    expect(t.card()).toContain('THIS GAME HAS ENDED');
+    expect(t.card()).toContain("🚩 THE GAME'S LAST CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+    // (and through the compaction of the ended game, which leaves that checkpoint)
+    for (let T = T0 + 21_000; T <= T0 + 40_000; T += 1_000) a.table.tickComputedTables([TABLE], T);
+    at(a, T0 + 40_200);
+    t.update();
+    expect(t.card()).toContain("🚩 THE GAME'S LAST CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+    t.unmount();
+  });
+
+  it("a checkpoint of a round this page had not seen decided: the card says it can't check it, with no flag", () => {
+    const { t, trim } = decidedRound();
+    trim({ u: 2, l: hex('9', 32), n: { [BOB.pid]: '500' } });
+    expect(t.card()).toContain("THIS PAGE DIDN'T SEE ROUND 2 DECIDED · IT CAN'T CHECK THE HOUSE'S CHECKPOINT");
+    expect(t.card()).not.toContain('🚩');
+    t.unmount();
+  });
+
   it('a game the switch names that has ended, or whose rules this build does not know, says so on the plaque and the card, with none of the owner\'s presses', () => {
     openGame();
     const end = trimOf(G, 'p', { u: 5, l: hex('e', 32), n: {}, e: 1, f: sealFin(G, FO_OWNER.pub, FO_OWNER.sign).value, s: undefined, h: undefined, k: FO_OWNER.pub, dl: undefined });

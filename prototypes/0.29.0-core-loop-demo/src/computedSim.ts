@@ -2270,6 +2270,13 @@ export class Sim {
       w.cpFlipped.add(res.base.sid);
       flip('checkpoint', `${res.base.sid} differs by ${check.checkpointDiff} chips`);
     }
+    // 🔒 (A game's checkpoint that signs another outcome than this page counted
+    // by the same decider: the card's flag, computedFairOnlyView.)
+    const fo = table.computedFairOnlyView(t, now);
+    if (fo && fo.inc === inc && fo.checkpoint && fo.checkpoint.counted !== null && !w.cpFlipped.has(`o:${res.base.sid}`)) {
+      w.cpFlipped.add(`o:${res.base.sid}`);
+      flip('checkpoint', `${res.base.sid} signs another outcome than ${String(fo.checkpoint.counted)}`);
+    }
   }
 
   /** When `close` first came to any page (the room's time), or undefined. */

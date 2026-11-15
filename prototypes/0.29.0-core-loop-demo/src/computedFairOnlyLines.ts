@@ -83,10 +83,30 @@ export function fairOnlyCardLines(v: ComputedFairOnlyView, game: Game, names: Fa
     out.push({ text: "RIDING BETS WAIT FOR THE OWNER'S HOUSE", color: AMBER });
   }
   if (v.round > 0 && v.o !== null) {
-    const o = typeof v.o === 'number' ? `POCKET ${v.o}` : `DICE ${v.o[0]} AND ${v.o[1]}`;
-    out.push({ text: `${roundOf(game)} ${v.round} · ${o} · SIGNED BY THE HOUSE`, color: DIM });
+    out.push({ text: `${roundOf(game)} ${v.round} · ${outcomeOf(v.o)} · SIGNED BY THE HOUSE`, color: DIM });
   }
+  out.push(...fairOnlyCheckpointLines(v, game));
   if (v.checking) out.push({ text: "CHECKING THIS GAME'S RECORDS", color: DIM });
+  return out;
+}
+
+const outcomeOf = (o: number | [number, number]): string => (typeof o === 'number' ? `POCKET ${o}` : `DICE ${o[0]} AND ${o[1]}`);
+
+/** The ⚙ card's rows for a house's checkpoint that does not agree with what
+ *  this page had counted (§8.3 "A page that disagrees"), or that this page
+ *  cannot check. The signed record is the evidence; nothing counts by a row. */
+export function fairOnlyCheckpointLines(v: ComputedFairOnlyView, game: Game): FairOnlyLine[] {
+  const c = v.checkpoint;
+  if (!c) return [];
+  const round = `${roundOf(game)} ${v.round}`;
+  // (The checkpoint that ended a game is its holder's own, or its house's.)
+  const cp = v.ended ? "THE GAME'S LAST CHECKPOINT" : "THE HOUSE'S CHECKPOINT";
+  if (c.covered === 'unseen') return [{ text: `THIS PAGE DIDN'T SEE ${round} DECIDED · IT CAN'T CHECK ${cp}`, color: AMBER }];
+  if (c.covered === 'split') return [{ text: `🚩 ${cp} NAMES ANOTHER CLOSE FOR ${round} THAN THIS PAGE COUNTED`, color: RED }];
+  const out: FairOnlyLine[] = [];
+  if (c.chips > 0) out.push({ text: `🚩 ${cp} DIFFERS FROM THIS PAGE BY ${c.chips} ${c.chips === 1 ? 'CHIP' : 'CHIPS'}`, color: RED });
+  if (c.carry) out.push({ text: `🚩 ${cp}'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S`, color: RED });
+  if (c.counted !== null) out.push({ text: `🚩 ${cp} SIGNS ANOTHER OUTCOME FOR ${round} · THIS PAGE COUNTED ${outcomeOf(c.counted)}`, color: RED });
   return out;
 }
 

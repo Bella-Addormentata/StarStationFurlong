@@ -224,6 +224,41 @@ describe('a roll of a FAIR ONLY craps game, on the pages', () => {
     }
   });
 
+  it("the house's checkpoint of a roll against what each page counted: none of the card's flags for the roll as it was, the table handed on when its point differs, the dice when the house signs others", async () => {
+    for (const lie of ['none', 'carry', 'dice'] as const) {
+      const pages = await betting(['A', 'B'], 6);
+      const [a, b] = pages;
+      const closedAt = run(pages, T0 + STEP, T0 + 60_000, { step: STEP, tables: [CRAPS_REF], until: () => keysIn(a, 'c', 1, TABLE).length > 0 });
+      run(pages, closedAt + STEP, closedAt + 12_000, { step: STEP, tables: [CRAPS_REF] });
+      const closeHash = hashIn(keysIn(a, 'c', 1, TABLE)[0]);
+      const hr = kit.houseReveal(H, 1, [closeHash], Object.values(closesOf(a, 1)[0].f).sort());
+      house(b, hr);
+      const at = closedAt + 12_000;
+      sync(at, ...pages);
+      for (const p of pages) expect(p.table.computedFairOnlyView(TABLE, at)?.checkpoint, lie).toBeUndefined();
+      const res = foldOf(a);
+      const dice = res.rounds[0].craps!.dice!;
+      const nets = Object.fromEntries([...res.nets].filter(([, v]) => v !== 0n).map(([pid, v]) => [pid, v.toString()]));
+      const carry = carryOf(a);
+      const cp = trimOf(Q, 'q', {
+        b: SID, u: 1, l: closeHash, d: `h:${hr.hash}`, o: lie === 'dice' ? [dice[1] === 6 ? 1 : dice[1] + 1, dice[0]] : dice, n: nets,
+        s: lie === 'carry' ? { ...carry, p: 8 } : carry, h: kit.houseCommit(H, 2), dl: delegation(owner, H.pub, PAGE_ROOM),
+      });
+      a.doc.transact(() => {
+        top(a).set(cp.key, cp.value);
+        for (const key of [...top(a).keys()]) if (key.startsWith(`ses:${TABLE}:${Q.inc}:`)) top(a).delete(key);
+        top(a).set(`ses:${TABLE}:${Q.inc}:${nextSid3(Q, cp.value)}`, new Y.Map());
+      });
+      sync(at, ...pages);
+      for (const p of pages) {
+        expect(p.casino.computedResolutionOf(TABLE, Q.inc), lie).toMatchObject({ base: { key: cp.key }, live: true });
+        expect(p.table.computedFairOnlyView(TABLE, at)?.checkpoint, `${lie} ${p.name}`).toEqual({
+          covered: 'same', chips: 0, carry: lie === 'carry', counted: lie === 'dice' ? dice : null,
+        });
+      }
+    }
+  });
+
   it('a page that leaves says goodbye over its riding bets and writes no more at the game; back from the back-forward cache, its frames write them again', async () => {
     const pages = await betting(['A', 'B'], 6);
     const [a, b] = pages;
