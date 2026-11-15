@@ -305,8 +305,9 @@ describe('the wiring', () => {
     const body = main.slice(writer, main.indexOf('\n}\n', writer));
     expect(body).toContain('const savedLook = loadSavedLook();');
     expect(body).toContain('...(savedLook ? { look: savedLook } : {}),');
-    const apply = main.indexOf('const applyLook = (raw: unknown): FoxLook => {');
-    const applied = main.slice(apply, apply + 400);
+    const apply = main.indexOf('function applyOwnLook(raw: unknown): FoxLook {');
+    expect(apply).toBeGreaterThan(-1);
+    const applied = main.slice(apply, main.indexOf('\n}\n', apply));
     expect(applied).toContain('const look = cleanLook(raw);');
     expect(applied).toContain('saveLook(look);');
     expect(applied).toContain('updateLocalPlayerEntry();');

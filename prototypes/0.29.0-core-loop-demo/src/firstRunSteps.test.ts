@@ -163,9 +163,9 @@ describe('firstRunSteps: the dial and the room', () => {
 });
 
 describe('enterMode: ENTER is always there', () => {
-  it('reveals by itself once the room is here, however short the wait', () => {
-    expect(enterMode(true, 0)).toBe('reveal');
-    expect(enterMode(true, ENTER_PATIENCE_MS * 10)).toBe('reveal');
+  it('says the room is here once it is, however short the wait', () => {
+    expect(enterMode(true, 0)).toBe('here');
+    expect(enterMode(true, ENTER_PATIENCE_MS * 10)).toBe('here');
   });
 
   it('is quiet inside the patience and lit from its end on', () => {
@@ -176,16 +176,16 @@ describe('enterMode: ENTER is always there', () => {
   });
 
   it('has no mode in which the player cannot enter', () => {
-    // `reveal` enters by itself; the other two are a button. Nothing else.
+    // Each is the ENTER button, lit or quiet. Nothing else.
     const modes = new Set([enterMode(true, 0), enterMode(false, 0), enterMode(false, ENTER_PATIENCE_MS)]);
-    expect([...modes].sort()).toEqual(['lit', 'quiet', 'reveal']);
+    expect([...modes].sort()).toEqual(['here', 'lit', 'quiet']);
   });
 
   it('says in each mode what entering now means', () => {
     expect(enterNote('quiet', ROOM)).toContain('You can enter at any time');
     expect(enterNote('lit', ROOM)).toContain('SSF-WELCOME is not here yet');
     expect(enterNote('lit', ROOM)).toContain('fills in by itself');
-    expect(enterNote('reveal', ROOM)).toBe('SSF-WELCOME is here.');
+    expect(enterNote('here', ROOM)).toBe('SSF-WELCOME is here. Enter when your fox is ready.');
   });
 
   it('never says nobody answered: a computer that answered may not hold the room yet', () => {
@@ -368,9 +368,9 @@ describe('main.ts: the title is wired to the search', () => {
     expect(handler).not.toMatch(/\bif\b/);
   });
 
-  it('NEW PLAYER holds only for the welcome room, and never once the room is here', () => {
+  it('NEW PLAYER waits only for the welcome room, and lights ENTER at once for another', () => {
     const handler = between('btnNew.addEventListener("click"', 'btnEnter.addEventListener("click"');
-    expect(handler).toContain('if (!waitsForWelcome() || welcomeReachedThisPage) {');
+    expect(handler).toContain('if (!waitsForWelcome()) {\n          // Not the welcome room (a pass to another): nothing to wait for.\n          lightEnter("ready", ENTER_READY_NOTE);');
     // ENTER is shown in the same step that hides the two choices.
     expect(handler).toContain('btnEnter.style.display = "";');
   });
@@ -456,10 +456,12 @@ describe('main.ts: the title is wired to the search', () => {
     expect(between('welcomeReachedThisPage = true;\n', 'clearWelcomePending(welcomeStore());')).toContain('firstRunRepaint?.();');
   });
 
-  it('ENTER NOW takes the focus when it replaces the two choices (Tab is the phone\'s key)', () => {
+  it('the fox chooser takes the focus when it and ENTER NOW replace the two choices (Tab is the phone\'s key)', () => {
     const handler = between('btnNew.addEventListener("click"', 'btnEnter.addEventListener("click"');
     const shown = handler.indexOf('btnEnter.style.display = "";');
     expect(shown).toBeGreaterThan(handler.indexOf('btnNew.style.display = "none";'));
-    expect(handler.indexOf('btnEnter.focus({ preventScroll: true });')).toBeGreaterThan(shown);
+    expect(handler.indexOf('chooser.focus();')).toBeGreaterThan(shown);
+    // ENTER follows the chooser, so Tab reaches it from the choices.
+    expect(handler).toContain('wrap.insertBefore(chooser.element, btnEnter);');
   });
 });

@@ -503,6 +503,7 @@ import {
 import type { MarkStore } from "./welcomeOnly";
 import {
   STEP_COLOR,
+  ENTER_READY_NOTE,
   enterMode,
   enterNote,
   firstRunSteps,
@@ -512,6 +513,7 @@ import {
   stepGlyph,
 } from "./firstRunSteps";
 import type { FirstRunFacts, ReportLog } from "./firstRunSteps";
+import { mountFoxChooser, startingLook, type FoxChooser } from "./foxChooser";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -5478,6 +5480,17 @@ interface PlayerEntry {
   /** 🦊 The fox's own look (foxLook.ts), once the player has chosen one:
    *  small numbers every reader cleans (`cleanLook`). */
   look?: FoxLook;
+}
+
+/** 🦊 Give our fox a look (foxLook.ts): drawn on our rig, saved on this
+ *  computer and mirrored into our players entry for the room's other pages.
+ *  The title's fox chooser calls it as the player enters (foxChooser.ts). */
+function applyOwnLook(raw: unknown): FoxLook {
+  const look = cleanLook(raw);
+  saveLook(look);
+  if (world) (world.getPlayer() as any).character.setLook(lookParts(look));
+  updateLocalPlayerEntry();
+  return look;
 }
 
 /**
@@ -12469,16 +12482,9 @@ async function init() {
     return true;
   };
   (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)
-  // 🦊 The fox's own look (foxLook.ts): drawn on the local rig, saved on this
-  // computer and mirrored into the players entry for the room's other pages.
-  const applyLook = (raw: unknown): FoxLook => {
-    const look = cleanLook(raw);
-    (world.getPlayer() as any).character.setLook(lookParts(look));
-    saveLook(look);
-    updateLocalPlayerEntry();
-    return look;
-  };
-  (window as any).__setLook = applyLook; // debug handle, until the title's step (part 3)
+  // 🦊 The fox's own look (foxLook.ts), chosen on the first-run title
+  // (foxChooser.ts): drawn on the local rig at boot from what is saved.
+  (window as any).__setLook = applyOwnLook; // debug handle (permanent, like __setOutfit)
   {
     const savedLook = loadSavedLook();
     if (savedLook) (world.getPlayer() as any).character.setLook(lookParts(savedLook));
@@ -12669,23 +12675,40 @@ function setupClickToEnter() {
        *  null before that. */
       let heldSince: number | null = null;
       let holdTimer: number | null = null;
+      /** 🦊 The fox chooser (foxChooser.ts), open from NEW PLAYER until the
+       *  player enters. */
+      let chooser: FoxChooser | null = null;
       let restoreBox: HTMLElement | null = null;
       let paintedSteps = "";
       const proceed = () => {
         if (holdTimer !== null) window.clearInterval(holdTimer);
         holdTimer = null;
         firstRunRepaint = null;
+        // 🦊 The fox the player chose is theirs from here on.
+        if (chooser) {
+          applyOwnLook(chooser.look());
+          chooser.dispose();
+          chooser = null;
+        }
         wrap.remove();
         dwellDone = true; // proceed at once — don't wait out the intro dwell
         proceedChosen = true;
         maybeFade();
       };
+      /** Light ENTER, or keep it quiet, with what entering means under it. */
+      const lightEnter = (mode: string, text: string) => {
+        if (btnEnter.dataset.mode === mode) return;
+        btnEnter.dataset.mode = mode;
+        btnEnter.style.cssText = mode === "quiet" ? secondary : primary;
+        note.textContent = text;
+      };
       const paintSteps = () => {
         if (!waitsForWelcome()) {
           steps.style.display = "none";
           paintedSteps = "";
-          // Another room after all (a pass resolved late): nothing to wait for.
-          if (heldSince !== null) proceed();
+          // Another room after all (a pass resolved late): nothing to wait
+          // for, but the player may still be choosing their fox.
+          if (heldSince !== null) lightEnter("ready", ENTER_READY_NOTE);
           return;
         }
         const facts = firstRunFactsNow();
@@ -12708,31 +12731,30 @@ function setupClickToEnter() {
         }
         steps.style.display = "flex";
         if (heldSince === null) return;
+        // 🦊 The player is choosing their fox: the room arriving lights
+        // ENTER, it never pulls them in mid-choice (owner, 2026-11-15).
         const mode = enterMode(facts.arrived, performance.now() - heldSince);
-        if (mode === "reveal") {
-          proceed();
-          return;
-        }
-        if (btnEnter.dataset.mode !== mode) {
-          btnEnter.dataset.mode = mode;
-          btnEnter.style.cssText = mode === "lit" ? primary : secondary;
-          note.textContent = enterNote(mode, DEFAULT_STATION.name);
-        }
+        lightEnter(mode, enterNote(mode, DEFAULT_STATION.name));
       };
       btnNew.addEventListener("click", (e) => {
         e.stopPropagation();
-        if (!waitsForWelcome() || welcomeReachedThisPage) {
-          proceed();
-          return;
-        }
         heldSince = performance.now();
         btnNew.style.display = "none";
         btnLoad.style.display = "none";
         restoreBox?.remove();
+        // 🦊 The fox chooser fills the wait (foxChooser.ts): the player picks
+        // their fox while the search goes on under it, and enters when ready.
+        chooser = mountFoxChooser(startingLook(loadSavedLook()));
+        wrap.insertBefore(chooser.element, btnEnter);
         btnEnter.style.display = "";
         // The button that was pressed is gone, and Tab is the phone's key
-        // here: the way in takes the focus, so a keyboard can still enter.
-        btnEnter.focus({ preventScroll: true });
+        // here: the chooser takes the focus, and ENTER follows it.
+        chooser.focus();
+        if (!waitsForWelcome()) {
+          // Not the welcome room (a pass to another): nothing to wait for.
+          lightEnter("ready", ENTER_READY_NOTE);
+          return;
+        }
         paintSteps();
         // The patience runs on a clock no event reports: look twice a second.
         holdTimer = window.setInterval(paintSteps, 500);
