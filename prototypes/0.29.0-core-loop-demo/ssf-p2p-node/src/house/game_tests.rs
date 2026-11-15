@@ -541,6 +541,33 @@ fn a_house_cut_off_for_as_long_as_the_pages_wait_settles_again() {
 }
 
 #[test]
+fn a_house_back_after_a_gap_settles_from_when_it_reads_the_game_again() {
+    // 🔒 Back after HOUSE_HEARD_MS to a record no reader can tell under the game's keys, which holds the game for
+    // longer than it takes to settle: a close come meanwhile, which it first reads once the record is gone, it first
+    // read while settling there, and never reveals. (Back sooner, it reveals it: the hold bounds how long it was there.)
+    for (gap, revealed) in [(HOUSE_HEARD_MS - 200, true), (HOUSE_HEARD_MS, false)] {
+        let mut game = Game::new(&format!("gap-held-{gap}"));
+        game.house.settle_ms = SETTLE_MS;
+        game.tick(0);
+        game.tick(SETTLE_MS);
+        assert_eq!(game.records("o:1:").len(), 1, "joined once settled");
+        let held = game.unreadable();
+        game.closed(1, &game.sid(), &game.commit(1));
+        game.seeds(1);
+        game.tick(gap);
+        game.settle();
+        assert!(game.records("h:1:").is_empty(), "nothing at the game while it is held");
+        game.delete_top(&held);
+        game.ticks();
+        assert_eq!(game.records("h:1:").len(), usize::from(revealed), "after {gap} ms away");
+        for _ in 0..8 {
+            game.tick(1_000);
+        }
+        assert_eq!(game.records("h:1:").len(), usize::from(revealed));
+    }
+}
+
+#[test]
 fn under_an_end_order_it_reveals_without_a_commitment_and_joins_nothing() {
     let mut game = Game::new("fin-closed");
     let (c, _, _) = game.closed_on_the_join();
@@ -1167,6 +1194,55 @@ fn a_house_the_holder_delegates_later_settles_at_the_game_first() {
 }
 
 #[test]
+fn a_house_serving_a_game_again_after_a_spell_away_settles_there_anew() {
+    // 🔒 Settled at the game and joined at round 1, the house is handed off it at its base (no round to come is its
+    // own), and then the buyer delegates it: a close on its join made while it did not serve the game it first reads
+    // while it settles there anew, and never reveals. One made once it has settled again it reveals.
+    for later in [false, true] {
+        let mut game = Game::new(&format!("served-again-{later}"));
+        game.house.settle_ms = SETTLE_MS;
+        game.settle();
+        assert_eq!(game.records("o:1:").len(), 1);
+        let buyer = who("buyer");
+        game.transfer(&buyer, 0);
+        game.settle();
+        if !later {
+            game.closed(1, &game.sid(), &game.commit(1));
+            game.seeds(1);
+            game.settle();
+            assert!(game.records("h:1:").is_empty(), "none of this house's rounds");
+        }
+        game.put_top(&format!("hk:{}", game.house.public()), &delegation(&buyer, game.house.public()));
+        game.settle();
+        if later {
+            game.closed(1, &game.sid(), &game.commit(1));
+            game.seeds(1);
+            game.settle();
+        }
+        assert_eq!(game.records("h:1:").len(), usize::from(later), "made once settled again: {later}");
+    }
+}
+
+#[test]
+fn a_close_at_the_round_in_flight_it_first_reads_after_a_hand_over_it_reveals() {
+    // The game handed on at round 1, which the house joined: that round is still the seller's house's to reveal, and
+    // it has read the game's session all along as its house, so it does not settle there again; a close on its join
+    // it first reads after the hand-over is one it reveals.
+    let mut game = Game::new("in-flight-later");
+    game.house.settle_ms = SETTLE_MS;
+    game.settle();
+    assert_eq!(game.records("o:1:").len(), 1);
+    game.transfer(&who("buyer"), 1);
+    game.settle();
+    game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert!(reveals[0].1.get("c").is_none(), "no commitment for a round that is not its own");
+}
+
+#[test]
 fn the_rooms_beat_goes_on_beside_a_game_it_serves_only_for_the_key_that_left() {
     // The deed holder's house table beside a game its holder handed on at the round in flight: the house serves the
     // game for that round alone, and is heard there for nobody, so the room's beat is the house table's and goes on.
@@ -1503,7 +1579,7 @@ fn a_game_whose_first_read_is_short_of_a_check_counts_as_one_it_serves_and_has_n
         // gone: no check of it to wait on.)
         game.tick(HEARTBEAT_MS);
         game.put_top(&format!("hk:{}", game.house.public()), &delegation(&game.owner, game.house.public()));
-        let (ctx, ses) = (std::mem::replace(&mut game.ctx, ctx2), std::mem::replace(&mut game.ses, ses2.clone()));
+        let (ctx, ses) = (std::mem::replace(&mut game.ctx, ctx2.clone()), std::mem::replace(&mut game.ses, ses2.clone()));
         game.closed(1, &game.sid(), &"ab".repeat(32));
         (game.ctx, game.ses) = (ctx, ses);
         let keys = if flooded { game.junk_keys(2_000) } else { Vec::new() };
@@ -1515,6 +1591,14 @@ fn a_game_whose_first_read_is_short_of_a_check_counts_as_one_it_serves_and_has_n
         for key in &keys {
             game.delete_top(key);
         }
+        // On the next tick a record no reader can tell holds the second game: it counts as the walk last found it,
+        // one it serves and has not settled at, so still not heard.
+        let ctx = std::mem::replace(&mut game.ctx, ctx2);
+        let held = game.unreadable();
+        game.ctx = ctx;
+        game.tick(HEARTBEAT_MS);
+        assert_eq!(game.beat(), before, "held after a short read, flooded: {flooded}");
+        game.delete_top(&held);
         // Read through: it joins, and is heard.
         game.ticks();
         assert_eq!(game.joins_in(&ses2), 1);
@@ -1540,7 +1624,7 @@ impl Game {
         for i in 0..1_200 {
             m.insert(format!("pad{i:04}"), Any::Undefined);
         }
-        let key = format!("xf:{T}:{}:{}", self.ctx.inc, "cd".repeat(16));
+        let key = format!("xf:{}:{}:{}", self.ctx.t, self.ctx.inc, "cd".repeat(16));
         self.put_top_any(&key, Any::Map(Arc::new(m)));
         key
     }

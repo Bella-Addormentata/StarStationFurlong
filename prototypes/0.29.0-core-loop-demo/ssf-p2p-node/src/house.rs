@@ -711,10 +711,11 @@ struct TableMem {
     /// `written`: the first time it reads the table, or holds it
     /// ([`House::own_from_before`]).
     kept_in: bool,
-    /// When it first read the table this run ([`SETTLE_MS`]).
+    /// When it first read the table this run ([`SETTLE_MS`]). 🔒 At a FAIR ONLY game, when it first read the game's
+    /// session after it was last away from it: cut off for [`HOUSE_HEARD_MS`], or not serving it.
     first_read: Option<u64>,
-    /// 🔒 At a FAIR ONLY game, as the last pass that read it through found it: whether this house served it, and
-    /// whether it had settled there (none: no pass of this run has; [`House::remembered`]).
+    /// 🔒 At a FAIR ONLY game, as the last pass that knew whether this house serves it found it: whether it served
+    /// it, and whether it had settled there (none: no pass of this run has; [`House::remembered`]).
     read_through: Option<(bool, bool)>,
     /// When the ticks it last held the table (a value there a page may read
     /// otherwise, [`House::unclear`]) began: a close it first sees once they
@@ -1387,7 +1388,9 @@ impl House {
             if mem.last_tick.is_some_and(|last| now.saturating_sub(last) >= HOUSE_HEARD_MS) {
                 for (key, table) in mem.tables.iter_mut() {
                     if ha::is_fair_only_inc(&key.1) {
-                        table.first_read = Some(now);
+                        // (From the next pass that reads its session: what it reads until then it has not read since
+                        // it came back.)
+                        table.first_read = None;
                         // (Settled there again only once a pass reads it through.)
                         if let Some((_, settled)) = table.read_through.as_mut() {
                             *settled = false;
@@ -1860,11 +1863,11 @@ impl House {
 
     /// 🔒 The room's FAIR ONLY games for its beat: how many this house serves now, and at how many of those it has
     /// settled. Each as this tick found it, where the walk got that far; else (a check put off, a record a page may
-    /// read otherwise, the tick's reads spent) as the last pass that read it through found it. A game it serves and
-    /// has not settled at holds the room's beat whether a pass reads it or not; one it has settled at does not, for
-    /// a close it first reads later is not one it first read while settling (the block, B2), and a flood under one
-    /// game's keys would stop the room's beat. `seen`: the games the doc holds records of, None when the pass did
-    /// not read the room's keys to their end (then every game it knows of).
+    /// read otherwise, the tick's reads spent) as the last pass that knew whether it serves it found it. A game it
+    /// serves and has not settled at holds the room's beat whether a pass reads it or not; one it has settled at does
+    /// not, for a close it first reads later is not one it first read while settling (the block, B2), and a flood
+    /// under one game's keys would stop the room's beat. `seen`: the games the doc holds records of, None when the
+    /// pass did not read the room's keys to their end (then every game it knows of).
     fn games_count(&self, room: &str, seen: Option<&[(String, String)]>) -> GamesOut {
         let tables = self.rooms.get(room).map(|mem| &mem.tables);
         let games: BTreeSet<(String, String)> = match seen {
@@ -1889,8 +1892,8 @@ impl House {
         out
     }
 
-    /// 🔒 FAIR ONLY game `key` as the last pass that read it through found it: whether this house served it, and
-    /// whether it had settled there. Read through on no pass of this run: one it serves and has not settled at where
+    /// 🔒 FAIR ONLY game `key` as the last pass that knew whether this house serves it found it: whether it served
+    /// it, and whether it had settled there. Known on no pass of this run: one it serves and has not settled at where
     /// its state holds what it revealed or stepped down there before a start (a page may close on what it committed
     /// to), else one it does not serve.
     fn remembered(&self, room: &str, key: &(String, String)) -> (bool, bool) {
@@ -2050,11 +2053,15 @@ impl House {
             let (t, inc) = key.clone();
             // (A game short of a check: nothing there this pass; and no pass of this tick reads it again once the
             // budget is spent. Whether it serves the game now, when the walk got that far: settled there, then, as
-            // when a pass last read it through.)
+            // when a pass last read it through; and so it counts on the passes after that cannot read it, until one
+            // reads further.)
             macro_rules! short {
                 ($serving:expr) => {{
                     self.short = true;
                     let found: Option<(bool, bool)> = $serving.map(|serving: bool| (serving, serving && self.remembered(room, &key).1));
+                    if let Some(found) = found {
+                        self.note_read_through(room, &key, found);
+                    }
                     self.games_through.insert(key.clone(), (found, true));
                     if self.budget == 0 || self.read_out {
                         self.through.insert(key.clone(), (false, true));
@@ -2106,6 +2113,14 @@ impl House {
             }
             // (Only a game it serves now counts for the room's beat: a game that has left its key never settles here.)
             let current = matches!(by_now, ha::HouseBy::Yes { .. });
+            // 🔒 A game it serves again after a spell it did not (handed on, or its delegation gone, and back): it
+            // settles there anew from the next pass that reads its session, as it read no close made meanwhile as the
+            // house of its round (design B2).
+            if current && !self.remembered(room, &key).0 {
+                if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
+                    table.first_read = None;
+                }
+            }
             match by {
                 ha::HouseBy::No => through!(false, false),
                 ha::HouseBy::Pending => short!(None),
@@ -2169,9 +2184,9 @@ impl House {
         Some(seen)
     }
 
-    /// 🔒 FAIR ONLY game `key` read through: whether this house serves it and has settled there, for the passes
-    /// that cannot read it ([`House::remembered`]). (Not kept where it is what the house would remember without it,
-    /// a game it holds nothing of: junk under new names would only grow the memory.)
+    /// 🔒 FAIR ONLY game `key` read through, or far enough to know whether this house serves it: whether it does and
+    /// has settled there, for the passes that cannot read it ([`House::remembered`]). (Not kept where it is what the
+    /// house would remember without it, a game it holds nothing of: junk under new names would only grow the memory.)
     fn note_read_through(&mut self, room: &str, key: &(String, String), found: (bool, bool)) {
         let before = self.done.contains_key(&(room.to_string(), key.0.clone(), key.1.clone()));
         let tables = &mut self.rooms.get_mut(room).unwrap().tables;
