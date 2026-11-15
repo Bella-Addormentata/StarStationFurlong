@@ -739,9 +739,12 @@ struct TableMem {
     /// rounds began, or the last spell its session's map was gone.
     held_since: Option<u64>,
     /// 🔒 At a FAIR ONLY game, the delegation it was last a house of the game by: given to the resolution after the
-    /// room's, so it counts while the doc lacks it, and then put back under its key (design-final section 8.5 N5), as
-    /// the pages hold the delegations a count goes by. For the run.
+    /// room's, so it counts while the doc lacks it, as the pages hold the delegations a count goes by. For the run.
     deleg: Option<CVal>,
+    /// 🔒 Whether that delegation wants this house's key (design-final section 8.5 N5): the game's base does not carry
+    /// it, and the house served the game by it when a pass last found whether it serves the game at all. (Not when it
+    /// found the game over, or that the house serves none of its rounds.)
+    keyed: bool,
 }
 
 #[derive(Default)]
@@ -2184,7 +2187,14 @@ impl House {
             }
             // (A check put off that could not change the answer.)
             self.deferred = false;
-            let Some(base) = res.base.as_ref().filter(|_| !res.newer && res.live) else { through!(false, false) };
+            let Some(base) = res.base.as_ref().filter(|_| !res.newer && res.live) else {
+                // (Over, or under rules this build does not know: its delegation wants no key. A game whose base the
+                // doc has lost is neither, and its put-back is the pages'.)
+                if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)).filter(|_| res.base.is_some()) {
+                    table.keyed = false;
+                }
+                through!(false, false)
+            };
             let base_u = base.ck.get("u").and_then(CVal::as_int).unwrap_or(0);
             // Whose game (design-final sections 8.5 N1 and 8.7): this house is a house of the rounds its delegator
             // holds the game for.
@@ -2208,14 +2218,19 @@ impl House {
                 ha::HouseBy::No => {
                     if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
                         table.held_since.get_or_insert(now);
+                        table.keyed = false;
                     }
                     through!(false, false)
                 }
                 ha::HouseBy::Pending => short!(None),
                 ha::HouseBy::Yes { ref value, ref hash } => {
-                    let (value, hash) = (value.clone(), hash.clone());
-                    self.game_put_backs(&t, &inc, &res, (&value, &hash), &in_doc, reput);
-                    self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default().deleg = Some(value);
+                    chain_put_backs(&t, &inc, &res, reput);
+                    // (Not the one the base carries: a game needs no key for it, and the pages hold none such,
+                    // casinoDoc keepHouses.)
+                    let carried = res.base.as_ref().and_then(|b| b.ck.get("dl")).and_then(hb::rec_hash);
+                    let table = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
+                    table.keyed = carried.as_deref() != Some(hash.as_str());
+                    table.deleg = Some(value.clone());
                 }
             }
             let ctx = Ctx { room: room.to_string(), t, inc };
@@ -2227,7 +2242,8 @@ impl House {
             // (the pages void one they saw that long). Nothing at the game meanwhile, and not settled there.
             let ses_key = format!("ses:{}:{}:{sid}", ctx.t, ctx.inc);
             if !matches!(comp.get(txn, &ses_key), Some(Out::YMap(_))) {
-                self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default().held_since.get_or_insert(now);
+                // (Its reveals from before a start among them, [`House::own_from_before`].)
+                self.hold_began(room, &key, now);
                 if !partial {
                     reput.push(Write::NewSession { ses: ses_key });
                 }
@@ -2282,6 +2298,18 @@ impl House {
             let settled = current && now.saturating_sub(first_read) >= self.settle_ms;
             through!(current, settled);
         }
+        // 🔒 This house's key holds one value (`hk:<house>`), and each game it serves by a delegation that game's base
+        // does not carry wants its own there. Where the doc holds none of theirs, the one of lowest hash goes back: the
+        // same whichever games a pass gets to, so two games handed to different holders never write over each other's.
+        // The others go by the delegation the house holds for them ([`TableMem::deleg`]). (Only of the games the doc
+        // holds records of.)
+        let tables = &self.rooms[room].tables;
+        let wanted: Vec<(String, &CVal)> = seen.iter().filter_map(|k| tables.get(k)).filter(|m| m.keyed).filter_map(|m| m.deleg.as_ref()).filter_map(|d| Some((hb::rec_hash(d)?, d))).collect();
+        if !wanted.iter().any(|(hash, _)| in_doc.contains(hash)) {
+            if let Some((_, d)) = wanted.iter().min_by(|a, b| a.0.cmp(&b.0)) {
+                reput.push(Write::Top { key: format!("hk:{me}"), value: (*d).clone() });
+            }
+        }
         Some(seen)
     }
 
@@ -2293,28 +2321,6 @@ impl House {
         let tables = &mut self.rooms.get_mut(room).unwrap().tables;
         if tables.contains_key(key) || found != (before, false) {
             tables.entry(key.clone()).or_default().read_through = Some(found);
-        }
-    }
-
-    /// 🔒 What game `t`/`inc`'s resolution goes by that the doc does not hold, into `reput` for the put-back's turn
-    /// (design-final section 8.5 N5). The transfers of its chain the doc holds only inside a checkpoint (`x`), under
-    /// their keys, as the pages put back the ones they hold. And this house's delegation `by`, the one its rounds go
-    /// by, under its key `hk:<house>` where the doc does not hold it (`in_doc`: the room's delegations, by hash), so
-    /// where that key holds anything else (nothing, junk, a stranger's, a forged one, another house's, an earlier
-    /// holder's); unless the base carries it. (A good one of this house by the same holder under that key is one the
-    /// resolution goes by first: [`ha::Resolution::house_by`]. The room's own key for its house tables wins over
-    /// this: [`House::plan`].)
-    fn game_put_backs(&self, t: &str, inc: &str, res: &ha::Resolution, by: (&CVal, &str), in_doc: &HashSet<String>, reput: &mut Vec<Write>) {
-        for holder in res.chain.iter().skip(1) {
-            if let Some(step) = holder.step.as_ref().filter(|s| s.key.is_none()) {
-                reput.push(Write::Top { key: format!("xf:{t}:{inc}:{}", step.id), value: step.xf.clone() });
-            }
-        }
-        // (Not the one the base carries: a game needs no key for it, and the pages hold none such, casinoDoc
-        // keepHouses.)
-        let carried = res.base.as_ref().and_then(|b| b.ck.get("dl")).and_then(hb::rec_hash);
-        if carried.as_deref() != Some(by.1) && !in_doc.contains(by.1) {
-            reput.push(Write::Top { key: format!("hk:{}", self.key.public), value: by.0.clone() });
         }
     }
 
@@ -3236,6 +3242,16 @@ pub fn to_any(v: &CVal) -> Any {
 }
 
 /// Write `writes` in one transaction; the update to send (None: nothing).
+/// 🔒 The transfers of game `t`/`inc`'s chain that its resolution found only inside a checkpoint (`x`), into `reput`
+/// under their keys for the put-back's turn (design-final section 8.5 N5), as the pages put back the ones they hold.
+fn chain_put_backs(t: &str, inc: &str, res: &ha::Resolution, reput: &mut Vec<Write>) {
+    for holder in res.chain.iter().skip(1) {
+        if let Some(step) = holder.step.as_ref().filter(|s| s.key.is_none()) {
+            reput.push(Write::Top { key: format!("xf:{t}:{inc}:{}", step.id), value: step.xf.clone() });
+        }
+    }
+}
+
 fn apply(txn: &mut TransactionMut, writes: &[Write]) -> Option<Vec<u8>> {
     if writes.is_empty() {
         return None;
