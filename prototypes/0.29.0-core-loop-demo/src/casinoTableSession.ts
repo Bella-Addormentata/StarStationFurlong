@@ -2885,7 +2885,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     houseDrawn = houseKey(lines);
     if (lines) {
       const out = lines.map((l) => `<div style="font-size:9px;color:${l.color};letter-spacing:1.2px;">${l.text}</div>`);
-      if (house && fairOnlyMine()) out.push(`<div style="display:flex;justify-content:flex-end;">${btn('fair-only-off', FAIR_ONLY_OFF_LABEL, true)}</div>`);
+      // (By the game's holder, not by who runs the room: after a deed that
+      // moved without the game, the seller still holds it and only its page
+      // can end it.)
+      if (fairOnlyMine()) out.push(`<div style="display:flex;justify-content:flex-end;">${btn('fair-only-off', FAIR_ONLY_OFF_LABEL, true)}</div>`);
       return out;
     }
     const h = computedHouseState(itemId);
@@ -3023,7 +3026,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       capture?.focus({ preventScroll: true });
       return;
     }
-    if (!house) return;
+    // 🔒 The way back is the game's holder's, the room's owner or not
+    // (pressFairOnly asks whose the game is).
+    if (!house && act !== 'fair-only-off') return;
     if (act === 'fair-only-on' || act === 'fair-only-cancel' || act === 'fair-only-confirm' || act === 'fair-only-off') {
       offArmed = false;
       pressFairOnly(act);
@@ -3250,6 +3255,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       card = null;
       confirming = false;
       offArmed = false;
+      // 🔒 (Nor does a question or a warning of FAIR ONLY's outlive the card.)
+      foConfirming = false;
+      foArmed = null;
       return;
     }
     const host = bar?.parentElement;

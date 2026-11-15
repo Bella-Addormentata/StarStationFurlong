@@ -1726,7 +1726,7 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     t.unmount();
   });
 
-  it('the way back ends the game at once when no round is in flight: the table is the owner\'s again; only the holder\'s own card has the press', () => {
+  it('the way back ends the game at once when no round is in flight: the table is the owner\'s again', () => {
     offered();
     const t = atTable(a, { house: true });
     t.update();
@@ -1735,14 +1735,6 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     const inc = a.casino.computedIncOf(TABLE)!;
     at(a, T0 + 400);
     t.update();
-    // A guest looking at the same game has no press, and one made anyway does nothing.
-    const g = atTable(a, { house: false });
-    g.update();
-    expect(g.card()).toContain('FAIRNESS · FAIR ONLY');
-    expect(g.card()).not.toContain('data-act="fair-only-off"');
-    g.press('fair-only-off');
-    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true, fin: null });
-    g.unmount();
     t.press('fair-only-off');
     expect(t.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
     expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
@@ -1774,6 +1766,57 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     // (with no row there, the press says nothing either)
     expect(t.said()).not.toContain('HOLDER');
     t.unmount();
+    // (nor on the card of a page that does not run the room)
+    const g = atTable(a, { house: false });
+    g.update();
+    expect(g.card()).toContain('FAIRNESS · FAIR ONLY');
+    expect(g.card()).not.toContain('data-act="fair-only-off"');
+    g.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: true, fin: null });
+    g.unmount();
+  });
+
+  it('the holder of a game whose room went to another (a deed that moved without the game) still has the way back, and nothing else of the owner\'s', () => {
+    offered();
+    const t = atTable(a, { house: true });
+    t.update();
+    t.press('fair-only-on');
+    t.press('fair-only-confirm');
+    const inc = a.casino.computedIncOf(TABLE)!;
+    t.unmount();
+    // The deed goes to Bob with no transfer of the game: this page runs the room no more.
+    pinOn(a, BOB);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', BOB.pid));
+    at(a, T0 + 400);
+    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true, holder: a.pub });
+    const s = atTable(a, { house: false });
+    s.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ inc, mine: true });
+    expect(s.card()).toContain('data-act="fair-only-off"');
+    expect(s.card()).not.toContain('data-act="fair-only-on"');
+    // (the owner's other presses stay the owner's)
+    s.press('house-fair');
+    expect(s.said()).not.toContain('ONLY THE ROOM');
+    s.press('fair-only-on');
+    expect(s.card()).not.toContain('data-act="fair-only-confirm"');
+    s.press('fair-only-off');
+    expect(s.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
+    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+    s.unmount();
+  });
+
+  it('closing the card takes the question back, and at craps the warning: reopened, SET FAIR ONLY asks again and END warns again', () => {
+    offered();
+    const t = atTable(a, { house: true });
+    t.update();
+    t.press('fair-only-on');
+    expect(t.card()).toContain('data-act="fair-only-confirm"');
+    t.press('close');
+    expect(t.card()).toContain('data-act="fair-only-on"');
+    expect(t.card()).not.toContain('data-act="fair-only-confirm"');
+    t.press('fair-only-confirm');
+    expect(a.casino.computedIncOf(TABLE)).toBe(RINC);
+    t.unmount();
   });
 
   it('at craps with a contract bet riding the way back warns first; the next press of it hands the bet back and ends the game, and any other press between takes the warning back', () => {
@@ -1801,6 +1844,11 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     // Another press between: the warning is given again.
     t.press('fair-only-cancel');
     t.press('fair-only-off');
+    expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: true, fin: null });
+    // The card closed and opened again between: warned again too.
+    t.press('close');
+    t.press('fair-only-off');
+    expect(t.said()).toBe('PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH');
     expect(a.casino.computedResolutionOf(TABLE, Q.inc)).toMatchObject({ live: true, fin: null });
     t.press('fair-only-off');
     expect(t.said()).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
