@@ -13,8 +13,7 @@
  *
  * Grants are keyed to IDENTITY PUBKEYS (base64url Ed25519, keypair.ts), not
  * ephemeral player ids — a grant survives leave/rejoin and ties into the
- * contacts system. This is the game's first owner-mediated social contract;
- * the same plumbing generalizes to co-host designation (durability C1) later.
+ * contacts system. This is the game's first owner-mediated social contract.
  *
  * POLICY LIVES HERE, NOT ON DoorRecord: pairing records are deleted on unpair
  * (the one-way-vestibule investigation's lesson) — policy must survive that.

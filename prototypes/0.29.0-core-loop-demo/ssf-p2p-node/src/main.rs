@@ -56,8 +56,9 @@ mod chia_strict;
 // off where the coins are real money until the player turns it on.
 mod chia_listing;
 // 🔦 The beacon switch (#231 D7): the player's switch for this node's
-// welcome-room beacon on one Chia network, off everywhere until lit in the
-// SpacePhone's Network settings (or held by SSF_CHIA_BEACON).
+// welcome-room beacon on one Chia network, in the SpacePhone's Network
+// settings. Never turned, it is lit on a test network and off where the
+// coins are real money (or held either way by SSF_CHIA_BEACON).
 mod chia_beacon_switch;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
@@ -209,9 +210,10 @@ pub struct SsfEnvelope {
 /// 🤝 C3 (#332 review): a node's signature, with its iroh key, over a stamp
 /// and a frame's canonical bytes (`node_state_sign_bytes`), proving the node
 /// built that frame for that room and sequence. A visitor's tab counts such
-/// a SyncStep2 as the room's own state when the node is one the room's owner
-/// or a co-host filed as theirs (src/network/nodeProof.ts), so a room whose
-/// owner's game is closed still counts as synced from the nodes that keep it.
+/// a SyncStep2 as the room's own state when the node is one a holder of the
+/// room filed as theirs and the copy is not empty (src/roomHolders.ts,
+/// src/network/nodeProof.ts), so a room whose owner's game is closed still
+/// counts as synced from any computer that holds it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeProof {
     /// Unix milliseconds when the node signed.
@@ -4320,7 +4322,7 @@ async fn dial_peer_inner(
                 }
             }
             // The WELCOME room (the bundled key): no inbox, no knock (N8). Dial
-            // the newest BEACONS instead (D7): nodes that opted into being its
+            // the newest BEACONS instead (D7): nodes whose beacon is lit, its
             // public entry points this era, by node id through the DHT, so the
             // room is reached through any of them and its relay — additive,
             // only after the pass's own hints failed, since the beacon hint is
@@ -5044,7 +5046,7 @@ fn handle_iroh_connection(
                                         let seq = envelope.seq.wrapping_add(1);
                                         // 🤝 C3: signed as built by this node, so a visitor's
                                         // tab can count it as the room's own state when the
-                                        // room names this node as its owner's or a co-host's.
+                                        // room lists this node among its holders.
                                         let proof = node_proof(&hub_clone.secret_key, room_id, seq, &payload);
                                         let reply_env = SsfEnvelope {
                                             v: 1,
@@ -5703,7 +5705,7 @@ async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>, acke
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
-        // A sync update, not the SyncStep2 a keeper proves it built.
+        // A sync update, not the SyncStep2 a holder proves it built.
         node_proof: None,
     };
     let Ok(bytes) = serde_json::to_vec(&env) else { return Vec::new() };
@@ -6785,10 +6787,10 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             encoder.write_buf(&missing_diff);
 
             // 🤝 C3 (#338 review): signed as built by this node, as for a
-            // peer, so a tab whose own node keeps the room (its owner's or a
-            // co-host's) counts this copy as the room's state with nobody
-            // else online. Any other tab's node is no keeper: it gains
-            // nothing from the proof.
+            // peer, so a tab whose own node holds the room (its player
+            // filed it among the room's holders) counts this copy as the
+            // room's state with nobody else online. A node that only
+            // registered the room proves an empty copy, which no tab counts.
             let payload = encoder.to_vec();
             let seq = envelope.seq.wrapping_add(1);
             let proof = node_proof(&hub.secret_key, room_id, seq, &payload);
@@ -7069,7 +7071,7 @@ fn say_beacon(net: chia_network::ChiaNet) {
 /// (8)).
 #[cfg(feature = "chia-publish")]
 fn beacon_lines(net: chia_network::ChiaNet) -> (String, Option<String>) {
-    let line = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding".to_string();
+    let line = "⛓️ ChiaHub beacon: on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding".to_string();
     // The warning is of the link the node id makes. The beacon guard keeps
     // one data folder's two beacons 14 days apart (§4.5 (7)); it is no
     // promise that the two chains are never linked, so the warning stays.
@@ -7089,7 +7091,7 @@ mod beacon_line_tests {
     use super::beacon_lines;
     use crate::chia_network::ChiaNet;
 
-    const DISH: &str = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding";
+    const DISH: &str = "⛓️ ChiaHub beacon: on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding";
 
     /// Stage 4 design §4.5 (8): the beacon is written from a key of its own
     /// that the lobby dish funds, on every network, so its line names no

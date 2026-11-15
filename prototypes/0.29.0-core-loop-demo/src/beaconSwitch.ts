@@ -8,8 +8,12 @@
 // load the welcome room from reads those ids and dials them.
 //
 // That makes a lit beacon a public line in a weekly list of nodes, so it is
-// the player's choice (D7 keeps the role opt-in): out on every network until
-// they light it here, after a warning that says what a beacon shows. Until
+// the player's to turn. Where the coins are real money it is out until they
+// light it here, after a warning that says what a beacon shows (D7: opt-in).
+// On a test network it starts lit (the owner's word of 2026-11-15: the most
+// doors with the fewest taps), and the row says what the beacon shows beside
+// the PUT OUT that stops it. The node decides which (`on` with `chosen`
+// false is its network's default); this page only says what it reads. Until
 // this switch the only way in was `SSF_CHIA_BEACON=1` in the node's
 // environment, which a player of the desktop app never sees.
 //
@@ -105,7 +109,8 @@ export const BEACON_NOT_CONFIRMED = 'The beacon was not confirmed for this node 
 /** What a beacon is for, in one sentence the notes share. */
 const WHAT_FOR = "when a new player's game has nobody else to load the welcome room from, it dials your node";
 
-/** Out where the player never turned it: every network. */
+/** Out where the player never turned it and the network's default is out
+ *  (where the coins are real money). */
 export const beaconDefaultOutNote = (net: ChiaNetwork | null): string =>
   `The beacon is out for ${where(net)}, where it starts out. Lit, your node becomes a public door into the welcome room: ${WHAT_FOR}.`;
 
@@ -122,6 +127,12 @@ export const beaconHeldOutNote = (net: ChiaNetwork | null): string =>
 /** Lit by the player: `state` is what the publisher found (`beaconState`). */
 export const beaconLitNote = (net: ChiaNetwork | null, state: string): string =>
   `The beacon is lit for ${where(net)}. Your node is a public door into the welcome room: ${WHAT_FOR}. ${state}`;
+
+/** Lit where the player never turned it: the network's default (a test
+ *  network). Nobody tapped CONFIRM under the warning, so the note itself
+ *  says what the beacon shows and how to stop it. */
+export const beaconDefaultLitNote = (net: ChiaNetwork | null, state: string): string =>
+  `The beacon is lit for ${where(net)}, where it starts lit. Your node is a public door into the welcome room: ${WHAT_FOR}. Once an edition (about a week), while it can be reached from outside and serves the welcome room, your node writes its node id in the clear, where anyone can read it and look up its network addresses from it. PUT OUT stops new beacons; what is written stays on the chain. ${state}`;
 
 /** Lit, and the node's environment holds it lit. */
 export const beaconHeldLitNote = (net: ChiaNetwork | null, state: string): string =>
@@ -207,9 +218,9 @@ export function beaconRow(fp: LocalFingerprint | null | undefined, ui: BeaconUi)
   }
   if (beacon.on) {
     const state = beaconState(fp);
-    return beacon.held
-      ? row(state.value, state.colour, beaconHeldLitNote(net, state.words), null)
-      : row(state.value, state.colour, beaconLitNote(net, state.words), putOut);
+    if (beacon.held) return row(state.value, state.colour, beaconHeldLitNote(net, state.words), null);
+    // Lit by the player, or by the network's default where they never turned it.
+    return row(state.value, state.colour, (beacon.chosen ? beaconLitNote : beaconDefaultLitNote)(net, state.words), putOut);
   }
   if (beacon.held) return out(beaconHeldOutNote(net), null);
   const note = beacon.damaged ? beaconDamagedNote(net) : beacon.chosen ? beaconOutNote(net) : beaconDefaultOutNote(net);

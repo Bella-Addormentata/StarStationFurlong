@@ -71,8 +71,10 @@ to the welcome room that another player hands a newcomer (`?seed=`) is used as
 given, with the bundled pass's routes beside its own, so the newcomer's computer
 also dials the node that link names, and on arrival it is that pass, with both
 sets of routes, that MY ROOMS keeps for the room. It no
-longer falls back to a module of its own, so today a new player's first room
-depends on that one node: the
+longer falls back to a module of its own, so a new player's first room depends
+on a computer that holds the room being in reach: the one the bundled pass
+names and, on a test network, a holder found by its beacon (that path has not
+been run on two real computers yet). The
 [External Infrastructure Register](docs/TDD/ExternalInfrastructureRegister.md)
 §2 lists it with the work that ends it. Once reached, the station stays one tap
 away in SpacePhone → ACCESS → DEFAULT STATION.
@@ -90,6 +92,50 @@ The project is structured according to game development industry standards to ma
 * **`brainstorming/`**: Unstructured ideation, AI notes, and raw concepts before they are formalized into the GDD or TDD.
 * **`src/`**: Source code for the actual game client and server (to be populated).
 * **`prototypes/`**: Quick throwaway code, proof-of-concepts, and playable demos to test game mechanics and technical feasibility.
+
+---
+
+## Who serves a room
+
+No machine is picked to host a room. Every computer that has loaded a room keeps
+a copy on its own disk and hands it to visitors, so a room still loads while its
+owner's computer is off, as long as one computer that holds it can be reached
+([`roomHolders.ts`](prototypes/0.29.0-core-loop-demo/src/roomHolders.ts)).
+
+What that puts on record: once a room has finished loading through the
+computer's own node, the game files that node in the room (the node's id and
+relay addresses, signed with the player's key), where everyone with a pass to
+the room can read it. For a public room such as the welcome room, whose key
+ships in every build, that is anyone: the room lists the computers of its most
+recent visitors, and a node's id is enough to look up its network addresses,
+because a node publishes them under its id by default (the Mainline DHT;
+`SSF_NO_DHT=1` turns that off). Games count 64 records at most, each for up to
+30 days after its last visit, and passes minted in the room name the owner's
+computer and the seven most recent others. Those are limits on what games use,
+not on what is kept: a record stays in the room's shared state, readable to
+whoever has the room's key, until a game that files its own record clears it
+(records more than 60 days old and the ones past the freshest 64, sixteen at a
+filing). In a room where nobody files any more, old records stay. Only the
+owner's record carries direct network addresses itself.
+
+One switch keeps a computer off every room's list: SpacePhone → ACCESS → ROOM
+HOLDERS → *List my computer in the rooms it holds*. It is on by default.
+Switching it off takes the record down at once in the room you are in, and in
+any other room at your next visit there, together with any record of this same
+computer filed under another identity that played on it (before Contacts →
+Restore identity, for instance). A record of another computer where the same
+identity plays is left to that computer's own switch. A record not refreshed
+for 30 days stops counting by itself (it is cleared later, as above). Off, the
+computer still keeps and hands on its
+copies; other players' games just no longer count a copy that came from it
+alone as the whole room. Your own game still does: it keeps a note on this
+computer of the rooms it has loaded (which room, on which node; never sent to
+anyone), so a room your computer holds still opens for you with nobody else
+online, listed or not.
+
+What it does not promise: a holder's copy may be old, and nothing yet proves a
+copy is complete or unaltered. Copies merge, so an old one is brought up to
+date by the first fresher holder that answers.
 
 ---
 

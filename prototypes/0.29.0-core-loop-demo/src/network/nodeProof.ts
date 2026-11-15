@@ -4,18 +4,19 @@
  *
  * Why: a tab counts a remote room as synced (`YjsSync.linkedSynced`, which
  * gates board trims and merges, the route keeper and far-door writes) only on
- * a frame its host's live browser signed. With the owner's game closed, the
- * room's state still comes from nodes that keep it: the owner's, and each
- * co-host's. Their SyncStep2 answers carried no author and no signature, so a
- * visitor's tab waited for a browser that never came. Now a node signs the
- * SyncStep2 it builds for a peer (ssf-p2p-node `node_proof`): its iroh key
- * over a stamp and the frame's canonical bytes. The tab takes it as the
- * room's own state only when the node is one the room's owner or a co-host
- * filed as theirs (coHostNodes.ts `keeperNodesIn`), and the stamp is fresh.
+ * a frame a live browser in the room signed. With every game closed, the
+ * room's state still comes from the nodes that hold it: the owner's, and any
+ * other player's whose game was in the room. Their SyncStep2 answers carried
+ * no author and no signature, so a visitor's tab waited for a browser that
+ * never came. Now a node signs the SyncStep2 it builds for a peer
+ * (ssf-p2p-node `node_proof`): its iroh key over a stamp and the frame's
+ * canonical bytes. The tab takes it as the room's own state only when the
+ * node is one a holder filed as theirs and the copy is not empty
+ * (roomHolders.ts `holderNodeOk`), and the stamp is fresh.
  *
  * What it proves: which node built the frame, for which room, sequence and
  * bytes, and roughly when. Relays can't change it, and a peer can't pass its
- * own frame off as a keeper's. What it doesn't: that the node's copy is
+ * own frame off as another node's. What it doesn't: that the node's copy is
  * complete. That is the same trust a member's signed frame already earns.
  */
 

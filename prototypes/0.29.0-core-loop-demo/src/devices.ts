@@ -1964,7 +1964,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
  * Owner gate for helm writes (REFUEL / DEPART / REDOCK). The helm is the
  * single writer for the ship's fuel + flight records, so the write path is
  * owner-gated at the CALLER (dev-phase honest-client posture — same as edit
- * mode / access mode / co-host controls). A missing setter (headless tests,
+ * mode / access mode). A missing setter (headless tests,
  * dev bootstrapping) treats the local player as authorized so the standalone
  * demo keeps working. Wired from main.ts after yjsSync mounts. */
 let helmOwnerCheck: (() => boolean) | null = null;

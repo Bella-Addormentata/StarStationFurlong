@@ -6,21 +6,26 @@
 //! node that serves the welcome room and can be reached from outside writes
 //! its node id in the clear under a hint anyone can compute, and a newcomer
 //! whose node has nobody to dial for the welcome room reads those ids and
-//! dials them (main.rs `beacon_fallback`). D7 keeps the role opt-in: the
+//! dials them (main.rs `beacon_fallback`). D7 made the role opt-in: the
 //! hint is derivable by anyone, and a roster of every active node id would
 //! be a public weekly directory. Until this switch the only way to opt in
 //! was `SSF_CHIA_BEACON=1` in the node's environment, which a player of the
 //! desktop app never sees, so nobody but whoever starts a node by hand
 //! could be a door.
 //!
-//! The switch keeps D7's rule and moves the choice to where a player can
-//! make it. It is off on every network until the player turns it on, in the
-//! SpacePhone's Network settings, after a warning that says what a beacon
-//! shows (`POST /api/chia/beacon`, main.rs, behind the wallet switch's gate,
-//! chia_wallet_switch::local_page). It is kept per network, in
-//! [`BEACON_FILE`] through `ChiaNet::path`, owner-only: a beacon lit on
-//! testnet11 says nothing about mainnet. A file that is there but cannot be
-//! read counts as off, and the node says so.
+//! The switch moves the choice to where a player can make it: the
+//! SpacePhone's Network settings (`POST /api/chia/beacon`, main.rs, behind
+//! the wallet switch's gate, chia_wallet_switch::local_page). Where the
+//! player never turned it, the network's default stands ([`default_on`]):
+//! off where the coins are real money, as D7 has it, so a beacon is lit
+//! there only after a warning that says what a beacon shows; and lit on a
+//! test network (the owner's word of 2026-11-15, which reverses D7 there:
+//! the most doors with the fewest taps), where the page says what the
+//! beacon shows beside the switch that puts it out. It is kept per
+//! network, in [`BEACON_FILE`] through `ChiaNet::path`, owner-only: a
+//! choice made on testnet11 says nothing about mainnet. A file that is
+//! there but cannot be read counts as off on every network, and the node
+//! says so.
 //!
 //! The environment still decides first, as it does for the SSF wallet
 //! (chia_wallet_switch.rs): `SSF_CHIA_BEACON=1` holds the beacon on for the
@@ -31,7 +36,8 @@
 //! An on is the player's word for one network on one node, the ones whose
 //! warning stood on the page at CONFIRM, so it names both and only that
 //! node on that network takes it ([`beacon_gate`]). An off names neither
-//! and is always taken.
+//! and is always taken; on a test network it is what turns the default
+//! off, and it is saved like any other turn.
 //!
 //! A turn holds from the publisher's next tick, within the run
 //! (chia_publish.rs `heartbeat_loop` asks [`BeaconSwitch::on`] at each
@@ -86,23 +92,28 @@ pub struct BeaconFile {
 /// What the switch's file says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Saved {
-    /// No file: the player never turned the switch on this network. Off.
+    /// No file: the player never turned the switch on this network, and its
+    /// default stands ([`default_on`]).
     Unset,
     /// The file says `"on": true`.
     On,
     /// The file says `"on": false`.
     Off,
     /// Something is there that is not a switch the node can read: counts as
-    /// off. The reason, in the node's words.
+    /// off, on every network. The reason, in the node's words.
     Damaged(String),
 }
 
 impl Saved {
-    /// Whether the file lights the beacon: only the player's own on. No
-    /// file is off on every network (D7: opt-in), and so is a file that
+    /// Whether this lights the beacon on `net`: the player's word, the
+    /// network's default where there is none, and off for a file that
     /// cannot be read (fails closed).
-    pub fn on(&self) -> bool {
-        matches!(self, Saved::On)
+    pub fn on(&self, net: ChiaNet) -> bool {
+        match self {
+            Saved::Unset => default_on(net),
+            Saved::On => true,
+            Saved::Off | Saved::Damaged(_) => false,
+        }
     }
 
     /// Whether the player turned the switch on this network: a file the
@@ -110,6 +121,14 @@ impl Saved {
     pub fn chosen(&self) -> bool {
         matches!(self, Saved::On | Saved::Off)
     }
+}
+
+/// The switch where the player never turned it: lit on a test network (the
+/// owner's word of 2026-11-15: a new computer that can be reached from
+/// outside is a door into the welcome room with nothing to tap), and off
+/// where the coins are real money (#231 D7: opt-in, after the warning).
+pub fn default_on(net: ChiaNet) -> bool {
+    net.is_test()
 }
 
 /// Read the switch's file at `path` ([`Saved`]). Nothing at `path` is
@@ -169,13 +188,13 @@ pub fn env_switch() -> EnvSwitch {
     *ENV.get_or_init(|| env_switch_of(std::env::var_os(BEACON_ENV).as_deref()))
 }
 
-/// Whether the beacon's arm may write: the environment first, then the
-/// player's switch.
-pub fn lit(saved: &Saved, env: EnvSwitch) -> bool {
+/// Whether the beacon's arm may write on `net`: the environment first,
+/// then the player's switch, then the network's default.
+pub fn lit(saved: &Saved, env: EnvSwitch, net: ChiaNet) -> bool {
     match env {
         EnvSwitch::On => true,
         EnvSwitch::Off => false,
-        EnvSwitch::Unset => saved.on(),
+        EnvSwitch::Unset => saved.on(net),
     }
 }
 
@@ -201,9 +220,12 @@ pub struct BeaconStatus {
 
 /// The fingerprint's `chia_beacon`, for the page:
 ///   - `on`: the beacon is lit on this node's network, by the player's
-///     switch or by `SSF_CHIA_BEACON=1`, so its publisher may write it;
+///     switch, by the network's default where the player never turned it
+///     ([`default_on`]), or by `SSF_CHIA_BEACON=1`, so its publisher may
+///     write it;
 ///   - `chosen`: the player turned the switch on this network (`false`:
-///     never turned, or the file cannot be read);
+///     never turned, so `on` is the network's default unless the
+///     environment holds it, or the file cannot be read);
 ///   - `held`, only when true: the node's environment decides and the
 ///     switch cannot change it. With `on`, `SSF_CHIA_BEACON=1` holds it on;
 ///     without, another value of the variable holds it off;
@@ -226,11 +248,11 @@ pub struct BeaconView {
     pub status: Option<BeaconStatus>,
 }
 
-/// The view of the file as it reads now (`saved`) under the environment's
-/// word (`env`), with no status: the caller that knows the publisher's
-/// adds it ([`BeaconView::with`]).
-pub fn view_of(saved: &Saved, env: EnvSwitch) -> BeaconView {
-    BeaconView { on: lit(saved, env), chosen: saved.chosen(), held: env != EnvSwitch::Unset, damaged: matches!(saved, Saved::Damaged(_)), status: None }
+/// The view of the file as it reads now (`saved`) on `net` under the
+/// environment's word (`env`), with no status: the caller that knows the
+/// publisher's adds it ([`BeaconView::with`]).
+pub fn view_of(saved: &Saved, env: EnvSwitch, net: ChiaNet) -> BeaconView {
+    BeaconView { on: lit(saved, env, net), chosen: saved.chosen(), held: env != EnvSwitch::Unset, damaged: matches!(saved, Saved::Damaged(_)), status: None }
 }
 
 impl BeaconView {
@@ -355,9 +377,9 @@ pub fn beacon_gate(local: bool, target: &str, net: ChiaNet, node_id: &str) -> Re
 const WHAT_IT_WRITES: &str = "With its SSF wallet on, this node writes its node id in the clear once an edition, while it can be reached from outside and serves the welcome room, from a key of its own that the lobby dish funds";
 
 /// The startup line for the switch as it read (`saved`) on `net` under the
-/// environment's word (`env`). `None` where the player never turned it and
-/// the environment says nothing: no beacon, as on every node before the
-/// switch, and nothing to say.
+/// environment's word (`env`). `None` where the player never turned it, the
+/// environment says nothing and the network's default is off: no beacon,
+/// as on every node before the switch, and nothing to say.
 pub fn start_line(net: ChiaNet, saved: &Saved, env: EnvSwitch) -> Option<String> {
     let name = net.name();
     match (env, saved) {
@@ -366,6 +388,9 @@ pub fn start_line(net: ChiaNet, saved: &Saved, env: EnvSwitch) -> Option<String>
         )),
         (EnvSwitch::Off, _) => Some(format!(
             "🔦 Beacon: off for {name}, held off by SSF_CHIA_BEACON in this node's environment. This node writes no beacon, and the switch in the SpacePhone's Network settings cannot light one while the variable is set."
+        )),
+        (EnvSwitch::Unset, Saved::Unset) if default_on(net) => Some(format!(
+            "🔦 Beacon: on for {name}, where it starts lit. {WHAT_IT_WRITES}, until it is put out in the SpacePhone's Network settings."
         )),
         (EnvSwitch::Unset, Saved::Unset) => None,
         (EnvSwitch::Unset, Saved::On) => Some(format!(
@@ -449,12 +474,12 @@ impl BeaconSwitch {
     /// Whether the beacon is lit now: asked by the publisher at each tick,
     /// never kept.
     pub fn on(&self) -> bool {
-        lit(&self.saved.lock().unwrap(), self.env)
+        lit(&self.saved.lock().unwrap(), self.env, self.net)
     }
 
     /// The fingerprint's view of the switch now, with no status.
     pub fn view(&self) -> BeaconView {
-        view_of(&self.saved.lock().unwrap(), self.env)
+        view_of(&self.saved.lock().unwrap(), self.env, self.net)
     }
 
     /// The startup line ([`start_line`]).
@@ -476,8 +501,10 @@ impl BeaconSwitch {
     /// took its name (the folder's sync comes last, private_file.rs), so a
     /// failed save is judged by what the file reads then, which is what the
     /// next start reads: on, the turn is taken and the node's log says the
-    /// save was not confirmed; anything else, it is refused. It is refused
-    /// while Chia is off ([`CHIA_OFF_WORDS`]).
+    /// save was not confirmed; nothing there on a network where the beacon
+    /// starts lit, it is taken too, since the next start lights it with no
+    /// file; anything else, it is refused. It is refused while Chia is off
+    /// ([`CHIA_OFF_WORDS`]).
     ///
     /// An off holds from this call whatever the disk does: when its save
     /// fails, the beacon is out for the rest of the run and the answer says
@@ -490,7 +517,7 @@ impl BeaconSwitch {
     /// after it wrote the file).
     fn turn_with(&self, on: bool, now: u64, chia_off: bool, save: impl FnOnce(&Path, bool, u64) -> std::io::Result<()>) -> BeaconTurn {
         let mut saved = self.saved.lock().unwrap();
-        let view = |saved: &Saved| view_of(saved, self.env);
+        let view = |saved: &Saved| view_of(saved, self.env, self.net);
         if on && chia_off {
             return BeaconTurn::refused(CHIA_OFF_WORDS, view(&saved), None);
         }
@@ -499,7 +526,7 @@ impl BeaconSwitch {
             (false, EnvSwitch::On) => return BeaconTurn::refused(HELD_ON_WORDS, view(&saved), None),
             _ => {}
         }
-        let was_lit = lit(&saved, self.env);
+        let was_lit = lit(&saved, self.env, self.net);
         let file = self.path.display();
         match (save(&self.path, on, now), on) {
             (Ok(()), _) => {
@@ -516,13 +543,27 @@ impl BeaconSwitch {
                 }
                 turn
             }
+            // Nothing is there and the network's default is lit: the beacon
+            // is lit now and at the next start with no file at all, so the
+            // turn is taken, and the node says the choice was not saved.
+            (Err(e), true) if saved_of(&self.path) == Saved::Unset && default_on(self.net) => {
+                *saved = Saved::Unset;
+                let mut turn = BeaconTurn::taken(view(&saved), turned_line(self.net, true), !was_lit);
+                if let Some(line) = turn.line.as_mut() {
+                    line.push_str(&format!(
+                        "\n⚠️  Beacon: {file} could not be saved ({e}); the beacon is lit on {} all the same, where it starts lit",
+                        self.net.name()
+                    ));
+                }
+                turn
+            }
             (Err(e), true) => BeaconTurn::refused(
                 &format!("The beacon was not lit: its switch could not be saved ({e})"),
                 view(&saved),
                 Some(format!("⚠️  Beacon: {file} could not be saved ({e}), so it was not lit")),
             ),
             (Err(e), false) => {
-                let next = if saved_of(&self.path).on() { "lit again" } else { "out" };
+                let next = if saved_of(&self.path).on(self.net) { "lit again" } else { "out" };
                 *saved = Saved::Off;
                 BeaconTurn::refused(
                     &format!("The beacon is out until this computer's node stops, but its switch could not be saved ({e}): at the node's next start it reads {next}"),
@@ -549,21 +590,42 @@ mod tests {
     const NODE: &str = "aa11";
 
     #[test]
-    fn the_beacon_is_off_on_every_network_until_the_player_lights_it() {
-        // #231 D7: opt-in. No file is off wherever the node runs, and a file
-        // that cannot be read is off too.
-        assert!(!Saved::Unset.on());
-        assert!(Saved::On.on());
-        assert!(!Saved::Off.on());
-        assert!(!Saved::Damaged("x".into()).on());
+    fn the_beacon_starts_lit_on_a_test_network_and_out_where_the_coins_are_real() {
+        // The owner's word of 2026-11-15 for a test network; #231 D7 (opt-in)
+        // where the coins are real money. The player's word wins over both,
+        // and a file that cannot be read is off wherever the node runs.
+        assert!(default_on(ChiaNet::Testnet11) && !default_on(ChiaNet::Mainnet));
         assert!(Saved::On.chosen() && Saved::Off.chosen());
         assert!(!Saved::Unset.chosen() && !Saved::Damaged("x".into()).chosen());
         for net in ChiaNet::ALL {
+            let test = net.is_test();
+            assert_eq!(default_on(net), test, "{net:?}");
+            assert_eq!(Saved::Unset.on(net), test, "{net:?}: no file, the network's default");
+            assert!(Saved::On.on(net) && !Saved::Off.on(net), "{net:?}: the player's word");
+            assert!(!Saved::Damaged("x".into()).on(net), "{net:?}: fails closed");
             let dir = temp_dir(&format!("default-{}", net.id()));
-            let switch = BeaconSwitch::read(net, dir.join(BEACON_FILE), EnvSwitch::Unset);
-            assert!(!switch.on(), "{net:?}: no file, no beacon");
-            assert_eq!(switch.view(), BeaconView { on: false, chosen: false, held: false, damaged: false, status: None }, "{net:?}");
-            assert_eq!(switch.start_line(), None, "{net:?}: and nothing to say, as before the switch");
+            let path = dir.join(BEACON_FILE);
+            let switch = BeaconSwitch::read(net, path.clone(), EnvSwitch::Unset);
+            assert_eq!(switch.on(), test, "{net:?}");
+            assert_eq!(switch.view(), BeaconView { on: test, chosen: false, held: false, damaged: false, status: None }, "{net:?}");
+            match switch.start_line() {
+                Some(line) => {
+                    assert!(test, "{net:?}: a line only where the default is lit");
+                    assert!(line.starts_with(&format!("🔦 Beacon: on for {}, where it starts lit.", net.name())), "{line}");
+                    assert!(line.contains("writes its node id in the clear once an edition"), "{line}");
+                    assert!(line.ends_with("until it is put out in the SpacePhone's Network settings."), "{line}");
+                }
+                None => assert!(!test, "{net:?}: nothing to say, as before the switch"),
+            }
+            assert_eq!(saved_of(&path), Saved::Unset, "{net:?}: a default writes no file");
+            // Put out, it is the player's word, at this start and the next.
+            let out = switch.turn(false, 7, false);
+            assert_eq!(out.body, serde_json::json!({ "ok": true, "beacon": { "on": false, "chosen": true } }), "{net:?}");
+            assert!(!switch.on() && !BeaconSwitch::read(net, path.clone(), EnvSwitch::Unset).on(), "{net:?}");
+            // A file that cannot be read is off on a test network too.
+            std::fs::write(&path, b"not json").unwrap();
+            let damaged = BeaconSwitch::read(net, path, EnvSwitch::Unset);
+            assert_eq!(damaged.view(), BeaconView { on: false, chosen: false, held: false, damaged: true, status: None }, "{net:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -578,16 +640,19 @@ mod tests {
         for other in ["0", "true", "on", " 1", "1 ", "yes", "2"] {
             assert_eq!(env_switch_of(Some(OsStr::new(other))), EnvSwitch::Off, "{other:?}");
         }
-        for saved in [Saved::Unset, Saved::On, Saved::Off, Saved::Damaged("x".into())] {
-            assert!(lit(&saved, EnvSwitch::On), "{saved:?}: SSF_CHIA_BEACON=1 needs no switch");
-            assert!(!lit(&saved, EnvSwitch::Off), "{saved:?}: and another value overrides it");
-            assert_eq!(lit(&saved, EnvSwitch::Unset), saved == Saved::On, "{saved:?}: unset, the player's on alone lights it");
+        for net in ChiaNet::ALL {
+            for saved in [Saved::Unset, Saved::On, Saved::Off, Saved::Damaged("x".into())] {
+                assert!(lit(&saved, EnvSwitch::On, net), "{net:?} {saved:?}: SSF_CHIA_BEACON=1 needs no switch");
+                assert!(!lit(&saved, EnvSwitch::Off, net), "{net:?} {saved:?}: and another value overrides it, the network's default too");
+                assert_eq!(lit(&saved, EnvSwitch::Unset, net), saved.on(net), "{net:?} {saved:?}: unset, the switch decides, and the network's default where it was never turned");
+            }
+            // The view says who decides.
+            assert_eq!(view_of(&Saved::Off, EnvSwitch::On, net), BeaconView { on: true, chosen: true, held: true, damaged: false, status: None });
+            assert_eq!(view_of(&Saved::On, EnvSwitch::Off, net), BeaconView { on: false, chosen: true, held: true, damaged: false, status: None });
+            assert_eq!(view_of(&Saved::Unset, EnvSwitch::Off, net), BeaconView { on: false, chosen: false, held: true, damaged: false, status: None });
+            assert_eq!(view_of(&Saved::On, EnvSwitch::Unset, net), BeaconView { on: true, chosen: true, held: false, damaged: false, status: None });
+            assert_eq!(view_of(&Saved::Damaged("x".into()), EnvSwitch::Unset, net), BeaconView { on: false, chosen: false, held: false, damaged: true, status: None });
         }
-        // The view says who decides.
-        assert_eq!(view_of(&Saved::Off, EnvSwitch::On), BeaconView { on: true, chosen: true, held: true, damaged: false, status: None });
-        assert_eq!(view_of(&Saved::On, EnvSwitch::Off), BeaconView { on: false, chosen: true, held: true, damaged: false, status: None });
-        assert_eq!(view_of(&Saved::On, EnvSwitch::Unset), BeaconView { on: true, chosen: true, held: false, damaged: false, status: None });
-        assert_eq!(view_of(&Saved::Damaged("x".into()), EnvSwitch::Unset), BeaconView { on: false, chosen: false, held: false, damaged: true, status: None });
     }
 
     #[test]
@@ -632,13 +697,16 @@ mod tests {
     fn the_file_is_kept_per_network() {
         assert_eq!(ChiaNet::Testnet11.path(BEACON_FILE), Path::new("chia_beacon.json"));
         assert_eq!(ChiaNet::Mainnet.path(BEACON_FILE), Path::new("chia-mainnet").join("chia_beacon.json"));
-        // A beacon lit on one network lights none on the other, in one folder.
+        // A turn on one network says nothing on the other, in one folder.
         let dir = temp_dir("per-net");
         std::fs::create_dir_all(dir.join("chia-mainnet")).unwrap();
-        let test = BeaconSwitch::read(ChiaNet::Testnet11, dir.join(ChiaNet::Testnet11.path(BEACON_FILE)), EnvSwitch::Unset);
-        assert_eq!(test.turn(true, 5, false).status, "200 OK");
-        let main = BeaconSwitch::read(ChiaNet::Mainnet, dir.join(ChiaNet::Mainnet.path(BEACON_FILE)), EnvSwitch::Unset);
-        assert!(test.on() && !main.on());
+        let read = |net: ChiaNet| BeaconSwitch::read(net, dir.join(net.path(BEACON_FILE)), EnvSwitch::Unset);
+        let (test, main) = (read(ChiaNet::Testnet11), read(ChiaNet::Mainnet));
+        assert!(test.on() && !main.on(), "each network's own default");
+        assert_eq!(main.turn(true, 5, false).status, "200 OK");
+        assert!(read(ChiaNet::Testnet11).view() == test.view() && !test.view().chosen, "lit on mainnet: testnet11's switch was not turned");
+        assert_eq!(test.turn(false, 6, false).status, "200 OK");
+        assert!(!read(ChiaNet::Testnet11).on() && read(ChiaNet::Mainnet).on(), "put out on testnet11: mainnet's stays lit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -692,14 +760,15 @@ mod tests {
 
     #[test]
     fn a_turn_holds_at_once_is_saved_and_says_whether_it_lit_a_beacon() {
+        // Where the beacon starts out (mainnet), the first on lights it.
         let dir = temp_dir("turn");
         let path = dir.join(BEACON_FILE);
-        let switch = BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset);
+        let switch = BeaconSwitch::read(ChiaNet::Mainnet, path.clone(), EnvSwitch::Unset);
         let lit_turn = switch.turn(true, 10, false);
         assert_eq!(lit_turn.status, "200 OK");
         assert_eq!(lit_turn.body, serde_json::json!({ "ok": true, "beacon": { "on": true, "chosen": true } }));
         assert!(lit_turn.newly_lit && !lit_turn.failed);
-        assert_eq!(lit_turn.line.as_deref(), Some(turned_line(ChiaNet::Testnet11, true).as_str()));
+        assert_eq!(lit_turn.line.as_deref(), Some(turned_line(ChiaNet::Mainnet, true).as_str()));
         assert!(switch.on());
         assert_eq!(saved_of(&path), Saved::On, "and the next start reads it");
         // On again: taken, and no beacon is newly lit.
@@ -708,10 +777,25 @@ mod tests {
         let out = switch.turn(false, 12, false);
         assert_eq!(out.body, serde_json::json!({ "ok": true, "beacon": { "on": false, "chosen": true } }));
         assert!(!out.newly_lit && !switch.on());
-        assert_eq!(out.line.as_deref(), Some(turned_line(ChiaNet::Testnet11, false).as_str()));
+        assert_eq!(out.line.as_deref(), Some(turned_line(ChiaNet::Mainnet, false).as_str()));
         assert_eq!(saved_of(&path), Saved::Off);
         // A later start reads what was saved.
-        assert!(!BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset).on());
+        assert!(!BeaconSwitch::read(ChiaNet::Mainnet, path.clone(), EnvSwitch::Unset).on());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Where it starts lit (a test network), an on from the default is
+        // taken and saved as the player's word, and lights nothing new; put
+        // out and lit again, it is newly lit.
+        let dir = temp_dir("turn-test");
+        let path = dir.join(BEACON_FILE);
+        let switch = BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset);
+        let kept = switch.turn(true, 20, false);
+        assert_eq!(kept.body, serde_json::json!({ "ok": true, "beacon": { "on": true, "chosen": true } }));
+        assert!(!kept.newly_lit && saved_of(&path) == Saved::On);
+        let out = switch.turn(false, 21, false);
+        assert!(!out.newly_lit && !switch.on() && saved_of(&path) == Saved::Off);
+        assert!(!BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset).on(), "a later start reads the off, not the default");
+        assert!(switch.turn(true, 22, false).newly_lit);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -764,7 +848,7 @@ mod tests {
         let dir = temp_dir("disk");
         let path = dir.join(BEACON_FILE);
         let fails = |_: &Path, _: bool, _: u64| -> std::io::Result<()> { Err(std::io::Error::other("disk full")) };
-        let switch = BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset);
+        let switch = BeaconSwitch::read(ChiaNet::Mainnet, path.clone(), EnvSwitch::Unset);
         // The save failed and nothing reads on: not lit.
         let refused = switch.turn_with(true, 1, false, fails);
         assert_eq!(refused.status, "409 Conflict");
@@ -791,20 +875,58 @@ mod tests {
         assert!(!switch.on() && off.failed);
         assert_eq!(off.body["beacon"], serde_json::json!({ "on": false, "chosen": true }));
         let _ = std::fs::remove_dir_all(&dir);
+
+        // Where the beacon starts lit and no file stands: an off whose save
+        // failed still holds for the run, and the answer says the next start
+        // lights it again (nothing was saved, so the default stands there).
+        let dir = temp_dir("disk-test");
+        let path = dir.join(BEACON_FILE);
+        let switch = BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset);
+        let off = switch.turn_with(false, 4, false, fails);
+        assert_eq!(
+            off.body["error"].as_str(),
+            Some("The beacon is out until this computer's node stops, but its switch could not be saved (disk full): at the node's next start it reads lit again")
+        );
+        assert!(!switch.on() && off.failed && saved_of(&path) == Saved::Unset);
+        assert!(BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset).on(), "and so it does");
+        // An on whose save failed there is taken all the same: with no file
+        // the beacon is lit now and at the next start, and the log says the
+        // choice was not saved.
+        let on = switch.turn_with(true, 5, false, fails);
+        assert_eq!(on.status, "200 OK");
+        assert_eq!(on.body, serde_json::json!({ "ok": true, "beacon": { "on": true, "chosen": false } }));
+        assert!(on.newly_lit && !on.failed && switch.on());
+        let line = on.line.as_deref().unwrap();
+        assert!(line.contains("could not be saved (disk full); the beacon is lit on") && line.ends_with("where it starts lit"), "{line}");
+        // A saved off stands in the way: the file reads off, so a failed on is refused.
+        save(&path, false, 6).unwrap();
+        let switch = BeaconSwitch::read(ChiaNet::Testnet11, path.clone(), EnvSwitch::Unset);
+        let refused = switch.turn_with(true, 7, false, fails);
+        assert_eq!(refused.status, "409 Conflict");
+        assert!(refused.failed && !switch.on());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_status_rides_only_on_a_lit_beacons_view() {
         let status = BeaconStatus { era: 7, reachable: true, serves_welcome: false, sent: false, confirmed: false };
-        let lit_view = view_of(&Saved::On, EnvSwitch::Unset).with(Some(status));
+        let net = ChiaNet::Testnet11;
+        let lit_view = view_of(&Saved::On, EnvSwitch::Unset, net).with(Some(status));
         assert_eq!(lit_view.status, Some(status));
         assert_eq!(
             serde_json::to_string(&lit_view).unwrap(),
             r#"{"on":true,"chosen":true,"status":{"era":7,"reachable":true,"serves_welcome":false,"sent":false,"confirmed":false}}"#
         );
         // Put out: the publisher's last look says nothing of now.
-        assert_eq!(view_of(&Saved::Off, EnvSwitch::Unset).with(Some(status)).status, None);
-        assert_eq!(serde_json::to_string(&view_of(&Saved::Off, EnvSwitch::Unset)).unwrap(), r#"{"on":false,"chosen":true}"#);
+        assert_eq!(view_of(&Saved::Off, EnvSwitch::Unset, net).with(Some(status)).status, None);
+        assert_eq!(serde_json::to_string(&view_of(&Saved::Off, EnvSwitch::Unset, net)).unwrap(), r#"{"on":false,"chosen":true}"#);
+        // Lit by the network's default: the look rides too, and the view
+        // says the player never turned the switch.
+        assert_eq!(
+            serde_json::to_string(&view_of(&Saved::Unset, EnvSwitch::Unset, net).with(Some(status))).unwrap(),
+            r#"{"on":true,"chosen":false,"status":{"era":7,"reachable":true,"serves_welcome":false,"sent":false,"confirmed":false}}"#
+        );
+        assert_eq!(view_of(&Saved::Unset, EnvSwitch::Unset, ChiaNet::Mainnet).with(Some(status)).status, None, "out by default: no look");
         let back: BeaconView = serde_json::from_str(r#"{"on":true,"chosen":false,"held":true}"#).unwrap();
         assert_eq!(back, BeaconView { on: true, chosen: false, held: true, damaged: false, status: None });
     }
@@ -813,7 +935,8 @@ mod tests {
     fn the_startup_line_says_who_decided_and_what_a_lit_beacon_writes() {
         for net in ChiaNet::ALL {
             let name = net.name();
-            assert_eq!(start_line(net, &Saved::Unset, EnvSwitch::Unset), None);
+            let default_line = start_line(net, &Saved::Unset, EnvSwitch::Unset);
+            assert_eq!(default_line.is_some(), net.is_test(), "{net:?}: said only where the beacon starts lit");
             let lit_line = start_line(net, &Saved::On, EnvSwitch::Unset).unwrap();
             assert!(lit_line.starts_with(&format!("🔦 Beacon: on for {name}, lit in the SpacePhone's Network settings.")), "{lit_line}");
             assert!(lit_line.contains("writes its node id in the clear once an edition"), "{lit_line}");
@@ -827,7 +950,7 @@ mod tests {
                 assert!(start_line(net, &saved, EnvSwitch::Off).unwrap().contains("held off by SSF_CHIA_BEACON"), "{saved:?}");
             }
             // No line names an address or asks for funding.
-            for line in [turned_line(net, true), turned_line(net, false), lit_line] {
+            for line in [turned_line(net, true), turned_line(net, false), lit_line].into_iter().chain(default_line) {
                 assert!(!line.contains("txch1") && !line.contains("xch1") && !line.to_lowercase().contains("fund it"), "{line}");
             }
             assert!(turned_line(net, false).contains("is not withdrawn"));
