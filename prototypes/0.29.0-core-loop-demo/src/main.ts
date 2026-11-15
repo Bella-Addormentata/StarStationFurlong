@@ -4765,6 +4765,22 @@ async function performRoomSwap(
         stranded = true;
       }
     }
+    // 🛰️ Welcome only: a swap that leaves an install still on its way to the
+    // welcome room with no room at all (its own node went away under the
+    // swap, so neither the room it chose nor the one it left could be
+    // joined) is not left offline until a manual Retry-node. The seek it had
+    // ended when the swap left its session, and a leave that was meant is no
+    // lost link, so nothing else would dock again: the docking is tried
+    // again by itself at the seek's pace, after the swap is over, and goes
+    // where a Retry-node would.
+    if (stranded && welcomeSeeking()) {
+      const docksAtWelcome =
+        !pendingBootstrapOverride || pendingBootstrapOverride.roomId === DEFAULT_STATION.welcomeRoomId;
+      if (docksAtWelcome && welcomeDockFailures === 0) {
+        logToPhoneSystem(welcomeRetryLine(DEFAULT_STATION.name));
+      }
+      scheduleWelcomeRetry();
+    }
     choreography.fail();
     await transitFadeTo(false);
     const failure = err instanceof Error ? err : new Error(String(err));
