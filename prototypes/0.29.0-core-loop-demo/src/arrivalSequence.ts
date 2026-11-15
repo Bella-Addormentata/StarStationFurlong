@@ -7,8 +7,7 @@
  *  1. SPACE: about ten seconds looking out into space, the sky alone,
  *     turning slowly toward the planet;
  *  2. APPROACH: the planet view (issue 218) from far off, closing in on the
- *     planet until it fills most of the view, this station small in front
- *     of it;
+ *     planet until it is large, the station just past its limb;
  *  3. ATLAS: a quick dip through black to the station from outside (the
  *     level-3 atlas view), zooming in on the whole station;
  *  4. FADE and BLACK: a fade to black, and under it the step into the room;
@@ -52,11 +51,11 @@ export const ARRIVAL_SECONDS = SHOTS.reduce((s, x) => s + x.seconds, 0);
  *  compressed km. */
 export const FAR_EYE_KM = 14_000;
 /** The approach starts this many times farther out, the planet a dot, and
- *  ends this many times out, the planet filling most of the view with the
- *  station in front of it (at the far pass's own distance the camera tips
- *  up off the planet: farOrbits.forwardClearOf). */
+ *  ends this many times out, the planet large, the station just past its
+ *  limb (nearer, the far pass tips the camera up over the planet to keep
+ *  the station in sight: farOrbits.forwardClearOf). */
 export const APPROACH_START_TIMES = 30;
-export const APPROACH_END_TIMES = 4;
+export const APPROACH_END_TIMES = 2;
 /** The cut from the approach to the atlas goes through black this quickly:
  *  down over the approach's last moment, up over the atlas's first. */
 export const CUT_DIP_OUT_SECONDS = 0.15;
@@ -108,7 +107,7 @@ export function lerp(a: number, b: number, p: number): number {
 }
 
 /** The approach's eye distance at `p`: geometric, so the closing speed feels
- *  even from a dot to the planet filling the view. */
+ *  even from a dot to the planet large in the view. */
 export function approachEyeKm(p: number): number {
   const e = ease(p);
   return FAR_EYE_KM * Math.exp(lerp(Math.log(APPROACH_START_TIMES), Math.log(APPROACH_END_TIMES), e));
