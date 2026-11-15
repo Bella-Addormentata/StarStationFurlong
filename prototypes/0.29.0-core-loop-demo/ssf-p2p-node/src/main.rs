@@ -3693,9 +3693,32 @@ async fn dial_peer_with_retry(
     release_dial(&hub, target_pub_key);
 }
 
+/// Whether a dial's status goes to EVERY page of the room, whichever page's
+/// envelope began the dial: `connected` does. A page asks the room for its
+/// state when it hears `connected` (it sends SyncStep1 again), and that
+/// question is also what tells the dialed node which room the new connection
+/// is for: until a frame names the room, the dialed node says nothing on it,
+/// and this node drops it as silent after three missed heartbeats.
+///
+/// The pages hear dial statuses on the streams the NODE opens toward them.
+/// On the stream a page opened itself, the one its envelope came in on, the
+/// game's page reads sync frames only, so a `connected` written there alone
+/// was never heard. It went unnoticed because a page also asks again by
+/// itself every 2 s for its first 30 s in a room, and a dial to a reachable
+/// computer lands inside that. One that lands later did not link: a dial
+/// opened by a DHT knock landed 46 s after it began (two home routers,
+/// 2026-11-14), the two nodes connected, and 16 s later the connection was
+/// dropped as silent with the page never having asked.
+fn dial_status_is_for_every_page(status: &str) -> bool {
+    status == "connected"
+}
+
 /// Report a dial's status to the browser: to the specific `send` stream when the
 /// dial was triggered by a local tab's envelope, or broadcast to every tab in the
 /// room when it came from a node-side path (gossip/graft) with no single stream.
+/// A status every page must hear ([`dial_status_is_for_every_page`]) is
+/// broadcast in both cases, and first: the broadcast waits on no page, while
+/// the write to `send` waits for that stream's lock and for its page to read.
 async fn report_dial_status(
     hub: &SharedHub,
     send: &Option<std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>>,
@@ -3706,10 +3729,29 @@ async fn report_dial_status(
 ) {
     match send {
         Some(s) => {
+            if dial_status_is_for_every_page(status) {
+                broadcast_bridge_status(hub, room_id, target, status, detail).await;
+            }
             let mut g = s.lock().await;
             let _ = write_bridge_status(&mut *g, room_id, target, status, detail).await;
         }
         None => broadcast_bridge_status(hub, room_id, target, status, detail).await,
+    }
+}
+
+#[cfg(test)]
+mod dial_status_tests {
+    use super::dial_status_is_for_every_page;
+
+    /// Only a dial that landed is told to every page of the room: the
+    /// statuses of a dial still going, or given up, stay with the page whose
+    /// envelope began it. The real binary's side is tests/dial_landed.rs.
+    #[test]
+    fn only_a_landed_dial_is_told_to_every_page() {
+        assert!(dial_status_is_for_every_page("connected"));
+        for other in ["dialing", "failed", "", "Connected", "connected ", "linked"] {
+            assert!(!dial_status_is_for_every_page(other), "{other:?}");
+        }
     }
 }
 
@@ -3857,7 +3899,9 @@ async fn dial_peer_inner(
                         room.candidates.remove(&target_pub_key);
                     }
                 }
-                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
+                // The connection is read from before the pages are told: what
+                // the peer answers to a page's question must find its reader,
+                // however long the report below waits on a page's stream.
                 let hub_out = hub.clone();
                 let iroh_out = iroh_ep.clone();
                 let room_out = room_id.clone();
@@ -3868,6 +3912,7 @@ async fn dial_peer_inner(
                         eprintln!("⚠️ Outbound P2P peer loop closed: {:?}", e);
                     }
                 });
+                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
                 return;
             }
             Err(e) => {
@@ -4275,7 +4320,7 @@ pub(crate) async fn hold_dial(
                         room.candidates.remove(&target_pub_key);
                     }
                 }
-                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
+                // Read from first, reported second, as in `dial_peer_inner`.
                 let hub_out = hub.clone();
                 let iroh_out = iroh_ep.clone();
                 let room_out = room_id.clone();
@@ -4284,6 +4329,7 @@ pub(crate) async fn hold_dial(
                         eprintln!("⚠️ ChiaHub-introduced peer loop closed: {:?}", e);
                     }
                 });
+                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
                 return true;
             }
             Ok(Err(e)) => {
