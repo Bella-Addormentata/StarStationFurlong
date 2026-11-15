@@ -578,3 +578,34 @@ describe('main.ts: a boot that lost the session publishes no override', () => {
     expect(main).toContain('pendingBootstrapOverride = target;');
   });
 });
+
+describe('main.ts: a room swap that ends with no room at all', () => {
+  const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+  const start = main.indexOf('async function performRoomSwap(');
+  const body = main.slice(start, main.indexOf('\n}\n', start));
+
+  it('arms the docking\'s retry for an install still on its way to the welcome room, before the swap reports its failure', () => {
+    expect(start).toBeGreaterThan(0);
+    // Both ways a swap ends roomless: the departure room could not be
+    // rejoined, or there was none.
+    expect(body.match(/stranded = true;/g)).toHaveLength(2);
+    const armed = body.indexOf('if (stranded && welcomeSeeking()) {');
+    expect(armed).toBeGreaterThan(body.lastIndexOf('stranded = true;'));
+    const report = body.indexOf('return stranded ? new StrandedOfflineError(failure.message) : failure;');
+    expect(report).toBeGreaterThan(armed);
+    const block = body.slice(armed, report);
+    expect(block).toContain('scheduleWelcomeRetry();');
+    // The line names the welcome room only when that is where the retry goes.
+    expect(block).toMatch(/if \(docksAtWelcome && welcomeDockFailures === 0\) \{\s+logToPhoneSystem\(welcomeRetryLine\(DEFAULT_STATION\.name\)\);/);
+  });
+
+  it('is looked at again by the retry only once the swap is over and no session is live', () => {
+    const at = main.indexOf('function scheduleWelcomeRetry(failed = true): void {');
+    expect(at).toBeGreaterThan(0);
+    const retry = main.slice(at, main.indexOf('\n}\n', at));
+    expect(retry).toContain('if (!welcomeSeeking() || yjsSync) return;');
+    expect(retry).toMatch(/if \(transitInProgress\) \{\s+scheduleWelcomeRetry\(\);\s+return;/);
+    expect(retry).toContain('void bootstrapNetworking();');
+  });
+});
+
