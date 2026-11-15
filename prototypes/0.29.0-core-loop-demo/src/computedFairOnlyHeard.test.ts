@@ -28,6 +28,7 @@ import { commitHouses, committingHouse, HOUSE_HEARD_MS, houseOfCommit, houseSign
 vi.stubGlobal('window', { location: { search: '' } });
 
 const T0 = 2_000_000_000;
+const STAND_IN_SCAN_MAX = 16; // (casinoDoc's, which a spec can't import: the module is loaded per page)
 const STEP = 200;
 
 beforeEach(() => {
@@ -87,6 +88,15 @@ function pinHouses(p: Page, ...houses: TestHouse[]): void {
   p.doc.transact(() => p.doc.getMap('roomInfo').set('owner', owner.pid));
   p.doc.transact(() => {
     for (const h of houses) top(p).set(`hk:${h.pub}`, delegation(owner, h.pub, PAGE_ROOM));
+  });
+}
+
+/** `holder` holds the deed of page p's room and delegates `houses` for it. */
+function pinUnder(p: Page, holder: typeof owner, ...houses: TestHouse[]): void {
+  p.doc.transact(() => p.doc.getMap('players').set(holder.pid, { keyB64: holder.pub, name: holder.pid }));
+  p.doc.transact(() => p.doc.getMap('roomInfo').set('owner', holder.pid));
+  p.doc.transact(() => {
+    for (const h of houses) top(p).set(`hk:${h.pub}`, delegation(holder, h.pub, PAGE_ROOM));
   });
 }
 
@@ -613,24 +623,6 @@ describe('the close waits for the house it names', () => {
     expect(closedAt).toBeLessThanOrEqual(quiet + a.table.STAGGER_MS + STEP * 2);
   });
 
-  it('waits for the one house the first join names when two joined it: the other beating alone is no help, the room\'s own houses included', async () => {
-    const [a, b] = await gameRoom(['A', 'B']);
-    // (both are the deed holder's houses as well: the room has a house online all the while, which is none of this game's to wait for)
-    pinHouses(a, H, H2);
-    const joins = [kit.houseJoin(H, 1), kit.houseJoin(H2, 1)].sort((x, y) => (x.hash < y.hash ? -1 : 1));
-    const first = joins[0].rec.k === H.pub ? H : H2;
-    const second = first === H ? H2 : H;
-    bet(a, b, T0, ...joins);
-    beating = [new Beating(a, second)];
-    const quiet = run([a, b], T0 + STEP, T0 + 60_000, { step: STEP });
-    for (const p of [a, b]) expect(keysIn(p, 'c', 1)).toEqual([]);
-    expect(heard(a, second.pub, quiet)).toBe(true);
-    expect(a.casino.houseOnline(quiet)).toBe(true);
-    beating.push(new Beating(a, first));
-    run([a, b], quiet, quiet + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
-    expect(closesOf(a, 1)[0].h).toBe(joins[0].rec.c);
-  });
-
   it('waits for the house the base names at the first round of a session, and no other', async () => {
     const [a, b] = await gameRoom(['A', 'B']);
     baseOf(a, trimAt(1));
@@ -702,6 +694,147 @@ describe('the close waits for the house it names', () => {
     expect(heard(a, H.pub, quiet + HOUSE_HEARD_MS + STEP)).toBe(false);
     a.doc.transact(() => top(a).set(key, top(a).get(key)));
     expect(heard(a, H.pub, quiet + HOUSE_HEARD_MS + STEP)).toBe(false);
+  });
+});
+
+describe('another house of the game stands in for the house a close names (PR 6c-5d-2)', () => {
+  /** The game's base carries H's commitment of round 2 and A and B bet on it; `before` sets the room up first. H never beats. */
+  async function required(before: (a: Page) => void = () => {}) {
+    const [a, b] = await gameRoom(['A', 'B']);
+    before(a);
+    baseOf(a, trimAt(1));
+    sync(T0, a, b);
+    const at = run([a, b], T0 + STEP, T0 + 30_000, { step: STEP, until: () => a.table.readComputedRoulette(TABLE)?.phase === 'betting' });
+    bet(a, b, at);
+    for (const p of [a, b]) expect(foldOf(p)).toMatchObject({ open: 2, required: kit.houseCommit(H, 2) });
+    return { a, b, at };
+  }
+  const firstOf = (a: Page, b: Page, r: number): Page => (dutyRank('abandon', G, r, a.pub) < dutyRank('abandon', G, r, b.pub) ? a : b);
+
+  it('closes the round on the commitment of a house that is away once another house the deed holder delegated is heard; the abandon voids it after HOUSE_HEARD_MS, and the round after is open to a join', async () => {
+    const { a, b, at } = await required((p) => pinHouses(p, H, H2));
+    const quiet = run([a, b], at + STEP, at + 60_000, { step: STEP });
+    for (const p of [a, b]) expect(keysIn(p, 'c', 2)).toEqual([]);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), quiet)).toBe(false);
+    beating = [new Beating(a, H2)];
+    const closedAt = run([a, b], quiet, quiet + 30_000, { step: STEP, until: () => keysIn(a, 'c', 2).length > 0 });
+    expect(closedAt).toBeLessThanOrEqual(quiet + a.table.STAGGER_MS + STEP * 2);
+    expect(closesOf(a, 2)[0].h).toBe(kit.houseCommit(H, 2));
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), closedAt)).toBe(true);
+    // (the game hears the committing house alone: the stand-in is heard as the room's house)
+    expect(housesOf(a)).toEqual([H.pub]);
+    const first = firstOf(a, b, 2);
+    const voidAt = run([a, b], closedAt + STEP, closedAt + 90_000, { step: STEP, until: () => keysIn(first, 'z', 2).length > 0 });
+    expect(voidAt).toBeGreaterThanOrEqual(closedAt + HOUSE_HEARD_MS);
+    expect(voidAt).toBeLessThan(closedAt + a.table.ABANDON_MS);
+    run([a, b], voidAt + STEP, voidAt + 3_000, { step: STEP });
+    for (const p of [a, b]) expect(foldOf(p)).toMatchObject({ open: 3, required: null, joins: [] });
+    // the house heard joins round 3, and its close waits for that house
+    const join = kit.houseJoin(H2, 3);
+    house(a, join);
+    sync(voidAt + 3_000, a, b);
+    const next = run([a, b], voidAt + 3_000 + STEP, voidAt + 33_000, { step: STEP, until: () => a.table.readComputedRoulette(TABLE)?.phase === 'betting' });
+    bet(a, b, next);
+    run([a, b], next + STEP, next + 60_000, { step: STEP, until: () => keysIn(a, 'c', 3).length > 0 });
+    expect(closesOf(a, 3)[0].h).toBe(join.rec.c);
+  });
+
+  it('waits on while the other house is silent, is no house the deed holder delegated, or is the committing house itself', async () => {
+    const cases: [string, (a: Page) => void, TestHouse | null][] = [
+      ['delegated and silent', (a) => pinHouses(a, H, H2), null],
+      ['beating, with no delegation', (a) => pinHouses(a, H), H2],
+      ['beating, a stranger', (a) => pinHouses(a, H, H2), STRANGER],
+      ['no other house: the deed holder delegated the committing one alone', (a) => pinHouses(a, H), null],
+      ['no deed holder known', () => {}, H2],
+    ];
+    for (const [name, before, beats] of cases) {
+      const { a, b, at } = await required(before);
+      beating = beats ? [new Beating(a, beats)] : [];
+      const quiet = run([a, b], at + STEP, at + 60_000, { step: STEP });
+      for (const p of [a, b]) expect(keysIn(p, 'c', 2), name).toEqual([]);
+      expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), quiet), name).toBe(false);
+    }
+  });
+
+  it('is no stand-in by another deed holder\'s delegation: the game is its holder\'s, and the houses of the room\'s holder are none of its', async () => {
+    // (the buyer holds the deed and delegates H2 for the room; the game stayed with the owner, whose house H is)
+    const { a, b, at } = await required((p) => pinUnder(p, buyer, H2));
+    beating = [new Beating(a, H2)];
+    const quiet = run([a, b], at + STEP, at + 60_000, { step: STEP });
+    expect(a.casino.houseOnline(quiet)).toBe(true);
+    for (const p of [a, b]) expect(keysIn(p, 'c', 2)).toEqual([]);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), quiet)).toBe(false);
+  });
+
+  it('counts a delegation that comes while the table waits; and no longer once the deed has left the holder that delegated it', async () => {
+    const { a, b, at } = await required((p) => pinHouses(p, H));
+    beating = [new Beating(a, H2)];
+    const quiet = run([a, b], at + STEP, at + 40_000, { step: STEP });
+    for (const p of [a, b]) expect(keysIn(p, 'c', 2)).toEqual([]);
+    clockOf(a, quiet);
+    a.doc.transact(() => top(a).set(`hk:${H2.pub}`, delegation(owner, H2.pub, PAGE_ROOM)));
+    sync(quiet, a, b);
+    // (the beat the doc holds counts as the pin comes, as it does for the room: houseOkOf)
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), quiet)).toBe(true);
+    const heardAt = run([a, b], quiet + STEP, quiet + 30_000, { step: STEP, until: () => keysIn(a, 'c', 2).length > 0 });
+    expect(heardAt).toBeLessThanOrEqual(quiet + a.table.STAGGER_MS + STEP * 3);
+    expect(heard(a, H2.pub, heardAt)).toBe(true);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), heardAt)).toBe(true);
+    // the deed moves to the buyer: the pin is the owner's, and stands for nothing now
+    a.doc.transact(() => a.doc.getMap('players').set(buyer.pid, { keyB64: buyer.pub, name: buyer.pid }));
+    clockOf(a, heardAt);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', buyer.pid));
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), heardAt)).toBe(false);
+  });
+
+  it('stands in for the house the first join names when two joined the round: the other one heard, the close names the first join and is voided', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    // (the owner delegated both, and no deed holder is known: neither is a house of the room, both are the game's)
+    a.doc.transact(() => top(a).set(`hk:${H2.pub}`, delegation(owner, H2.pub, PAGE_ROOM)));
+    bet(a, b, T0, kit.houseJoin(H, 1), kit.houseJoin(H2, 1));
+    const joins = foldOf(a).joins;
+    expect(joins.map((j) => j.rec.k).sort()).toEqual([H.pub, H2.pub].sort());
+    const first = joins[0].rec.k === H.pub ? H : H2;
+    const second = first === H ? H2 : H;
+    expect(a.casino.houseOkOf(second.pub)).toBe(false);
+    // (a key no game hears beats all the while: it stands in for nobody)
+    beating = [new Beating(a, STRANGER)];
+    const quiet = run([a, b], T0 + STEP, T0 + 60_000, { step: STEP });
+    for (const p of [a, b]) expect(keysIn(p, 'c', 1)).toEqual([]);
+    beating.push(new Beating(a, second));
+    const closedAt = run([a, b], quiet, quiet + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    expect(closesOf(a, 1)[0].h).toBe(joins[0].rec.c);
+    expect(heard(a, first.pub, closedAt)).toBe(false);
+    const z = firstOf(a, b, 1);
+    const voidAt = run([a, b], closedAt + STEP, closedAt + 90_000, { step: STEP, until: () => keysIn(z, 'z', 1).length > 0 });
+    expect(voidAt).toBeLessThan(closedAt + a.table.ABANDON_MS);
+  });
+
+  it('does not stand in for itself: the house the close names heard, and no other, is the round\'s own house and no stand-in', async () => {
+    const { a, at } = await required((p) => pinHouses(p, H, H2));
+    beatIn(a, at + STEP, H, 1);
+    expect(heard(a, H.pub, at + STEP)).toBe(true);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), at + STEP)).toBe(false);
+    // …nor for a commitment the round does not ask for, or none
+    beatIn(a, at + STEP, H2, 1);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, kit.houseCommit(H, 2), at + STEP)).toBe(true);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, hex('9', 64), at + STEP)).toBe(false);
+    expect(a.casino.computedStandInHeard(TABLE, G.inc, undefined, at + STEP)).toBe(false);
+    expect(a.casino.computedStandInHeard(T2, G2.inc, kit.houseCommit(H, 2), at + STEP)).toBe(false);
+  });
+
+  it('looks through the first STAND_IN_SCAN_MAX of the deed holder\'s pins and no further: a limit', async () => {
+    const many = Array.from({ length: STAND_IN_SCAN_MAX }, (_, i) => testHouse(`stand-in-${i}`));
+    const { a, b, at } = await required((p) => pinHouses(p, ...many, H2));
+    beating = [new Beating(a, H2)];
+    const quiet = run([a, b], at + STEP, at + 40_000, { step: STEP });
+    expect(heard(a, H2.pub, quiet)).toBe(true);
+    for (const p of [a, b]) expect(keysIn(p, 'c', 2)).toEqual([]);
+    // (one pin fewer before it, and it counts)
+    const { a: a2, b: b2, at: at2 } = await required((p) => pinHouses(p, ...many.slice(1), H2));
+    beating = [new Beating(a2, H2)];
+    run([a2, b2], at2 + STEP, at2 + 40_000, { step: STEP, until: () => keysIn(a2, 'c', 2).length > 0 });
+    expect(keysIn(a2, 'c', 2)).toHaveLength(1);
   });
 });
 

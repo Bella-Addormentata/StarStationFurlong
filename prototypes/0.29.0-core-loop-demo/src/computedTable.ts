@@ -154,6 +154,9 @@ import {
   computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
+  computedFairOnlyEnded,
+  computedFairOnlyForged,
+  compactFairOnly,
   computedFairOnlyChecking,
   computedFairOnlyRecoveries,
   computedFairOnlyReturns,
@@ -183,7 +186,9 @@ import {
   computedTablePidBytes,
   computedTablePids,
   COMPUTED_MIN_BUILD,
+  computedStandInHeard,
   computedVerdictOf,
+  deleteFairOnlyForged,
   delegationHeld,
   delegationOf,
   fairSettingSeq,
@@ -231,7 +236,7 @@ import {
   writeHouseSum,
   writeOwnerRunChosen,
 } from './casinoDoc';
-import type { ComputedRecovery, EndedComputed, FairOnlyRecovery, RecoveryTrigger } from './casinoDoc';
+import type { ComputedRecovery, EndedComputed, FairOnlyEnded, FairOnlyForged, FairOnlyRecovery, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
   forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_SLIP_BETS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid, parseKey,
@@ -768,6 +773,10 @@ function lookAtClock(now: number): void {
     recoveryRanks.clear();
     keeping.clear();
     keptAt = null;
+    tidying.clear();
+    tidiedAt = null;
+    fairEndedAt.clear();
+    fairCompactedAt = null;
     endingSince.clear();
     endLookedAt = null;
     adoptTried.clear();
@@ -2877,6 +2886,8 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   compactDuty(getIdentityPub(), now);
   recoverDuty(getIdentityPub(), now);
   fairKeepDuty(getIdentityPub(), now);
+  fairTidyDuty(getIdentityPub(), now);
+  fairCompactDuty(getIdentityPub(), now);
   fairEndDuty(getIdentityPub(), now);
   adoptDuty(now);
   houseDuty(now);
@@ -3554,8 +3565,15 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
  *   few long felts the table's strangers put down on the round that is open.
  * - the house whose commitment the close would name (`h`) is not heard
  *   (houseAway): only that house holds the seed behind it, so a close written
- *   while it is away is a round nobody reveals for. Another house heard
- *   decides nothing. A house the page can't tell, or that is none of the
+ *   while it is away is a round nobody reveals for. Unless another house
+ *   of the game is heard (computedStandInHeard, PR 6c-5d-2: one the deed holder
+ *   pins that is the game's for the open round, or one that joined the open
+ *   round): then the close is written
+ *   to be voided. No house reveals for it, a bettor's abandon voids it after
+ *   HOUSE_HEARD_MS (abandonWait), the void lifts the commitment, and the
+ *   house heard joins the round after: one round lost, and the table plays
+ *   on. (The committing house back in time reveals, and the round counts.) A
+ *   house the page can't tell, or that is none of the
  *   game's for the open round any more (a hand-over moved the game to a
  *   holder whose houses it is not), is no pause: the close that names it is
  *   voided by an abandon, and the round after is the houses' that are, the
@@ -3566,7 +3584,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
 function closePaused(st: TableState, res: FoldResult, h: string, now: number): boolean {
   return fairClosePaused(
     res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, (computedResolutionOf(st.t, st.inc)?.fin ?? null) !== null,
-  ) || houseAway(st, h, now);
+  ) || (houseAway(st, h, now) && !computedStandInHeard(st.t, st.inc, h, now));
 }
 
 /** closePaused's rule on its own inputs: the session's kept bytes, the room's
@@ -4767,6 +4785,121 @@ function standOver(w: Keeping, now: number): number | null {
   return over;
 }
 
+/** Since when this page has seen forged records in a game, by game: the tidy
+ *  duty's turns run from there. */
+const tidying = new Map<string, number>();
+/** When the tidy duty last looked (at most every TICK_MS). */
+let tidiedAt: number | null = null;
+
+/**
+ * 🔒 8b. Delete the forged records of the room's FAIR ONLY games (design §8.4
+ * P7, PR 6c-4b-3a): a checkpoint or a transfer whose signature fails under the
+ * key it claims (casinoDoc computedFairOnlyForged). Anyone can write one, each
+ * costs every page that resolves the game a check, and enough of them in the
+ * holder's way hold the game's answer off (computedFairOnlyAuth
+ * MAX_FORGED_XFS), and the room's spending with it: deleted, the next
+ * resolution goes on past them.
+ * At once, in turn (tidyTurn: dutyRank('restore') among the signers of the
+ * game's staked felts, STAGGER_MS a place, and a page with no felt there in
+ * one of TIDY_OUTSIDER_TURNS turns after them, by its own rank: no long wait
+ * for an outsider as the put-backs have, since two pages that delete the same
+ * keys at once cost a few bytes and a game with no felt down must not wait;
+ * the turns run from this page's first sight of forged records in the game,
+ * until it sees none), then at every look
+ * (TICK_MS), FORGED_DELETE_MAX a write: a resolution lists no more than it
+ * walked past, so a flood goes a look's worth at a time. No stand-down: a peer
+ * that keeps writing them is answered for as long as it does, a delete for
+ * each write, since the room cannot spend while they stand. On an awake page
+ * with the room's state in and its doc whole. Nothing is signed.
+ */
+function fairTidyDuty(pub: string, now: number): void {
+  if (tidiedAt !== null && now >= tidiedAt && now - tidiedAt < TICK_MS) return;
+  tidiedAt = now;
+  if (casinoDocEpoch() !== clock.epoch) return;
+  const games = computedFairOnlyForged();
+  if (games.length === 0 && tidying.size === 0) return;
+  const ready = roomStateIn(now) && tablesAwake(now) && casinoWhole();
+  const listed = new Set<string>();
+  for (const r of games) {
+    const key = `${r.t}:${r.inc}`;
+    listed.add(key);
+    let at = tidying.get(key);
+    // (Not ready, or a clock gone back: the turns start again.)
+    if (at === undefined || at > now || !ready) tidying.set(key, at = now);
+    if (!ready || now < at + tidyTurn(r, pub)) continue;
+    deleteFairOnlyForged(r.t, r.inc);
+  }
+  for (const key of [...tidying.keys()]) if (!listed.has(key)) tidying.delete(key);
+}
+
+/** Since when this page has seen an ended game with records left, by game:
+ *  the compaction's wait and turns run from there. */
+const fairEndedAt = new Map<string, number>();
+/** When the game compaction duty last looked (at most every TICK_MS). */
+let fairCompactedAt: number | null = null;
+
+/**
+ * 🔒 9b. Compact the room's ended FAIR ONLY games (design §8.4 P6, PR
+ * 6c-4b-3b): once a game's base is a checkpoint that ends it, and that
+ * checkpoint stands by itself (casinoDoc computedFairOnlyEnded: it carries its
+ * end order, its house's delegation and the transfers of its chain), what the
+ * doc holds of the game beside it goes: the maps of its sessions, its other
+ * checkpoints, its transfers under their own keys, its end order. The nets
+ * stand on the end checkpoint, which the pages go on putting back
+ * (fairKeepDuty), and a page that comes later reads the game from it alone.
+ * COMPACT_MS after this page first saw the game ended with something left, in
+ * one of TIDY_OUTSIDER_TURNS turns by its own rank (compactTurn: an ended game
+ * counts no felt, so no page has a stake to go first by, and two pages that
+ * delete the same keys at once cost a few bytes), then at every look,
+ * COMPACT_DELETE_MAX keys a write. A record of the game that comes after (a
+ * page that lagged puts back a checkpoint the room has moved on from, once; a
+ * peer writes a session's map) starts the wait again and goes the same way.
+ * On an awake page with the room's state in and its doc whole, and with no
+ * check of the game waiting. Nothing is signed: the game's end is its
+ * holder's to write (fairEndDuty), never compaction's.
+ */
+function fairCompactDuty(pub: string, now: number): void {
+  if (fairCompactedAt !== null && now >= fairCompactedAt && now - fairCompactedAt < TICK_MS) return;
+  fairCompactedAt = now;
+  if (casinoDocEpoch() !== clock.epoch) return;
+  const games = computedFairOnlyEnded();
+  if (games.length === 0 && fairEndedAt.size === 0) return;
+  const ready = roomStateIn(now) && tablesAwake(now) && casinoWhole();
+  const listed = new Set<string>();
+  for (const r of games) {
+    const key = `${r.t}:${r.inc}`;
+    listed.add(key);
+    let at = fairEndedAt.get(key);
+    // (Not ready, or a clock gone back: the wait starts again.)
+    if (at === undefined || at > now || !ready) fairEndedAt.set(key, at = now);
+    if (!ready || now < at + COMPACT_MS + compactTurn(r, pub)) continue;
+    // (The last of it gone: what is written under the game's keys after this
+    // waits its own COMPACT_MS, were it written before this page looks again.)
+    if (compactFairOnly(r.t, r.inc) >= r.left) fairEndedAt.delete(key);
+  }
+  for (const key of [...fairEndedAt.keys()]) if (!listed.has(key)) fairEndedAt.delete(key);
+}
+
+/** This page's turn to compact an ended game: one of TIDY_OUTSIDER_TURNS,
+ *  STAGGER_MS apart, which its own rank for the duty at the end's round picks. */
+function compactTurn(r: FairOnlyEnded, pub: string): number {
+  return (parseInt(dutyRank('restore', r.ctx, r.u, pub).slice(0, 2), 16) % TIDY_OUTSIDER_TURNS) * STAGGER_MS;
+}
+
+/** How many turns the pages with no felt at a game share for its tidying. */
+export const TIDY_OUTSIDER_TURNS = 4;
+
+/** This page's turn to delete a game's forged records: its place among the
+ *  signers of the game's staked felts (STAGGER_MS a place, RECOVERY_PLACES at
+ *  most), or for a page that is none of them one of TIDY_OUTSIDER_TURNS turns
+ *  after them, which its own rank for the duty picks. */
+function tidyTurn(r: FairOnlyForged, pub: string): number {
+  const idx = placeOf('restore', r.ctx, r.u, r.pubs, pub, recoveryRanks);
+  const places = Math.min(idx, RECOVERY_PLACES);
+  if (idx < r.pubs.length) return places * STAGGER_MS;
+  return (places + parseInt(dutyRank('restore', r.ctx, r.u, pub).slice(0, 2), 16) % TIDY_OUTSIDER_TURNS) * STAGGER_MS;
+}
+
 function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, over: number | null): void {
   // (A clock gone back leaves no stand-down longer than one.)
   if (w.until > now + KEEP_BACKOFF_MS) w.until = now + KEEP_BACKOFF_MS;
@@ -5101,7 +5234,8 @@ export function computedCompactionPending(): boolean {
  *  stand-down too, whose end the page must be awake at), or a live game this
  *  page has something at stake in (serveLeftGames: its seed to reveal, its
  *  close, its abandon, what it puts back), or a game this page holds with an
- *  end order standing (fairEndDuty: its end). All are an awake page's, and with
+ *  end order standing (fairEndDuty: its end), or a game with forged records to
+ *  delete (fairTidyDuty). All are an awake page's, and with
  *  the room's last table out World would mark no frame: the page would read as
  *  asleep a lapse on, and for good. (Without this term the table went back by
  *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
@@ -5117,6 +5251,12 @@ export function computedFairOnlyPending(): boolean {
     // in the round or none, and with its table taken out of the room there
     // may be no other table to keep the page awake for it.)
     if (computedGamesEnding(getIdentityPub()).length > 0) return true;
+    // (A game with forged records to delete, fairTidyDuty: past
+    // MAX_FORGED_XFS of them its answer waits until they are gone, and the
+    // casino's spending with it, computedSettled.)
+    if (computedFairOnlyForged().length > 0) return true;
+    // (An ended game with records left to compact, fairCompactDuty.)
+    if (computedFairOnlyEnded().length > 0) return true;
     if (fairTables.size === 0) return false;
     const me = getPlayerId();
     for (const st of fairTables.values()) {

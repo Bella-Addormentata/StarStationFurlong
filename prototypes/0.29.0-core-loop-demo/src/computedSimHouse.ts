@@ -32,6 +32,14 @@
  * transfer's, and its checkpoints carry the chain of transfers and the
  * buyer's delegation. A second instance on the buyer's page's doc is the
  * buyer's node (computedSim handOver).
+ *
+ * Two houses of one holder at a FAIR ONLY game (design §8.7; computedSim
+ * PageSpec node): one house to a round by the join rules house.rs has, and
+ * one more here, which the node's half of FAIR ONLY is to have: no join of a
+ * round while the round before waits on another house's reveal (`theirs` in
+ * tableDuties). That reveal carries its house's commitment for the round, so
+ * a join made before it counts for nothing. The house that plays keeps the
+ * game until it steps down or a round of its own is voided.
  */
 
 import * as Y from 'yjs';
@@ -132,6 +140,8 @@ interface TableRead {
   sid: string;
   baseU: number;
   cpH: string | undefined;
+  /** Whether a key is a house that decides a round (readTable). */
+  houseAt: (k: string, r: number) => boolean;
   sesKey: string;
   slips: Map<string, Slip>;
   /** `${r}|${pid}` → the seeds revealed. */
@@ -667,7 +677,7 @@ export class SimHouse {
     if (!(ses instanceof Y.Map)) return null;
     const asSlip = asSlipFor(ctx);
     const read: TableRead = {
-      ctx, sid, baseU: base.u, cpH: base.h, sesKey, slips: new Map(), seeds: new Map(), closes: [], top: base.u, abandoned: new Set(),
+      ctx, sid, baseU: base.u, cpH: base.h, houseAt, sesKey, slips: new Map(), seeds: new Map(), closes: [], top: base.u, abandoned: new Set(),
       reveals: [], joins: [], keys: (ses as Y.Map<unknown>).size,
     };
     const closes: [Close, Record<string, unknown>][] = [];
@@ -800,7 +810,10 @@ export class SimHouse {
     const eligible = new Set(read.closes.map((c) => c.hash));
     for (const [x, r, k, v] of abandons) {
       if (!eligible.has(x) || read.abandoned.has(x)) continue;
-      if (fo && !this.frozenKey(read, read.closes.find((c) => c.hash === x)!, k)) continue;
+      const of = read.closes.find((c) => c.hash === x)!;
+      // (Of its close's round: the fold counts no other, computedFold decide.)
+      if (of.r !== r) continue;
+      if (fo && !this.frozenKey(read, of, k)) continue;
       if (this.abandonOk(ctx, r, k, v)) read.abandoned.add(x);
     }
     return read;
@@ -1022,6 +1035,38 @@ export class SimHouse {
     const toReveal = r - 1 > done && !mem.refused.has(r - 1)
       && closesAt(r - 1).some((c) => c.h === before && !mem!.blocked.has(c.hash));
     if (toReveal) return;
+    // 🏠🏠 Nor, at a FAIR ONLY game (whose node half is still to be written:
+    // this is its rule; house.rs at the house tables joins as it did), while
+    // the round before waits on another house: a close of it
+    // names the commitment of another house of that round, nobody abandoned
+    // it, and no reveal of the round is in. That house's reveal will carry
+    // its commitment for this round (and then this join would count for
+    // nothing: a record a round, an unopened seed each); if it carries none,
+    // or the bettors void the close, the join is the next tick's. (Not a
+    // commitment of no house of that round, a seller's house's left over at a
+    // hand-over: nobody reveals that close, and the round after it wants a
+    // join now. Nor one whose house the session does not tell: past a
+    // checkpoint, the reveal that carried it is the copy a trim keeps.)
+    const whose = (h: string): string | undefined => read.joins.find((o) => o.r === r - 1 && o.c === h)?.k
+      ?? read.reveals.find((v) => v.r === r - 2 && v.c === h)?.k;
+    // (Nor once any close of that round is abandoned: the pages abandon the
+    // close their fold chose, which voids the round, and a rival of it that
+    // nobody abandons would hold this house off for good.)
+    // (Nor once a house has revealed a close of the round: the round is that
+    // close's, and a rival of it on another house's commitment is nobody's
+    // to reveal. A step-down, which reveals no close, ends no wait: another
+    // house's from its own join of the round leaves the close waiting, and
+    // a close on a commitment stepped down is none the fold takes.)
+    const theirs = fo && r - 1 > read.baseU
+      && !closesAt(r - 1).some((c) => read.abandoned.has(c.hash))
+      && !read.reveals.some((v) => v.r === r - 1 && v.x.length > 0)
+      && closesAt(r - 1).some((c) => {
+        const h = c.h;
+        if (h === undefined) return false;
+        const k = whose(h);
+        return k !== undefined && k !== this.pub && read.houseAt(k, r - 1);
+      });
+    if (theirs) return;
     this.writeSession(mem, read.sesKey, 'o', r, this.signed('hcommit', ctx, { r, c: this.commit(ctx, r), k: this.pub }), writes);
     out.joins += 1;
   }
