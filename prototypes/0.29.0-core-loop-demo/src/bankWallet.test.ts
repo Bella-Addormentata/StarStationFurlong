@@ -3,7 +3,7 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { BANK_LISTING_LINE, BANK_LISTING_LINE_TEST, UNKNOWN_NETWORK_TEXT, bankWalletView, chiaOffBankText, createInAppText, listsWhen, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { BANK_LISTING_LINE, BANK_LISTING_LINE_TEST, ON_BY_ITSELF, UNKNOWN_NETWORK_TEXT, bankWalletView, chiaOffBankText, createInAppText, listsWhen, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
 import { chiaOffWhy } from './chiaLane';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import type { ChiaLane, ChiaListing, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
@@ -83,6 +83,33 @@ describe('bankWalletView', () => {
     expect(bankWalletView(node({ state: 'on', stays: true, mnemonic: true }, ADDR), IDLE).notice).toBeNull();
     // Only an on wallet with an address has one: a ready node is not re-minted yet.
     expect(bankWalletView(node({ state: 'ready', reminted: true }), IDLE).notice).toBeNull();
+  });
+
+  it('says above the address that the node turned the wallet on by itself, until its words are saved (🆕)', () => {
+    const auto = bankWalletView(node({ state: 'on', stays: true, auto: true, mnemonic: true }, ADDR), IDLE);
+    expect(auto.notice).toBe(ON_BY_ITSELF(TESTNET11));
+    for (const said of ['turned this SSF wallet on by itself', 'on testnet11', 'unless you turn it off here', 'cannot list itself or knock', 'TURN OFF holds from its next start']) {
+      expect(auto.notice).toContain(said);
+    }
+    // It promises no listing and names no payer: LIST ME and the dish line say those.
+    expect(auto.notice).not.toMatch(/is listed|lobby dish|coin/);
+    // The switch under it is the ordinary one: TURN OFF, as for any wallet that stays on.
+    expect(auto).toMatchObject({ showsAddress: true, text: 'SSF wallet on — it comes back on whenever your node starts.', button: { act: 'off', label: 'TURN OFF' } });
+    // Not once the words are saved, not while the environment holds the wallet on, and not from an older node.
+    expect(bankWalletView(node({ state: 'on', stays: true, auto: true, mnemonic: true, backed_up: true }, ADDR), IDLE).notice).toBeNull();
+    expect(bankWalletView(node({ state: 'on', stays: true, held: true, auto: true, mnemonic: true }, ADDR), IDLE).notice).toBeNull();
+    expect(bankWalletView(node({ state: 'on', stays: true, mnemonic: true }, ADDR), IDLE).notice).toBeNull();
+    // Only a wallet that is on: a ready node offers its switch with no notice.
+    expect(bankWalletView(node({ state: 'ready', auto: true, mnemonic: true }), IDLE).notice).toBeNull();
+    // Only on a test network: no node turns a wallet on by itself where coins are real money.
+    const mainAddr = addressOn(MAINNET, ADDR.slice('txch1'.length));
+    const main = bankWalletView({ ...node({ state: 'on', stays: true, auto: true, mnemonic: true }), chia_net: MAINNET, chia_address: mainAddr }, IDLE);
+    expect(main.showsAddress).toBe(true);
+    expect(main.notice).toBeNull();
+    // With a wallet this run also re-minted, both are said, this one first.
+    const both = bankWalletView(node({ state: 'on', stays: true, auto: true, mnemonic: true, reminted: true }, ADDR), IDLE).notice ?? '';
+    expect(both.startsWith(ON_BY_ITSELF(TESTNET11))).toBe(true);
+    expect(both).toContain('at a new address');
   });
 
   it('shows the address once the wallet is on, with the switch that fits how it stays on', () => {

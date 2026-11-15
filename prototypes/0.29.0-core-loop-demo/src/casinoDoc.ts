@@ -3376,6 +3376,26 @@ export function deedOffersTo(pub: string): DeedOffer[] {
   return out.sort((a, b) => (a.nonce < b.nonce ? -1 : a.nonce > b.nonce ? 1 : 0));
 }
 
+/** 🔒 The room's deed holder as this page reads it, for the ⚙ card (PR
+ *  6c-4c): the player the room names its owner (null: none, or the legacy
+ *  marker) and that player's key as this page pinned it (deedHolderKey:
+ *  undefined while it hasn't shown up). Read-only. */
+export function computedDeedHolder(): { pid: string | null; key: string | null | undefined } {
+  const owner = boundDoc?.getMap('roomInfo').get('owner');
+  const key = deedHolderKey();
+  return { pid: key === null || typeof owner !== 'string' ? null : owner, key };
+}
+
+/** 🔒 The player this page pinned identity key `pub` to (readPlayerKey's map,
+ *  the other way: the first of them by id, were two players to show one key),
+ *  or undefined for a key no player of the room showed. Display only. */
+export function computedPlayerOfKey(pub: string): string | undefined {
+  if (!docAlive() || !boundDoc) return undefined;
+  let found: string | undefined;
+  for (const [pid, key] of pinnedKeys) if (key === pub && (found === undefined || pid < found)) found = pid;
+  return found;
+}
+
 /** 🔒 Whether this page's key is the room's deed holder's, as this page
  *  pinned it (deedHolderKey). */
 export function deedHeldBy(pub: string): boolean {
@@ -5096,7 +5116,9 @@ function resolveFairOnly(c: ComputedInc): void {
     if (!live) foLive.set(c.t, live = new Map());
     live.set(c.inc, fo.res);
   } else live?.delete(c.inc);
-  // (The fold asks about every house record again: the keys it counts are found anew.)
+  // (The fold asks about every house record again: the keys it counts are found
+  // anew. Its answer is made anew with them, so the table's view is told of
+  // every resolution, whatever of it the ⚙ card shows: computedFairOnlyView.)
   fo.houseUsed.clear();
   c.fold.houseChanged();
 }
