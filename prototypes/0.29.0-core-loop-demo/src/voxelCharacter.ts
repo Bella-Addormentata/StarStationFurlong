@@ -517,7 +517,8 @@ export class VoxelCharacter {
    *  the clone vat has it (its squeeze and door are measured for that fox),
    *  easing to `size` once the vat lets it go. */
   private sizeShown = 1;
-  /** The clone vat has this fox (holdStandardSize). */
+  /** The clone vat has this fox: its size and ears are drawn as first drawn
+   *  (holdStandardShape). */
   private sizeHeld = false;
 
   // ── 🧬 Fresh-clone pallor (#165) ───────────────────────────────────────────
@@ -1819,6 +1820,16 @@ export class VoxelCharacter {
     if (face.shape !== this.faceDrawn.shape || face.eye !== this.faceDrawn.eye || face.sheen !== this.faceDrawn.sheen) {
       this._drawFace(face.shape, face.eye, face.sheen);
     }
+    this._applyEars();
+    this.size = look ? look.size : 1;
+    if (!this.sizeHeld) this.sizeShown = this.size;
+    this._applySize();
+  }
+
+  /** The ears in the look's size and lean, or as first drawn while the
+   *  shape is held (holdStandardShape). */
+  private _applyEars(): void {
+    const look = this.sizeHeld ? null : this.look;
     const ears: Array<[THREE.Group | null, -1 | 1]> = [[this.leftEar, -1], [this.rightEar, 1]];
     for (const [ear, side] of ears) {
       if (!ear) continue;
@@ -1826,21 +1837,25 @@ export class VoxelCharacter {
       ear.scale.set(scale, EAR_HEIGHT * scale * (look ? look.earHeight : 1), scale);
       ear.rotation.z = side * -(EAR_LEAN + (look ? look.earLean : 0));
     }
-    this.size = look ? look.size : 1;
-    if (!this.sizeHeld) this.sizeShown = this.size;
-    this._applySize();
   }
 
-  /** 🧬 Draw the fox as first drawn, whatever its look's size, while `held`:
-   *  the clone vat's squeeze and door are measured for that fox (vatGauge.ts).
-   *  Let go, it eases to its own size. */
-  holdStandardSize(held: boolean): void {
+  /** 🧬 Draw the fox's shape as first drawn, its size and its ears, whatever
+   *  its look, while `held`: the clone vat's squeeze and door are measured
+   *  for that fox (vatGauge.ts). Let go, its ears are its own again and it
+   *  eases to its own size. Its colours and eyes stay its own throughout. */
+  holdStandardShape(held: boolean): void {
     if (held === this.sizeHeld) return;
     this.sizeHeld = held;
     if (held) {
       this.sizeShown = 1;
       this._applySize();
     }
+    this._applyEars();
+  }
+
+  /** The size the look draws the fox at, held or not. */
+  getLookSize(): number {
+    return this.size;
   }
 
   /** How big the fox is drawn now (1 for the fox as first drawn), for the
