@@ -256,6 +256,20 @@ describe('a roll of a FAIR ONLY craps game, on the pages', () => {
           covered: 'same', chips: 0, carry: lie === 'carry', counted: lie === 'dice' ? dice : null,
         });
       }
+      // the house's sweep of that session repeats the checkpoint: it stands against the roll each page counted, as the first did
+      const sweep = trimOf(Q, 'q', { ...cp.value, g: undefined, b: nextSid3(Q, cp.value), w: 1 });
+      a.doc.transact(() => {
+        top(a).set(sweep.key, sweep.value);
+        for (const key of [...top(a).keys()]) if (key.startsWith(`ses:${TABLE}:${Q.inc}:`)) top(a).delete(key);
+        top(a).set(`ses:${TABLE}:${Q.inc}:${nextSid3(Q, sweep.value)}`, new Y.Map());
+      });
+      sync(at, ...pages);
+      for (const p of pages) {
+        expect(p.casino.computedResolutionOf(TABLE, Q.inc), lie).toMatchObject({ base: { key: sweep.key }, live: true });
+        expect(p.table.computedFairOnlyView(TABLE, at)?.checkpoint, `sweep ${lie} ${p.name}`).toEqual({
+          covered: 'same', chips: 0, carry: lie === 'carry', counted: lie === 'dice' ? dice : null,
+        });
+      }
     }
   });
 

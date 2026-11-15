@@ -2217,6 +2217,17 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
     t.unmount();
   });
 
+  it.each([false, true])("the house's sweep, its next checkpoint at the same round, stands against what this page counted of that round: no row that it can't check it, and nets it did not count stay flagged (nets not counted: %s)", (lie) => {
+    const { t, trim, nets } = decidedRound();
+    const n = lie ? { ...nets, [BOB.pid]: (BigInt(nets[BOB.pid] ?? '0') + 7n).toString() } : nets;
+    const first = trim({ n });
+    trim({ n, b: nextSid3(G, first.value), w: 1 });
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ round: 1, checkpoint: { covered: 'same', chips: lie ? 7 : 0, counted: null } });
+    expect(t.card().includes('CHECKPOINT'), `${lie}`).toBe(lie);
+    if (lie) expect(t.card()).toContain("🚩 THE HOUSE'S CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+    t.unmount();
+  });
+
   it.each([false, true])('a game ended at a round a checkpoint already covered is still held against what this page counted of that round: nets it did not count stay flagged on the ended card, and the true ones clear the flag (true nets: %s)', (honestEnd) => {
     {
       const { t, trim, nets } = decidedRound();

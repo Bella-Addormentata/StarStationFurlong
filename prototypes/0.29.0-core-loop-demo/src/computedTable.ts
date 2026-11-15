@@ -242,7 +242,7 @@ import {
 import type { ComputedRecovery, EndedComputed, FairOnlyEnded, FairOnlyForged, FairOnlyRecovery, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
-  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_SLIP_BETS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid, parseKey,
+  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_SLIP_BETS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey,
   recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor, utf8Length,
 } from './computedFold';
 import type {
@@ -595,12 +595,12 @@ interface TableState {
    *  pocket, or the dice; null: void), for the 🔒 check of a game's signed
    *  outcome (computedFairOnlyView); null when it had not seen it decided.
    *  `at`: the round, the close this page had for it and the nets it had
-   *  counted to it, kept for a game's next checkpoint at the same round (its
-   *  end: cpDiffOf); null when it had not seen it decided. */
+   *  counted to it, kept for a game's next checkpoint at the same round (a
+   *  sweep, or its end: cpDiffOf), with at craps the table it had after it; null when it had not seen it decided. */
   cpDiff: {
     sid: string; chips: number; nets: number; carry: boolean; covered: 'unseen' | 'split' | 'same';
     own: { d: string; o: number | [number, number] | null } | null;
-    at: { u: number; close: string; expect: ReadonlyMap<string, bigint> } | null;
+    at: { u: number; close: string; expect: ReadonlyMap<string, bigint>; carry: CrapsCarry | null } | null;
   } | null;
   /** 🩹 While the table counts a checkpoint that puts a restore in motion
    *  (noteResult): the head's session, the fold of it, and the keys of what
@@ -1312,31 +1312,31 @@ function cpDiffOf(st: TableState, was: FoldResult, res: FoldResult): NonNullable
       if (!v.decided || v.r > u) continue;
       for (const [pid, x] of v.deltas) expect.set(pid, (expect.get(pid) ?? 0n) + x);
     }
-    kept = { u, close: at.close, expect };
+    kept = { u, close: at.close, expect, carry: at.craps ? at.craps.sOut : null };
   }
   return { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n, covered: d.covered, own, at: kept };
 }
 
-/** 🔒 A game's next checkpoint at the round the page already counts from (the
- *  end of a game with no round decided since): the
+/** 🔒 A game's next checkpoint at the round the page already counts from (a
+ *  house's sweep, or the end of a game with no round decided since): the
  *  round is out of the session, so it stands against what this page kept of
  *  it when the last checkpoint came (its close, its count, how it was
- *  decided), or, on a page that never compared that one (it came to the game
+ *  decided, at craps the table it had after it), or, on a page that never compared that one (it came to the game
  *  after), against that checkpoint itself, with no outcome to compare. A
- *  page that had not seen the round decided still has not. No carry: what
- *  the table handed on then is not kept. */
+ *  page that had not seen the round decided still has not. */
 function cpDiffAgain(st: TableState, was: FoldResult, res: FoldResult): NonNullable<TableState['cpDiff']> {
   const prior = st.cpDiff && st.cpDiff.sid === was.base.sid ? st.cpDiff : null;
   const sid = res.base.sid;
   if (prior && !prior.at) return { sid, chips: 0, nets: 0, carry: false, covered: 'unseen', own: null, at: null };
-  const kept = prior?.at ?? { u: was.base.u, close: was.base.l ?? NO_CLOSE, expect: was.base.n };
+  const craps = st.game === 'craps';
+  const kept = prior?.at ?? { u: was.base.u, close: was.base.l ?? NO_CLOSE, expect: was.base.n, carry: craps ? was.base.state as CrapsCarry : null };
   let diff = 0n;
   for (const pid of new Set([...kept.expect.keys(), ...res.base.n.keys()])) {
     const x = (res.base.n.get(pid) ?? 0n) - (kept.expect.get(pid) ?? 0n);
     diff += x < 0n ? -x : x;
   }
-  const nets = clampSafe(diff);
-  return { sid, chips: nets, nets, carry: false, covered: kept.close === res.base.l ? 'same' : 'split', own: prior?.own ?? null, at: kept };
+  const carry = craps && kept.carry ? carryDiff(kept.carry, res.base.state as CrapsCarry) : 0n;
+  return { sid, chips: clampSafe(diff + carry), nets: clampSafe(diff), carry: carry > 0n, covered: kept.close === res.base.l ? 'same' : 'split', own: prior?.own ?? null, at: kept };
 }
 
 /** 🔒 How the checkpoint that ended a FAIR ONLY game this page played stood
@@ -5310,10 +5310,13 @@ export interface ComputedFairOnlyView {
  *  `checkpoint`): only of the checkpoint the fold now counts from, and only
  *  on a page that saw the session move on to it (or, of the checkpoint that
  *  ended the game, that played the game until then). Reads, creates nothing. */
-function fairOnlyCheckpointOf(t: string, inc: string, ck: { u: number; l: string; d?: string; o?: number | [number, number] }): ComputedFairOnlyView['checkpoint'] {
+function fairOnlyCheckpointOf(t: string, inc: string, ck: Parameters<typeof nextSid3>[1] & { d?: string; o?: number | [number, number] }): ComputedFairOnlyView['checkpoint'] {
   const d = fairTables.get(`${t}:${inc}`)?.cpDiff ?? endedDiffs.get(`${t}:${inc}`);
   const base = computedFoldOf(t, inc)?.base;
-  if (!d || !base || d.sid !== base.sid || base.u !== ck.u || base.u === 0) return undefined;
+  // (Of the checkpoint the view shows, and no other: the fold can be one
+  // checkpoint behind the resolution, at the same round even (a sweep), and
+  // what was compared with that one says nothing of this one.)
+  if (!d || !base || base.u === 0 || d.sid !== base.sid || nextSid3({ room: casinoRoomId(), t, inc }, ck) !== base.sid) return undefined;
   const same = d.covered === 'same';
   const signs = same && d.own !== null && d.own.o !== null && ck.o !== undefined && ck.d === d.own.d && String(ck.o) !== String(d.own.o);
   // (The checkpoint that ends a game hands no table on: the bets that rode are
