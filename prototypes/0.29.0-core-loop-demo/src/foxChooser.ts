@@ -12,6 +12,11 @@
  * and the preview are built by `mountFoxChooser`, which keeps the chosen
  * look and hands it back. Nothing is saved here: main.ts saves and applies
  * the look when the player enters.
+ *
+ * A keyboard moves as through any set of radio buttons: each row is one tab
+ * stop (its chosen option), the arrow keys choose within a row, and Tab goes
+ * row to row, on to RANDOM and to ENTER (main.ts, `nextTabStop`), since the
+ * game's own Tab is the phone's toggle.
  */
 
 import * as THREE from 'three';
@@ -69,6 +74,35 @@ export function startingLook(saved: FoxLook | null, rand: () => number = Math.ra
   return saved ? cleanLook(saved) : randomLook(rand);
 }
 
+/** The option an arrow key (or Home / End) chooses in a row of `count`,
+ *  from the option at `at`; null for any other key. Round at either end. */
+export function arrowChoice(key: string, at: number, count: number): number | null {
+  if (count <= 0) return null;
+  switch (key) {
+    case 'ArrowRight':
+    case 'ArrowDown':
+      return (at + 1) % count;
+    case 'ArrowLeft':
+    case 'ArrowUp':
+      return (at - 1 + count) % count;
+    case 'Home':
+      return 0;
+    case 'End':
+      return count - 1;
+    default:
+      return null;
+  }
+}
+
+/** The tab stop Tab (or Shift+Tab, `back`) moves to among `count` stops,
+ *  from the one at `at` (-1 when the focus is on none of them). Round at
+ *  either end, so the title keeps the focus. */
+export function nextTabStop(count: number, at: number, back: boolean): number {
+  if (count <= 0) return -1;
+  if (at < 0 || at >= count) return back ? count - 1 : 0;
+  return (at + (back ? count - 1 : 1)) % count;
+}
+
 export interface FoxChooser {
   /** The chooser's element, to put on the title. */
   element: HTMLElement;
@@ -76,6 +110,9 @@ export interface FoxChooser {
   look(): FoxLook;
   /** Focus the selected choice of the first row (for a keyboard). */
   focus(): void;
+  /** The chooser's tab stops in order: each row's chosen option, then
+   *  RANDOM. */
+  tabStops(): HTMLElement[];
   /** Stop the preview and free its drawing context. */
   dispose(): void;
 }
@@ -131,9 +168,10 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
     const r = rig;
     const gl = renderer;
     renderer.setAnimationLoop(() => {
-      // A slow sway between three-quarter views, so ears and tail show.
-      r.masterGroup.rotation.y = Math.sin(clock.getElapsedTime() * 0.6) * 0.55;
       r.update();
+      // A slow sway between three-quarter views, so ears and tail show. After
+      // the rig's update, which sets this rotation from its own heading.
+      r.masterGroup.rotation.y = Math.sin(clock.getElapsedTime() * 0.6) * 0.55;
       gl.render(scene, camera);
     });
   } catch {
@@ -152,7 +190,9 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
     for (const [key, list] of buttons) {
       list.forEach((b, i) => {
         const on = look[key] === i;
-        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        b.setAttribute('aria-checked', on ? 'true' : 'false');
+        // One tab stop per row: its chosen option (the arrow keys do the rest).
+        b.tabIndex = on ? 0 : -1;
         if (b.dataset.swatch) {
           b.style.boxShadow = on ? `0 0 0 2px #1a1206, 0 0 0 4px ${GOLD}` : '0 0 0 1px rgba(255,255,255,0.25)';
         } else {
@@ -172,13 +212,14 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
     label.id = `fox-chooser-${row.key}`;
     label.style.cssText = `flex:0 0 84px; font-family:inherit; font-size:10px; font-weight:600; line-height:1.2; letter-spacing:1.5px; color:${LABEL_COLOUR};`;
     const choices = document.createElement('div');
-    choices.setAttribute('role', 'group');
+    choices.setAttribute('role', 'radiogroup');
     choices.setAttribute('aria-labelledby', label.id);
     choices.style.cssText = 'display:flex; gap:6px; flex-wrap:wrap; flex:1 1 200px;';
     const list: HTMLButtonElement[] = [];
     row.options.forEach((opt, i) => {
       const b = document.createElement('button');
       b.type = 'button';
+      b.setAttribute('role', 'radio');
       b.title = opt.name;
       b.setAttribute('aria-label', `${row.label.toLowerCase()}: ${opt.name}`);
       if (opt.swatch) {
@@ -197,6 +238,16 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
       });
       list.push(b);
       choices.appendChild(b);
+    });
+    // The arrow keys choose within the row, as in any set of radio buttons.
+    choices.addEventListener('keydown', (e) => {
+      const to = arrowChoice(e.key, look[row.key], list.length);
+      if (to === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      look = withChoice(look, row.key, to);
+      paint();
+      list[to].focus({ preventScroll: true });
     });
     buttons.set(row.key, list);
     line.append(label, choices);
@@ -225,6 +276,10 @@ export function mountFoxChooser(initial: FoxLook): FoxChooser {
       const first = buttons.get(CHOICE_ROWS[0].key);
       first?.[look[CHOICE_ROWS[0].key]]?.focus({ preventScroll: true });
     },
+    tabStops: () => [
+      ...CHOICE_ROWS.map((row) => buttons.get(row.key)?.[look[row.key]]).filter((b): b is HTMLButtonElement => !!b),
+      random,
+    ],
     dispose: () => {
       if (renderer) {
         renderer.setAnimationLoop(null);

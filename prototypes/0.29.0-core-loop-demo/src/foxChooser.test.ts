@@ -7,7 +7,7 @@ import { CREAM_COLOURS, DEFAULT_LOOK, EAR_STYLES, EYE_COLOURS, EYE_SHAPES, FUR_C
 // canvas as it loads: a canvas that draws nothing will do here.
 vi.stubGlobal('document', { createElement: () => ({ width: 0, height: 0, style: {}, getContext: () => new Proxy({}, { get: () => () => ({ addColorStop: () => undefined }) }) }) });
 vi.stubGlobal('window', { location: { search: '' } });
-const { CHOICE_ROWS, cssHex, startingLook, withChoice } = await import('./foxChooser');
+const { CHOICE_ROWS, arrowChoice, cssHex, nextTabStop, startingLook, withChoice } = await import('./foxChooser');
 
 describe('the chooser\'s rows', () => {
   it('set every choice of a look, each once', () => {
@@ -52,6 +52,32 @@ describe('the look a new player starts from', () => {
     const look = startingLook(null, () => 0.999999);
     expect(cleanLook(look)).toEqual(look);
     expect(look.fur).toBe(FUR_COLOURS.length - 1);
+  });
+});
+
+describe('a keyboard in the chooser', () => {
+  it('chooses with the arrow keys within a row, round at either end', () => {
+    expect(arrowChoice('ArrowRight', 0, 5)).toBe(1);
+    expect(arrowChoice('ArrowDown', 4, 5)).toBe(0);
+    expect(arrowChoice('ArrowLeft', 0, 5)).toBe(4);
+    expect(arrowChoice('ArrowUp', 3, 5)).toBe(2);
+    expect(arrowChoice('Home', 3, 5)).toBe(0);
+    expect(arrowChoice('End', 1, 5)).toBe(4);
+  });
+
+  it('leaves every other key alone, Tab and Enter among them', () => {
+    for (const key of ['Tab', 'Enter', ' ', 'a', 'Escape']) expect(arrowChoice(key, 2, 5), key).toBeNull();
+    expect(arrowChoice('ArrowRight', 0, 0)).toBeNull();
+  });
+
+  it('tabs round its stops both ways, and in from anywhere else', () => {
+    expect(nextTabStop(8, 0, false)).toBe(1);
+    expect(nextTabStop(8, 7, false)).toBe(0);
+    expect(nextTabStop(8, 0, true)).toBe(7);
+    expect(nextTabStop(8, 5, true)).toBe(4);
+    expect(nextTabStop(8, -1, false)).toBe(0);
+    expect(nextTabStop(8, -1, true)).toBe(7);
+    expect(nextTabStop(0, -1, false)).toBe(-1);
   });
 });
 
@@ -100,6 +126,29 @@ describe('the chooser on the title (main.ts)', () => {
   it('puts the focus on the first row\'s chosen option', () => {
     const focus = chooser.slice(chooser.indexOf('focus: () => {'), chooser.indexOf('dispose: () => {'));
     expect(focus).toContain('.focus({ preventScroll: true });');
+  });
+
+  it('lets Tab go round the chooser and ENTER, not the phone, while it is open', () => {
+    const tab = between('wrap.addEventListener("keydown"', '});');
+    expect(tab).toContain('if (e.key !== "Tab" || !chooser) return;');
+    expect(tab).toContain('e.stopPropagation();');
+    expect(tab).toContain('const stops = [...chooser.tabStops(), btnEnter];');
+    // The listener is on the title, so it runs before the window's Tab.
+    expect(main.indexOf('wrap.addEventListener("keydown"')).toBeGreaterThan(main.indexOf('const wrap = document.createElement("div");'));
+  });
+
+  it('makes each row one tab stop, chosen with the arrow keys', () => {
+    expect(chooser).toContain("choices.setAttribute('role', 'radiogroup');");
+    expect(chooser).toContain("b.setAttribute('role', 'radio');");
+    expect(chooser).toContain('b.tabIndex = on ? 0 : -1;');
+    expect(chooser).toContain('const to = arrowChoice(e.key, look[row.key], list.length);');
+  });
+
+  it('sways the preview after the rig\'s update, which sets the same rotation', () => {
+    const loop = chooser.slice(chooser.indexOf('renderer.setAnimationLoop(() => {'));
+    expect(loop.indexOf('r.update();')).toBeGreaterThan(-1);
+    expect(loop.indexOf('r.masterGroup.rotation.y =')).toBeGreaterThan(loop.indexOf('r.update();'));
+    expect(loop.indexOf('gl.render(scene, camera);')).toBeGreaterThan(loop.indexOf('r.masterGroup.rotation.y ='));
   });
 
   it('frees its drawing context when it is done', () => {

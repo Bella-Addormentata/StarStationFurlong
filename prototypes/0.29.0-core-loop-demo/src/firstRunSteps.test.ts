@@ -456,12 +456,12 @@ describe('main.ts: the title is wired to the search', () => {
     expect(between('welcomeReachedThisPage = true;\n', 'clearWelcomePending(welcomeStore());')).toContain('firstRunRepaint?.();');
   });
 
-  it('the fox chooser takes the focus when it and ENTER NOW replace the two choices (Tab is the phone\'s key)', () => {
+  it('the fox chooser takes the focus when it and ENTER NOW replace the two choices', () => {
     const handler = between('btnNew.addEventListener("click"', 'btnEnter.addEventListener("click"');
     const shown = handler.indexOf('btnEnter.style.display = "";');
     expect(shown).toBeGreaterThan(handler.indexOf('btnNew.style.display = "none";'));
     expect(handler.indexOf('chooser.focus();')).toBeGreaterThan(shown);
-    // ENTER follows the chooser, so Tab reaches it from the choices.
+    // ENTER follows the chooser on the title, as it follows it for Tab.
     expect(handler).toContain('wrap.insertBefore(chooser.element, btnEnter);');
   });
 });

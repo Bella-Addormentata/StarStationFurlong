@@ -513,7 +513,7 @@ import {
   stepGlyph,
 } from "./firstRunSteps";
 import type { FirstRunFacts, ReportLog } from "./firstRunSteps";
-import { mountFoxChooser, startingLook, type FoxChooser } from "./foxChooser";
+import { mountFoxChooser, nextTabStop, startingLook, type FoxChooser } from "./foxChooser";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -12747,8 +12747,8 @@ function setupClickToEnter() {
         chooser = mountFoxChooser(startingLook(loadSavedLook()));
         wrap.insertBefore(chooser.element, btnEnter);
         btnEnter.style.display = "";
-        // The button that was pressed is gone, and Tab is the phone's key
-        // here: the chooser takes the focus, and ENTER follows it.
+        // The button that was pressed is gone: the chooser takes the focus,
+        // and Tab goes on from there to ENTER (the keydown below).
         chooser.focus();
         if (!waitsForWelcome()) {
           // Not the welcome room (a pass to another): nothing to wait for.
@@ -12762,6 +12762,17 @@ function setupClickToEnter() {
       btnEnter.addEventListener("click", (e) => {
         e.stopPropagation();
         proceed();
+      });
+      // 🦊 While the fox chooser is open, Tab goes round its rows, RANDOM and
+      // ENTER: the window's Tab is the phone's toggle (setupSpacePhoneOverlay)
+      // and would leave a keyboard stuck on the first row.
+      wrap.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab" || !chooser) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const stops = [...chooser.tabStops(), btnEnter];
+        const at = stops.indexOf(document.activeElement as HTMLElement);
+        stops[nextTabStop(stops.length, at, e.shiftKey)]?.focus({ preventScroll: true });
       });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
