@@ -204,6 +204,11 @@ export interface ChiaWalletSwitch {
   stays?: boolean;
   /** On: `SSF_CHIA_LANE=1` holds it on; the Bank cannot turn it off. */
   held?: boolean;
+  /** 🆕 On, and not `held`: the node turned it on by itself, at a start on a
+   *  test network that found no choice saved, and no turn in the Bank has
+   *  been saved since. The Bank says so (bankWallet.ts). An older node
+   *  never sends it. */
+  auto?: boolean;
   /** On: the loaded wallet is made from 24 words the node keeps. Ready:
    *  turning on makes or loads a wallet from 24 words. The capability marker
    *  for the Bank's BACK UP (bankBackup.ts) and CREATE's wording
@@ -238,7 +243,7 @@ export interface ChiaWalletSwitch {
  *  Nothing else is copied: the fingerprint never carries the words, and a
  *  field of any other name from a node (or a stranger on its port) is
  *  dropped here. */
-const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up', 'reminted', 'rewrapped'] as const;
+const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'auto', 'mnemonic', 'backed_up', 'reminted', 'rewrapped'] as const;
 
 /** The at-rest fields: a string, kept only when it is a lock this page can
  *  word (a newer node's other lock is dropped, not the whole switch). */
