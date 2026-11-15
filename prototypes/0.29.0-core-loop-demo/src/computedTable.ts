@@ -593,8 +593,15 @@ interface TableState {
    *  differs (its riding bets, point or dice's hands). `own`: how this page
    *  had the checkpoint's round decided (decisionSig) and its outcome (a
    *  pocket, or the dice; null: void), for the 🔒 check of a game's signed
-   *  outcome (computedFairOnlyView); null when it had not seen it decided. */
-  cpDiff: { sid: string; chips: number; nets: number; carry: boolean; covered: 'unseen' | 'split' | 'same'; own: { d: string; o: number | [number, number] | null } | null } | null;
+   *  outcome (computedFairOnlyView); null when it had not seen it decided.
+   *  `at`: the round, the close this page had for it and the nets it had
+   *  counted to it, kept for a game's next checkpoint at the same round (its
+   *  end: cpDiffOf); null when it had not seen it decided. */
+  cpDiff: {
+    sid: string; chips: number; nets: number; carry: boolean; covered: 'unseen' | 'split' | 'same';
+    own: { d: string; o: number | [number, number] | null } | null;
+    at: { u: number; close: string; expect: ReadonlyMap<string, bigint> } | null;
+  } | null;
   /** 🩹 While the table counts a checkpoint that puts a restore in motion
    *  (noteResult): the head's session, the fold of it, and the keys of what
    *  this page had written into it; and the session the table last moved to
@@ -1292,11 +1299,44 @@ function endForged(st: TableState, res: FoldResult): void {
 
 /** How the checkpoint that opened `res`'s session stands against what this
  *  page had folded in `was` (TableState.cpDiff). */
-function cpDiffOf(was: FoldResult, res: FoldResult): NonNullable<TableState['cpDiff']> {
+function cpDiffOf(st: TableState, was: FoldResult, res: FoldResult): NonNullable<TableState['cpDiff']> {
+  const u = res.base.u;
+  const at = was.rounds.find((v) => v.decided && v.r === u);
+  if (!at && isFairOnlyInc(st.inc) && u > 0 && u === was.base.u) return cpDiffAgain(st, was, res);
   const d = checkpointDiff(was, res);
-  const at = was.rounds.find((v) => v.decided && v.r === res.base.u);
   const own = at ? { d: decisionSig(at), o: (at.craps ? at.craps.dice : at.pocket) ?? null } : null;
-  return { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n, covered: d.covered, own };
+  let kept: NonNullable<TableState['cpDiff']>['at'] = null;
+  if (at) {
+    const expect = new Map(was.base.n);
+    for (const v of was.rounds) {
+      if (!v.decided || v.r > u) continue;
+      for (const [pid, x] of v.deltas) expect.set(pid, (expect.get(pid) ?? 0n) + x);
+    }
+    kept = { u, close: at.close, expect };
+  }
+  return { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n, covered: d.covered, own, at: kept };
+}
+
+/** 🔒 A game's next checkpoint at the round the page already counts from (the
+ *  end of a game with no round decided since): the
+ *  round is out of the session, so it stands against what this page kept of
+ *  it when the last checkpoint came (its close, its count, how it was
+ *  decided), or, on a page that never compared that one (it came to the game
+ *  after), against that checkpoint itself, with no outcome to compare. A
+ *  page that had not seen the round decided still has not. No carry: what
+ *  the table handed on then is not kept. */
+function cpDiffAgain(st: TableState, was: FoldResult, res: FoldResult): NonNullable<TableState['cpDiff']> {
+  const prior = st.cpDiff && st.cpDiff.sid === was.base.sid ? st.cpDiff : null;
+  const sid = res.base.sid;
+  if (prior && !prior.at) return { sid, chips: 0, nets: 0, carry: false, covered: 'unseen', own: null, at: null };
+  const kept = prior?.at ?? { u: was.base.u, close: was.base.l ?? NO_CLOSE, expect: was.base.n };
+  let diff = 0n;
+  for (const pid of new Set([...kept.expect.keys(), ...res.base.n.keys()])) {
+    const x = (res.base.n.get(pid) ?? 0n) - (kept.expect.get(pid) ?? 0n);
+    diff += x < 0n ? -x : x;
+  }
+  const nets = clampSafe(diff);
+  return { sid, chips: nets, nets, carry: false, covered: kept.close === res.base.l ? 'same' : 'split', own: prior?.own ?? null, at: kept };
 }
 
 /** 🔒 How the checkpoint that ended a FAIR ONLY game this page played stood
@@ -1311,7 +1351,7 @@ function noteEndedDiff(key: string, st: TableState): void {
   const res = computedFoldOf(st.t, st.inc);
   if (!res || !res.base.ended) return;
   const d = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff
-    : st.lastRes && st.lastRes.base.sid !== res.base.sid ? cpDiffOf(st.lastRes, res) : null;
+    : st.lastRes && st.lastRes.base.sid !== res.base.sid ? cpDiffOf(st, st.lastRes, res) : null;
   if (!d) return;
   endedDiffs.delete(key);
   endedDiffs.set(key, d);
@@ -1326,7 +1366,7 @@ function noteEndedDiff(key: string, st: TableState): void {
  *  kept of the rounds it covers goes (noteResult); but for `since`, what it
  *  wrote into `res`'s session since (endForged). */
 function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null, fromForged = false): void {
-  st.cpDiff = cpDiffOf(was, res);
+  st.cpDiff = cpDiffOf(st, was, res);
   const u = res.base.u;
   for (const key of [...st.seen.keys()]) if ((parseKey(key)?.r ?? 0) <= u) st.seen.delete(key);
   for (const [id, e] of [...st.decided]) if (e.r < u) st.decided.delete(id);
@@ -5276,7 +5316,9 @@ function fairOnlyCheckpointOf(t: string, inc: string, ck: { u: number; l: string
   if (!d || !base || d.sid !== base.sid || base.u !== ck.u || base.u === 0) return undefined;
   const same = d.covered === 'same';
   const signs = same && d.own !== null && d.own.o !== null && ck.o !== undefined && ck.d === d.own.d && String(ck.o) !== String(d.own.o);
-  return { covered: d.covered, chips: same ? d.nets : 0, carry: same && d.carry, counted: signs ? d.own!.o : null };
+  // (The checkpoint that ends a game hands no table on: the bets that rode are
+  // released, which is no disagreement.)
+  return { covered: d.covered, chips: same ? d.nets : 0, carry: same && d.carry && !base.ended, counted: signs ? d.own!.o : null };
 }
 
 export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairOnlyView | null {

@@ -12,7 +12,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { faironlyInc } from './computedFairOnly';
+import { faironlyInc, sealFin } from './computedFairOnly';
 import { diceOf } from './computedCraps';
 import { asClose, MAX_TABLE_PIDS, nextSid3, seedTable } from './computedFold';
 import type { CloseRec, CrapsSlipRec, HouseRevealRec } from './computedFold';
@@ -256,6 +256,35 @@ describe('a roll of a FAIR ONLY craps game, on the pages', () => {
           covered: 'same', chips: 0, carry: lie === 'carry', counted: lie === 'dice' ? dice : null,
         });
       }
+    }
+  });
+
+  it('the checkpoint that ends a game with a point on and bets riding: the bets it releases are no disagreement over the table handed on', async () => {
+    const pages = await betting(['A', 'B'], 6);
+    const [a, b] = pages;
+    const closedAt = run(pages, T0 + STEP, T0 + 60_000, { step: STEP, tables: [CRAPS_REF], until: () => keysIn(a, 'c', 1, TABLE).length > 0 });
+    run(pages, closedAt + STEP, closedAt + 12_000, { step: STEP, tables: [CRAPS_REF] });
+    const closeHash = hashIn(keysIn(a, 'c', 1, TABLE)[0]);
+    const hr = kit.houseReveal(H, 1, [closeHash], Object.values(closesOf(a, 1)[0].f).sort());
+    house(b, hr);
+    sync(closedAt + 12_000, ...pages);
+    // (each page's frame notes the roll decided before the end comes)
+    const at = run(pages, closedAt + 12_000 + STEP, closedAt + 12_000 + 2 * STEP, { step: STEP, tables: [CRAPS_REF] });
+    const res = foldOf(a);
+    expect(carryOf(a).p).toBe(6);
+    const nets = Object.fromEntries([...res.nets].filter(([, v]) => v !== 0n).map(([pid, v]) => [pid, v.toString()]));
+    const end = trimOf(Q, 'q', {
+      b: SID, u: 1, l: closeHash, d: `h:${hr.hash}`, o: res.rounds[0].craps!.dice!, n: nets, e: 1, f: sealFin(Q, owner.pub, owner.sign).value,
+      s: undefined, h: undefined, k: owner.pub, dl: undefined,
+    });
+    a.doc.transact(() => {
+      top(a).set(end.key, end.value);
+      a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: Q.inc });
+    });
+    sync(at, ...pages);
+    const after = run(pages, at + STEP, at + 2_000, { step: STEP, tables: [CRAPS_REF] });
+    for (const p of pages) {
+      expect(p.table.computedFairOnlyView(TABLE, after), p.name).toMatchObject({ ended: true, checkpoint: { covered: 'same', chips: 0, carry: false, counted: null } });
     }
   });
 

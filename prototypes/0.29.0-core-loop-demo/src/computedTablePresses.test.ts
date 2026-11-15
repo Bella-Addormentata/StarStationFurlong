@@ -2131,7 +2131,7 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
     expect(round).toMatchObject({ r: 1, decided: 'house' });
     const pocket = round.pocket!;
     const nets = Object.fromEntries([...foldOf(a).nets].filter(([, v]) => v !== 0n).map(([pid, v]) => [pid, v.toString()]));
-    const trim = (patch: Record<string, unknown> = {}): void => {
+    const trim = (patch: Record<string, unknown> = {}) => {
       const cp = trimOf(G, 'p', {
         b: sid, u: 1, l: hashOf(close.key), d: `h:${hashOf(hr.key)}`, o: pocket, n: nets, h: gk.houseCommit(FO_HOUSE, 2),
         dl: delegation(FO_OWNER, FO_HOUSE.pub, PAGE_ROOM), ...patch,
@@ -2146,6 +2146,7 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
       at(a, T0 + 19_800);
       t.update();
       expect(a.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ base: { key: cp.key } });
+      return cp;
     };
     return { t, trim, pocket, nets, other: (pocket + 1) % 37 };
   }
@@ -2213,6 +2214,49 @@ describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ car
     at(a, T0 + 40_200);
     t.update();
     expect(t.card()).toContain("🚩 THE GAME'S LAST CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+    t.unmount();
+  });
+
+  it.each([false, true])('a game ended at a round a checkpoint already covered is still held against what this page counted of that round: nets it did not count stay flagged on the ended card, and the true ones clear the flag (true nets: %s)', (honestEnd) => {
+    {
+      const { t, trim, nets } = decidedRound();
+      const wrong = { ...nets, [BOB.pid]: (BigInt(nets[BOB.pid] ?? '0') + 7n).toString() };
+      const first = trim({ n: wrong });
+      expect(t.card()).toContain("🚩 THE HOUSE'S CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS");
+      a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+      trim({ b: nextSid3(G, first.value), e: 1, f: sealFin(G, FO_OWNER.pub, FO_OWNER.sign).value, h: undefined, k: FO_OWNER.pub, dl: undefined, n: honestEnd ? nets : wrong });
+      a.table.tickComputedTables([TABLE], T0 + 20_000);
+      at(a, T0 + 20_200);
+      t.update();
+      expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ ended: true, checkpoint: { covered: 'same', chips: honestEnd ? 0 : 7 } });
+      expect(t.card().includes("🚩 THE GAME'S LAST CHECKPOINT DIFFERS FROM THIS PAGE BY 7 CHIPS"), `${honestEnd}`).toBe(!honestEnd);
+      expect(t.card()).not.toContain("CAN'T CHECK");
+      t.unmount();
+    }
+  });
+
+  it('a game ended at a round a checkpoint already covered, by a checkpoint that names another close for it: flagged as that on the ended card', () => {
+    const { t, trim, nets } = decidedRound();
+    const first = trim();
+    a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    trim({ b: nextSid3(G, first.value), l: hex('9', 32), e: 1, f: sealFin(G, FO_OWNER.pub, FO_OWNER.sign).value, h: undefined, k: FO_OWNER.pub, dl: undefined, n: nets });
+    a.table.tickComputedTables([TABLE], T0 + 20_000);
+    at(a, T0 + 20_200);
+    t.update();
+    expect(t.card()).toContain("🚩 THE GAME'S LAST CHECKPOINT NAMES ANOTHER CLOSE FOR ROUND 1 THAN THIS PAGE COUNTED");
+    t.unmount();
+  });
+
+  it("a game ended at a round this page had not seen decided, which a checkpoint already covered: the ended card still says it can't check it", () => {
+    const { t, trim } = decidedRound();
+    const first = trim({ u: 2, l: hex('9', 32), n: { [BOB.pid]: '500' } });
+    a.doc.transact(() => a.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    trim({ b: nextSid3(G, first.value), u: 2, l: hex('9', 32), n: { [BOB.pid]: '500' }, e: 1, f: sealFin(G, FO_OWNER.pub, FO_OWNER.sign).value, h: undefined, k: FO_OWNER.pub, dl: undefined });
+    a.table.tickComputedTables([TABLE], T0 + 20_000);
+    at(a, T0 + 20_200);
+    t.update();
+    expect(t.card()).toContain("THIS PAGE DIDN'T SEE ROUND 2 DECIDED · IT CAN'T CHECK THE GAME'S LAST CHECKPOINT");
+    expect(t.card()).not.toContain('🚩');
     t.unmount();
   });
 
