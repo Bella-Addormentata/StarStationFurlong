@@ -1661,9 +1661,12 @@ async function bootstrapNetworking() {
   // leave may take the session meanwhile: Retry-node, a pass the player
   // followed, or a second boot the docking's own retry started. This boot
   // then stands down: it neither joins on top of that session nor cleans up
-  // after itself over it.
+  // after itself over it. A session that is live by then is never this
+  // boot's (it has none until its own join, after which it no longer asks):
+  // that covers a boot that began while a newer join was still on its way,
+  // whose count this boot took for its own.
   const bootEpoch = sessionEpoch;
-  const yields = (): boolean => bootYields(bootEpoch, sessionEpoch, transitInProgress);
+  const yields = (): boolean => bootYields(bootEpoch, sessionEpoch, transitInProgress, yjsSync !== null);
   const standDown = (): void => {
     console.info("🛰️ A newer join or leave owns the session: this boot stands down.");
     // Still on the way to the welcome room: looked at again at the retry's

@@ -501,6 +501,38 @@ describe('welcome only: a boot that lost the session stands down (bootYields)', 
     expect(bootYields(3, 3, true)).toBe(true);
     expect(bootYields(3, 4, true)).toBe(true);
   });
+
+  it('stands down when a session is live although the count stands still: the boot began while that join was on its way', () => {
+    // The docking's retry fires while a Retry-node's join is in flight: the
+    // boot it starts reads that join's count as its own, and the join then
+    // goes live with the count unmoved.
+    expect(bootYields(5, 5, false, true)).toBe(true);
+    expect(bootYields(5, 6, false, true)).toBe(true);
+    expect(bootYields(5, 5, true, true)).toBe(true);
+    // No session: the count and the swap decide, as before.
+    expect(bootYields(5, 5, false, false)).toBe(false);
+  });
+});
+
+describe('main.ts: a boot never joins on top of a live session', () => {
+  const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+  const start = main.indexOf('async function bootstrapNetworking() {');
+  const body = main.slice(start, main.indexOf('\n}\n', start));
+
+  it('tells its stand-down rule whether a session is live, and asks it last thing before its own join', () => {
+    expect(start).toBeGreaterThan(0);
+    expect(body).toContain('const yields = (): boolean => bootYields(bootEpoch, sessionEpoch, transitInProgress, yjsSync !== null);');
+    // Nothing awaits between the last ask and the join: a join that goes
+    // live cannot slip in between them.
+    const join = body.indexOf('await joinRoom(');
+    expect(join).toBeGreaterThan(0);
+    const asked = body.lastIndexOf('if (yields()) {', join);
+    expect(asked).toBeGreaterThan(0);
+    expect(body.slice(asked, join)).not.toMatch(/await /);
+    // After its own join the boot asks only for a failure from before it.
+    expect(body.slice(join)).not.toMatch(/[^&] yields\(\)|\(yields\(\)\)/);
+    expect(body.slice(join)).toContain('if (!joining && yields()) {');
+  });
 });
 
 describe('welcome only: a pass to the welcome room added while standing in it (welcomePassAddedLine)', () => {

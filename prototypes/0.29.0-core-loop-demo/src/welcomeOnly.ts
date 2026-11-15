@@ -308,9 +308,17 @@ export function welcomeRecordWithHeld<B extends { roomId: string }>(
  * welcome room over the room the player chose), and cleaning up after a
  * failure would tear down a session that is not this boot's. A room swap
  * under way owns the session until it ends, whatever the count.
+ *
+ * A session that is live when the boot asks (`sessionLive`) is never the
+ * boot's own: a boot begins with none, and asks only before its own join.
+ * It is the one case the count misses: a boot that BEGAN after a newer join
+ * had claimed the count and before that join was live (the docking's retry
+ * firing while a Retry-node's join is still on its way, or a Retry-node
+ * whose leave a followed pass overtook) reads the newer join's count as its
+ * own, and the count then stands still while that join goes live.
  */
-export function bootYields(beganAt: number, now: number, swapUnderWay: boolean): boolean {
-  return swapUnderWay || now !== beganAt;
+export function bootYields(beganAt: number, now: number, swapUnderWay: boolean, sessionLive = false): boolean {
+  return swapUnderWay || sessionLive || now !== beganAt;
 }
 
 /** What ADD PASS says for a pass to the welcome room added while the player
