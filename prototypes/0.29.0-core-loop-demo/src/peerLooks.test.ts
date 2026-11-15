@@ -147,7 +147,8 @@ describe('the wiring', () => {
     const bound = main.indexOf('const playersMap = sync.doc.getMap("players");');
     expect(main.indexOf('peerDress = looksByLane(playersMap.entries());\n  if (world) world.refreshPeerLooks();', bound)).toBeGreaterThan(bound);
     const observer = main.indexOf('playersMap.observe((_event) => {');
-    expect(main.slice(observer, observer + 300)).toContain('peerDress = looksByLane(playersMap.entries());\n    if (world) world.refreshPeerLooks();');
+    // Only while the room is the session's: a room being left still fires.
+    expect(main.slice(observer, observer + 600)).toContain('if (yjsSync === sync) {\n      peerDress = looksByLane(playersMap.entries());\n      if (world) world.refreshPeerLooks();\n    }');
   });
 
   it('dresses a rig in the outfit of the entry that claims its lane', () => {
