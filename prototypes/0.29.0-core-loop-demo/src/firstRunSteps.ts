@@ -5,12 +5,14 @@
  * The game starts looking the moment the page loads, behind the title. A new
  * player used to see none of it: NEW PLAYER revealed the station at once, and
  * the room they walked into was an empty copy until some computer answered.
- * The title now shows where the search stands, one line per step, and holds
- * the reveal for a short while so the room has a chance to be there:
+ * The title now shows where the search stands, one line per step, under
+ * the fox chooser that NEW PLAYER opens (foxChooser.ts), so the wait is
+ * spent choosing a fox:
  *
- *  - the room answers: the station is revealed by itself;
- *  - it has not answered after {@link ENTER_PATIENCE_MS}: the ENTER button
- *    lights and the title says nobody answered yet;
+ *  - the room answers: the ENTER button lights and says the room is here;
+ *    the player is never pulled in mid-choice;
+ *  - it has not answered after {@link ENTER_PATIENCE_MS}: ENTER lights and
+ *    the title says the room is not here yet;
  *  - at any moment: ENTER is there and reveals the station as it stands. The
  *    room fills in by itself when a computer answers (welcomeOnly.ts's seek).
  *
@@ -188,21 +190,24 @@ export function firstRunSteps(f: FirstRunFacts, roomName: string): StepLine[] {
   return lines;
 }
 
-/** How long the title holds the reveal for the room after NEW PLAYER, before
- *  it lights ENTER and says the room is not here yet. ENTER is there
- *  throughout. */
+/** How long after NEW PLAYER the title waits for the room before it lights
+ *  ENTER and says the room is not here yet. ENTER is there throughout. */
 export const ENTER_PATIENCE_MS = 45_000;
+
+/** Under ENTER when the room is here, or there is no room to wait for. */
+export const ENTER_READY_NOTE = 'Enter when your fox is ready.';
 
 /**
  * What the title does about entering:
- *  - `reveal`: the room is here, the station is revealed by itself;
+ *  - `here`: the room is here, ENTER is the lit button;
  *  - `lit`: the patience is over, ENTER is the lit button;
  *  - `quiet`: still inside the patience, ENTER is there but quiet.
+ * None enters by itself: the player may be choosing their fox.
  */
-export type EnterMode = 'reveal' | 'lit' | 'quiet';
+export type EnterMode = 'here' | 'lit' | 'quiet';
 
 export function enterMode(arrived: boolean, waitedMs: number): EnterMode {
-  if (arrived) return 'reveal';
+  if (arrived) return 'here';
   return waitedMs >= ENTER_PATIENCE_MS ? 'lit' : 'quiet';
 }
 
@@ -210,7 +215,7 @@ export function enterMode(arrived: boolean, waitedMs: number): EnterMode {
  *  answered: a computer may have answered that does not hold the room yet
  *  (another install still waiting for it), and the steps above say so. */
 export function enterNote(mode: EnterMode, roomName: string): string {
-  if (mode === 'reveal') return `${roomName} is here.`;
+  if (mode === 'here') return `${roomName} is here. ${ENTER_READY_NOTE}`;
   if (mode === 'lit') {
     return `${roomName} is not here yet. Enter now: it fills in by itself when a computer that holds it answers.`;
   }
