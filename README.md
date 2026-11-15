@@ -99,8 +99,10 @@ owner's record carries direct network addresses itself.
 One switch keeps a computer off every room's list: SpacePhone → ACCESS → ROOM
 HOLDERS → *List my computer in the rooms it holds*. It is on by default.
 Switching it off takes the record down at once in the room you are in, and in
-any other room at your next visit there; a record not refreshed for 30 days
-stops counting by itself. Off, the computer still keeps and hands on its
+any other room at your next visit there, together with any record of this same
+computer filed under another identity that played on it (before Contacts →
+Restore identity, for instance); a record not refreshed for 30 days stops
+counting by itself. Off, the computer still keeps and hands on its
 copies; other players' games just no longer count a copy that came from it
 alone as the whole room. Your own game still does: it keeps a note on this
 computer of the rooms it has loaded (which room, on which node; never sent to

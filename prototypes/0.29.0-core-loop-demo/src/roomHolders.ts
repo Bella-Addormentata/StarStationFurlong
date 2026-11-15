@@ -526,9 +526,11 @@ export interface FilingFacts {
 /**
  * A game files (or refreshes) its computer's node in the bound room once it
  * holds the room, and takes its record down when the player has switched
- * listing off. A filing also clears a few stale records (staleHolderKeys).
- * Returns what it did to this player's own record. Listed or not, a game
- * that holds the room notes so on its own computer (noteRoomHeld, `held`).
+ * listing off: the player's own, and any other that names this computer. A
+ * filing also clears a few stale records (staleHolderKeys). Returns what it
+ * did to this player's own record ('removed' too when only another key's
+ * record of this computer came down). Listed or not, a game that holds the
+ * room notes so on its own computer (noteRoomHeld, `held`).
  */
 export function fileMyHolderNode(
   roomId: string,
@@ -543,8 +545,21 @@ export function fileMyHolderNode(
   const storedRaw = nodesMap!.get(signer.pub);
   if (!me.listed) {
     filedAs = null; // switched on again, it files afresh
-    if (storedRaw === undefined) return 'kept';
-    boundDoc!.transact(() => { nodesMap!.delete(signer.pub); });
+    // The switch is the computer's, so every record that names this computer
+    // comes down with the player's own: one filed under another identity that
+    // played here (Contacts → Restore identity) would keep it listed, and its
+    // key is no longer here to take it down.
+    const mine = hint?.irohNodeId ?? localNode;
+    const keys: string[] = storedRaw === undefined ? [] : [signer.pub];
+    if (mine) {
+      for (const [pub, raw] of nodesMap!.entries()) {
+        if (pub !== signer.pub && holderNodeFromWire(raw)?.node === mine) keys.push(pub);
+      }
+    }
+    if (keys.length === 0) return 'kept';
+    boundDoc!.transact(() => {
+      for (const key of keys) nodesMap!.delete(key);
+    });
     return 'removed';
   }
   if (!me.holds || !hint) return 'kept';

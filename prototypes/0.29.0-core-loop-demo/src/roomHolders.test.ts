@@ -467,6 +467,43 @@ describe('the bound store', () => {
     expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 1000, ann)).toBe('filed');
   });
 
+  it('takes down every record that names this computer when listing is switched off, whoever filed it', () => {
+    // Ann played here and filed; then Ben's identity was restored on this computer.
+    fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann);
+    records().set(cat.pub, signHolderNode(ROOM, hint(node('c')), NOW, cat));
+    records().set('junk', { v: 1, node: 'not a node' });
+    expect(fileMyHolderNode(ROOM, { ...holder, listed: false }, hint(node('a')), NOW + 1000, ben)).toBe('removed');
+    // Ann's record of this computer is gone; another computer's and junk are not this switch's to clear.
+    expect(records().has(ann.pub)).toBe(false);
+    expect(records().has(cat.pub)).toBe(true);
+    expect(records().has('junk')).toBe(true);
+    expect(holdersHere(ROOM, undefined, NOW + 1000).map((h) => h.record.node)).toEqual([node('c')]);
+    expect(fileMyHolderNode(ROOM, { ...holder, listed: false }, hint(node('a')), NOW + 2000, ben)).toBe('kept');
+    // Ben's own and Ann's go together, in one change (Ben's filing cleared the junk).
+    fileMyHolderNode(ROOM, holder, hint(node('a')), NOW + 3000, ben);
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW + 3000, ann));
+    let changes = 0;
+    const stop = subscribeHolderNodes(() => changes++);
+    expect(fileMyHolderNode(ROOM, { ...holder, listed: false }, hint(node('a')), NOW + 4000, ben)).toBe('removed');
+    stop();
+    expect(changes).toBe(1);
+    expect([...records().keys()]).toEqual([cat.pub]);
+  });
+
+  it('knows this computer by its node as last read when a game with listing off has no route to hand', () => {
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW, ann));
+    const off: FilingFacts = { listed: false, holds: false, owner: false };
+    // The node is not known yet: nothing says which record is this computer's.
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ben)).toBe('kept');
+    expect(records().has(ann.pub)).toBe(true);
+    setLocalHolderNode(node('b'));
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ben)).toBe('kept');
+    expect(records().has(ann.pub)).toBe(true);
+    setLocalHolderNode(node('a'));
+    expect(fileMyHolderNode(ROOM, off, null, NOW, ben)).toBe('removed');
+    expect(records().size).toBe(0);
+  });
+
   it('does not file again in a visit where a full list cleared its record, and does in the next', () => {
     expect(fileMyHolderNode(ROOM, holder, hint(node('a')), NOW, ann)).toBe('filed');
     records().delete(ann.pub); // another filer's clearing arrived
