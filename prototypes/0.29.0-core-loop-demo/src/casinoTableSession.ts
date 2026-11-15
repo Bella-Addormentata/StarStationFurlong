@@ -65,14 +65,16 @@ import {
   SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
 import {
-  computedCheckpointView, computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedContested, computedRollChange,
+  computedCheckpointView, computedCrapsClose, computedDecidedTo, computedFairOnlyView, computedFlungFor, computedMine, computedOldBuildDriving, computedContested, computedRollChange,
   computedHouseState, computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
   CRAPS_SWITCH_ON_CONFIRM, CRAPS_SWITCH_ON_REFUSED, noteComputedFling, readComputedBets, readComputedCraps,
   readComputedCrapsBets, readComputedRoulette, readMyComputedBets, readMyComputedCrapsBets, SWITCH_OFF_REFUSED,
   setComputedFairness, SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip,
   writeComputedSlip,
 } from './computedTable';
-import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import type { ComputedCrapsState, ComputedFairOnlyView, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import { fairOnlyBadge, fairOnlyCardLines, fairOnlyClosedLine, fairOnlyFeltLine } from './computedFairOnlyLines';
+import type { FairOnlyLine } from './computedFairOnlyLines';
 import type { Decision } from './computedFold';
 import { noteComputedToss } from './computedRobot';
 import { crapsBackend } from './crapsBackend';
@@ -116,7 +118,14 @@ export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { te
   // table included, knows the result before it is decided); else the seeds
   // are the players' only. A table PR 2–4 opened, or one in a room with no
   // house, never has the house's.
+  // 🔒 A FAIR ONLY table: every round takes the house's seed, or none runs.
+  // A game the switch still names that has ended, or whose rules this build
+  // does not know, is no computed table any more (nothing of it is played),
+  // and says so here all the same.
+  const fo = fairOnlyViewFor(tableId, game);
+  if (fo && (fo.newer || fo.ended)) return fairOnlyBadge(fo);
   if (isComputedFor(tableId, game)) {
+    if (fo) return fairOnlyBadge(fo);
     const h = computedHouseState(tableId);
     if (!h?.setUp) return { text: "PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS", color: FRIENDLY_RED, fair: false };
     if (h.openFair) return { text: "✔ FAIR · PLAYERS' TABLE · THE HOUSE AND EVERY BETTOR ADD A SEED", color: '#7CF5B0', fair: true };
@@ -128,6 +137,13 @@ export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { te
   return roundIsFair(tableId, game)
     ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
     : { text: "🤝 FRIENDLY TABLE · YOU'RE TRUSTING THE OWNER", color: FRIENDLY_RED, fair: false };
+}
+
+/** 🔒 What the page reads of the FAIR ONLY game table `tableId` plays, when it
+ *  is a game of `game` (a name of the table's other game is a peer's doing). */
+function fairOnlyViewFor(tableId: string, game: 'craps' | 'roulette'): ComputedFairOnlyView | null {
+  const fo = computedFairOnlyView(tableId);
+  return fo && fo.game === game ? fo : null;
 }
 
 /** The Friendly plaque's red. */
@@ -2376,6 +2392,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const mine = computedMine(itemId);
     const pending = myThrowPending();
     const moving = animating();
+    // 🔒 A FAIR ONLY table that closes no roll now says so, the bets' timer run
+    // out or not (the view reads closing once it has, with no close in), once
+    // the last roll's dice lie still.
+    if (s.phase !== 'settled' && !moving) {
+      const paused = fairOnlyWait();
+      if (paused) return paused;
+    }
     // (An offer lasts while its roll is on screen, taken back to betting
     // or shown again no longer; and only for a roll whose dice I held.)
     if (offered && (offered.inc !== s.inc || offered.r !== s.round || s.phase === 'betting')) offered = null;
@@ -2470,11 +2493,20 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  says it (null: the bettors' seeds, or no Fair round): the house's seed,
    *  once every bettor's is in; or nobody's, the house unheard. */
   const houseWait = (): { line: string; color: string } | null => {
+    const fo = fairOnlyViewFor(itemId, game);
+    if (fo) return fairOnlyClosedLine(fo, game);
     const w = computedHouseState(itemId)?.waiting ?? null;
     if (w === 'offline') {
       return { line: `⚠ THE HOUSE WENT OFFLINE · THIS ${game === 'craps' ? 'ROLL' : 'ROUND'} GOES VOID UNLESS IT COMES BACK · THEN THE TABLE RUNS FRIENDLY`, color: GOLD_BRIGHT };
     }
     return w === 'house' ? { line: "✋ NO MORE BETS — WAITING FOR THE HOUSE'S SEED", color: PINK } : null;
+  };
+
+  /** 🔒 The paused felt of a FAIR ONLY table (null: rounds close, or no
+   *  such table): why no round closes now. */
+  const fairOnlyWait = (): { line: string; color: string } | null => {
+    const fo = fairOnlyViewFor(itemId, game);
+    return fo ? fairOnlyFeltLine(fo, game) : null;
   };
 
   /** 🧮 The status lines only a computed table has (null: the owner-run
@@ -2485,6 +2517,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const shown = seeComputed(itemId, s.inc, s.spinKey).shown;
     const to = computedDecidedTo(itemId);
     if (to !== null && shown > to) return { line: `⚠ ROUND ${shown} UNDONE — BETS BACK${remain()}`, color: GOLD_BRIGHT };
+    // 🔒 A FAIR ONLY table that closes no round now says so (the wheel's view
+    // reads betting until a close is in, the bets' timer run out or not).
+    if (s.phase === 'betting') {
+      const paused = fairOnlyWait();
+      if (paused) return paused;
+    }
     const mine = computedMine(itemId);
     if (s.phase === 'closing') {
       if (mine?.tooLate) return { line: '✋ TOO LATE — THE CLOSE HAD YOUR EARLIER BETS', color: PINK };
@@ -2795,13 +2833,38 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return rows;
   };
 
+  /** 🔒 The ⚙ card's rows at a FAIR ONLY table (null at any other), names
+   *  as this page knows them: a player's is anyone's to set, so escaped; a
+   *  holder no player of the room showed the key of reads as the start of
+   *  its key. */
+  const fairOnlyRows = (): FairOnlyLine[] | null => {
+    const fo = fairOnlyViewFor(itemId, game);
+    if (!fo) return null;
+    return fairOnlyCardLines(fo, game, {
+      holder: fo.holder === null ? null : escapeHtml(fo.holderPid !== null ? readPlayerDisplayName(fo.holderPid).toUpperCase() : fo.holder.slice(0, 8)),
+      deed: fo.deedPid == null ? null : escapeHtml(readPlayerDisplayName(fo.deedPid).toUpperCase()),
+    }, game === 'craps' ? computedCraps()?.riders ?? 0 : 0);
+  };
+
+  /** What the card's house rows were drawn from, as one string: the card is
+   *  drawn again when it changes (the tick). */
+  const houseKey = (lines: FairOnlyLine[] | null): string => {
+    if (lines) return lines.map((l) => l.text).join('|');
+    const h = computedHouseState(itemId);
+    return h ? `${h.setUp}|${h.online}|${h.fairness}|${h.openFair}` : '';
+  };
+
   /** 🏠 The ⚙ card's house rows at a house table (none at a table PR 2–4
    *  opened): whether the room's house is online, and the owner's FAIRNESS
    *  (a press for the deed holder, a line for everyone else) while the room
    *  has a house. */
   const houseRows = (house: boolean): string[] => {
+    // 🔒 A FAIR ONLY table: whose game it is and how its house stands; nothing
+    // to press (the game's holder sets it: PR 6c-4c's second half).
+    const lines = fairOnlyRows();
+    houseDrawn = houseKey(lines);
+    if (lines) return lines.map((l) => `<div style="font-size:9px;color:${l.color};letter-spacing:1.2px;">${l.text}</div>`);
     const h = computedHouseState(itemId);
-    houseDrawn = h ? `${h.setUp}|${h.online}|${h.fairness}|${h.openFair}` : '';
     if (!h) return [];
     const rows: string[] = [];
     const state = !h.setUp ? `NOT SET UP${h.canSet ? ' · YOUR NODE ADDS IT WHEN IT RUNS THIS ROOM' : ''}`
@@ -2835,6 +2898,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // ⚖️ Fair / Friendly, how the result is made, and the last result's check.
     const badge = fairnessBadge(itemId, game);
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
+    // 🔒 A FAIR ONLY game the switch still names, ended or of rules this build
+    // does not know: no table to run by hand either, so none of the owner's
+    // presses, only what the game is.
+    if (!comp && fairOnlyRows()) {
+      rows.push(...houseRows(house));
+      pushHelp(rows);
+      return;
+    }
     if (comp) {
       // 🧮 No robot line (the robot runs nothing here), nothing to press but
       // the owner's: 🏠 the house and its FAIRNESS, the fold's verdict, the
@@ -3239,9 +3310,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       syncTakeDown();
       renderBar();
       if (card) {
-        const h = computedHouseState(itemId);
-        const drawn = h ? `${h.setUp}|${h.online}|${h.fairness}|${h.openFair}` : '';
-        if (drawn !== houseDrawn) renderCard();
+        if (houseKey(fairOnlyRows()) !== houseDrawn) renderCard();
       }
     },
   };

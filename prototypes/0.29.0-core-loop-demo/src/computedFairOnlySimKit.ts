@@ -7,7 +7,7 @@
 import { expect } from 'vitest';
 import { isFairOnlyInc } from './computedFairOnly';
 import { Sim } from './computedSim';
-import type { FlipKind, SimSummary } from './computedSim';
+import type { FlipKind, SimPage, SimSummary } from './computedSim';
 
 /** Each scenario's summary line, printed again once the file is done. */
 export const lines: string[] = [];
@@ -24,6 +24,9 @@ export interface Finish {
   /** The house is away for a while (the scenario's own doing): the table
    *  waits for it, so the roulette sims' stall budget is not held. */
   houseAway?: boolean;
+  /** The warm transactions' p95 this scenario may reach instead of WARM_MS: one whose cheat makes every page check
+   *  signatures by the hundred (a check is the cost of a forged record, and a recount's budget of them is past WARM_MS). */
+  warmMs?: number;
   /** Bytes of junk a cheat lays into a session at a time: the session's bound
    *  is the house's, on what the fold used, and junk lies there until its
    *  next trim or sweep. */
@@ -59,7 +62,7 @@ export async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSu
   // With its house there, a game stalls no longer than a house table does.
   if (!opts.houseAway) expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(table.ABANDON_MS + 2 * table.GRACE_MAX_MS);
   expect(s.coldFoldMs, sim.label).toBeLessThan(COLD_FOLD_MS);
-  expect(s.warmP95Ms, sim.label).toBeLessThan(WARM_MS);
+  expect(s.warmP95Ms, sim.label).toBeLessThan(opts.warmMs ?? WARM_MS);
   const allowed = new Set([...(opts.flips ?? []), ...(opts.awayFlips ?? [])]);
   const unexpected = sim.pages.flatMap((sp) => (Object.entries(sp.flipKinds) as [FlipKind, number][])
     .filter(([k]) => !allowed.has(k)).map(([k, n]) => `${sp.name}: ${n} × ${k}`));
@@ -71,11 +74,18 @@ export async function rouletteFinish(sim: Sim, opts: Finish = {}): Promise<SimSu
 
 /** What a FAIR ONLY room adds to a finish (the header's list). */
 export function fairOnlyFinish(sim: Sim, s: SimSummary, ended: readonly string[] = []): void {
-  const node = sim.node!;
+  // (The owner's node, after a hand-over the buyer's with it, and those of the holder's other machines: what they did, together.)
+  const nodes = sim.nodes;
+  const sum = (of: (n: typeof nodes[number]) => number): number => nodes.reduce((a, n) => a + of(n), 0);
+  const node = {
+    wrote: nodes.length === 1 ? nodes[0].wrote : nodes.map((n) => n.wrote), trims: sum((n) => n.trims), sweeps: sum((n) => n.sweeps), ends: sum((n) => n.ends),
+    rowPutBacks: sum((n) => n.rowPutBacks), newSessions: sum((n) => n.newSessions), crossCheckMismatches: sum((n) => n.crossCheckMismatches),
+    refusals: sum((n) => n.refusals), blockedSeen: sum((n) => n.blockedSeen),
+  };
   const line = `[fair only] ${sim.label}: opened ${JSON.stringify([...sim.opened])} (refused before: ${JSON.stringify(sim.openRefusals)}), `
     + `house ${JSON.stringify(node.wrote)} trims ${node.trims} sweeps ${node.sweeps} put back: checkpoints ${node.rowPutBacks}, sessions ${node.newSessions}; `
     + `cross-check refusals ${node.crossCheckMismatches}, refused rounds ${node.refusals}, blocked closes ${node.blockedSeen}; `
-    + `ends: the house's ${node.ends}, the holder's ${sim.ownerEndsWritten}; bases held to the oracle ${sim.basesCounted}`;
+    + `ends: the house's ${node.ends}, the holder's ${sim.ownerEndsWritten}; bases held to the oracle ${sim.basesCounted}${sim.buyer ? `; handed over to ${sim.buyer.name}, adoptions ${sim.adoptionsWritten}` : ''}`;
   lines.push(line);
   console.log(line);
   expect([...sim.opened.keys()].sort(), sim.label).toEqual([...sim.tables].sort());
@@ -95,7 +105,7 @@ export function fairOnlyFinish(sim: Sim, s: SimSummary, ended: readonly string[]
   // (…or an end: the house's, or one the game's holder signed on its own page.)
   expect(sim.houseCheckpoints, sim.label).toBe(node.trims + node.sweeps + node.ends);
   if (node.trims > 0) expect(sim.basesCounted, sim.label).toBeGreaterThan(0);
-  expect(sim.basesCounted, sim.label).toBeLessThanOrEqual(node.trims + node.sweeps + node.ends + sim.ownerEndsWritten);
+  expect(sim.basesCounted, sim.label).toBeLessThanOrEqual(node.trims + node.sweeps + node.ends + sim.ownerEndsWritten + sim.adoptionsWritten);
   // One end to a game that ended, and none to one that plays.
   expect(node.ends + sim.ownerEndsWritten, sim.label).toBe(ended.length);
 }
@@ -107,14 +117,14 @@ export function fairOnlyFinish(sim: Sim, s: SimSummary, ended: readonly string[]
  *  answered, in order without repeats, and when the first one was made and
  *  the game was over on the holder's page; and how many presses were refused
  *  for contract bets riding. */
-export function pressEnd(sim: Sim, t: string, game: 'roulette' | 'craps', from: number, when: () => boolean = () => true, once = false): { said: string[]; first: number | null; over: number | null; contracts: number } {
-  const { house } = sim;
+export function pressEnd(sim: Sim, t: string, game: 'roulette' | 'craps', from: number, when: () => boolean = () => true, once = false, by: () => SimPage = () => sim.house): { said: string[]; first: number | null; over: number | null; contracts: number } {
   const out: { said: string[]; first: number | null; over: number | null; contracts: number } = { said: [], first: null, over: null, contracts: 0 };
   let go = false;
   let again = false;
   let done = false;
   sim.at(from, () => { go = true; });
   sim.every(() => {
+    const house = by();
     const now = sim.enter(house);
     if (go && out.over === null && out.first !== null && !house.p.casino.isComputedTable(t)) out.over = sim.elapsed;
     if (!go || done || house.mode !== 'up') return;

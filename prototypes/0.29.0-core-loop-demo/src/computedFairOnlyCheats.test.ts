@@ -24,15 +24,18 @@
  * house up and an honest bettor at the table, no cheat here holds a round up
  * longer than a house table's worst.
  *
- * Not here yet (they need parts not built): 4,001 pids, a flood of junk
- * `ck:` (P7), 5 MiB of junk (the harness holds a doc under 1 MB), the ends,
+ *   - the flooder (P7, PR 6c-4b-3a): forged transfers by the game's holder and
+ *     forged checkpoints, by the hundred: the pages delete them, and the
+ *     game's answer waits no longer than that takes.
+ *
+ * Not here yet (they need parts not built): 4,001 pids, 5 MiB of junk (the harness holds a doc under 1 MB), the ends,
  * transfers, two houses, the owner rewrite, migration back.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { sealCk, sealFin } from './computedFairOnly';
-import type { CkRec } from './computedFairOnly';
+import { ckId, ckKey, sealCk, sealFin, xfId, xfKey } from './computedFairOnly';
+import type { CkRec, XferRec } from './computedFairOnly';
 import { fairOnlyFinish, lines, rouletteFinish } from './computedFairOnlySimKit';
 import type { FoldCtx } from './computedFold';
 import { PAGE_ROOM } from './computedPageKit';
@@ -429,5 +432,72 @@ describe('cheats against a FAIR ONLY game', () => {
       // (Its own red chip, which the honest pages' closes froze like any felt, is the most it moved.)
       expect(Number(sp.p.casino.computedFoldOf(T)?.nets.get(X.pid) ?? 0n), `${sim.label} ${sp.name}`).toBeLessThan(100);
     }
+  }, TIMEOUT);
+  it('the flooder: 150 forged transfers by the game\'s holder and a forged checkpoint every 10 s: the pages delete the transfers inside 8 s each time, the game\'s answer waits no longer than that, and the house decides every round (a round may read gone for a moment where a trim lands while the answer waits)', async () => {
+    const sim = await Sim.open({
+      name: 'fair-only-flooder', seed: seed(1226), houseNode: true, fairOnly: true, bot: HEAVY_BOT,
+      pages: [...named('ABCD'), { name: 'X', bot: null, honest: false }],
+    });
+    const X = peer(sim, 'X');
+    const honest = sim.pages.filter((sp) => sp.honest);
+    const BAD_SIG = X.p.keypair.signIdentity(new Uint8Array([1, 2, 3]));
+    let floods = 0;
+    let n = 0;
+    const late: string[] = [];
+    const mine = new Set<string>();
+    let forgedCks = 0;
+    /** How many of the flooder's records page sp's doc holds, and whether its answer about the game waits. */
+    const state = (sp: SimPage): { left: number; pending: boolean } => {
+      const top = sp.p.doc.getMap<unknown>('casinoComputed');
+      const inc = sp.p.casino.computedIncOf(T);
+      let left = 0;
+      for (const key of mine) if (top.has(key)) left++;
+      return { left, pending: inc !== null && sp.p.casino.computedResolutionOf(T, inc)?.pending === true };
+    };
+    // (For the first three minutes, also of a long run: a deleted record leaves its key in the doc's history, some
+    // 100 B each, and the harness holds a doc under 1 MB. The game is played on after the flood, tidied.)
+    for (let at = 30_000; at + 20_000 <= Math.min(RUN_MS, 180_000); at += 10_000) {
+      sim.at(at, () => {
+        const game = gameOn(X);
+        if (!game) return;
+        const holder = X.p.casino.computedResolutionOf(T, game.inc)!.holder!;
+        X.p.doc.transact(() => {
+          for (let i = 0; i < 150; i++) {
+            const o = {
+              v: 1, kind: 'transfer-offer', asset: { kind: 'deed', roomId: PAGE_ROOM, roomName: 'Furlong' }, makerPub: holder, makerName: 'Maker',
+              toPub: X.p.pub, price: 0, issuedAt: game.base.ck.ts + 1_000, expiresAt: game.base.ck.ts + 8 * 24 * 3_600_000,
+              nonce: (++n).toString(16).padStart(24, '0'), sig: BAD_SIG,
+            };
+            const value = { v: 1, o, u: game.base.ck.u, k: X.p.pub, g: BAD_SIG };
+            const key = xfKey(T, game.inc, xfId(value as unknown as XferRec) as string);
+            mine.add(key);
+            game.top.set(key, value);
+          }
+          const ck = { ...game.base.ck, g: BAD_SIG };
+          // (A checkpoint nobody signed, at the base's round: looked at while the base stands there, and deleted
+          // then; one the base has passed is looked at by no page, and lies there until the game is compacted.)
+          game.top.set(ckKey(T, game.inc, ckId(ck) as string), ck);
+          forgedCks += 1;
+        });
+        floods += 1;
+      });
+      sim.at(at + 8_000, () => {
+        for (const sp of honest.filter((q) => q.mode === 'up')) {
+          sim.enter(sp);
+          const st = state(sp);
+          if (st.left > 0 || st.pending) late.push(`${sp.name} at ${sim.elapsed} ms: ${st.left} forged records left, pending ${st.pending}`);
+        }
+      });
+    }
+    await sim.run(RUN_MS);
+    // (Each forged record costs every page one check, and a recount checks until its budget is spent: the updates that
+    // bring a flood, and the slices after, cost a budget each, which is what a page pays for 150 forged records in 10 s.)
+    const s = await rouletteFinish(sim, { warmMs: 4 * 40, flips: ['blip'] });
+    fairOnlyFinish(sim, s);
+    lines.push(`flooder: ${floods} floods, ${mine.size} forged transfers, ${forgedCks} forged checkpoints; by the house ${s.byHouse}, voids ${s.voids}, stall ${s.worstStallMs}`);
+    expect(floods, sim.label).toBeGreaterThanOrEqual(5);
+    expect(late, sim.label).toEqual([]);
+    expect(s.byHouse, sim.label).toBeGreaterThanOrEqual(5);
+    expect(s.voids, sim.label).toBe(0);
   }, TIMEOUT);
 });
