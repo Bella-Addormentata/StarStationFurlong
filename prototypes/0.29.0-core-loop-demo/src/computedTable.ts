@@ -5745,8 +5745,7 @@ export type FairOnlyOnResult = 'ok' | FairOnlyOnRefusal;
 
 /**
  * 🔒 The room's owner moves house table `t` to a FAIR ONLY game (design §8.7;
- * the ⚙ card's FAIR ONLY · THE TABLE WAITS FOR THE HOUSE, once it has the
- * line): in ONE transaction the house table's incarnation ends as a switch-off
+ * the ⚙ card's FAIR ONLY · THE TABLE WAITS FOR THE HOUSE): in ONE transaction the house table's incarnation ends as a switch-off
  * ends it (its final checkpoint with the fold's nets, which count on; its
  * sessions gone; its `gone:` mark; the deed holder's attestation of the end),
  * and the game opens: a name no other game has (its inputs this page's key,
@@ -5767,8 +5766,8 @@ export type FairOnlyOnResult = 'ok' | FairOnlyOnRefusal;
  * and contract bets riding until the second press, `again`, which hands them
  * back with the rest), or its last result still shows. Bets on an open round
  * go back to their players, as at a switch-off. 'ok' with nothing written at a
- * table where this page's key holds a live game of `game` already. Nothing
- * calls this yet but the specs: the ⚙ card's line is PR 6c-4c's.
+ * table where this page's key holds a live game of `game` already. The ⚙
+ * card's SET FAIR ONLY calls it, after its question (casinoTableSession).
  */
 export function switchFairOnlyOn(t: string, game: GameName = 'roulette', now = Date.now(), again = false): FairOnlyOnResult {
   lookAtClock(now);
@@ -5929,7 +5928,7 @@ function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec, x: Xfer
 
 /**
  * 🔒 The page that holds FAIR ONLY game of `game` at table `t` ends it (design
- * §8.6; the ⚙ card's way back, once it has the line): each one its key holds
+ * §8.6; the ⚙ card's way back): each one its key holds
  * there, where it holds more than one, in the one write, 'ok' once all are
  * over and 'ending' while any waits for its round. Only the game's holder
  * can: the end order is signed by this page's key, and counts on every page
@@ -5951,7 +5950,8 @@ function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec, x: Xfer
  * game's records are still being checked, at craps while contract bets ride
  * until the second press (`again`), and for a game another key holds. 'ok'
  * with nothing written where this page holds no live game of `game` at `t`.
- * Nothing calls this yet but the specs: the ⚙ card's line is PR 6c-4c's.
+ * The ⚙ card's END FAIR ONLY calls it, on the page that holds the game, and
+ * so does that page's removal of the table.
  */
 export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = Date.now(), again = false): FairOnlyOffResult {
   lookAtClock(now);

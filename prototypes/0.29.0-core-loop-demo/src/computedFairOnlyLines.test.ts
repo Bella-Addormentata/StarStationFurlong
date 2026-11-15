@@ -20,6 +20,7 @@ import { black, ComputedKit, red } from './computedTestKit';
 import { HOUSE_HEARD_MS } from './computedHouse';
 import {
   FAIR_ONLY_SETTING, FAIR_ONLY_UPDATE, FAIR_ONLY_WAITS, fairOnlyBadge, fairOnlyCardLines, fairOnlyClosedLine, fairOnlyFeltLine,
+  cardFocusAfter, fairOnlyOffNotice, fairOnlyOnNotice,
 } from './computedFairOnlyLines';
 import type { ComputedFairOnlyView } from './computedTable';
 
@@ -150,6 +151,45 @@ describe('the words of a FAIR ONLY table (computedFairOnlyLines)', () => {
     expect(texts(view({ checking: true })).at(-1)).toBe("CHECKING THIS GAME'S RECORDS");
     expect(texts(view()).some((t) => t.includes('CHECKING'))).toBe(false);
     expect(texts(view({ newer: true, moved: true, checking: true, round: 7, o: 1 }))).toEqual([`${FAIR_ONLY_UPDATE} · ITS GAME USES RULES THIS VERSION DOES NOT KNOW`]);
+  });
+});
+
+describe("what the card says at the owner's presses (fairOnlyOnNotice, fairOnlyOffNotice)", () => {
+  it('each answer of the FAIR ONLY press that is its own has its words; a switch\'s answers are left to the switch\'s', () => {
+    expect(fairOnlyOnNotice('ok')).toBe('THIS TABLE IS FAIR ONLY NOW · IT WAITS FOR THE HOUSE');
+    const own = ['owner', 'off', 'no-house', 'no-engine', 'not-house', 'theirs', 'house-away'] as const;
+    const words = own.map((r) => fairOnlyOnNotice(r));
+    expect(words.every((w) => typeof w === 'string' && w.length > 0)).toBe(true);
+    expect(new Set(words).size).toBe(own.length);
+    expect(fairOnlyOnNotice('house-away')).toBe('THE HOUSE IS OFFLINE · FAIR ONLY STARTS WHEN IT IS BACK');
+    expect(fairOnlyOnNotice('theirs')).toBe("THIS TABLE PLAYS ANOTHER HOLDER'S FAIR ONLY GAME");
+    for (const r of ['asleep', 'reconnecting', 'busy', 'old-build', 'craps', 'contract'] as const) expect(fairOnlyOnNotice(r)).toBeNull();
+  });
+
+  it('the way back: ended, ending by the game\'s own word for a round, another holder\'s; the rest are the switch\'s', () => {
+    expect(fairOnlyOffNotice('ok', 'roulette')).toBe('THIS FAIR ONLY GAME HAS ENDED · THE OWNER RUNS THIS TABLE AGAIN');
+    expect(fairOnlyOffNotice('ending', 'roulette')).toBe('THIS GAME ENDS ONCE ITS ROUND IS DECIDED · NO NEW ROUND STARTS');
+    expect(fairOnlyOffNotice('ending', 'craps')).toBe('THIS GAME ENDS ONCE ITS ROLL IS DECIDED · NO NEW ROLL STARTS');
+    expect(fairOnlyOffNotice('theirs', 'craps')).toBe("ONLY THE GAME'S HOLDER ENDS IT");
+    for (const r of ['asleep', 'reconnecting', 'contract'] as const) expect(fairOnlyOffNotice(r, 'craps')).toBeNull();
+  });
+});
+
+describe('where the focus goes when a press replaced its own control (cardFocusAfter)', () => {
+  const on = (...acts: string[]) => (a: string): boolean => acts.includes(a);
+  it('stays on a control that is still there; a question opened puts it on CANCEL, never CONFIRM; answered or cancelled, back on the row\'s press', () => {
+    expect(cardFocusAfter('house-fair', on('house-fair', 'fair-only-on'))).toBe('house-fair');
+    expect(cardFocusAfter('fair-only-on', on('fair-only-cancel', 'fair-only-confirm'))).toBe('fair-only-cancel');
+    expect(cardFocusAfter('fair-only-cancel', on('fair-only-on'))).toBe('fair-only-on');
+    // (refused: the row is back; gone through: the way back is what is there)
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-cancel', 'fair-only-confirm'))).toBe('fair-only-confirm');
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-on'))).toBe('fair-only-on');
+    expect(cardFocusAfter('fair-only-confirm', on('fair-only-off'))).toBe('fair-only-off');
+    expect(cardFocusAfter('computed-on', on('computed-cancel', 'computed-confirm'))).toBe('computed-cancel');
+    expect(cardFocusAfter('computed-cancel', on('computed-on'))).toBe('computed-on');
+    expect(cardFocusAfter('computed-confirm', on('computed-off'))).toBe('computed-off');
+    expect(cardFocusAfter('fair-only-off', on('house-fair'))).toBeNull();
+    expect(cardFocusAfter('close', on())).toBeNull();
   });
 });
 
