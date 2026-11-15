@@ -3954,8 +3954,13 @@ async function joinRoomAtEpoch(
   playersMap.observe((_event) => {
     renderPhonePlayersList();
     updateRoomUI();
-    peerOutfits = outfitsByLane(playersMap.entries());
-    if (world) world.refreshPeerLooks();
+    // 🦊 Only the session's own room dresses the foxes: a room being left
+    // still fires here while its sync flushes and closes (leaveRoomNow), and
+    // the next room's join may already have read its own entries.
+    if (yjsSync === sync) {
+      peerOutfits = outfitsByLane(playersMap.entries());
+      if (world) world.refreshPeerLooks();
+    }
     harvestRoomPlayersIntoMesh(playersMap);
     // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
     // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
