@@ -360,6 +360,27 @@ describe('the fox rig in a look', () => {
     expect(visual.scale.y).toBeCloseTo(SIZES[tall].scale);
     expect(r.masterGroup.scale.toArray()).toEqual([1, 1, 1]);
   });
+
+  it('is drawn as first drawn while the clone vat has it, then eases to its own size', () => {
+    const r = rig();
+    (r as unknown as { clock: { getDelta: () => number; getElapsedTime: () => number } }).clock = { getDelta: () => 0.02, getElapsedTime: () => 0 };
+    const visual = (r as unknown as { visualGroup: THREE.Group }).visualGroup;
+    const tall = SIZES[SIZES.findIndex((s) => s.id === 'tall')].scale;
+    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4 }));
+    expect(r.getDrawnSize()).toBe(tall);
+    r.holdStandardSize(true);
+    expect([r.getDrawnSize(), visual.scale.y]).toEqual([1, 1]);
+    // A look put on in the vat waits for it to let go.
+    r.setLook(lookParts({ ...DEFAULT_LOOK, size: 4, fur: 2 }));
+    for (let i = 0; i < 20; i++) r.update();
+    expect([r.getDrawnSize(), visual.scale.y]).toEqual([1, 1]);
+    r.holdStandardSize(false);
+    r.update();
+    expect(r.getDrawnSize()).toBeGreaterThan(1);
+    expect(r.getDrawnSize()).toBeLessThan(tall);
+    for (let i = 0; i < 120; i++) r.update();
+    expect([r.getDrawnSize(), visual.scale.y]).toEqual([tall, tall]);
+  });
 });
 
 describe('the wiring', () => {
@@ -377,6 +398,16 @@ describe('the wiring', () => {
     expect(applied).toContain('const look = cleanLook(raw);');
     expect(applied).toContain('saveLook(look);');
     expect(applied).toContain('updateLocalPlayerEntry();');
+  });
+
+  it('holds our fox at the vat\'s size while the vat has it, and squishes every fox by its drawn size', () => {
+    const player = readFileSync(fileURLToPath(new URL('./player.ts', import.meta.url)), 'utf8');
+    expect(player).toContain('this.character.holdStandardSize(this.isVatBound());');
+    const spawn = player.slice(player.indexOf('public beginVatSpawn('), player.indexOf('public walkOutOfVat('));
+    expect(spawn).toContain('this.character.holdStandardSize(true);');
+    expect(world).toContain('foxSquish(at, facing, foxes.filter((f) => f.rig !== rig), size);');
+    expect(world).toContain('squishOf(null, me.position, this.player.getDrawnFacing(), this.player.getDrawnSize());');
+    expect(world).toContain('squishOf(avatar.rig, pos, avatar.rig.getFacing(), avatar.rig.getDrawnSize());');
   });
 
   it('dresses a remote fox in the look its entry names, with or without an outfit this game knows', () => {

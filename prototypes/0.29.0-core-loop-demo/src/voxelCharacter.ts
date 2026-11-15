@@ -513,6 +513,12 @@ export class VoxelCharacter {
   private faceDrawn = { shape: 'round' as EyeShape, eye: '#2f5fa8', sheen: '#4a80c8' };
   /** The whole drawing's size, from its feet (applied with the squish). */
   private size = 1;
+  /** The size it is drawn at now: `size`, but the fox as first drawn while
+   *  the clone vat has it (its squeeze and door are measured for that fox),
+   *  easing to `size` once the vat lets it go. */
+  private sizeShown = 1;
+  /** The clone vat has this fox (holdStandardSize). */
+  private sizeHeld = false;
 
   // ── 🧬 Fresh-clone pallor (#165) ───────────────────────────────────────────
   /** 0 = its own colours, 1 = the clone grey (vatGauge.VAT_PALLOR_HEX). */
@@ -1821,7 +1827,30 @@ export class VoxelCharacter {
       ear.rotation.z = side * -(EAR_LEAN + (look ? look.earLean : 0));
     }
     this.size = look ? look.size : 1;
-    this.visualGroup.scale.set(this.squish.width * this.size, this.size, this.size);
+    if (!this.sizeHeld) this.sizeShown = this.size;
+    this._applySize();
+  }
+
+  /** 🧬 Draw the fox as first drawn, whatever its look's size, while `held`:
+   *  the clone vat's squeeze and door are measured for that fox (vatGauge.ts).
+   *  Let go, it eases to its own size. */
+  holdStandardSize(held: boolean): void {
+    if (held === this.sizeHeld) return;
+    this.sizeHeld = held;
+    if (held) {
+      this.sizeShown = 1;
+      this._applySize();
+    }
+  }
+
+  /** How big the fox is drawn now (1 for the fox as first drawn), for the
+   *  squish beside other foxes (foxSquish.ts). */
+  getDrawnSize(): number {
+    return this.sizeShown;
+  }
+
+  private _applySize(): void {
+    this.visualGroup.scale.set(this.squish.width * this.sizeShown, this.sizeShown, this.sizeShown);
   }
 
   /** The colour every palette-role material is drawn in: the look's own
@@ -2194,7 +2223,12 @@ export class VoxelCharacter {
     // masterGroup's frame, turned from the drawn one by the snap.
     this.squish.width = THREE.MathUtils.lerp(this.squish.width, this.squishTarget.width, lerpSpeed);
     this.squish.shift = THREE.MathUtils.lerp(this.squish.shift, this.squishTarget.shift, lerpSpeed);
-    this.visualGroup.scale.x = this.squish.width * this.size;
+    if (!this.sizeHeld && this.sizeShown !== this.size) {
+      this.sizeShown = Math.abs(this.size - this.sizeShown) < 1e-4
+        ? this.size
+        : THREE.MathUtils.lerp(this.sizeShown, this.size, lerpSpeed);
+    }
+    this._applySize();
     const turn = this.visualGroup.rotation.y;
     this.visualGroup.position.x = this.squish.shift * Math.cos(turn);
     this.visualGroup.position.z = -this.squish.shift * Math.sin(turn);
