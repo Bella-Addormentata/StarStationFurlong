@@ -34,7 +34,8 @@
 //!   (`chia_knock::KnockBook::prune`). So the knock keys of a drill need
 //!   the switch on in the runs that write them;
 //! - the beacon's key B, when the wallet loads with the beacon lit
-//!   (chia_beacon_switch.rs: the player's switch, or `SSF_CHIA_BEACON=1`),
+//!   (chia_beacon_switch.rs: the player's switch, the network's default
+//!   where it was never turned, or `SSF_CHIA_BEACON=1`),
 //!   or when the beacon is lit with the wallet already loaded
 //!   ([`beacon_lit_line`]): B is one key and one address, whichever
 //!   version wrote from it ([`wallet_lines`]). It is named wherever the
