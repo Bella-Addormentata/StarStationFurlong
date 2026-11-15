@@ -1962,3 +1962,90 @@ fn a_check_put_off_that_cannot_change_the_base_leaves_the_pass_its_duties() {
     game.tick_with_passes(200, 1);
     assert_eq!(game.records("o:1:").len(), 1);
 }
+
+#[test]
+fn a_flood_at_a_house_table_leaves_the_games_their_reads() {
+    // 🔒 ~6 MB of junk in the house table's session, more than a tick reads, and the house table the room's only one
+    // (its turn comes first every tick): half of what the tick may read is the games', so the game beside is joined
+    // and its close revealed.
+    let mut game = Game::new("flood-house-table");
+    game.add_house_table();
+    game.junk_in(&format!("ses:{T2}:{INC_R}:g"), 100, 60_000);
+    game.ticks();
+    assert_eq!(game.records("o:1:").len(), 1, "joined beside the flood");
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+}
+
+#[test]
+fn a_flood_of_the_casinos_keys_leaves_the_games_their_reads() {
+    // 🔒 More of the casino's keys than a tick reads, beside a house table: no pass reads the switches to their end,
+    // so nothing at the house tables; the game is the deed holder's whatever they hold, and is served all the same.
+    let mut game = Game::new("flood-casino");
+    game.add_house_table();
+    {
+        let mut txn = game.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..5_000 {
+            casino.insert(&mut txn, format!("zz{i:04}{}", "k".repeat(994)), Any::Bool(true));
+        }
+    }
+    game.ticks();
+    assert_eq!(game.at_house_table("o:"), 0, "the switches not read: nothing at the house table");
+    assert_eq!(game.records("o:1:").len(), 1, "the game is joined");
+    game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    assert_eq!(game.records("h:1:").len(), 1);
+}
+
+#[test]
+fn an_end_order_at_a_game_far_past_its_first_round_looks_for_its_commitment_from_its_base() {
+    // 🔒 The house's trim at round 1,000,000, carrying its commitment for the round after, then the holder's end
+    // order: a house with no memory of the game steps the commitment down, looking for it from past the base (the
+    // rounds below were decided before it), not from round 1.
+    let mut game = Game::new("far-end");
+    let commit = game.commit(1_000_001);
+    game.trim(1_000_000, &"ab".repeat(16), &"cd".repeat(16), Some(&commit));
+    game.fin(&who("owner"));
+    game.restart(0);
+    game.ticks();
+    let downs = game.records("h:1000001:");
+    assert_eq!(downs.len(), 1, "stepped down");
+    assert!(strs(&downs[0].1, "x").is_empty());
+    assert!(game.house.commits.get() < 1_000, "{} commitments made", game.house.commits.get());
+}
+
+#[test]
+fn a_house_that_serves_the_games_again_settles_at_them_again() {
+    // 🔒 Settled at the game and joined at round 1, the house stops serving the games while the room still ticks
+    // (no gap), and a close comes meanwhile: served again, it settles at the game again, so it first reads that close
+    // while settling and never reveals it. One that comes once it has settled again it reveals.
+    for later in [false, true] {
+        let mut game = Game::new(&format!("served-on-again-{later}"));
+        game.house.settle_ms = SETTLE_MS;
+        game.settle();
+        assert_eq!(game.records("o:1:").len(), 1);
+        game.house.serve_fair_only(false);
+        if !later {
+            game.closed(1, &game.sid(), &game.commit(1));
+            game.seeds(1);
+        }
+        for _ in 0..30 {
+            game.tick(1_000);
+        }
+        assert!(game.records("h:1:").is_empty(), "nothing served");
+        game.house.serve_fair_only(true);
+        game.settle();
+        if later {
+            game.closed(1, &game.sid(), &game.commit(1));
+            game.seeds(1);
+            game.settle();
+        }
+        assert_eq!(game.records("h:1:").len(), usize::from(later), "the close came once it had settled again: {later}");
+    }
+}

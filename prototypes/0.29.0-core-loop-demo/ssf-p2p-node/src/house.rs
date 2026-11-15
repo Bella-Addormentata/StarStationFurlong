@@ -762,6 +762,22 @@ struct RoomMem {
     gapped: bool,
 }
 
+impl RoomMem {
+    /// 🔒 The house was away from the room's FAIR ONLY games (cut off for [`HOUSE_HEARD_MS`], or not serving them):
+    /// it settles at each again from the next pass that reads its session, as what it reads until then it has not
+    /// read since, and is settled there only once a pass reads it through.
+    fn settle_games_again(&mut self) {
+        for (key, table) in self.tables.iter_mut() {
+            if ha::is_fair_only_inc(&key.1) {
+                table.first_read = None;
+                if let Some((_, settled)) = table.read_through.as_mut() {
+                    *settled = false;
+                }
+            }
+        }
+    }
+}
+
 /// The house tables a pass found in a room it is delegated a house of, and
 /// the deed holder's key they stand under.
 #[derive(Clone, Debug, PartialEq)]
@@ -921,6 +937,9 @@ pub struct House {
     /// Tables read (tests).
     #[cfg(test)]
     table_reads: usize,
+    /// Commitments made (tests).
+    #[cfg(test)]
+    commits: std::cell::Cell<usize>,
 }
 
 /// A value [`House::read_charged`] read.
@@ -1110,6 +1129,8 @@ impl House {
             on_check: None,
             #[cfg(test)]
             table_reads: 0,
+            #[cfg(test)]
+            commits: std::cell::Cell::new(0),
         })
     }
 
@@ -1127,6 +1148,12 @@ impl House {
     /// 🔒 Serve the FAIR ONLY games (letters `p`/`q`) this house is delegated a house of: join, reveal and step down
     /// there (design-final section 8.5, N1). Off unless told: the node says so once it also signs their checkpoints.
     pub fn serve_fair_only(&mut self, on: bool) {
+        // 🔒 (On again after a spell off: it settles at each game again, as after a gap, for it read none of them.)
+        if on && !self.serve_games {
+            for mem in self.rooms.values_mut() {
+                mem.settle_games_again();
+            }
+        }
         self.serve_games = on;
     }
 
@@ -1342,6 +1369,8 @@ impl House {
     }
 
     fn commit(&self, ctx: &Ctx, r: i64) -> String {
+        #[cfg(test)]
+        self.commits.set(self.commits.get() + 1);
         hb::house_commit(ctx, r, &self.key.seed(ctx, r))
     }
 
@@ -1386,17 +1415,7 @@ impl House {
         // it settles at each FAIR ONLY game again, reading before it reveals (design-final section 8.5, N1).
         if let Some(mem) = self.rooms.get_mut(room) {
             if mem.last_tick.is_some_and(|last| now.saturating_sub(last) >= HOUSE_HEARD_MS) {
-                for (key, table) in mem.tables.iter_mut() {
-                    if ha::is_fair_only_inc(&key.1) {
-                        // (From the next pass that reads its session: what it reads until then it has not read since
-                        // it came back.)
-                        table.first_read = None;
-                        // (Settled there again only once a pass reads it through.)
-                        if let Some((_, settled)) = table.read_through.as_mut() {
-                            *settled = false;
-                        }
-                    }
-                }
+                mem.settle_games_again();
             }
         }
         let mut out = TickOut::default();
@@ -1488,17 +1507,25 @@ impl House {
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
-        // The room's house tables (`r`/`d`), while the deed holder delegates this house.
+        // 🔒 While it serves the games, half of what the tick may still read is theirs: a flood at a house table, or
+        // among the casino's keys, leaves them their reads (as a flood at one game leaves the others their turns).
+        let games_share = if self.serve_games && self.read_left != usize::MAX { self.read_left / 2 } else { 0 };
+        self.read_left -= games_share;
+        // The room's house tables (`r`/`d`), while the deed holder delegates this house. (🔒 A pass that cannot read
+        // them still reads the games, which are whoever holds the deed's.)
         let rd = match self.house_tables(room, txn, &comp, now, prev, &mut writes) {
-            Tables::Stop => return writes,
-            Tables::None if !self.serve_games => return writes,
-            Tables::None => None,
+            Tables::Stop | Tables::None if !self.serve_games => return writes,
+            Tables::Stop | Tables::None => None,
             Tables::Some(rd) => Some(rd),
         };
-        // 🔒 The FAIR ONLY games it is a house of, whoever holds the deed.
+        // 🔒 The FAIR ONLY games it is a house of, whoever holds the deed. (The house tables' reads spent are theirs.)
         let fo = if self.serve_games {
+            let tables_out = std::mem::replace(&mut self.read_out, false);
+            self.read_left += games_share;
             self.rooms.entry(room.to_string()).or_default();
-            self.games(room, txn, &comp, now, &mut writes)
+            let fo = self.games(room, txn, &comp, now, &mut writes);
+            self.read_out |= tables_out;
+            fo
         } else {
             GamesOut::default()
         };
@@ -2873,7 +2900,9 @@ impl House {
             if revealed_now.is_some() {
                 return;
             }
-            let Some(r) = (done + 1..=read.next_round().max(done + 1)).find(|r| carried(*r, self) || joined(*r, self)) else { return };
+            // (🔒 At a game, from past its base, whose rounds a checkpoint may run far ahead of this house's.)
+            let from = if fo { (done + 1).max(read.base_u + 1) } else { done + 1 };
+            let Some(r) = (from..=read.next_round().max(from)).find(|r| carried(*r, self) || joined(*r, self)) else { return };
             if !mine(r) {
                 return;
             }
