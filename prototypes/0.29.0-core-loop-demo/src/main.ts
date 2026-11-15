@@ -70,7 +70,8 @@ import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
-import { laneFromEnvelope, laneOfPeerId, outfitsByLane } from "./peerLooks";
+import { laneFromEnvelope, laneOfPeerId, looksByLane, type PeerDress } from "./peerLooks";
+import { cleanLook, loadSavedLook, lookParts, saveLook, type FoxLook } from "./foxLook";
 import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
 import { wheelPixels, wheelTargetZooms, type FovZoom } from "./firstPersonZoom";
 import {
@@ -819,8 +820,8 @@ let yjsSync: YjsSync | null = null;
  *  entry so the room's other pages can dress our fox in our outfit. */
 let myTickLane: string | null = null;
 /** 🦊 The current room's players entries, by the lane each claims: the
- *  outfit a remote fox wears (peerLooks.ts `outfitsByLane`). */
-let peerOutfits: Map<string, string> = new Map();
+ *  outfit and look a remote fox wears (peerLooks.ts `looksByLane`). */
+let peerDress: Map<string, PeerDress> = new Map();
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
 let roomCacheHandle: RoomCacheHandle | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
@@ -2906,7 +2907,7 @@ async function joinRoomAtEpoch(
   (window as any).__players = playersMap; // debug handle (permanent, like __setOutfit)
   // 🦊 Remote foxes wear the outfit of the players entry that claims their
   // lane (peerLooks.ts); read afresh for this room, and on every change.
-  peerOutfits = outfitsByLane(playersMap.entries());
+  peerDress = looksByLane(playersMap.entries());
   if (world) world.refreshPeerLooks();
 
   // Bind the shared games map (issue #45): per-table game state (checkers
@@ -3958,7 +3959,7 @@ async function joinRoomAtEpoch(
     // still fires here while its sync flushes and closes (leaveRoomNow), and
     // the next room's join may already have read its own entries.
     if (yjsSync === sync) {
-      peerOutfits = outfitsByLane(playersMap.entries());
+      peerDress = looksByLane(playersMap.entries());
       if (world) world.refreshPeerLooks();
     }
     harvestRoomPlayersIntoMesh(playersMap);
@@ -5474,6 +5475,9 @@ interface PlayerEntry {
    *  pages dress that fox in `outfitId`. Absent until told, and from older
    *  games, whose foxes keep their hue tint. */
   lane?: string;
+  /** 🦊 The fox's own look (foxLook.ts), once the player has chosen one:
+   *  small numbers every reader cleans (`cleanLook`). */
+  look?: FoxLook;
 }
 
 /**
@@ -5490,6 +5494,7 @@ function updateLocalPlayerEntry(): void {
   const id = getPlayerId();
   const prev = players.get(id) as Partial<PlayerEntry> | undefined;
   const name = getPlayerName();
+  const savedLook = loadSavedLook();
   const entry: PlayerEntry = {
     name,
     joinedAt: typeof prev?.joinedAt === "number" ? prev.joinedAt : Date.now(),
@@ -5499,6 +5504,7 @@ function updateLocalPlayerEntry(): void {
     keyB64: getIdentityPub(),
     keySig: signNameCert(name),
     ...(myTickLane ? { lane: myTickLane } : {}),
+    ...(savedLook ? { look: savedLook } : {}),
   };
   sync.doc.transact(() => {
     players.set(id, entry);
@@ -12310,8 +12316,11 @@ async function init() {
   // lane its ticks carry (peerLooks.ts); one no entry claims keeps its tint.
   world.setPeerLooks((peerId) => {
     const lane = laneOfPeerId(peerId);
-    const outfitId = lane ? peerOutfits.get(lane) : undefined;
-    return outfitId ? (getOutfitById(outfitId) ?? null) : null;
+    const found = lane ? peerDress.get(lane) : undefined;
+    if (!found) return null;
+    const outfit = getOutfitById(found.outfitId) ?? null;
+    const look = found.look ? lookParts(found.look) : null;
+    return outfit || look ? { outfit, look } : null;
   });
 
   // 🥣 Faucet dish (#231 onboarding): the fixture's take / give / status
@@ -12460,6 +12469,20 @@ async function init() {
     return true;
   };
   (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)
+  // 🦊 The fox's own look (foxLook.ts): drawn on the local rig, saved on this
+  // computer and mirrored into the players entry for the room's other pages.
+  const applyLook = (raw: unknown): FoxLook => {
+    const look = cleanLook(raw);
+    (world.getPlayer() as any).character.setLook(lookParts(look));
+    saveLook(look);
+    updateLocalPlayerEntry();
+    return look;
+  };
+  (window as any).__setLook = applyLook; // debug handle, until the title's step (part 3)
+  {
+    const savedLook = loadSavedLook();
+    if (savedLook) (world.getPlayer() as any).character.setLook(lookParts(savedLook));
+  }
   const savedOutfitId = loadSavedOutfitId();
   if (
     savedOutfitId &&

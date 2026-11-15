@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { isLaneId, laneFromEnvelope, laneOfPeerId, outfitsByLane } from './peerLooks';
+import { isLaneId, laneFromEnvelope, laneOfPeerId, looksByLane, outfitsByLane } from './peerLooks';
+import { DEFAULT_LOOK } from './foxLook';
 import { ADDRESSED_TICK_BYTES, unpackAddressedTick } from './network/protocol';
 
 /** A `lane` envelope's payload as the node writes it: base64 of the JSON. */
@@ -102,6 +103,30 @@ describe('the outfits by lane', () => {
   });
 });
 
+describe('the looks by lane', () => {
+  it('carries each entry\'s look, cleaned, beside its outfit; none from a game with no looks', () => {
+    const found = looksByLane([
+      ['p1', { outfitId: 'ember', lane: LANE_A, look: { fur: 3, cream: 1, eyes: 2, eyeColour: 4, ears: 1, size: 0 } }],
+      ['p2', { outfitId: 'default', lane: LANE_B }],
+    ]);
+    expect(found.get(LANE_A)).toEqual({ outfitId: 'ember', look: { fur: 3, cream: 1, eyes: 2, eyeColour: 4, ears: 1, size: 0 } });
+    expect(found.get(LANE_B)).toEqual({ outfitId: 'default', look: null });
+  });
+
+  it('cleans a look it cannot read into the default, and leaves out the same entries the outfits do', () => {
+    const entries: [string, unknown][] = [
+      ['p1', { outfitId: 'ember', lane: LANE_A, look: 'not a look' }],
+      ['p2', { outfitId: 'ember', lane: LANE_B, look: { fur: 1 } }],
+      ['p3', { outfitId: 'midnight', lane: LANE_B, look: { fur: 2 } }],
+      ['p4', { lane: '0000000000000000', look: { fur: 1 } }],
+    ];
+    const found = looksByLane(entries);
+    expect([...found.keys()]).toEqual([LANE_A]);
+    expect(found.get(LANE_A)?.look).toEqual(DEFAULT_LOOK);
+    expect([...outfitsByLane(entries).keys()]).toEqual([...found.keys()]);
+  });
+});
+
 describe('the wiring', () => {
   const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
   const world = readFileSync(fileURLToPath(new URL('./world.ts', import.meta.url)), 'utf8');
@@ -120,10 +145,10 @@ describe('the wiring', () => {
 
   it('reads the entries afresh at the join and on every change, and dresses the rigs again', () => {
     const bound = main.indexOf('const playersMap = sync.doc.getMap("players");');
-    expect(main.indexOf('peerOutfits = outfitsByLane(playersMap.entries());\n  if (world) world.refreshPeerLooks();', bound)).toBeGreaterThan(bound);
+    expect(main.indexOf('peerDress = looksByLane(playersMap.entries());\n  if (world) world.refreshPeerLooks();', bound)).toBeGreaterThan(bound);
     const observer = main.indexOf('playersMap.observe((_event) => {');
     // Only while the room is the session's: a room being left still fires.
-    expect(main.slice(observer, observer + 600)).toContain('if (yjsSync === sync) {\n      peerOutfits = outfitsByLane(playersMap.entries());\n      if (world) world.refreshPeerLooks();\n    }');
+    expect(main.slice(observer, observer + 600)).toContain('if (yjsSync === sync) {\n      peerDress = looksByLane(playersMap.entries());\n      if (world) world.refreshPeerLooks();\n    }');
   });
 
   it('dresses a rig in the outfit of the entry that claims its lane', () => {
@@ -131,8 +156,8 @@ describe('the wiring', () => {
     expect(resolver).toBeGreaterThan(main.indexOf('world = new worldModule.World(scene);'));
     const body = main.slice(resolver, resolver + 300);
     expect(body).toContain('const lane = laneOfPeerId(peerId);');
-    expect(body).toContain('peerOutfits.get(lane)');
-    expect(body).toContain('getOutfitById(outfitId) ?? null');
+    expect(body).toContain('peerDress.get(lane)');
+    expect(body).toContain('const outfit = getOutfitById(found.outfitId) ?? null;');
   });
 
   it('dresses a new rig, and tints only a rig no entry claims', () => {
@@ -142,7 +167,8 @@ describe('the wiring', () => {
     expect(spawned).not.toContain('applyPeerTint');
     const dress = world.indexOf('private dressPeer(avatar: RemoteAvatar, id: string): void {');
     const body = world.slice(dress, world.indexOf('\n  }\n', dress));
-    expect(body).toContain('this.removePeerTint(avatar.rig);\n      avatar.rig.setOutfit(outfit);');
+    expect(body).toContain('this.removePeerTint(avatar.rig);');
+    expect(body).toContain('if (dress.outfit) avatar.rig.setOutfit(dress.outfit);');
     expect(body).toContain('avatar.rig.clearOutfit();\n      this.applyPeerTint(avatar.rig, id);');
   });
 });

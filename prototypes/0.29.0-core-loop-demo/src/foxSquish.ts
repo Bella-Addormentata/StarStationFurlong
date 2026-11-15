@@ -8,6 +8,9 @@
  * away into the free side, and from both sides when it stands between two.
  * Only the drawing changes; where the player is, and so what they bump
  * into, does not. Pure, so it can be tested.
+ *
+ * A fox drawn bigger or smaller (its look's size, foxLook.ts) is that much
+ * wider: it squishes against its own width, so it still keeps to its half.
  */
 
 import { FOX_HALF_WIDTH_M } from './sightline';
@@ -39,19 +42,22 @@ export interface FoxSquish {
  * How a fox standing at `me` (its feet), facing `facing` (the yaw it is drawn
  * at), is squished by the foxes at `others` (not itself): it keeps no more
  * than half the space across to the nearest one beside it on each side.
+ * `size` is how big it is drawn (1 for the fox as first drawn).
  */
 export function foxSquish(
   me: { x: number; y: number; z: number },
   facing: number,
   others: ReadonlyArray<{ x: number; y: number; z: number }>,
+  size = 1,
 ): FoxSquish {
+  const half = FOX_HALF_WIDTH_M * (Number.isFinite(size) && size > 0 ? size : 1);
   // Its own +x across the floor, and the way it faces (+z), at that yaw.
   const ax = Math.cos(facing);
   const az = -Math.sin(facing);
   const fx = Math.sin(facing);
   const fz = Math.cos(facing);
-  let plus = FOX_HALF_WIDTH_M;
-  let minus = FOX_HALF_WIDTH_M;
+  let plus = half;
+  let minus = half;
   for (const o of others) {
     if (Math.abs(o.y - me.y) >= FOX_BESIDE_HEIGHT_M) continue;
     const dx = o.x - me.x;
@@ -64,7 +70,7 @@ export function foxSquish(
     else minus = Math.min(minus, room);
   }
   return {
-    width: Math.max(FOX_SQUISH_MIN, (plus + minus) / (2 * FOX_HALF_WIDTH_M)),
+    width: Math.max(FOX_SQUISH_MIN, (plus + minus) / (2 * half)),
     shift: (plus - minus) / 2,
   };
 }

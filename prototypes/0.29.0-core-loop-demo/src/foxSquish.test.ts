@@ -95,6 +95,25 @@ describe('foxSquish', () => {
     expect(p1.shift).toBeGreaterThan(0);
   });
 
+  it('squishes a fox drawn bigger or smaller against its own width, so four of mixed sizes still fit', () => {
+    const xs = [-1.5, -0.5, 0.5, 1.5];
+    const sizes = [1.1, 1.1, 0.9, 1.05];
+    const squished = xs.map((x, i) => foxSquish(at(x), SCREENS, xs.filter((_, j) => j !== i).map((o) => at(o)), sizes[i]));
+    const spans = xs.map((x, i) => {
+      const s = squished[i]!;
+      const middle = x - s.shift;
+      const half = s.width * FOX_HALF_WIDTH_M * sizes[i]!;
+      return [middle - half, middle + half];
+    });
+    for (let i = 1; i < spans.length; i++) expect(spans[i]![0]).toBeGreaterThanOrEqual(spans[i - 1]![1] - 1e-9);
+    // The middle two each take their metre between the others, whatever their size.
+    expect(spans[2]![1] - spans[1]![0]).toBeCloseTo(2, 9);
+    // On its own, a fox of any size is drawn whole.
+    expect(foxSquish(at(0), SCREENS, [], 1.1)).toEqual({ width: 1, shift: 0 });
+    // A size that is not one is the fox as first drawn.
+    expect(foxSquish(at(0), SCREENS, [at(1)], Number.NaN)).toEqual(foxSquish(at(0), SCREENS, [at(1)]));
+  });
+
   it('never squishes a fox to less than FOX_SQUISH_MIN, however tight', () => {
     const tight = row([-0.4, 0, 0.4]);
     expect(tight[1]!.width).toBe(FOX_SQUISH_MIN);

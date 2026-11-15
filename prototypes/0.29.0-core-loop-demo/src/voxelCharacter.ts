@@ -53,7 +53,8 @@
  */
 
 import * as THREE from 'three';
-import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
+import { tintFur, type OutfitDef, type PaletteRole, type AccessoryKind } from './outfits';
+import type { EyeShape, FoxLookParts } from './foxLook';
 import { vatPallorHex } from './vatGauge';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
@@ -171,6 +172,41 @@ const PAL = {
   outline:    0x5a3a28,  // warm dark-brown line-art outline
   pawLine:    0x1c100a,  // toe/finger cleft strokes (darker than the paws)
 };
+
+/** 🦊 The palette roles a look (foxLook.ts) holds: the fox's own fur, its
+ *  markings and its inner ears. An outfit worn with a look leaves these to
+ *  it, so a fur colour the player picked shows whatever they wear (an
+ *  outfit may only lay its `furTint` over that fur); an outfit on a fox
+ *  with no look recolours them as before. */
+const LOOK_ROLES: ReadonlySet<PaletteRole> = new Set<PaletteRole>(['fur', 'furDeep', 'cream']);
+/** The drawn ears' height squash and outward lean (buildEar), which a
+ *  look's ears scale and add to. */
+const EAR_HEIGHT = 0.82;
+const EAR_LEAN = 0.16;
+/** 🦊 The first-drawn colour each look role was built from. A role's
+ *  materials can be drawn in more than one shade of it (the two ear-cavity
+ *  tones, `furShade` and `furShadeLo`): a look's colour keeps each shade's
+ *  place against it (`shadeOf`), so the default look changes nothing. */
+const LOOK_BASE: Readonly<Partial<Record<PaletteRole, number>>> = {
+  fur: PAL.fur,
+  furDeep: PAL.furShade,
+  cream: PAL.cream,
+};
+
+/** `colour`, shaded as `shade` is against `base`: each channel scaled by
+ *  shade/base (rounded, at most 255). `shade === base` gives `colour`, and
+ *  `colour === base` gives `shade`, exactly. */
+export function shadeOf(colour: number, shade: number, base: number): number {
+  let out = 0;
+  for (const shift of [16, 8, 0]) {
+    const c = (colour >> shift) & 0xff;
+    const s = (shade >> shift) & 0xff;
+    const b = (base >> shift) & 0xff;
+    const v = b === 0 ? c : Math.min(255, Math.round((c * s) / b));
+    out |= v << shift;
+  }
+  return out;
+}
 
 // ── Toon gradient (smooth airbrush ramp) ───────────────────────────────────
 // A 64×1 DataTexture used as MeshToonMaterial.gradientMap, LINEAR-filtered.
@@ -465,6 +501,25 @@ export class VoxelCharacter {
   >();
   /** Currently attached head accessory (one slot), or null. */
   private accessoryGroup: THREE.Group | null = null;
+  /** The outfit the rig wears, or null (setOutfit / clearOutfit). */
+  private currentOutfit: OutfitDef | null = null;
+
+  // ── 🦊 The fox's own look (foxLook.ts) ─────────────────────────────────────
+  /** The look the rig is drawn in, or null for the fox as first drawn. */
+  private look: FoxLookParts | null = null;
+  /** The face decal's canvas and texture, redrawn for an eye shape/colour. */
+  private faceCanvas: { ctx: CanvasRenderingContext2D; tex: THREE.CanvasTexture } | null = null;
+  /** The face as last drawn: shape and colours. */
+  private faceDrawn = { shape: 'round' as EyeShape, eye: '#2f5fa8', sheen: '#4a80c8' };
+  /** The whole drawing's size, from its feet (applied with the squish). */
+  private size = 1;
+  /** The size it is drawn at now: `size`, but the fox as first drawn while
+   *  the clone vat has it (its squeeze and door are measured for that fox),
+   *  easing to `size` once the vat lets it go. */
+  private sizeShown = 1;
+  /** The clone vat has this fox: its size and ears are drawn as first drawn
+   *  (holdStandardShape). */
+  private sizeHeld = false;
 
   // ── 🧬 Fresh-clone pallor (#165) ───────────────────────────────────────────
   /** 0 = its own colours, 1 = the clone grey (vatGauge.VAT_PALLOR_HEX). */
@@ -860,9 +915,9 @@ export class VoxelCharacter {
       // z -0.10: the sheet's side view seats the ears on the BACK HALF of
       // the crown, not centred over it.
       g.position.set(side * 0.30, 0.82, -0.10);
-      g.rotation.z = side * -0.16;
+      g.rotation.z = side * -EAR_LEAN;
       g.rotation.x = -0.10;
-      g.scale.y = 0.82;
+      g.scale.y = EAR_HEIGHT;
       return g;
     };
     this.leftEar  = buildEar(-1);
@@ -956,69 +1011,14 @@ export class VoxelCharacter {
     const ctx = canvas.getContext('2d')!;
     ctx.scale(2, 2);
 
-    // Transparent background — the head fur shows through everywhere the
-    // face isn't drawn.
-    ctx.clearRect(0, 0, SIZE, SIZE);
-
-    // Reference-sheet face structure (big glossy ovals, dual shines, thin
-    // brows) in the fox colorway's BLUE (owner call at the checkpoint —
-    // the sheet's charcoal was '#35333a'/'#4a4852').
-    const EYE      = '#2f5fa8';
-    const EYE_SOFT = '#4a80c8';   // subtle lighter lower-inner sheen
-    const SHINE    = '#ffffff';
-    const BROW     = '#3a383f';
-
-    // ── Eyes ─── two mirrored dark glossy ovals ──────────────────────
-    // Face coord system: (0,0) = top-left of canvas, (256, 256) = center.
-    // Positioned in the upper-middle so the muzzle/mouth 3D geometry
-    // occupies the lower face.
-    const drawEye = (cx: number, cy: number, side: -1 | 1) => {
-      // Eye body — tall dark oval
-      ctx.fillStyle = EYE;
-      ctx.beginPath();
-      ctx.ellipse(cx, cy, 68, 92, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Soft lower sheen — slightly lighter oval sunk toward the bottom,
-      // sells the "wet glossy" ball read from the sheet.
-      ctx.fillStyle = EYE_SOFT;
-      ctx.beginPath();
-      ctx.ellipse(cx, cy + 26, 46, 54, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Big shine — white oval, upper-left on BOTH eyes (single light
-      // source, exactly like the sheet).
-      ctx.fillStyle = SHINE;
-      ctx.beginPath();
-      ctx.ellipse(cx - 22, cy - 34, 20, 26, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Small secondary shine — lower-right dot
-      ctx.beginPath();
-      ctx.ellipse(cx + 18, cy + 36, 9, 11, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Thin eyebrow stroke — short gentle arc close above the eye,
-      // slightly higher at the inner end (the sheet's soft neutral brow;
-      // brows floating too high read "surprised").
-      ctx.strokeStyle = BROW;
-      ctx.lineWidth = 9;
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(cx - side * 40, cy - 104);
-      ctx.quadraticCurveTo(cx, cy - 120, cx + side * 34, cy - 100);
-      ctx.stroke();
-    };
-    // Two eyes with a WIDE nose-bridge gap — the sheet spaces the eyes
-    // about half an eye-width apart, and centres them slightly BELOW the
-    // head ball's midline (238 in canvas space lands there).
-    drawEye(158, 238, -1);
-    drawEye(354, 238,  1);
-
     // Build the texture and plane. The plane is sized 0.90 units wide so
     // the drawn eyes end up ~0.24 wide each in world space — the big dark
     // glossy read the reference sheet leads with.
     const tex = new THREE.CanvasTexture(canvas);
+    // 🦊 Kept to redraw for a look's eyes (setLook), and drawn now as the
+    // fox was first drawn.
+    this.faceCanvas = { ctx, tex };
+    this._drawFace(this.faceDrawn.shape, this.faceDrawn.eye, this.faceDrawn.sheen);
     tex.magFilter = THREE.LinearFilter;
     tex.minFilter = THREE.LinearMipmapLinearFilter;
     tex.anisotropy = 8;
@@ -1053,6 +1053,109 @@ export class VoxelCharacter {
     // Render after the skull so alpha compositing works cleanly.
     patch.renderOrder = 5;
     return patch;
+  }
+
+  /**
+   * 🦊 Draw the face decal's eyes and brows: the reference-sheet face (big
+   * glossy ovals, dual shines, thin brows), in the shape and colours a look
+   * names (foxLook.ts). 'round' in blue is the face as first drawn (owner
+   * call at the checkpoint: the fox colorway's BLUE; the sheet's charcoal
+   * was '#35333a'/'#4a4852'). Draws into 512-space (the canvas is 2x).
+   */
+  private _drawFace(shape: EyeShape, eye: string, sheen: string): void {
+    if (!this.faceCanvas) return;
+    const { ctx } = this.faceCanvas;
+    const SIZE = 512;
+    // Transparent background — the head fur shows through everywhere the
+    // face isn't drawn.
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    const EYE      = eye;
+    const EYE_SOFT = sheen;       // subtle lighter lower-inner sheen
+    const SHINE    = '#ffffff';
+    const BROW     = '#3a383f';
+    // The drawn eye's size against the first one (68 x 92), and the brow's
+    // lift above it; 'sleepy' and 'happy' are drawn their own way below.
+    const k = shape === 'big' ? { w: 1.17, h: 1.12, brow: -8 } : shape === 'narrow' ? { w: 0.74, h: 0.9, brow: 6 } : { w: 1, h: 1, brow: 0 };
+
+    // ── Eyes ─── two mirrored dark glossy ovals ──────────────────────
+    // Face coord system: (0,0) = top-left of canvas, (256, 256) = center.
+    // Positioned in the upper-middle so the muzzle/mouth 3D geometry
+    // occupies the lower face.
+    const drawEye = (cx: number, cy: number, side: -1 | 1) => {
+      if (shape === 'happy') {
+        // Closed, smiling: an upturned arc in the eye colour.
+        ctx.strokeStyle = EYE;
+        ctx.lineWidth = 20;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.arc(cx, cy + 30, 58, Math.PI * 1.16, Math.PI * 1.84);
+        ctx.stroke();
+      } else {
+        // 'sleepy' draws the round eye under a lowered lid.
+        ctx.save();
+        if (shape === 'sleepy') {
+          ctx.beginPath();
+          ctx.rect(cx - 120, cy - 22, 240, 240);
+          ctx.clip();
+        }
+        // Eye body — tall dark oval
+        ctx.fillStyle = EYE;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, 68 * k.w, 92 * k.h, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Soft lower sheen — slightly lighter oval sunk toward the bottom,
+        // sells the "wet glossy" ball read from the sheet.
+        ctx.fillStyle = EYE_SOFT;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 26 * k.h, 46 * k.w, 54 * k.h, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Big shine — white oval, upper-left on BOTH eyes (single light
+        // source, exactly like the sheet). Under a sleepy lid it shows
+        // below the lid line instead.
+        ctx.fillStyle = SHINE;
+        ctx.beginPath();
+        if (shape === 'sleepy') ctx.ellipse(cx - 22, cy + 4, 16, 18, 0, 0, Math.PI * 2);
+        else ctx.ellipse(cx - 22 * k.w, cy - 34 * k.h, 20 * k.w, 26 * k.h, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Small secondary shine — lower-right dot
+        ctx.beginPath();
+        ctx.ellipse(cx + 18 * k.w, cy + 36 * k.h, 9 * k.w, 11 * k.h, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        if (shape === 'sleepy') {
+          // The lid: a soft line across the top of what shows.
+          ctx.strokeStyle = BROW;
+          ctx.lineWidth = 10;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(cx - 66, cy - 18);
+          ctx.quadraticCurveTo(cx, cy - 30, cx + 66, cy - 18);
+          ctx.stroke();
+        }
+      }
+
+      // Thin eyebrow stroke — short gentle arc close above the eye,
+      // slightly higher at the inner end (the sheet's soft neutral brow;
+      // brows floating too high read "surprised").
+      ctx.strokeStyle = BROW;
+      ctx.lineWidth = 9;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(cx - side * 40, cy - 104 + k.brow);
+      ctx.quadraticCurveTo(cx, cy - 120 + k.brow, cx + side * 34, cy - 100 + k.brow);
+      ctx.stroke();
+    };
+    // Two eyes with a WIDE nose-bridge gap — the sheet spaces the eyes
+    // about half an eye-width apart, and centres them slightly BELOW the
+    // head ball's midline (238 in canvas space lands there).
+    drawEye(158, 238, -1);
+    drawEye(354, 238,  1);
+    this.faceCanvas.tex.needsUpdate = true;
+    this.faceDrawn = { shape, eye, sheen };
   }
 
   // ── Torso ────────────────────────────────────────────────────────────────
@@ -1690,11 +1793,89 @@ export class VoxelCharacter {
     // capture below never records a pallored hex), re-apply it after.
     const pallor = this.pallor;
     if (pallor > 0) this.setPallor(0);
-    this._applyOutfit(outfit);
+    this.currentOutfit = outfit;
+    this._applyColours();
+    this.removeAccessory();
+    if (outfit.accessory) this.attachAccessory(outfit.accessory);
     if (pallor > 0) this.setPallor(pallor);
   }
 
-  private _applyOutfit(outfit: OutfitDef): void {
+  /**
+   * 🦊 Draw the rig in a look (foxLook.ts `lookParts`): its fur and marking
+   * colours, its eyes, its ears and its size; null for the fox as first
+   * drawn. The look's colours are the fox's own: an outfit worn with a look
+   * keeps its accessory and its paw colour, and leaves the fur, the
+   * markings and the inner ears to the look (`LOOK_ROLES`). Exact and
+   * idempotent like setOutfit.
+   */
+  setLook(look: FoxLookParts | null): void {
+    const pallor = this.pallor;
+    if (pallor > 0) this.setPallor(0);
+    this.look = look;
+    this._applyColours();
+    if (pallor > 0) this.setPallor(pallor);
+    const face = look
+      ? { shape: look.eyeShape, eye: look.eye, sheen: look.eyeSheen }
+      : { shape: 'round' as EyeShape, eye: '#2f5fa8', sheen: '#4a80c8' };
+    if (face.shape !== this.faceDrawn.shape || face.eye !== this.faceDrawn.eye || face.sheen !== this.faceDrawn.sheen) {
+      this._drawFace(face.shape, face.eye, face.sheen);
+    }
+    this._applyEars();
+    this.size = look ? look.size : 1;
+    if (!this.sizeHeld) this.sizeShown = this.size;
+    this._applySize();
+  }
+
+  /** The ears in the look's size and lean, or as first drawn while the
+   *  shape is held (holdStandardShape). */
+  private _applyEars(): void {
+    const look = this.sizeHeld ? null : this.look;
+    const ears: Array<[THREE.Group | null, -1 | 1]> = [[this.leftEar, -1], [this.rightEar, 1]];
+    for (const [ear, side] of ears) {
+      if (!ear) continue;
+      const scale = look ? look.earScale : 1;
+      ear.scale.set(scale, EAR_HEIGHT * scale * (look ? look.earHeight : 1), scale);
+      ear.rotation.z = side * -(EAR_LEAN + (look ? look.earLean : 0));
+    }
+  }
+
+  /** 🧬 Draw the fox's shape as first drawn, its size and its ears, whatever
+   *  its look, while `held`: the clone vat's squeeze and door are measured
+   *  for that fox (vatGauge.ts). Let go, its ears are its own again and it
+   *  eases to its own size. Its colours and eyes stay its own throughout. */
+  holdStandardShape(held: boolean): void {
+    if (held === this.sizeHeld) return;
+    this.sizeHeld = held;
+    if (held) {
+      this.sizeShown = 1;
+      this._applySize();
+    }
+    this._applyEars();
+  }
+
+  /** The size the look draws the fox at, held or not. */
+  getLookSize(): number {
+    return this.size;
+  }
+
+  /** How big the fox is drawn now (1 for the fox as first drawn), for the
+   *  squish beside other foxes (foxSquish.ts). */
+  getDrawnSize(): number {
+    return this.sizeShown;
+  }
+
+  private _applySize(): void {
+    this.visualGroup.scale.set(this.squish.width * this.sizeShown, this.sizeShown, this.sizeShown);
+  }
+
+  /** The colour every palette-role material is drawn in: the look's own
+   *  for the roles it holds, else the outfit's, else the first drawn. */
+  private _applyColours(): void {
+    const outfit = this.currentOutfit;
+    const look = this.look;
+    const lookColour: Partial<Record<PaletteRole, number>> = look
+      ? { fur: outfit?.furTint ? tintFur(look.fur, outfit.furTint) : look.fur, furDeep: look.innerEar, cream: look.cream }
+      : {};
     const seen = new Set<THREE.Material>();
     this.visualGroup.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
@@ -1719,13 +1900,14 @@ export class VoxelCharacter {
           };
           this.outfitOriginals.set(mat, orig);
         }
-        const target = outfit.paletteOverrides[role] ?? orig.color;
+        const lookRole = LOOK_ROLES.has(role) ? lookColour[role] : undefined;
+        const base = LOOK_BASE[role];
+        const own = lookRole === undefined || base === undefined ? lookRole : shadeOf(lookRole, orig.color, base);
+        const target = own ?? outfit?.paletteOverrides[role] ?? lookColour[role] ?? orig.color;
         mat.color.setHex(target);
         if (mat.emissive && orig.emissiveSeeded) mat.emissive.setHex(target);
       }
     });
-    this.removeAccessory();
-    if (outfit.accessory) this.attachAccessory(outfit.accessory);
   }
 
   /** Restore every outfit-touched material to its pristine color/emissive and
@@ -1733,10 +1915,13 @@ export class VoxelCharacter {
   clearOutfit(): void {
     const pallor = this.pallor;
     if (pallor > 0) this.setPallor(0);
+    this.currentOutfit = null;
     for (const [mat, orig] of this.outfitOriginals) {
       mat.color.setHex(orig.color);
       if (mat.emissive) mat.emissive.setHex(orig.emissive);
     }
+    // 🦊 A look's own colours stay.
+    if (this.look) this._applyColours();
     this.removeAccessory();
     if (pallor > 0) this.setPallor(pallor);
   }
@@ -2053,7 +2238,12 @@ export class VoxelCharacter {
     // masterGroup's frame, turned from the drawn one by the snap.
     this.squish.width = THREE.MathUtils.lerp(this.squish.width, this.squishTarget.width, lerpSpeed);
     this.squish.shift = THREE.MathUtils.lerp(this.squish.shift, this.squishTarget.shift, lerpSpeed);
-    this.visualGroup.scale.x = this.squish.width;
+    if (!this.sizeHeld && this.sizeShown !== this.size) {
+      this.sizeShown = Math.abs(this.size - this.sizeShown) < 1e-4
+        ? this.size
+        : THREE.MathUtils.lerp(this.sizeShown, this.size, lerpSpeed);
+    }
+    this._applySize();
     const turn = this.visualGroup.rotation.y;
     this.visualGroup.position.x = this.squish.shift * Math.cos(turn);
     this.visualGroup.position.z = -this.squish.shift * Math.sin(turn);

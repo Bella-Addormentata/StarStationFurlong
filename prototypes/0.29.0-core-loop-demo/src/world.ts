@@ -311,6 +311,14 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { decodeStandingYaw } from "./network/protocol";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
+import type { FoxLookParts } from "./foxLook";
+
+/** 🦊 How a remote fox is drawn, from its player's entry (peerLooks.ts):
+ *  its outfit and its own look, either of which may be unknown. */
+export interface PeerDressParts {
+  outfit: OutfitDef | null;
+  look: FoxLookParts | null;
+}
 import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
 import type { OctagonHull, HullWallpapers, HullDoorOpening } from "./octagonHull";
 import {
@@ -387,8 +395,9 @@ interface RemoteAvatar {
   seatSince: number;
   /** 🪑 The peer's latest movement-tick counter — breaks a seat clash. */
   seq: number;
-  /** 🦊 What the rig wears: the id of the outfit its player's entry names
-   *  (peerLooks.ts), null for the hue tint, undefined before it is dressed. */
+  /** 🦊 What the rig wears: a key of the outfit and look its player's entry
+   *  names (peerLooks.ts), null for the hue tint, undefined before it is
+   *  dressed. */
   look?: string | null;
 }
 
@@ -4651,8 +4660,9 @@ export class World {
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
 
   // ── 🦊 Remote foxes in their players' outfits (peerLooks.ts) ───────────────
-  /** The outfit a remote rig's player wears, by rig id (main.ts sets it). */
-  private peerLook: (id: string) => OutfitDef | null = () => null;
+  /** The outfit and look a remote rig's player wears, by rig id (main.ts
+   *  sets it); null when no entry claims the rig. */
+  private peerLook: (id: string) => PeerDressParts | null = () => null;
   /** The colours a rig had before its hue tint, so the tint can be lifted
    *  exactly (offsetHSL is cumulative) when its player's outfit is known. */
   private peerTintOriginals = new WeakMap<
@@ -4660,8 +4670,8 @@ export class World {
     Map<THREE.Material, { color: number | null; emissive: number | null }>
   >();
 
-  /** Where the outfit of a remote rig's player is read from. */
-  public setPeerLooks(look: (id: string) => OutfitDef | null): void {
+  /** Where the outfit and look of a remote rig's player are read from. */
+  public setPeerLooks(look: (id: string) => PeerDressParts | null): void {
     this.peerLook = look;
   }
 
@@ -4674,14 +4684,17 @@ export class World {
    *  and the per-peer hue tint otherwise. Nothing changes when the look is
    *  the one it already wears. */
   private dressPeer(avatar: RemoteAvatar, id: string): void {
-    const outfit = this.peerLook(id);
-    const look = outfit ? outfit.id : null;
+    const dress = this.peerLook(id);
+    const look = dress ? `${dress.outfit ? dress.outfit.id : ""}|${dress.look ? JSON.stringify(dress.look) : ""}` : null;
     if (avatar.look === look) return;
     avatar.look = look;
-    if (outfit) {
+    if (dress) {
       this.removePeerTint(avatar.rig);
-      avatar.rig.setOutfit(outfit);
+      avatar.rig.setLook(dress.look);
+      if (dress.outfit) avatar.rig.setOutfit(dress.outfit);
+      else avatar.rig.clearOutfit();
     } else {
+      avatar.rig.setLook(null);
       avatar.rig.clearOutfit();
       this.applyPeerTint(avatar.rig, id);
     }
@@ -4970,9 +4983,9 @@ export class World {
         return { rig: a.rig as VoxelCharacter | null, x: p.x, y: p.y, z: p.z };
       }),
     ];
-    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number) =>
-      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig));
-    const mine = squishOf(null, me.position, this.player.getDrawnFacing());
+    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number, size: number) =>
+      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig), size);
+    const mine = squishOf(null, me.position, this.player.getDrawnFacing(), this.player.getDrawnSize());
     this.player.squishTo(mine.width, mine.shift);
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
@@ -4981,7 +4994,7 @@ export class World {
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
       avatar.rig.masterGroup.visible = !views.some((v) => blocksSight(v.eye, v.anchor, pos));
-      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing());
+      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing(), avatar.rig.getDrawnSize());
       avatar.rig.squishTo(squish.width, squish.shift);
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the

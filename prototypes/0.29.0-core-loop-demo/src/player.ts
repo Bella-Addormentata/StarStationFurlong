@@ -355,6 +355,9 @@ export class Player {
    *  pale). Wall-clock, not accumulated frame time: the fade runs its 30 s
    *  even while update() is gated off (station view, a hidden tab). */
   private pallorFrom = -1;
+  /** 🦊 Since the vat last spawned this fox, and until it stands clear of
+   *  the door at its own size (_holdShapeInVat). */
+  private shapeHeldTillClear = false;
   /** WAIT_CLEAR / ORPHANED: seconds between tries for somewhere to step out to. */
   private readonly VAT_WAIT_RETRY = 0.5;
   /** WAIT_CLEAR: where on the door path the clone is held (to look from). */
@@ -867,6 +870,7 @@ export class Player {
     // fresh clone's colours ease back from the pallor grey.
     this._sealVatWhenClear();
     this._updatePallor();
+    this._holdShapeInVat();
 
     // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
     //    tube while it drains/opens, then the straight walk-out). Input is
@@ -2792,6 +2796,9 @@ export class Player {
     this.vatPhase = "NONE";
     this._sealVat();
     this.mesh.scale.set(1, 1, 1);
+    // 🦊 Beamed away from the vat: its own shape again (beginVatSpawn, which
+    // beams first, holds it afresh).
+    this.shapeHeldTillClear = false;
 
     this.mesh.position.x = x;
     this.mesh.position.z = z;
@@ -2832,6 +2839,8 @@ export class Player {
     this.vatOnClear = onSeal ?? null;
     this.logicalAngle = faceAngle;
     this._applyVatPose(VAT_HOLD_ALONG);
+    this.shapeHeldTillClear = true;
+    this.character.holdStandardShape(true); // from this frame on (update() keeps it)
     this.character.setState("idle", faceAngle);
     // 🧬 A fresh clone decants almost-white grey; its own colours come back
     // over VAT_PALLOR_FADE_S once it is out (_releaseVat starts the fade).
@@ -2913,6 +2922,11 @@ export class Player {
     return this.character.getFacing();
   }
 
+  /** 🦊 How big this fox is drawn now (its look's size; 1 in the vat). */
+  public getDrawnSize(): number {
+    return this.character.getDrawnSize();
+  }
+
   /** 🦊🦊 #345: squish this fox to fit beside others (foxSquish.ts); full
    *  size while the clone vat's own squeeze has it. */
   public squishTo(width: number, shift: number): void {
@@ -2932,6 +2946,9 @@ export class Player {
    * retries.
    */
   public abortVatSpawn(): void {
+    // 🦊 The vat is going: no door left to clear. The standard shape still
+    // holds while the clone is held (isVatBound), until it is released.
+    this.shapeHeldTillClear = false;
     if (!this.isVatBound()) return;
     this._sealVat();
     if (this.vatPhase === "NONE") return; // already released: nothing to hold
@@ -2947,6 +2964,22 @@ export class Player {
     this.mesh.position.y = 0;
     this.navMode = "MANUAL";
     this.pallorFrom = performance.now(); // out of the vat: colour starts coming back
+  }
+
+  /**
+   * 🦊 The fox's shape (size and ears) as first drawn while the vat has it,
+   * and after, until it stands clear of the door's sweep at its own size:
+   * the vat's squeeze, its door and its release spots are measured for that
+   * fox (vatGauge.ts), and the door may still be swinging shut. Then the
+   * fox's own shape, eased in by the rig.
+   */
+  private _holdShapeInVat(): void {
+    if (this.shapeHeldTillClear && !this.isVatBound()) {
+      const pos = this.mesh.position;
+      const distance = Math.hypot(pos.x - this.vatCentre.x, pos.z - this.vatCentre.z);
+      if (vatClearOfDoorAt(distance, this.character.getLookSize())) this.shapeHeldTillClear = false;
+    }
+    this.character.holdStandardShape(this.isVatBound() || this.shapeHeldTillClear);
   }
 
   /** 🧬 Ease a released clone's colours back from the pallor grey. */
