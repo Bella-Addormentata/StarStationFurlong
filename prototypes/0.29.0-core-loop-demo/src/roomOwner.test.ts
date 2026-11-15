@@ -138,9 +138,10 @@ describe('ownerGateRefusal — a legacy room reads as legacy', () => {
  * is shape-checked, peer-written, and tied to nothing about this room or its
  * owner. So a fabricated office record passes `isRoomOwner` — and while that
  * is intended for room edits, docking and door policy, it must not carry the
- * right to lock the room out or to unseat its co-hosts. The deed hand-over and
- * the croupier election already sit with the raw deed holder; #142 moved these
- * two to join them.
+ * right to lock the room out. The deed hand-over and the croupier election
+ * already sit with the raw deed holder; #142 moved the access mode to join
+ * them. (Co-host accept/deny/revoke moved with it, and left the game when
+ * rooms came to be served by every computer that holds them: roomHolders.ts.)
  *
  * ⚠️ Read what this proves, and no more. Both gates live in `main.ts`, which
  * runs the whole client on import and so cannot be loaded by vitest — this
@@ -221,40 +222,39 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     expect(calls - declarations).toBe(6);
   });
 
-  it('the co-host section repaints when either map behind the deed check moves', () => {
-    // The gate change widened this section's live dependencies: the old
-    // shareholder predicate compared against our player id, while
-    // currentRoomDeedIsMine() reads roomInfo.owner AND players[owner].keyB64.
-    // updateRoomUI is what both map observers call, so the repaint has to
-    // happen there — otherwise a deed hand-over, or the owner's players entry
-    // landing late (the ordinary join order), leaves the new holder with no
-    // controls and the old holder with buttons the handler refuses.
+  it('the owner-dependent ACCESS rows repaint when either map behind the deed check moves', () => {
+    // currentRoomDeedIsMine() reads roomInfo.owner AND players[owner].keyB64,
+    // and the holders list puts the owner's computer first and names holders
+    // from their players entries. updateRoomUI is what both map observers
+    // call, so the repaint has to happen there — otherwise a deed hand-over,
+    // or the owner's players entry landing late (the ordinary join order),
+    // leaves the new holder with no controls and the list in the wrong order.
     const start = main.indexOf('const updateRoomUI = () => {');
     const end = main.indexOf('roomMap.observe(', start);
     expect(start, 'updateRoomUI not found in main.ts').toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const updateRoomUI = main.slice(start, end);
-    expect(updateRoomUI).toContain('renderCoHostsSection()');
-    // The access-mode selector's enabled state is the same check, repainted
+    expect(updateRoomUI).toContain('renderRoomHoldersSection()');
+    // The access-mode selector's enabled state is the deed check, repainted
     // through refreshAccessRoomRow -> applyAccessModeUI.
     expect(updateRoomUI).toContain('refreshAccessRoomRow()');
   });
 
-  it('co-host accept/deny/revoke gate on the deed, in handler and render alike', () => {
-    // BOTH sites, pinned by count. They live inside one render function rather
-    // than named functions of their own, and there are exactly two: the
-    // delegated click handler and the markup that decides whether a REVOKE
-    // button is drawn at all. Scanning the whole file for "at least one"
-    // passed even if one of them was deleted or widened.
-    const body = bodyOf('renderCoHostsSection');
-    const bindings = body.match(/const amOwner = .*;/g) ?? [];
-    expect(bindings).toEqual([
-      'const amOwner = currentRoomDeedIsMine();',
-      'const amOwner = currentRoomDeedIsMine();',
-    ]);
-    // And nothing else in the section reaches for a wider gate.
+  it('nobody is picked to serve a room: the holders section grants nothing and gates nothing', () => {
+    // Co-host request / accept / deny / revoke are gone (roomHolders.ts), so
+    // there is no surface left for an owner predicate to guard, and none for
+    // a peer-written record to open. Pinned so a later "let the owner remove
+    // a holder" arrives as a decision about its gate, not as a stray button.
+    expect(main).not.toContain('renderCoHostsSection');
+    expect(main).not.toContain('roomRoles');
+    expect(main).not.toMatch(/coHostRequests|getMap\(["']coHosts["']\)/);
+    const body = bodyOf('renderRoomHoldersSection');
+    expect(body).not.toContain('currentRoomDeedIsMine');
     expect(body).not.toContain('isLocalPlayerRoomOwner');
     expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
+    // Its one control is the player's own switch.
+    const actions = [...body.matchAll(/data-holder-action="([a-z-]+)"/g)].map((m) => m[1]);
+    expect(actions).toEqual(['toggle']);
   });
 });
 
@@ -264,7 +264,7 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
  *
  * This is the narrower of the two authority predicates and the one that
  * governs everything irreversible: handing the module away, the sole-croupier
- * election, and — since #142 — the room's access mode and co-host management.
+ * election, and — since #142 — the room's access mode.
  * Until now it lived in main.ts and had no coverage at all, which is why #148
  * could only pin those gates with a source scan.
  */

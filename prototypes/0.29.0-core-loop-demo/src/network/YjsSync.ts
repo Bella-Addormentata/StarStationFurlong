@@ -52,12 +52,12 @@ export interface YjsSyncOptions {
    * room then never syncs).
    */
   bootRecord?: () => { memberHints?: unknown; irohNodeId?: unknown; irohRelayUrls?: unknown; irohDirectAddrs?: unknown } | null | undefined;
-  /** 🤝 C3: is this node one that keeps the room for its owner or a co-host
-   *  (coHostNodes.ts `keeperNodesIn`, read once the frame has applied)? A
-   *  SyncStep2 such a node proved it built (nodeProof.ts) opens the
-   *  readiness gate as the host's signed frame does, so a room whose owner's
-   *  game is closed still counts as synced. Needs `verify`. */
-  keeperNode?: (nodeId: string, doc: Y.Doc, roomId: string) => boolean;
+  /** 🤝 Is this node one that holds the room (roomHolders.ts `holderNodeOk`,
+   *  asked once the frame has applied)? A SyncStep2 such a node proved it
+   *  built (nodeProof.ts) opens the readiness gate as a live game's signed
+   *  frame does, so a room whose owner's game is closed still counts as
+   *  synced from any computer that holds it. Needs `verify`. */
+  holderNode?: (nodeId: string, doc: Y.Doc, roomId: string) => boolean;
 }
 
 function u8ToB64(u8: Uint8Array): string {
@@ -539,11 +539,11 @@ export class YjsSync {
     return bytes;
   }
 
-  /** 🤝 C3: the check of a node's proof on this frame, run only if the
+  /** 🤝 The check of a node's proof on this frame, run only if the
    *  readiness gate would need it (nodeProof.ts). Null without a proof. */
   #nodeProofOf(env: { seq?: unknown; iroh_node_id?: unknown; node_proof?: unknown }, payload: Uint8Array): (() => string | null) | null {
     const verify = this.opts.verify;
-    if (!verify || !this.opts.keeperNode || env.node_proof === undefined) return null;
+    if (!verify || !this.opts.holderNode || env.node_proof === undefined) return null;
     return () => nodeProofSigner(env, this.opts.roomId, payload, Date.now(), verify, b64ToU8);
   }
 
@@ -609,13 +609,14 @@ export class YjsSync {
         this.#linkedSynced = true;
         this.#resolveLinkedSynced();
       }
-      // 🤝 C3: or a SyncStep2 a node that keeps the room proved it built
-      // from its copy (the owner's game closed, its node still serving). The
-      // keeper set is read after the frame applied: on a first visit, the
-      // room's own records of its keepers come in this very frame.
+      // 🤝 Or a SyncStep2 a node that holds the room proved it built from
+      // its copy (the owner's game closed, any holder's node still serving).
+      // The holders are read after the frame applied: on a first visit, the
+      // room's own records of them come in this very frame, and an empty
+      // copy brings none.
       if (subtype === 1 && this.#peerLinked && !this.#linkedSynced && nodeProof) {
         const node = nodeProof();
-        if (node && this.opts.keeperNode?.(node, this.doc, this.opts.roomId)) {
+        if (node && this.opts.holderNode?.(node, this.doc, this.opts.roomId)) {
           this.#linkedSynced = true;
           this.#resolveLinkedSynced();
         }
