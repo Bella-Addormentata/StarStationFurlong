@@ -183,6 +183,30 @@ const LOOK_ROLES: ReadonlySet<PaletteRole> = new Set<PaletteRole>(['fur', 'furDe
  *  look's ears scale and add to. */
 const EAR_HEIGHT = 0.82;
 const EAR_LEAN = 0.16;
+/** 🦊 The first-drawn colour each look role was built from. A role's
+ *  materials can be drawn in more than one shade of it (the two ear-cavity
+ *  tones, `furShade` and `furShadeLo`): a look's colour keeps each shade's
+ *  place against it (`shadeOf`), so the default look changes nothing. */
+const LOOK_BASE: Readonly<Partial<Record<PaletteRole, number>>> = {
+  fur: PAL.fur,
+  furDeep: PAL.furShade,
+  cream: PAL.cream,
+};
+
+/** `colour`, shaded as `shade` is against `base`: each channel scaled by
+ *  shade/base (rounded, at most 255). `shade === base` gives `colour`, and
+ *  `colour === base` gives `shade`, exactly. */
+export function shadeOf(colour: number, shade: number, base: number): number {
+  let out = 0;
+  for (const shift of [16, 8, 0]) {
+    const c = (colour >> shift) & 0xff;
+    const s = (shade >> shift) & 0xff;
+    const b = (base >> shift) & 0xff;
+    const v = b === 0 ? c : Math.min(255, Math.round((c * s) / b));
+    out |= v << shift;
+  }
+  return out;
+}
 
 // ── Toon gradient (smooth airbrush ramp) ───────────────────────────────────
 // A 64×1 DataTexture used as MeshToonMaterial.gradientMap, LINEAR-filtered.
@@ -1832,7 +1856,9 @@ export class VoxelCharacter {
           };
           this.outfitOriginals.set(mat, orig);
         }
-        const own = LOOK_ROLES.has(role) ? lookColour[role] : undefined;
+        const lookRole = LOOK_ROLES.has(role) ? lookColour[role] : undefined;
+        const base = LOOK_BASE[role];
+        const own = lookRole === undefined || base === undefined ? lookRole : shadeOf(lookRole, orig.color, base);
         const target = own ?? outfit?.paletteOverrides[role] ?? lookColour[role] ?? orig.color;
         mat.color.setHex(target);
         if (mat.emissive && orig.emissiveSeeded) mat.emissive.setHex(target);
