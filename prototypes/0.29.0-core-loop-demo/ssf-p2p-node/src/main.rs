@@ -131,6 +131,9 @@ mod treasury_codec;
 // computed-table fold computes, and the owner's node's house job.
 mod house;
 mod house_bytes;
+// 🔒 FAIR ONLY tables (PR 6c, the node's half): who holds a game and which
+// checkpoint it stands at, read as every page reads it.
+mod house_auth;
 // 🧮 The pages' fold run by the node in QuickJS (PR 6b-1): behind a cargo
 // feature while it runs in shadow only.
 #[cfg(feature = "house-fold")]

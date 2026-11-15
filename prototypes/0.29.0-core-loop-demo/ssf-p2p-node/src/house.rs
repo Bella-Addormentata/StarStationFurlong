@@ -176,7 +176,7 @@ pub(crate) const COMPUTED_MAP: &str = "casinoComputed";
 
 // ── Shapes (computedFold / computedHouse guards, as far as the house reads) ──
 
-fn hex_of(s: &str, n: usize) -> bool {
+pub(crate) fn hex_of(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -184,16 +184,16 @@ fn b64url_of(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn is_pub(s: &str) -> bool {
+pub(crate) fn is_pub(s: &str) -> bool {
     b64url_of(s, 43)
 }
 
-fn is_sig(s: &str) -> bool {
+pub(crate) fn is_sig(s: &str) -> bool {
     b64url_of(s, 86)
 }
 
 /// casinoDoc isPlayerKey: 1–256 UTF-16 units, not `__proto__`.
-fn is_pid(s: &str) -> bool {
+pub(crate) fn is_pid(s: &str) -> bool {
     let n = s.encode_utf16().count();
     n > 0 && n <= 256 && s != "__proto__"
 }
@@ -207,7 +207,7 @@ fn str_of<'a>(v: &'a CVal, k: &str) -> Option<&'a str> {
 }
 
 /// computedFold hasFields: exactly these fields (an undefined one is absent).
-fn has_fields(v: &CVal, required: &[&str], optional: &[&str]) -> bool {
+pub(crate) fn has_fields(v: &CVal, required: &[&str], optional: &[&str]) -> bool {
     let Some(fields) = v.fields() else { return false };
     fields.iter().all(|(k, _)| required.contains(&k.as_str()) || optional.contains(&k.as_str()))
         && required.iter().all(|k| v.get(k).is_some())
@@ -349,7 +349,7 @@ const MAX_SHOOTER_PID: usize = 128;
 /// (every rider Object.keys lists: an undefined one has no felt); a shooter
 /// `h` and a last shooter `a` that are player ids of at most
 /// MAX_SHOOTER_PID UTF-16 units; `i` only as 1, and only with a shooter.
-fn is_carry(v: &CVal) -> bool {
+pub(crate) fn is_carry(v: &CVal) -> bool {
     if !has_fields(v, &["p", "w"], &["h", "a", "i"]) || !v.get("p").and_then(CVal::as_int).is_some_and(|p| CARRY_POINTS.contains(&p)) {
         return false;
     }
