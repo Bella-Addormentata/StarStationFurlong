@@ -506,6 +506,16 @@ export function holdersHere(roomId: string, ownerPub: string | undefined, now = 
   return readHolders(nodesMap!.entries(), { roomId, now, ownerPub, verify: cachedVerify, max });
 }
 
+/**
+ * Whether a listed holder is this computer: its record names this computer's
+ * node (as main.ts last read it, setLocalHolderNode). The computer and not
+ * the player: one identity can play on two computers, and the record under
+ * its key is then the other computer's as often as this one's.
+ */
+export function holderIsThisComputer(holder: Holder): boolean {
+  return localNode !== null && holder.record.node === localNode;
+}
+
 /** The holder hints of the bound room, for a pass or the node's dial. */
 export function holderHintsHere(roomId: string, ownerPub: string | undefined, now = Date.now()): RoomMemberHint[] {
   return holdersHere(roomId, ownerPub, now, MAX_HOLDER_HINTS).map(hintOf);
@@ -524,7 +534,10 @@ export function sessionOnOwnNode(wtUrl: string | undefined | null): boolean {
   if (!wtUrl) return false;
   try {
     const host = new URL(wtUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase();
-    return host === 'localhost' || host === '::1' || host.startsWith('127.');
+    // An address, not a name: the URL parser writes every IPv4 address as four
+    // decimal parts, so 127.example.org and 127.0.0.1.nip.io (names that can
+    // lead to another computer) do not pass.
+    return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
   } catch {
     return false;
   }

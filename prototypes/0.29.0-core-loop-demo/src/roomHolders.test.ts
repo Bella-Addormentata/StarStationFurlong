@@ -26,6 +26,7 @@ import {
   bindHolderNodes,
   fileMyHolderNode,
   holderHintsHere,
+  holderIsThisComputer,
   holderNodeFromWire,
   holderNodeOk,
   holderNodeSignBytes,
@@ -520,6 +521,24 @@ describe('the bound store', () => {
     expect(records().size).toBe(0);
   });
 
+  it('calls a holder this computer by the node its record names, not by the key that filed it', () => {
+    // Ann plays on computer A and, with the same identity, on this one.
+    records().set(ann.pub, signHolderNode(ROOM, hint(node('a')), NOW, ann));
+    records().set(ben.pub, signHolderNode(ROOM, hint(node('c')), NOW, ben));
+    const here = () => holdersHere(ROOM, undefined, NOW + 1000).filter(holderIsThisComputer).map((h) => h.pub);
+    // No node read here: no record is this computer's, Ann's own included.
+    expect(here()).toEqual([]);
+    // This computer's node is b: the record under Ann's key is computer A's.
+    setLocalHolderNode(node('b'));
+    expect(here()).toEqual([]);
+    // This computer's node is a: the record is its own.
+    setLocalHolderNode(node('a'));
+    expect(here()).toEqual([ann.pub]);
+    // A record of this computer filed under another key (a second player on it) is this computer too.
+    setLocalHolderNode(node('c'));
+    expect(here()).toEqual([ben.pub]);
+  });
+
   it('takes no record down while nothing says which node is this computer’s, and knows it by its own note of the room', () => {
     const s = memStore();
     const off: FilingFacts = { listed: false, holds: false, owner: false };
@@ -707,12 +726,27 @@ describe('the bound store', () => {
 
 describe('the node a session runs through', () => {
   it('is this computer’s own for a loopback address, and nobody’s for anything else', () => {
-    for (const own of ['https://127.0.0.1:4443', 'https://127.0.0.1:4444/', 'https://localhost:4443', 'https://[::1]:4443', 'https://127.8.9.1:4443']) {
+    for (const own of ['https://127.0.0.1:4443', 'https://127.0.0.1:4444/', 'https://localhost:4443', 'https://[::1]:4443', 'https://127.8.9.1:4443', 'https://127.1:4443']) {
       expect(sessionOnOwnNode(own), own).toBe(true);
     }
     for (const other of ['https://192.168.1.20:4443', 'https://203.0.113.9:4443', 'https://example.org:4443', 'https://[2001:db8::1]:4443', 'https://1270.0.0.1:4443', 'not a url', '', undefined, null]) {
       expect(sessionOnOwnNode(other), String(other)).toBe(false);
     }
+    // A name is not an address, whatever it begins with: it can lead to another computer.
+    for (const other of ['https://127.example.org:4443', 'https://127.0.0.1.nip.io:4443', 'https://127.0.0.1.example:4443', 'https://localhost.example.org:4443', 'https://127.0.0.1x:4443']) {
+      expect(sessionOnOwnNode(other), String(other)).toBe(false);
+    }
+  });
+
+  it('main.ts marks "your computer" in the ROOM HOLDERS list by the node, never by the player’s key', () => {
+    const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+    const at = main.indexOf('function renderRoomHoldersSection(): void {');
+    expect(at).toBeGreaterThan(0);
+    const body = main.slice(at, main.indexOf('\n}\n', at));
+    expect(body).toMatch(/const mine = holders\.some\(holderIsThisComputer\);/);
+    expect(body).toMatch(/\$\{holderIsThisComputer\(h\) \? ' <span[^>]*>\(your computer\)<\/span>' : ""\}/);
+    expect(body).toMatch(/!shown\.some\(holderIsThisComputer\)/);
+    expect(body).not.toMatch(/getIdentityPub\(|=== myPub/);
   });
 
   it('main.ts files this computer’s node only for a session that runs through it', () => {

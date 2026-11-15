@@ -419,6 +419,7 @@ import {
   bindHolderNodes,
   fileMyHolderNode,
   holderHintsHere,
+  holderIsThisComputer,
   holderNodeTrust,
   holdersHere,
   listsThisComputer,
@@ -8685,10 +8686,11 @@ function renderRoomHoldersSection(): void {
   const pill =
     "display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;";
   const roomId = activeBootstrap?.roomId ?? "";
-  const myPub = getIdentityPub();
   const listed = listsMyComputer();
   const holders = roomId ? holdersHere(roomId, roomOwnerInfo(roomId).ownerPub) : [];
-  const mine = holders.some((h) => h.pub === myPub);
+  // By the node a record names, not by the key that filed it: one identity
+  // can play on two computers, and the other one's record is not this one's.
+  const mine = holders.some(holderIsThisComputer);
 
   const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 ROOM HOLDERS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· who serves this room</span></div>
     <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Every computer that has loaded this room keeps a copy and hands it to visitors, so the room still loads while the owner's computer is off. Nobody is picked. Passes name the owner's computer and the ${MAX_HOLDER_HINTS - 1} most recent others.</div>`;
@@ -8697,7 +8699,7 @@ function renderRoomHoldersSection(): void {
   const rows = shown
     .map(
       (h) => `
-    <div style="margin-top:5px; color:#00e676; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(h.pub)}">✔ ${esc(holderNameOf(h.pub))} <span style="color:rgba(212,168,75,0.4);">${esc(h.pub.slice(0, 8))}</span>${h.pub === myPub ? ' <span style="color:rgba(0,230,118,0.6);">(your computer)</span>' : ""}</div>`,
+    <div style="margin-top:5px; color:#00e676; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(h.pub)}">✔ ${esc(holderNameOf(h.pub))} <span style="color:rgba(212,168,75,0.4);">${esc(h.pub.slice(0, 8))}</span>${holderIsThisComputer(h) ? ' <span style="color:rgba(0,230,118,0.6);">(your computer)</span>' : ""}</div>`,
     )
     .join("");
   const more =
@@ -8707,7 +8709,7 @@ function renderRoomHoldersSection(): void {
 
   let status: string;
   if (!listed) status = "Your computer is not listed: the switch below is off.";
-  else if (mine) status = holders.length > shown.length && !shown.some((h) => h.pub === myPub) ? "Your computer is listed too." : "";
+  else if (mine) status = holders.length > shown.length && !shown.some(holderIsThisComputer) ? "Your computer is listed too." : "";
   else if (!localFingerprint?.iroh_node_id) status = "Your game runs without a node of its own here, so it has no copy to hand on.";
   else if (holders.length === 0) status = "No computer is listed yet. Yours is listed once this room has finished loading.";
   else status = "Your computer is listed once this room has finished loading.";
