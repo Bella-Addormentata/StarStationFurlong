@@ -152,6 +152,9 @@ import {
   checkpointLabelOf,
   computedCheckpointOf,
   computedCommitHouse,
+  computedDeedHolder,
+  computedGameMovedOf,
+  computedPlayerOfKey,
   computedEndedIncs,
   computedFairOnlyBytes,
   computedFairOnlyEnded,
@@ -5149,7 +5152,9 @@ export interface ComputedHouseState {
 
 export function computedHouseState(t: string, now = Date.now()): ComputedHouseState | null {
   const inc = computedIncOf(t);
-  if (inc === null || !houseRules(inc)) return null;
+  // (🔒 A FAIR ONLY game has its own house and no setting to run without it:
+  // computedFairOnlyView.)
+  if (inc === null || !houseRules(inc) || isFairOnlyInc(inc)) return null;
   const res = computedFoldOf(t);
   const tip = res?.tip ?? null;
   const online = houseOnline(now);
@@ -5158,6 +5163,88 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
     : !online ? 'offline'
       : tip.revealed.length === tip.present.length ? 'house' : null;
   return { setUp: houseSetUp(), online, fairness: readFairSetting(t), canSet: holdsDeed(), openFair, waiting };
+}
+
+/** 🔒 What the ⚙ card, the plaque and the felt show of the FAIR ONLY game
+ *  table t plays (design §8.3 "Display at p/q", §8.4 "The paused felt"; PR
+ *  6c-4c). Display only: nothing counts by it.
+ *  - `newer`: the game's rules are a version this build does not know, and
+ *    nothing of it counts here (UPDATE TO PLAY THIS TABLE).
+ *  - `checking`: a check of the game's records waits, so the rest can change.
+ *  - `holder`, `holderPid`: the key that holds the game (the chain's last)
+ *    and the player this page pinned to it; `mine` when it is this page's.
+ *  - `deedPid`: set when the deed names another holder than the game's: the
+ *    player the room names its owner (null: none).
+ *  - `ended`: the game has ended (its base ends it) and the switch still
+ *    names it.
+ *  - `waits`: why no round closes now (closePaused): 'ending' an end order
+ *    stands; 'house' the house whose commitment the close would name is not
+ *    heard and no other house of the game is, or no house has joined;
+ *    'full' the session, or the room's games together, hold all they may
+ *    until the house trims. Null: rounds close.
+ *  - `waiting`: what a round closed and undecided waits on, as at a house
+ *    table (ComputedHouseState): 'house' once every bettor's seed is in,
+ *    'offline' when its house is not heard (an abandon will void it).
+ *  - `round`, `o`: the round the checkpoint the page counts from is at, and
+ *    that round's outcome as the checkpoint signs it (a pocket, or the dice;
+ *    null: it carries none).
+ *  - `moved`: the table's game moved during this visit to the game shown
+ *    (casinoDoc computedGameMovedOf).
+ *  Null at a table that plays no FAIR ONLY game. */
+export interface ComputedFairOnlyView {
+  inc: string;
+  newer: boolean;
+  checking: boolean;
+  holder: string | null;
+  holderPid: string | null;
+  mine: boolean;
+  deedPid?: string | null;
+  ended: boolean;
+  waits: 'ending' | 'house' | 'full' | null;
+  waiting: 'house' | 'offline' | null;
+  round: number;
+  o: number | [number, number] | null;
+  moved: boolean;
+}
+
+export function computedFairOnlyView(t: string, now = Date.now()): ComputedFairOnlyView | null {
+  const inc = computedIncOf(t);
+  if (inc === null || !isFairOnlyInc(inc)) return null;
+  lookAtClock(now);
+  const resolved = computedResolutionOf(t, inc);
+  const holder = resolved?.holder ?? null;
+  const deed = computedDeedHolder();
+  const view: ComputedFairOnlyView = {
+    inc,
+    newer: resolved?.newer ?? false,
+    checking: resolved?.pending ?? false,
+    holder,
+    holderPid: holder === null ? null : computedPlayerOfKey(holder) ?? null,
+    mine: holder !== null && holder === getIdentityPub(),
+    ended: resolved !== null && resolved.base !== null && !resolved.live,
+    waits: null,
+    waiting: null,
+    round: resolved?.base?.ck.u ?? 0,
+    o: resolved?.base?.ck.o ?? null,
+    moved: computedGameMovedOf(t)?.to === inc,
+  };
+  // (A key still to show up names nobody yet: no line for it.)
+  if (holder !== null && deed.key !== undefined && deed.key !== holder) view.deedPid = deed.pid;
+  if (!resolved?.live) return view;
+  const at = tableOf(t);
+  if (!at) return view;
+  const { st, res } = at;
+  const tip = res.tip;
+  if (tip) {
+    const h = tip.closeRec.h;
+    if (h !== undefined) view.waiting = houseAway(st, h, now) ? 'offline' : tip.revealed.length === tip.present.length ? 'house' : null;
+    return view;
+  }
+  const h = res.required ?? res.joins[0]?.rec.c;
+  if (resolved.fin !== null) view.waits = 'ending';
+  else if (fairClosePaused(res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, false)) view.waits = 'full';
+  else if (h === undefined || (houseAway(st, h, now) && !computedStandInHeard(st.t, st.inc, h, now))) view.waits = 'house';
+  return view;
 }
 
 /** The final checkpoint of the page-signed incarnation `at` runs, as this page

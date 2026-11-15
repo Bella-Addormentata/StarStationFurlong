@@ -19,11 +19,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { seedTable } from './computedFold';
 import type { FoldCtx, SlipRec } from './computedFold';
-import { beatKey, delegationKey, houseSign, roomSignBytes } from './computedHouse';
+import { beatKey, delegationKey, HOUSE_HEARD_MS, houseSign, roomSignBytes } from './computedHouse';
 import {
   clockOf, deleteIn, keysIn, loadPage, PAGE_CTX as CTX, PAGE_TABLE as TABLE, putIn, switchOn, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
+import { faironlyInc } from './computedFairOnly';
+import { delegation, house as FO_HOUSE, NAME as FO_NAME, owner as FO_OWNER, rootOf } from './computedFairOnlyKit';
+import { nextSid3 } from './computedFold';
+import { beatOf, PAGE_ROOM } from './computedPageKit';
 import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
 
@@ -1632,6 +1636,92 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'house', counted: [BOB.pid] });
     expect(t.card()).not.toContain('🚩');
     expect(a.table.computedRoundCheck(TABLE)?.houseDropped).toEqual([]);
+    t.unmount();
+  });
+});
+
+describe('a FAIR ONLY table (PR 6c-4c): the plaque, the status line, the ⚙ card', () => {
+  const G = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, FO_NAME) };
+  const root = rootOf(G, 'p', { dl: delegation(FO_OWNER, FO_HOUSE.pub, PAGE_ROOM) });
+
+  /** The owner's game open at the table on page a, the owner a player of the room that holds its deed. */
+  function openGame(): void {
+    pinOn(a, FO_OWNER);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', FO_OWNER.pid));
+    a.doc.transact(() => {
+      const top = a.doc.getMap<unknown>('casinoComputed');
+      top.set(root.key, root.value);
+      top.set(`ses:${TABLE}:${G.inc}:${nextSid3(G, root.value)}`, new Y.Map());
+    });
+    at(a, T0);
+  }
+
+  it('while no house has joined: the plaque and the felt say the table waits, and the card names whose game it is with nothing to press and no Friendly anywhere', () => {
+    openGame();
+    const t = atTable(a);
+    t.update();
+    expect(t.plaque()).toBe('FAIR ONLY · THE TABLE WAITS FOR THE HOUSE');
+    expect(a.session.fairnessBadge(TABLE, 'roulette')).toEqual({ text: 'FAIR ONLY · THE TABLE WAITS FOR THE HOUSE', color: '#F5C26B', fair: true });
+    expect(t.status()).toBe('THE TABLE WAITS FOR THE HOUSE · BETS STAY ON THE FELT');
+    const card = t.card();
+    expect(card).toContain(`THE HOUSE OF ${FO_OWNER.pid.toUpperCase()}`);
+    expect(card).toContain('THE TABLE WAITS FOR THE HOUSE · BETS STAY ON THE FELT');
+    expect(card).toContain('FAIRNESS · FAIR ONLY · THE TABLE WAITS FOR THE HOUSE');
+    expect(card).not.toContain('FRIENDLY');
+    expect(card).not.toContain('data-act="house-fair"');
+    expect(card).not.toContain('OFFLINE');
+    t.unmount();
+  });
+
+  it('once a house that is heard has joined: the plaque reads Fair, the felt takes bets, and the open card is drawn again by the frame', () => {
+    openGame();
+    const t = atTable(a);
+    t.update();
+    expect(t.card()).toContain('THE TABLE WAITS FOR THE HOUSE · BETS STAY ON THE FELT');
+    const gk = new ComputedKit(G);
+    const join = gk.houseJoin(FO_HOUSE, 1);
+    a.doc.transact(() => {
+      a.casino.computedSessionForWrite(TABLE)!.set(join.key, join.rec);
+    });
+    // (its beat comes in after the join: a beat is counted from a key the game hears)
+    const [beat, rec] = beatOf(PAGE_ROOM, FO_HOUSE, 1);
+    at(a, T0 + 200);
+    a.doc.transact(() => a.doc.getMap<unknown>('casinoComputed').set(beat, rec));
+    at(a, T0 + 400);
+    t.update();
+    expect(a.table.computedFairOnlyView(TABLE)).toMatchObject({ waits: null });
+    expect(t.plaque()).toBe('✔ FAIR ONLY · THE HOUSE AND EVERY BETTOR ADD A SEED');
+    expect(t.status()).toContain('PLACE YOUR BETS');
+    // (the card that was open: no press, no reopening)
+    expect(t.card()).toContain('THE HOUSE IS ONLINE');
+    expect(t.card()).not.toContain('BETS STAY ON THE FELT');
+    t.unmount();
+  });
+
+  it("a round closed: the bettors' seeds, then the house's; with the house silent the round goes void and the table waits for it, with no Friendly round promised", () => {
+    openGame();
+    const t = atTable(a);
+    const gk = new ComputedKit(G);
+    const join = gk.houseJoin(FO_HOUSE, 1);
+    const bob = gk.slip(BOB, 1, [red(10)]);
+    const cat = gk.slip(CAT, 1, [black(10)]);
+    put(a, T0 + 500, join, bob, cat);
+    wait(a, T0 + 500, T0 + 18_800, t);
+    const [beat, rec] = beatOf(PAGE_ROOM, FO_HOUSE, 1);
+    at(a, T0 + 18_800);
+    a.doc.transact(() => a.doc.getMap<unknown>('casinoComputed').set(beat, rec));
+    put(a, T0 + 19_000, gk.close(BOB, 1, nextSid3(G, root.value), [bob, cat], join.rec.c));
+    t.update();
+    expect(t.plaque()).toBe('✔ FAIR ONLY · THE HOUSE AND EVERY BETTOR ADD A SEED');
+    expect(t.status()).toBe('✋ NO MORE BETS — WAITING FOR SEEDS');
+    put(a, T0 + 19_200, gk.reveal(1, BOB.pid), gk.reveal(1, CAT.pid));
+    t.update();
+    expect(foldOf(a).tip).toMatchObject({ decided: null });
+    expect(t.status()).toBe("✋ NO MORE BETS — WAITING FOR THE HOUSE'S SEED");
+    at(a, T0 + 18_800 + HOUSE_HEARD_MS + 400);
+    t.update();
+    expect(t.status()).toBe('⚠ THE HOUSE WENT OFFLINE · THIS ROUND GOES VOID UNLESS IT COMES BACK · THEN THE TABLE WAITS FOR IT');
+    expect(t.card()).toContain('THE HOUSE IS NOT HEARD · THIS ROUND GOES VOID UNLESS IT COMES BACK');
     t.unmount();
   });
 });
