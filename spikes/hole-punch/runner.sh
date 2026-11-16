@@ -61,7 +61,9 @@ seal() { # pubkey plain prefix
   rm -f "$OUT/k"
 }
 unseal() { # key.b64 data.b64 out
-  base64 -d "$1" | openssl pkeyutl -decrypt -inkey "$OUT/me.key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 > "$OUT/k" &&
+  # A key sealed on Windows ends "\r\n" (its openssl writes text mode); the
+  # password is the hex alone, so the "\r" goes before it is used.
+  base64 -d "$1" | openssl pkeyutl -decrypt -inkey "$OUT/me.key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 | tr -d '\r' > "$OUT/k" &&
     base64 -d "$2" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "file:$OUT/k" > "$3"
   local ok=$?
   rm -f "$OUT/k"
