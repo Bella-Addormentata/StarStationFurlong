@@ -524,6 +524,15 @@ pub struct HouseFoldReport {
     /// only so many (they are followed as others end).
     pub tables: u64,
     pub tables_over: u64,
+    /// 🔒 FAIR ONLY games followed now (the ones the house serves), the ones left out for want of the worker's places,
+    /// and the ones whose latest answer is the game as the node last read it: what the house's trims of its games will
+    /// go by. Nothing is compared with the pages for them.
+    #[serde(default)]
+    pub games: u64,
+    #[serde(default)]
+    pub games_over: u64,
+    #[serde(default)]
+    pub game_answers: u64,
     /// Why the fold is off (`crashes`: the worker failed too often; `env`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off: Option<String>,

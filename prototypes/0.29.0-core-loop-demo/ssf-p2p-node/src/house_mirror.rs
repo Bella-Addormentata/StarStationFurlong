@@ -42,6 +42,13 @@
 //! worker's table is opened again from the new base (a trim, a new
 //! incarnation).
 //!
+//! 🔒 A FAIR ONLY game (letters `p`/`q`) has no `sum:`: its base is the
+//! checkpoint (`ck:`) the house's authority resolver chose, and the caller
+//! GIVES it ([`RoomMirror::want_with`]). The mirror reads no base of such a
+//! table from the doc and watches no `sum:` for it; its live session is
+//! `ses:<t>:<inc>:<sid>` with the id the base names ([`hb::next_sid3`]), and a
+//! base given anew is a change of base as a trim is, read at the next drain.
+//!
 //! BOUNDED. Reads are charged as the house's are (key + [`VISIT_BYTES`] +
 //! the value's weight, [`MAX_RECORD_BYTES`] for a heavy one) to a budget of
 //! [`DRAIN_BYTES`] and [`DRAIN_PATHS`] a drain, and what it leaves unread
@@ -611,6 +618,9 @@ struct Cold {
 struct Table {
     ctx: Ctx,
     sum_name: String,
+    /// 🔒 The base the caller gave (a FAIR ONLY game's checkpoint, chosen by the house's authority resolver): no `sum:`
+    /// is read or watched for the table, and its live session is the one the base names ([`hb::next_sid3`]).
+    given: Option<CVal>,
     /// The base is still to be read (a new table).
     read_base: bool,
     /// It has been read once.
@@ -693,6 +703,7 @@ impl Table {
         Table {
             ctx,
             sum_name,
+            given: None,
             read_base: true,
             based: false,
             base: Base::Absent,
@@ -783,9 +794,11 @@ impl Table {
         }
         self.based = true;
         self.base = new;
-        self.live = match &self.base {
-            Base::Absent => hb::next_sid(&self.ctx, None),
-            Base::Cp(cp) if cp.get("e").is_none() => hb::next_sid(&self.ctx, Some(cp)),
+        self.live = match (&self.given, &self.base) {
+            (Some(_), Base::Cp(cp)) if cp.get("e").is_none() => hb::next_sid3(&self.ctx, cp),
+            (Some(_), _) => None,
+            (None, Base::Absent) => hb::next_sid(&self.ctx, None),
+            (None, Base::Cp(cp)) if cp.get("e").is_none() => hb::next_sid(&self.ctx, Some(cp)),
             _ => None,
         }
         .map(|sid| format!("ses:{}:{}:{sid}", self.ctx.t, self.ctx.inc));
@@ -1032,26 +1045,32 @@ impl Table {
     /// the budget is spent.
     fn step<T: ReadTxn>(&mut self, pending: &mut Dirt, comp: Option<&MapRef>, txn: &T, b: &mut Budget, limits: &Limits) -> bool {
         // The base.
-        if self.read_base || pending.tops.contains(&self.sum_name) {
+        if self.read_base || (self.given.is_none() && pending.tops.contains(&self.sum_name)) {
             if !b.path() {
                 return false;
             }
-            let out = comp.and_then(|c| c.get(txn, &self.sum_name));
-            // (As the house reads it: a checkpoint is read up to what a tick may read.)
-            let new = match read_costed(|n| b.charge(n), self.sum_name.len(), out, READ_PER_TICK) {
-                Read::Spent => return false,
-                Read::Val(v) if checkpoint_ok(&v, &self.ctx.inc) => Base::Cp(v),
-                Read::Val(_) | Read::Absent => Base::Absent,
-                // (One a page may take as read, or as junk: held if it is a
-                // checkpoint as read, no base if it is none either way.)
-                Read::Unclear(v, hb::Clarity::Proto) => {
-                    if checkpoint_ok(&v, &self.ctx.inc) {
-                        Base::Held
-                    } else {
-                        Base::Absent
+            let new = match &self.given {
+                // 🔒 (Given: read by the house, which chose it.)
+                Some(cp) => Base::Cp(cp.clone()),
+                None => {
+                    let out = comp.and_then(|c| c.get(txn, &self.sum_name));
+                    // (As the house reads it: a checkpoint is read up to what a tick may read.)
+                    match read_costed(|n| b.charge(n), self.sum_name.len(), out, READ_PER_TICK) {
+                        Read::Spent => return false,
+                        Read::Val(v) if checkpoint_ok(&v, &self.ctx.inc) => Base::Cp(v),
+                        Read::Val(_) | Read::Absent => Base::Absent,
+                        // (One a page may take as read, or as junk: held if it is a
+                        // checkpoint as read, no base if it is none either way.)
+                        Read::Unclear(v, hb::Clarity::Proto) => {
+                            if checkpoint_ok(&v, &self.ctx.inc) {
+                                Base::Held
+                            } else {
+                                Base::Absent
+                            }
+                        }
+                        Read::Unclear(..) | Read::Heavy => Base::Held,
                     }
                 }
-                Read::Unclear(..) | Read::Heavy => Base::Held,
             };
             pending.tops.remove(&self.sum_name);
             let sets = pending.writes.remove(&self.sum_name).unwrap_or(0);
@@ -1320,15 +1339,30 @@ impl RoomMirror {
     /// Mirror these tables, `(t, inc)`, and no others. The ones dropped are
     /// returned, for the worker to forget.
     pub fn want(&mut self, tables: &[(String, String)]) -> Vec<Ctx> {
+        self.want_with(tables, &BTreeMap::new())
+    }
+
+    /// 🔒 [`RoomMirror::want`], and the tables in `given` (FAIR ONLY games) follow the base given there, not a `sum:`:
+    /// a base other than the one a table has (by its canonical bytes) is read as its new base at the next drain, as a
+    /// trim is. A table of `tables` that `given` does not name keeps the base it was given last (or none, and follows
+    /// its `sum:`, if it never had one).
+    pub fn want_with(&mut self, tables: &[(String, String)], given: &BTreeMap<(String, String), CVal>) -> Vec<Ctx> {
         let keep: BTreeSet<&(String, String)> = tables.iter().collect();
         let gone: Vec<Ctx> = self.tables.iter().filter(|(k, _)| !keep.contains(k)).map(|(_, t)| t.ctx.clone()).collect();
         self.tables.retain(|k, _| keep.contains(k));
         for (t, inc) in tables {
             let (room, births) = (&self.room, &mut self.births);
-            self.tables.entry((t.clone(), inc.clone())).or_insert_with(|| {
+            let table = self.tables.entry((t.clone(), inc.clone())).or_insert_with(|| {
                 *births += 1;
                 Table::new(Ctx { room: room.clone(), t: t.clone(), inc: inc.clone() }, *births)
             });
+            if let Some(cp) = given.get(&(t.clone(), inc.clone())) {
+                let same = table.given.as_ref().is_some_and(|was| matches!((hb::canon(was), hb::canon(cp)), (Some(a), Some(b)) if a == b));
+                if !same {
+                    table.given = Some(cp.clone());
+                    table.read_base = true;
+                }
+            }
         }
         self.sync_watch();
         self.sweep();
@@ -1379,10 +1413,11 @@ impl RoomMirror {
         self.resets
     }
 
-    /// The names the observer watches: each table's `sum:`, and its live session.
+    /// The names the observer watches: each table's `sum:` (🔒 but a table's whose base is given), and its live session.
     fn sync_watch(&mut self) {
-        let names: HashSet<String> = self.tables.values().flat_map(|t| [Some(t.sum_name.clone()), t.live.clone()]).flatten().collect();
-        let sums: HashMap<String, String> = self.tables.values().map(|t| (t.sum_name.clone(), t.ctx.inc.clone())).collect();
+        let sum = |t: &Table| t.given.is_none().then(|| t.sum_name.clone());
+        let names: HashSet<String> = self.tables.values().flat_map(|t| [sum(t), t.live.clone()]).flatten().collect();
+        let sums: HashMap<String, String> = self.tables.values().filter(|t| t.given.is_none()).map(|t| (t.sum_name.clone(), t.ctx.inc.clone())).collect();
         let mut w = lock(&self.shared);
         w.names = names;
         w.sums = sums;
@@ -1458,7 +1493,7 @@ impl RoomMirror {
     /// been noted that no drain has read.
     pub fn base_unread(&self, t: &str, inc: &str) -> bool {
         let Some(tb) = self.tables.get(&(t.to_string(), inc.to_string())) else { return false };
-        tb.read_base || self.pending.tops.contains(&tb.sum_name) || lock(&self.shared).dirt.tops.contains(&tb.sum_name)
+        tb.read_base || (tb.given.is_none() && (self.pending.tops.contains(&tb.sum_name) || lock(&self.shared).dirt.tops.contains(&tb.sum_name)))
     }
 
     /// Start a table over, to be sent again from scratch (the worker lost it):
@@ -1477,7 +1512,7 @@ impl RoomMirror {
     /// (as of the last drain): nothing of it is waiting to be read.
     pub fn current(&self, t: &str, inc: &str) -> bool {
         let Some(tb) = self.tables.get(&(t.to_string(), inc.to_string())) else { return false };
-        if !tb.based || tb.read_base || tb.need_session || tb.cold.is_some() || tb.recount || self.pending.tops.contains(&tb.sum_name) {
+        if !tb.based || tb.read_base || tb.need_session || tb.cold.is_some() || tb.recount || (tb.given.is_none() && self.pending.tops.contains(&tb.sum_name)) {
             return false;
         }
         match &tb.live {

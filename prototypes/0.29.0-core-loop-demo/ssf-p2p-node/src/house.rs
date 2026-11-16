@@ -89,7 +89,7 @@
 //! The rules are computedFold's (THE HOUSE) and the bytes house_bytes.rs's.
 //! The node never decides a round: the pages' fold does, from the records.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -799,6 +799,11 @@ struct RoomMem {
     /// through every table it holds memory of (one for each game it ever held, junk among them).
     serving_games: BTreeSet<GameKey>,
     keyed_games: BTreeSet<GameKey>,
+    /// 🔒 What the node's fold in shadow follows of each FAIR ONLY game this house serves ([`GamePlan`]), as the last
+    /// pass that read the game's session through found it: kept while the passes after it cannot read the game (a check
+    /// put off, a record a page may read otherwise, the tick's reads spent), and gone once a pass finds the game is not
+    /// this house's, or has no base or no session to follow, or the doc holds no record of it.
+    game_plans: BTreeMap<GameKey, GamePlan>,
 }
 
 impl RoomMem {
@@ -862,6 +867,28 @@ pub struct HousePlan {
     /// may have been withdrawn in it, which nothing watched, and the houses here, which are pinned for the run, may be
     /// more than a page that binds now counts. The shadow takes the room's delegations as churned.
     pub gapped: bool,
+    /// 🔒 The FAIR ONLY games this house serves, whoever holds the deed ([`GamePlan`]): followed by the fold, whose answer
+    /// is kept for the house's trim (design-final section 8.5 N3; nothing is compared with the pages, nor signed, yet).
+    pub games: Vec<GamePlan>,
+}
+
+/// 🔒 A FAIR ONLY game this house serves, as the fold in shadow follows it: the base the authority resolver chose, the
+/// session that follows it, and who the game's houses are by round. A game's houses are no set of the room's: each is a
+/// house of the rounds a holder of the game delegated it for (house_auth.rs `house_by`), and the fold is told so.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GamePlan {
+    pub t: String,
+    pub inc: String,
+    /// The rules version the game's name binds.
+    pub rv: String,
+    /// The base: the doc key of its checkpoint (`ck:<t>:<inc>:<id>`), and the checkpoint.
+    pub base_key: String,
+    pub base: CVal,
+    /// The id of the session that follows the base (`ses:<t>:<inc>:<sid>`).
+    pub sid: String,
+    /// `(key, from, to)`: the key is a house of each round r with from < r <= to (no `to`: every round after `from`),
+    /// for this house and every house whose join or reveal the session holds, as the pass found them.
+    pub spans: Vec<(String, i64, Option<i64>)>,
 }
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
@@ -1198,6 +1225,12 @@ impl House {
                 mem.settle_games_again();
             }
         }
+        // (Off: no game is followed for it, and a pass that finds them again plans them afresh.)
+        if !on {
+            for mem in self.rooms.values_mut() {
+                mem.game_plans.clear();
+            }
+        }
         self.serve_games = on;
     }
 
@@ -1350,14 +1383,27 @@ impl House {
     /// here, so the house's lock is held for a copy only.
     pub fn fold_plan(&self, room: &str) -> Option<HousePlan> {
         let mem = self.rooms.get(room)?;
-        let plan = mem.fold.as_ref()?;
+        // 🔒 The FAIR ONLY games it serves, whoever holds the deed: in a room where it is no house of the deed holder's,
+        // a plan of the games only.
+        let games: Vec<GamePlan> = mem.game_plans.values().cloned().collect();
+        let Some(plan) = mem.fold.as_ref() else {
+            return (!games.is_empty()).then(|| HousePlan {
+                owner: String::new(),
+                owner_key: String::new(),
+                tables: Vec::new(),
+                houses: vec![self.key.public.clone()],
+                complete: false,
+                gapped: false,
+                games,
+            });
+        };
         let mut houses: Vec<String> = mem.houses.iter().filter(|(_, owner)| **owner == plan.owner_key).map(|(k, _)| k.clone()).collect();
         houses.push(self.key.public.clone());
         houses.sort();
         houses.dedup();
         // (Only a plan that names a house besides this one has any pinned to be stale.)
         let gapped = mem.gapped && houses.len() > 1;
-        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete, gapped })
+        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete, gapped, games })
     }
 
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
@@ -2037,6 +2083,43 @@ impl House {
         found.unwrap_or_else(|| (self.done.contains_key(&(room.to_string(), key.0.clone(), key.1.clone())), false))
     }
 
+    /// 🔒 Keep what the fold in shadow is to follow of game `key` ([`GamePlan`]), or let it go (None).
+    fn plan_game(&mut self, room: &str, key: &GameKey, plan: Option<GamePlan>) {
+        let Some(mem) = self.rooms.get_mut(room) else { return };
+        match plan {
+            Some(plan) => {
+                mem.game_plans.insert(key.clone(), plan);
+            }
+            None => {
+                mem.game_plans.remove(key);
+            }
+        }
+    }
+
+    /// 🔒 Who the houses of a FAIR ONLY game are by round, for the fold: each of `keys` is a house of every round of a
+    /// holder's stretch (after its `from`, up to the next holder's, or for good) that the holder delegated it for
+    /// ([`ha::Resolution::house_by_with`], with the room's delegation of it, as the walk weighs a house's records: which
+    /// goes by the round only through the holder that holds it), as `(key, from, to)`. A stretch that holds no round, or
+    /// none after the base `base_u`, is left out. None while a check is put off (`deferred` set).
+    fn spans_of(&mut self, room: &str, res: &ha::Resolution, keys: &BTreeSet<&str>, hk: &BTreeMap<String, Hk>, base_u: i64) -> Option<Vec<(String, i64, Option<i64>)>> {
+        let mut spans = Vec::new();
+        let mut waiting = false;
+        for (i, holder) in res.chain.iter().enumerate() {
+            let to = res.chain.get(i + 1).map(|next| next.from);
+            if to.is_some_and(|to| to <= holder.from.max(base_u)) {
+                continue;
+            }
+            for k in keys {
+                match res.house_by_with(k, holder.from + 1, delegation_of(hk, k), &mut |id, key, bytes, g| self.verified_auth(room, id, key, bytes, g)) {
+                    ha::HouseBy::Yes { .. } => spans.push((k.to_string(), holder.from, to)),
+                    ha::HouseBy::No => {}
+                    ha::HouseBy::Pending => waiting = true,
+                }
+            }
+        }
+        (!waiting).then_some(spans)
+    }
+
     /// The walk of [`House::games`]: what it finds of each game goes into `games_through`, and what the doc lost of
     /// it into `reput`. Whether the pass brought the room's index of the games' records up to the doc
     /// (house_index.rs).
@@ -2236,6 +2319,9 @@ impl House {
                 continue;
             }
             let (t, inc) = key.clone();
+            // 🔒 What the fold in shadow is to follow of the game, once the walk has read its session through: a walk that
+            // goes through the game short of that leaves it no plan; one cut short keeps the last.
+            let mut planned: Option<GamePlan> = None;
             // (A game short of a check: nothing there this pass; and no pass of this tick reads it again once the
             // budget is spent. Whether it serves the game now, when the walk got that far: settled there, then, as
             // when a pass last read it through; and so it counts on the passes after that cannot read it, until one
@@ -2258,6 +2344,7 @@ impl House {
                 ($serving:expr, $settled:expr) => {{
                     let found: (bool, bool) = ($serving, $settled);
                     self.note_read_through(room, &key, found);
+                    self.plan_game(room, &key, planned.take());
                     self.through.insert(key.clone(), (false, false));
                     self.games_through.insert(key.clone(), (Some(found), false));
                     continue;
@@ -2430,6 +2517,15 @@ impl House {
                     view.houses_before.insert(k.to_string());
                 }
             }
+            // 🔒 What the fold in shadow follows of the game: its base, the session that follows it, and who its houses
+            // are by round, of this house and of every house whose join or reveal the session holds (a record of any
+            // other key is no house's at its round, and the fold counts it so with no span of its key).
+            let mut keys: BTreeSet<&str> = read.joins.iter().map(|o| o.k.as_str()).chain(read.reveals.iter().map(|e| e.k.as_str())).collect();
+            keys.insert(me.as_str());
+            if let (Some(spans), Some(name)) = (self.spans_of(room, &res, &keys, &ix.hk, read.base_u), res.name.as_ref()) {
+                let sid = read.ses_key.rsplit(':').next().unwrap_or("").to_string();
+                planned = Some(GamePlan { t: key.0.clone(), inc: key.1.clone(), rv: name.rv.clone(), base_key: base.key.clone(), base: base.ck.clone(), sid, spans });
+            }
             if self.deferred {
                 short!(Some(current));
             }
@@ -2440,6 +2536,10 @@ impl House {
         }
         for (key, quiet) in hushed {
             ix.hush(&key, quiet);
+        }
+        // 🔒 (A game the doc holds no record of has no plan: the walk goes through it no more.)
+        if let Some(mem) = self.rooms.get_mut(room) {
+            mem.game_plans.retain(|k, _| ix.games.contains_key(k));
         }
         // 🔒 This house's key holds one value (`hk:<house>`), and each game it serves by a delegation that game's base
         // does not carry wants its own there. One goes back only over what no game can go by: nothing, junk, another

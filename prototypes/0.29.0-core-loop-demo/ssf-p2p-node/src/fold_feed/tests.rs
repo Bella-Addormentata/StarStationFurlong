@@ -11,6 +11,7 @@ use crate::house::{checkpoint_ok, to_any};
 use crate::house_bytes::CVal;
 use crate::house_fold::tests::{cases, check_for, Case};
 use crate::house_mirror::tests::{cp, live0, live_of, obj, rk, rv, s, sum_of};
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -536,6 +537,51 @@ fn houses_and_pins_that_change_are_sent_and_the_same_in_another_order_is_not() {
     let reqs = rig.reqs();
     let w = &warms(&reqs)[0];
     assert!(w.changes.is_empty() && w.pins.len() == 2);
+}
+
+#[test]
+fn a_games_houses_by_round_go_to_that_game_alone_and_the_rooms_houses_to_no_game() {
+    // t1 is a house table, t2 a FAIR ONLY game: the feed goes by what it is given, the game's houses by round and no
+    // set of houses for t2, the room's houses for t1.
+    type Spans = Vec<(String, i64, Option<i64>)>;
+    let game = |spans: Spans| BTreeMap::from([(("t2".to_string(), INC.to_string()), FairHouses { rv: "f1".into(), spans })]);
+    let first: Spans = vec![("h1".into(), 0, None)];
+    let mut rig = stand_rig(&Script::default());
+    rig.inputs = Inputs::new(vec!["h1".into()], vec![]).with_fair(game(first.clone()));
+    rig.session(&live0(), &recs(1));
+    rig.session(&live_of("t2", None), &recs(1));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.until("both caught up", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+    let reqs = rig.reqs();
+    let cold = |t: &str| colds(&reqs).into_iter().find(|c| c.ctx.t == t).map(|c| (c.houses.clone(), c.fair.clone())).unwrap();
+    assert_eq!(cold(T), (vec!["h1".to_string()], None));
+    assert_eq!(cold("t2"), (vec![], Some(FairHouses { rv: "f1".into(), spans: first.clone() })));
+
+    // A hand-over at the game: a warm for the game alone.
+    let handed: Spans = vec![("h1".into(), 0, Some(1)), ("h2".into(), 1, None)];
+    rig.inputs = Inputs::new(vec!["h1".into()], vec![]).with_fair(game(handed.clone()));
+    rig.until("the game told", |r| warms(&r.reqs()).len() == 1 && r.caught_up_of(T) && r.caught_up_of("t2"));
+    let reqs = rig.reqs();
+    let w = warms(&reqs)[0];
+    assert_eq!((w.ctx.t.as_str(), w.houses.clone(), w.fair.clone()), ("t2", vec![], Some(FairHouses { rv: "f1".into(), spans: handed.clone() })));
+
+    // A house more in the room: a warm for the house table alone, and none for the game.
+    rig.inputs = Inputs::new(vec!["h1".into(), "h2".into()], vec![]).with_fair(game(handed.clone()));
+    rig.until("the house table told", |r| warms(&r.reqs()).len() == 2 && r.caught_up_of(T) && r.caught_up_of("t2"));
+    for _ in 0..10 {
+        rig.tick();
+    }
+    let reqs = rig.reqs();
+    assert_eq!(warms(&reqs).len(), 2, "nothing for the game");
+    let w = warms(&reqs)[1];
+    assert_eq!((w.ctx.t.as_str(), w.houses.clone(), w.fair.clone()), (T, vec!["h1".to_string(), "h2".to_string()], None));
+
+    // And the same houses by round given again: nothing.
+    rig.inputs = Inputs::new(vec!["h2".into(), "h1".into()], vec![]).with_fair(game(handed));
+    for _ in 0..10 {
+        rig.tick();
+    }
+    assert_eq!(warms(&rig.reqs()).len(), 2);
 }
 
 // ── Losing a table ───────────────────────────────────────────────────────────
