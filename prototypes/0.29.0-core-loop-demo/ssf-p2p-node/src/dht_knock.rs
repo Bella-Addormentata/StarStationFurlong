@@ -740,49 +740,57 @@ impl KnockDht {
         self.dht.announce_peer(id, Some(port)).await.map(|_| ()).map_err(|e| e.to_string())
     }
 
-    /// The newest note signed by `public`, as far as the DHT answered `within`
-    /// that long, and whether the read got to its end by then. `None` only
-    /// when the DHT client has stopped. As with a lookup, what came early is
-    /// kept when the tail is slow.
-    async fn newest_note(&self, public: &[u8; 32], within: Duration) -> Option<NoteRead> {
+    /// Every version of the note signed by `public` that the DHT handed over
+    /// within `within` ([`NOTE_VERSIONS_MAX`] at most, the newest kept), and
+    /// whether the read got to its end by then. `None` only when the DHT
+    /// client has stopped. As with a lookup, what came early is kept when the
+    /// tail is slow.
+    async fn read_note(&self, public: &[u8; 32], within: Duration) -> Option<NoteRead> {
         let deadline = tokio::time::Instant::now() + within;
-        let mut items = match tokio::time::timeout_at(deadline, self.dht.get_mutable(public, None, None)).await {
-            Ok(Ok(items)) => items,
+        let mut answers = match tokio::time::timeout_at(deadline, self.dht.get_mutable(public, None, None)).await {
+            Ok(Ok(answers)) => answers,
             Ok(Err(_)) => return None,
-            Err(_) => return Some(NoteRead { item: None, complete: false }),
+            Err(_) => return Some(NoteRead { items: Vec::new(), complete: false }),
         };
-        let mut newest: Option<MutableItem> = None;
-        loop {
-            match tokio::time::timeout_at(deadline, items.next()).await {
+        let mut items: Vec<MutableItem> = Vec::new();
+        let complete = loop {
+            match tokio::time::timeout_at(deadline, answers.next()).await {
                 Ok(Some(item)) => {
-                    if newest.as_ref().map_or(true, |kept| item.seq() > kept.seq()) {
-                        newest = Some(item);
+                    if !items.iter().any(|kept| kept.seq() == item.seq() && kept.value() == item.value()) {
+                        items.push(item);
+                        items.sort_by_key(|kept| std::cmp::Reverse(kept.seq()));
+                        items.truncate(NOTE_VERSIONS_MAX);
                     }
                 }
-                Ok(None) => return Some(NoteRead { item: newest, complete: true }),
-                Err(_) => return Some(NoteRead { item: newest, complete: false }),
+                Ok(None) => break true,
+                Err(_) => break false,
             }
-        }
+        };
+        Some(NoteRead { items, complete })
     }
 
     /// Leave `mine`, this computer's public IPv6 addresses, in the note for
     /// `holder` in the room of `room_key` during the hour `bucket`: read the
     /// note (waiting `read_within` at most), keep what other knockers left
-    /// that still stands, write it back one newer, and read it again
+    /// that still stands, write it back newer, and read it again
     /// [`V6_NOTE_RECHECK`] later. The number of entries the note holds on
     /// success.
     ///
     /// A note is one item that every knocker at this holder writes whole, and
-    /// the DHT keeps the last write. So:
+    /// a DHT node keeps the last write it was handed. So:
     /// - a read that did not get to its end and found nothing writes nothing:
     ///   the note may be there unread, and writing over it would drop the
     ///   other knockers' entries. The next knock tries again.
-    /// - a write after a read that found the note names the version it read
+    /// - what is written is merged from every version the read saw, so two
+    ///   versions that nodes hold side by side (two knockers who wrote at
+    ///   once) become one again; and the write names the newest version read
     ///   (`cas`): where another knocker wrote in between, the DHT's nodes turn
     ///   it down, and the knocker reads again and writes once more.
-    /// - two knockers that both found no note write with nothing to name; the
-    ///   later write drops the earlier's entries. The read after the write
-    ///   sees that, and the knocker whose entries went writes them back.
+    /// - the read after the write must find the note settled: one newest
+    ///   version, with all of ours in it ([`note_settled`]). Otherwise our
+    ///   write was crossed, counts for nothing, and the knocker writes again.
+    ///   Three crossed writes in a row are a failure, and the next knock
+    ///   tries again.
     async fn leave_v6_note(
         &self,
         room_key: &[u8; 32],
@@ -794,34 +802,27 @@ impl KnockDht {
         let signer = v6_note_signer(room_key, holder, bucket);
         let key = v6_note_key(room_key, holder, bucket);
         let public = signer.verifying_key().to_bytes();
-        // Entries the note held after our last write that the read after it
-        // saw ours in, or that we wrote without a read after it yet.
+        // Our last write, until the read after it says it was crossed.
         let mut written: Option<usize> = None;
         for _ in 0..3 {
-            let read = self.newest_note(&public, read_within).await.ok_or("the DHT client stopped")?;
-            let old = read.item.as_ref().and_then(|item| open_v6_note(&key, item.value())).unwrap_or_default();
+            let read = self.read_note(&public, read_within).await.ok_or("the DHT client stopped")?;
+            let versions = opened_versions(&key, &read.items);
             if let Some(entries) = written {
-                // The read after our write: where all of ours still stand,
-                // the note is left. A read that saw nothing in time says
-                // nothing either way.
-                let kept = mine.iter().all(|addr| old.iter().any(|entry| entry.addr == *addr));
-                if kept || (read.item.is_none() && !read.complete) {
-                    return Ok(if kept { old.len() } else { entries });
+                if note_settled(&versions, mine) {
+                    return Ok(note_entries(&versions).len());
                 }
-            } else if read.item.is_none() && !read.complete {
+                // A read that saw nothing in time says nothing either way.
+                if read.items.is_empty() && !read.complete {
+                    return Ok(entries);
+                }
+                written = None;
+            } else if read.items.is_empty() && !read.complete {
                 return Err(format!("the note could not be read within {} s; the next knock writes it", read_within.as_secs()));
             }
             let now = crate::chia_resolve::unix_now();
-            let cas = read.item.as_ref().map(|item| item.seq());
-            let entries = merge_v6_note(&old, mine, now);
-            // One newer than what was read, and never behind the clock in
-            // milliseconds: two knockers who both found no note write two
-            // versions the DHT's nodes order alike (a node keeps the higher
-            // and turns the lower down), so the read after the write shows
-            // the earlier writer that its entries went, never a split.
-            let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as i64);
-            let seq = cas.map_or(0, |seq| seq.saturating_add(1)).max(millis);
-            let item = MutableItem::new(&signer, &seal_v6_note(&key, &entries), seq, None);
+            let cas = read.items.iter().map(MutableItem::seq).max();
+            let entries = merge_v6_note(&note_entries(&versions), mine, now);
+            let item = MutableItem::new(&signer, &seal_v6_note(&key, &entries), note_seq(cas), None);
             match self.dht.put_mutable(item, cas).await {
                 Ok(_) => {
                     written = Some(entries.len());
@@ -831,15 +832,61 @@ impl KnockDht {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        written.ok_or_else(|| "other knocks wrote the note at the same moments, three times".to_string())
+        match written {
+            // The last write was not read back yet: nothing says it was crossed.
+            Some(entries) => Ok(entries),
+            None => Err("other knocks crossed every write of the note; the next knock writes it".to_string()),
+        }
     }
 }
 
-/// What a read of a note found: the newest version it saw, and whether the
-/// read got to its end in the time it had.
+/// Versions of one note a read keeps at most.
+const NOTE_VERSIONS_MAX: usize = 16;
+
+/// What a read of a note found: the versions it saw, newest first, and
+/// whether the read got to its end in the time it had.
 pub(crate) struct NoteRead {
-    item: Option<MutableItem>,
+    items: Vec<MutableItem>,
     complete: bool,
+}
+
+/// The versions among `items` that `key` opens, as (version, entries).
+pub(crate) fn opened_versions(key: &[u8; 32], items: &[MutableItem]) -> Vec<(i64, Vec<V6Entry>)> {
+    items.iter().filter_map(|item| open_v6_note(key, item.value()).map(|entries| (item.seq(), entries))).collect()
+}
+
+/// Every entry of every version, one per address, the one that stands longest.
+/// The holder opens toward all of them: nodes may hold two versions side by
+/// side for a while (two knockers wrote at once), and each names a knocker.
+pub(crate) fn note_entries(versions: &[(i64, Vec<V6Entry>)]) -> Vec<V6Entry> {
+    let mut out: Vec<V6Entry> = Vec::new();
+    for entry in versions.iter().flat_map(|(_, entries)| entries) {
+        match out.iter_mut().find(|kept| kept.addr == entry.addr) {
+            Some(kept) => kept.until = kept.until.max(entry.until),
+            None => out.push(*entry),
+        }
+    }
+    out
+}
+
+/// Is the note as a knocker wants to leave it: one newest version (two that
+/// share a version number but differ are two knockers' writes that crossed),
+/// holding all of `mine`?
+pub(crate) fn note_settled(versions: &[(i64, Vec<V6Entry>)], mine: &[SocketAddrV6]) -> bool {
+    let Some(top) = versions.iter().map(|(seq, _)| *seq).max() else { return false };
+    let newest: Vec<&Vec<V6Entry>> = versions.iter().filter(|(seq, _)| *seq == top).map(|(_, entries)| entries).collect();
+    newest.windows(2).all(|pair| pair[0] == pair[1]) && mine.iter().all(|addr| newest[0].iter().any(|entry| entry.addr == *addr))
+}
+
+/// The version number of a write after a read whose newest version was `cas`:
+/// above it, and above the clock in microseconds with a random part below the
+/// millisecond, so two knockers who write at once (both after the same read,
+/// or both after none) all but never pick one number. Where they do, the
+/// read after the write sees two versions under it ([`note_settled`]).
+pub(crate) fn note_seq(cas: Option<i64>) -> i64 {
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as i64);
+    let clock = millis.saturating_mul(1000).saturating_add(rand::Rng::gen_range(&mut rand::thread_rng(), 0..1000));
+    cas.map_or(0, |seq| seq.saturating_add(1)).max(clock)
 }
 
 /// Every address `answers` hands over before `deadline`, and all of them when
@@ -1027,7 +1074,7 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         let (looked, noted) = tokio::join!(
             n0_future::join_all(points.into_iter().map(|(room_id, point)| async move { (room_id, knock.lookup(point, LOOKUP_TIMEOUT).await) })),
             n0_future::join_all(
-                notes.into_iter().map(|(room_id, public, key)| async move { (room_id, key, knock.newest_note(&public, LOOKUP_TIMEOUT).await) })
+                notes.into_iter().map(|(room_id, public, key)| async move { (room_id, key, knock.read_note(&public, LOOKUP_TIMEOUT).await) })
             ),
         );
         if looked.iter().any(|(_, found)| found.is_none()) || noted.iter().any(|(_, _, found)| found.is_none()) {
@@ -1045,8 +1092,8 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         }
         let now = crate::chia_resolve::unix_now();
         for (room_id, key, found) in noted {
-            let Some(NoteRead { item: Some(note), .. }) = found else { continue };
-            let entries = open_v6_note(&key, note.value()).unwrap_or_default();
+            let Some(read) = found else { continue };
+            let entries = note_entries(&opened_versions(&key, &read.items));
             for addr in v6_openings(&entries, now, &own6, crate::ipv6_is_public) {
                 knocked.push((room_id.clone(), SocketAddr::V6(addr)));
             }
@@ -2196,12 +2243,12 @@ mod tests {
         let hour = bucket_of(crate::chia_resolve::unix_now());
         let public = v6_note_signer(&room, &me, hour).verifying_key().to_bytes();
         let seal = v6_note_key(&room, &me, hour);
-        assert!(matches!(holder.newest_note(&public, LOOKUP_TIMEOUT).await, Some(NoteRead { item: None, complete: true })), "nothing left yet");
+        assert!(nothing_at(&holder, &public).await, "nothing left yet");
 
         assert_eq!(first.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], LOOKUP_TIMEOUT).await, Ok(1));
         assert_eq!(second.leave_v6_note(&room, &me, hour, &[pub6(2, 44452), pub6(3, 44452)], LOOKUP_TIMEOUT).await, Ok(3));
-        let note = holder.newest_note(&public, LOOKUP_TIMEOUT).await.expect("a lookup").item.expect("a note");
-        let entries = open_v6_note(&seal, note.value()).expect("the room's key opens it");
+        let read = holder.read_note(&public, LOOKUP_TIMEOUT).await.expect("a lookup");
+        let entries = note_entries(&opened_versions(&seal, &read.items));
         let now = crate::chia_resolve::unix_now();
         let mut opened = v6_openings(&entries, now, &HashSet::new(), crate::ipv6_is_public);
         opened.sort();
@@ -2210,9 +2257,47 @@ mod tests {
         assert_eq!(first.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], LOOKUP_TIMEOUT).await, Ok(3));
         // Another hour's note, or another holder's, is somewhere else.
         let elsewhere = v6_note_signer(&room, &me, hour + 1).verifying_key().to_bytes();
-        assert!(matches!(holder.newest_note(&elsewhere, LOOKUP_TIMEOUT).await, Some(NoteRead { item: None, complete: true })));
+        assert!(nothing_at(&holder, &elsewhere).await);
         let other_holder = v6_note_signer(&room, &key(2), hour).verifying_key().to_bytes();
-        assert!(matches!(holder.newest_note(&other_holder, LOOKUP_TIMEOUT).await, Some(NoteRead { item: None, complete: true })));
+        assert!(nothing_at(&holder, &other_holder).await);
+    }
+
+    /// A read that got to its end and found no note.
+    async fn nothing_at(dht: &KnockDht, public: &[u8; 32]) -> bool {
+        let read = dht.read_note(public, LOOKUP_TIMEOUT).await.expect("a lookup");
+        read.complete && read.items.is_empty()
+    }
+
+    /// The addresses of every version of the note a read sees, sorted.
+    async fn noted_addrs(dht: &KnockDht, public: &[u8; 32], seal: &[u8; 32]) -> Vec<SocketAddrV6> {
+        let read = dht.read_note(public, LOOKUP_TIMEOUT).await.expect("a lookup");
+        let mut addrs: Vec<SocketAddrV6> = note_entries(&opened_versions(seal, &read.items)).iter().map(|entry| entry.addr).collect();
+        addrs.sort();
+        addrs
+    }
+
+    #[test]
+    fn a_note_is_settled_only_with_one_newest_version_that_holds_ours() {
+        let (a, b) = (pub6(1, 44442), pub6(2, 44452));
+        let at = |addr: SocketAddrV6, until: u64| V6Entry { addr, until };
+        // Two versions under one number: two writes crossed. Not settled for
+        // either writer, and the holder opens toward both.
+        let crossed = vec![(5, vec![at(a, 100)]), (5, vec![at(b, 100)])];
+        assert!(!note_settled(&crossed, &[a]) && !note_settled(&crossed, &[b]));
+        assert_eq!(note_entries(&crossed), vec![at(a, 100), at(b, 100)]);
+        // One newest version with ours in it: settled, whatever older ones say.
+        let merged = vec![(6, vec![at(b, 100), at(a, 200)]), (5, vec![at(a, 100)])];
+        assert!(note_settled(&merged, &[a]) && note_settled(&merged, &[b]));
+        // One address in two versions is one entry, the one that stands longest.
+        assert_eq!(note_entries(&merged), vec![at(b, 100), at(a, 200)]);
+        // Ours dropped by a newer write: not settled.
+        assert!(!note_settled(&[(7, vec![at(b, 100)]), (6, vec![at(a, 100), at(b, 100)])], &[a]));
+        // No version at all: nothing is settled.
+        assert!(!note_settled(&[], &[a]));
+        // A version number is above the one read, and above the clock.
+        assert_eq!(note_seq(Some(i64::MAX - 1)), i64::MAX);
+        let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+        assert!(note_seq(None) >= micros - 1_000_000 && note_seq(Some(5)) > 5);
     }
 
     /// Two knockers who both read the note before either wrote: the later
@@ -2242,20 +2327,54 @@ mod tests {
         // A read given no time at all finds nothing and finishes nothing.
         let unfinished = first.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], Duration::ZERO).await;
         assert!(unfinished.is_err(), "{unfinished:?}");
-        assert!(matches!(holder.newest_note(&public, LOOKUP_TIMEOUT).await, Some(NoteRead { item: None, complete: true })), "nothing was written");
+        assert!(nothing_at(&holder, &public).await, "nothing was written");
 
-        // Both at once; the second a moment later, so the two versions are
-        // not of one millisecond.
+        // Both at once.
         let (one, two) = ([pub6(1, 44442)], [pub6(2, 44452)]);
-        let (a, b) = tokio::join!(first.leave_v6_note(&room, &me, hour, &one, LOOKUP_TIMEOUT), async {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            second.leave_v6_note(&room, &me, hour, &two, LOOKUP_TIMEOUT).await
-        });
+        let (a, b) = tokio::join!(
+            first.leave_v6_note(&room, &me, hour, &one, LOOKUP_TIMEOUT),
+            second.leave_v6_note(&room, &me, hour, &two, LOOKUP_TIMEOUT)
+        );
         assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
-        let note = holder.newest_note(&public, LOOKUP_TIMEOUT).await.expect("a lookup").item.expect("a note");
-        let mut addrs: Vec<SocketAddrV6> = open_v6_note(&seal, note.value()).expect("opens").iter().map(|entry| entry.addr).collect();
-        addrs.sort();
-        assert_eq!(addrs, vec![pub6(1, 44442), pub6(2, 44452)]);
+        assert_eq!(noted_addrs(&holder, &public, &seal).await, vec![pub6(1, 44442), pub6(2, 44452)]);
+    }
+
+    /// Two writes under ONE version number, forced: the second knocker's
+    /// write replaces the first's at the DHT's nodes (a node takes an equal
+    /// number). The first knocker's next leave reads its entries gone, merges
+    /// them back, and the holder sees both.
+    #[tokio::test]
+    async fn a_write_under_the_same_version_number_is_mended_by_the_knocker_it_dropped() {
+        let testnet = n0_mainline::Testnet::new(8).await.expect("a DHT of our own");
+        let client = || {
+            let mut builder = DhtBuilder::default();
+            builder.bootstrap(&testnet.bootstrap);
+            KnockDht::start(&builder).expect("a DHT client")
+        };
+        let first = client();
+        let second = client();
+        let holder = client();
+        for dht in [&first, &second, &holder] {
+            assert_eq!(dht.dht.bootstrapped().await, Ok(true));
+        }
+        let room = [10u8; 32];
+        let me = key(4);
+        let hour = bucket_of(crate::chia_resolve::unix_now());
+        let signer = v6_note_signer(&room, &me, hour);
+        let public = signer.verifying_key().to_bytes();
+        let seal = v6_note_key(&room, &me, hour);
+        let until = crate::chia_resolve::unix_now() + V6_NOTE_LIFE.as_secs();
+        let (a, b) = (pub6(1, 44442), pub6(2, 44452));
+        let seq = note_seq(None);
+        let written = |addr: SocketAddrV6| MutableItem::new(&signer, &seal_v6_note(&seal, &[V6Entry { addr, until }]), seq, None);
+        first.dht.put_mutable(written(a), None).await.expect("the first write");
+        second.dht.put_mutable(written(b), None).await.expect("the second, under the same number");
+        assert_eq!(noted_addrs(&holder, &public, &seal).await, vec![b], "the first knocker's entry went");
+
+        assert!(first.leave_v6_note(&room, &me, hour, &[a], LOOKUP_TIMEOUT).await.is_ok());
+        assert_eq!(noted_addrs(&holder, &public, &seal).await, vec![a, b]);
+        // And the second, knocking again, finds the note settled as it is.
+        assert_eq!(second.leave_v6_note(&room, &me, hour, &[b], LOOKUP_TIMEOUT).await, Ok(2));
     }
 
     #[test]
