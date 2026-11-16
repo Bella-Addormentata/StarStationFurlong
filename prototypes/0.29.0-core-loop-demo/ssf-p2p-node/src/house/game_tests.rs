@@ -3559,3 +3559,123 @@ fn a_new_holders_good_delegation_stays_while_the_hand_over_is_not_yet_resolved()
     game.ticks();
     assert_eq!(game.records("h:1:").len(), 1, "carol's round, by hers");
 }
+
+// ── What the node's fold in shadow follows of a game ─────────────────────────
+
+/// The games of the house's plan for the room.
+fn planned(house: &House) -> Vec<GamePlan> {
+    house.fold_plan(ROOM).map(|p| p.games).unwrap_or_default()
+}
+
+/// Plans as compared: a base by its canonical bytes (the doc gives its fields in an order of its own), the rest as is.
+fn as_compared(plans: &[GamePlan]) -> Vec<(GamePlan, String)> {
+    plans.iter().map(|p| (GamePlan { base: CVal::Undef, ..p.clone() }, hb::canon(&p.base).expect("a base with canonical bytes"))).collect()
+}
+
+#[test]
+fn the_plan_names_a_game_it_serves_with_its_base_its_session_and_its_houses_by_round() {
+    // The deed is another's, who delegated nothing: the room has no house tables of this house's, and the plan is of
+    // the game only.
+    let mut game = Game::opened("plan", "landlord");
+    assert!(game.house.fold_plan(ROOM).is_none(), "nothing read yet");
+    game.tick(0);
+    let plan = game.house.fold_plan(ROOM).expect("a plan of the game");
+    assert!(plan.tables.is_empty());
+    assert_eq!(plan.houses, vec![game.house.public().to_string()]);
+    let me = game.house.public().to_string();
+    let first = GamePlan {
+        t: T.into(),
+        inc: game.ctx.inc.clone(),
+        rv: "f1".into(),
+        base_key: game.ck_key(&game.base),
+        base: game.base.clone(),
+        sid: game.sid(),
+        spans: vec![(me.clone(), 0, None)],
+    };
+    assert_eq!(as_compared(&plan.games), as_compared(&[first.clone()]));
+
+    // Round 1 decided by its reveal, and trimmed: the plan follows the new base and the session after it.
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    let reveal = game.records("h:1:")[0].0.rsplit(':').next().unwrap().to_string();
+    let commit2 = game.commit(2);
+    game.trim(1, &c, &reveal, Some(&commit2));
+    game.ticks();
+    let after = GamePlan { base_key: game.ck_key(&game.base), base: game.base.clone(), sid: game.sid(), ..first.clone() };
+    assert_ne!(after.sid, first.sid);
+    assert_eq!(as_compared(&planned(&game.house)), as_compared(&[after]));
+}
+
+#[test]
+fn a_game_is_planned_beside_the_house_tables_of_the_deed_holder_it_is_a_house_of() {
+    let mut game = Game::new("plan-beside");
+    // The deed holder delegates this house under its key in the room: a house of the room's house tables too.
+    game.put_top(&format!("hk:{}", game.house.public()), &delegation(&game.owner, game.house.public()));
+    game.ticks();
+    let plan = game.house.fold_plan(ROOM).expect("a plan");
+    assert_eq!(plan.owner, "owner");
+    assert_eq!(plan.games.len(), 1);
+    assert_eq!(plan.games[0].spans, vec![(game.house.public().to_string(), 0, None)]);
+}
+
+#[test]
+fn after_a_hand_over_each_house_is_a_house_of_its_holders_rounds_only() {
+    let mut game = Game::new("plan-hand-over");
+    game.closed_on_the_join();
+    let me = game.house.public().to_string();
+    // Handed to the buyer at round 1, in flight: the seller's house is a house of round 1 only.
+    let buyer = who("buyer");
+    game.transfer(&buyer, 1);
+    let mut theirs = game.second_house(9, &buyer);
+    game.ticks();
+    assert_eq!(planned(&game.house)[0].spans, vec![(me.clone(), 0, Some(1))]);
+    // The seller's house reveals round 1, and the buyer's joins round 2: each one's plan names both, each a house of
+    // its own holder's rounds.
+    game.seeds(1);
+    game.ticks();
+    game.ticks_of(&mut theirs);
+    assert_eq!(game.of("o:2:", theirs.public()).len(), 1, "the buyer's house joined round 2");
+    game.ticks();
+    let both = vec![(me.clone(), 0, Some(1)), (theirs.public().to_string(), 1, None)];
+    assert_eq!(planned(&game.house)[0].spans, both, "the seller's house");
+    let theirs_plan = theirs.fold_plan(ROOM).expect("the buyer's house's plan");
+    assert_eq!(theirs_plan.games.len(), 1);
+    assert_eq!(theirs_plan.games[0].spans, both, "the buyer's house");
+}
+
+#[test]
+fn a_game_it_does_not_serve_has_no_plan() {
+    // Not served: no plan.
+    let mut game = Game::new("plan-off");
+    game.tick(0);
+    assert_eq!(planned(&game.house).len(), 1);
+    game.house.serve_fair_only(false);
+    assert!(game.house.fold_plan(ROOM).is_none(), "off: no game is followed");
+    game.house.serve_fair_only(true);
+    assert!(game.house.fold_plan(ROOM).is_none(), "on again: nothing from before it was off");
+    game.ticks();
+    assert_eq!(planned(&game.house).len(), 1, "on again: planned afresh");
+
+    // Handed on before any of its rounds was decided, to a holder who did not delegate this house: none of its rounds
+    // is this house's, and it is followed no more. (Under an end order it is still served, and followed: its rounds in
+    // flight are this house's to reveal.)
+    game.fin(&game.owner);
+    game.ticks();
+    assert_eq!(planned(&game.house).len(), 1, "an end order: still served");
+    game.transfer(&who("buyer"), 0);
+    game.ticks();
+    assert!(planned(&game.house).is_empty(), "none of its rounds is this house's");
+}
+
+#[test]
+fn a_game_whose_records_are_gone_has_no_plan() {
+    let mut game = Game::new("plan-gone");
+    game.tick(0);
+    assert_eq!(planned(&game.house).len(), 1);
+    // A peer deletes the game's checkpoint and its session: the doc holds no record of it.
+    game.delete_top(&game.ck_key(&game.base));
+    game.delete_top(&game.ses.clone());
+    game.ticks();
+    assert!(planned(&game.house).is_empty());
+}

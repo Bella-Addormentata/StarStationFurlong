@@ -3174,3 +3174,74 @@ fn a_session_replaced_beside_another_tables_trim_is_a_session_replaced_on_its_ow
         }
     }
 }
+
+// ── 🔒 A FAIR ONLY game: the base is given ───────────────────────────────────
+
+#[test]
+fn a_game_follows_the_base_it_is_given_and_no_sum() {
+    const GINC: &str = "p0123456789abcdef01234567";
+    let gctx = Ctx { room: ROOM.into(), t: T.into(), inc: GINC.into() };
+    let tables = [(T.to_string(), GINC.to_string())];
+    let given = |cp: &CVal| BTreeMap::from([(tables[0].clone(), cp.clone())]);
+    let base = norm(obj(vec![("b", s("g")), ("u", CVal::Int(0)), ("l", s(&"0".repeat(32))), ("n", obj(vec![]))]));
+    let live = format!("ses:{T}:{GINC}:{}", hb::next_sid3(&gctx, &base).unwrap());
+    let doc = Doc::new();
+    let m = RoomMirror::attach(&doc, ROOM);
+    let mut f = Fix { doc, m };
+    f.session(&live, &records(&[(1, 10)]));
+    // A `sum:` under the game's name is nobody's base.
+    let sum = format!("sum:{T}:{GINC}");
+    f.put_top(&sum, &cp(5));
+    f.m.want_with(&tables, &given(&base));
+    assert!(f.m.base_unread(T, GINC), "a new table's base is read at the next drain");
+    f.drain();
+    let st = f.m.state(T, GINC).unwrap();
+    assert_eq!(st.live, Some(live.as_str()));
+    assert!(st.serving());
+    assert_eq!(st.base.cloned().map(norm), Some(base.clone()));
+    let got = f.m.take(T, GINC, usize::MAX).map(norm_taken).unwrap();
+    assert!(got.reset);
+    assert_eq!(got.base, Some(base.clone()));
+    assert_eq!(got.changes, vec![(rk(1, 1), Some(rv(1, 10)))]);
+    assert!(f.m.current(T, GINC));
+
+    // A `sum:` written for it is no change: nothing to read, nothing to take.
+    let generation = f.m.state(T, GINC).unwrap().generation;
+    f.put_top(&sum, &cp(6));
+    assert!(f.m.current(T, GINC) && !f.m.base_unread(T, GINC));
+    f.drain();
+    assert_eq!(f.m.state(T, GINC).unwrap().generation, generation);
+    assert!(f.m.take(T, GINC, usize::MAX).unwrap().changes.is_empty());
+
+    // The same base given again, its fields in another order, is no change either.
+    let CVal::Obj(fields) = &base else { unreachable!() };
+    let reordered = CVal::Obj(fields.iter().rev().cloned().collect());
+    f.m.want_with(&tables, &given(&reordered));
+    assert!(!f.m.base_unread(T, GINC) && f.m.current(T, GINC));
+
+    // A new base given: read at the next drain, as a trim is; the table starts over on the session it names.
+    let next = norm(obj(vec![("b", s(live.rsplit(':').next().unwrap())), ("u", CVal::Int(1)), ("l", s(&"a".repeat(32))), ("n", obj(vec![("alice", s("5"))]))]));
+    let live2 = format!("ses:{T}:{GINC}:{}", hb::next_sid3(&gctx, &next).unwrap());
+    f.session(&live2, &records(&[(2, 20)]));
+    f.m.want_with(&tables, &given(&next));
+    assert!(f.m.base_unread(T, GINC) && !f.m.current(T, GINC));
+    f.drain();
+    let st = f.m.state(T, GINC).unwrap();
+    assert_eq!(st.live, Some(live2.as_str()));
+    assert_eq!((st.trims, st.generation > generation), (1, true));
+    let got = f.m.take(T, GINC, usize::MAX).map(norm_taken).unwrap();
+    assert!(got.reset);
+    assert_eq!(got.base, Some(next.clone()));
+    assert_eq!(got.changes, vec![(rk(1, 2), Some(rv(1, 20)))]);
+
+    // Wanted with no base given: it keeps the one it has.
+    f.m.want(&tables);
+    assert!(!f.m.base_unread(T, GINC));
+    f.drain();
+    assert_eq!(f.m.state(T, GINC).unwrap().live, Some(live2.as_str()));
+    // And a record of the session it follows is read as any is.
+    f.put(&live2, &rk(1, 3), &rv(1, 30));
+    assert!(!f.m.current(T, GINC));
+    f.drain();
+    assert_eq!(f.m.take(T, GINC, usize::MAX).map(norm_taken).unwrap().changes, vec![(rk(1, 3), Some(rv(1, 30)))]);
+}

@@ -44,6 +44,13 @@
 //! the house says when it matters: a plan that comes back after a stretch with no plan, in a room where other houses
 //! were pinned (`HousePlan::gapped`), has houses that nothing watched in between (they stay pinned, as the pages pin
 //! them, and a page that binds now counts only those the doc holds), so the room's delegations are churned for good.
+//!
+//! 🔒 FAIR ONLY GAMES. The house's plan also names the FAIR ONLY games it serves (`HousePlan::games`): each one's base,
+//! chosen by the house's authority resolver (the mirror is given it: a game has no `sum:`), and who its houses are by
+//! round. The shadow follows them as it follows the house tables, before them in the worker's places (the house's trims
+//! of its games, design-final section 8.5 N3, go by what the fold says of them), and compares them with nothing: a game's
+//! checkpoints are the house's own to write. What it keeps of each is the latest answer that was the game as the mirror
+//! had last read it, under the plan of the tick ([`GameAnswer`]).
 
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
@@ -56,9 +63,10 @@ use yrs::{Doc, Transact};
 use crate::fold_feed::{Counts, Feed, Inputs};
 use crate::fold_pins::{PinWatch, PlayerPins, PIN_WALK_KEYS, PIN_WALK_TIME};
 use crate::fold_supervisor::{Event, Launch, Supervisor};
-use crate::house::{checkpoint_ok, HousePlan};
+use crate::house::{checkpoint_ok, GamePlan, HousePlan};
+use crate::house_auth as ha;
 use crate::house_bytes::{self as hb, CVal};
-use crate::house_fold::{rules_id, FoldSummary, FOLD_TABLES};
+use crate::house_fold::{rules_id, FairHouses, FoldSummary, HouseSpan, FOLD_TABLES};
 use crate::house_mirror::{Hold, Limits, RoomMirror};
 use crate::HouseFoldReport;
 
@@ -342,6 +350,30 @@ pub struct FoldView {
     /// The houses of the plan are pinned ones that nothing watched for a stretch in which the room had no plan
     /// ([`HousePlan::gapped`]): the room's delegations are taken as churned, for good.
     pub gapped: bool,
+    /// 🔒 The FAIR ONLY games to follow, with their bases and houses by round ([`HousePlan::games`]).
+    pub games: Vec<GamePlan>,
+}
+
+/// 🔒 The latest answer of the fold for a FAIR ONLY game that was the game as the mirror had last read it: of the last
+/// frame sent, which carried the houses by round of the plan of its tick, with nothing left to send or to read, on the
+/// plan's base, and finished (no signature left unchecked). What the house's trim of the game goes by.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameAnswer {
+    /// The base it was folded on (the doc key of its checkpoint) and the id of the session that follows it.
+    pub base_key: String,
+    pub sid: String,
+    /// The houses by round it was folded under (the plan's of its tick): a trim goes by an answer under the houses
+    /// it would sign under.
+    pub spans: Vec<HouseSpan>,
+    /// Which taking up of the game by the mirror, and which frame of the worker's, it is the answer of.
+    pub born: u64,
+    pub frame: u64,
+    pub summary: FoldSummary,
+}
+
+/// 🔒 Whether a table is a FAIR ONLY game (`p`/`q`): followed on the base the plan gives, and compared with nothing.
+fn is_game(k: &TableKey) -> bool {
+    ha::is_fair_only_inc(&k.1)
 }
 
 /// How long a table that the plan stopped naming is kept for the final checkpoint a page writes when it compacts it. The
@@ -500,6 +532,8 @@ struct RoomShadow {
     leaving: bool,
     /// What its comparisons said, for the shadow's log.
     said: Said,
+    /// 🔒 The latest answer for each FAIR ONLY game the view follows ([`GameAnswer`]).
+    answers: BTreeMap<TableKey, GameAnswer>,
 }
 
 /// A checkpoint's identity: the hash of its canonical bytes.
@@ -571,6 +605,7 @@ impl RoomShadow {
             gone: BTreeMap::new(),
             leaving: false,
             said: Vec::new(),
+            answers: BTreeMap::new(),
         }
     }
 
@@ -578,6 +613,10 @@ impl RoomShadow {
     /// the plan stopped naming it (the pages count it ended) and the checkpoint a page writes when it compacts it may
     /// yet come.
     fn kept(&self, k: &TableKey, now: Instant) -> bool {
+        // 🔒 (A game the plan stopped naming is let go of: no checkpoint of it is compared.)
+        if is_game(k) {
+            return false;
+        }
         if self.mirror.base_unread(&k.0, &k.1) {
             return true;
         }
@@ -595,7 +634,7 @@ impl RoomShadow {
         self.gone.retain(|k, _| !view.tables.contains(k));
         for c in self.mirror.tables() {
             let k = (c.t.clone(), c.inc.clone());
-            if !view.tables.contains(&k) {
+            if !view.tables.contains(&k) && !is_game(&k) {
                 self.gone.entry(k).or_insert(now);
             }
         }
@@ -656,6 +695,32 @@ impl RoomShadow {
         }
     }
 
+    /// 🔒 Keep, for each FAIR ONLY game the view follows, the answer in hand if it is the game as the mirror last read it
+    /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it: [`Feed::covers`]), the doc
+    /// has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the plan's, and the fold is
+    /// finished. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
+    /// its answer let go of.
+    fn keep_answers<L: Launch>(&mut self, view: &FoldView, inputs: &Inputs, sup: &Supervisor<L>) {
+        let games: BTreeSet<TableKey> = view.games.iter().map(|g| (g.t.clone(), g.inc.clone())).collect();
+        self.answers.retain(|k, _| games.contains(k));
+        for g in &view.games {
+            let k = (g.t.clone(), g.inc.clone());
+            if !self.feed.covers(&k.0, &k.1, &self.mirror, sup, inputs) || !self.mirror.current(&k.0, &k.1) {
+                continue;
+            }
+            let Some(st) = self.mirror.state(&k.0, &k.1) else { continue };
+            let on_base = st.base.is_some_and(|cp| matches!((hb::canon(cp), hb::canon(&g.base)), (Some(a), Some(b)) if a == b));
+            let Some(fold) = self.feed.fold(&k.0, &k.1).filter(|f| !f.summary.pending) else { continue };
+            if !on_base {
+                continue;
+            }
+            let answer = GameAnswer { base_key: g.base_key.clone(), sid: g.sid.clone(), spans: g.spans.clone(), born: st.born, frame: fold.frame, summary: fold.summary.clone() };
+            if self.answers.get(&k) != Some(&answer) {
+                self.answers.insert(k, answer);
+            }
+        }
+    }
+
     /// The doc read, the worker's answers taken, the tables compared where a
     /// page's trim came. `planned`: every table the plan names, those the cap has no place for included (the view
     /// follows the rest). `keep`: the tables of this room that the view does not follow
@@ -669,9 +734,13 @@ impl RoomShadow {
         if view.gapped {
             self.mirror.inherit_churn();
         }
-        let inputs = Inputs::new(view.houses.clone(), view.pins.clone());
+        // 🔒 (A FAIR ONLY game is folded with its own houses by round, on the base the plan gives.)
+        let fair: BTreeMap<TableKey, FairHouses> = view.games.iter().map(|g| ((g.t.clone(), g.inc.clone()), FairHouses { rv: g.rv.clone(), spans: g.spans.clone() })).collect();
+        let given: BTreeMap<TableKey, CVal> = view.games.iter().map(|g| ((g.t.clone(), g.inc.clone()), g.base.clone())).collect();
+        let inputs = Inputs::new(view.houses.clone(), view.pins.clone()).with_fair(fair);
         // What the answers in hand cover, and were made with, before this tick's drain brings what a page wrote since.
         let covered = self.covered(&inputs, sup);
+        self.keep_answers(view, &inputs, sup);
         let delegations = self.mirror.delegations();
         // (A delegation that changed since the last tick may not be in the plan yet: the house has had no pass since.)
         let moved = delegations.changes != self.seen_delegations;
@@ -698,6 +767,7 @@ impl RoomShadow {
         // that ended it is compared before the table is let go of.
         let mut read: Vec<TableKey> = self.mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
         read.extend(view.tables.iter().cloned());
+        read.extend(given.keys().cloned());
         read.sort();
         read.dedup();
         if handed {
@@ -708,7 +778,7 @@ impl RoomShadow {
                 doubt(&mut self.handover, key, live);
             }
         }
-        self.mirror.want(&read);
+        self.mirror.want_with(&read, &given);
         // (A room with no table has nothing to read: its doc is not taken for it.)
         if !read.is_empty() {
             let txn = doc.transact();
@@ -721,11 +791,12 @@ impl RoomShadow {
         self.expire(now, view, tally);
         // The view's tables, and those that left it and are kept.
         let mut want: Vec<TableKey> = view.tables.clone();
+        want.extend(given.keys().cloned());
         let outside: Vec<TableKey> = self.mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).chain(keep.iter().cloned()).collect();
         want.extend(outside.into_iter().filter(|k| !view.tables.contains(k) && self.kept(k, now)));
         want.sort();
         want.dedup();
-        self.mirror.want(&want);
+        self.mirror.want_with(&want, &given);
         self.gone.retain(|k, _| want.contains(k));
         self.feed.release(now, &self.mirror, sup);
         self.inputs = inputs;
@@ -740,6 +811,7 @@ impl RoomShadow {
         self.feed.absorb(now, events);
         self.mirror.want(&[]);
         self.gone.clear();
+        self.answers.clear();
         self.feed.release(now, &self.mirror, sup);
         self.inputs = Inputs::default();
     }
@@ -774,6 +846,10 @@ impl RoomShadow {
         confirmed.retain(|k, _| keys.contains(k));
         handover.retain(|k, _| keys.contains(k) || planned.contains(k));
         for key in keys {
+            // 🔒 (A FAIR ONLY game's checkpoints are its house's own: nothing to compare.)
+            if is_game(&key) {
+                continue;
+            }
             let (t, inc) = (&key.0, &key.1);
             // (What a line says of which table: the room too, since two rooms can hold the same table.)
             let at = || tag(&room, t, inc);
@@ -971,6 +1047,9 @@ pub struct FoldShadow<L: Launch> {
     /// because the worker has room for [`MAX_SHADOW_TABLES`] only.
     followed: u64,
     over: u64,
+    /// 🔒 The same of the FAIR ONLY games.
+    games_followed: u64,
+    games_over: u64,
 }
 
 impl<L: Launch> FoldShadow<L> {
@@ -989,6 +1068,8 @@ impl<L: Launch> FoldShadow<L> {
             gone: Counts::default(),
             followed: 0,
             over: 0,
+            games_followed: 0,
+            games_over: 0,
         }
     }
 
@@ -1048,7 +1129,7 @@ impl<L: Launch> FoldShadow<L> {
         // (And the key the watch has pinned for that holder is the key the pass pinned: the houses are the ones that
         // key delegated.)
         let held = deed.as_deref() == Some(plan.owner.as_str()) && pins.iter().any(|(pid, key)| *pid == plan.owner && *key == plan.owner_key);
-        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch), gapped: plan.gapped }
+        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch), gapped: plan.gapped, games: plan.games }
     }
 
     /// One tick, with every room the node serves: its doc, and what to follow there (None:
@@ -1072,6 +1153,7 @@ impl<L: Launch> FoldShadow<L> {
             }
             self.remembered.clear();
             self.followed = 0;
+            self.games_followed = 0;
             return;
         }
         let events = self.sup.poll(clock());
@@ -1096,11 +1178,13 @@ impl<L: Launch> FoldShadow<L> {
         // is taken from the others, which may put another out: until no more is. (`base_unread` is false for a
         // table the mirror does not hold: one never followed is not reserved.)
         let order: Vec<(String, TableKey)> = rooms.iter().flat_map(|(room, _, view)| view.iter().flat_map(move |v| v.tables.iter().map(move |k| (room.clone(), k.clone())))).collect();
+        // 🔒 The FAIR ONLY games take their places first: the house's trims of them go by what the fold says.
+        let games: usize = rooms.iter().filter_map(|(_, _, view)| view.as_ref()).map(|v| v.games.len()).sum();
         let mut reserved: usize = keep.values().map(BTreeSet::len).sum();
         let allowance = loop {
             let allowance = MAX_SHADOW_TABLES.saturating_sub(reserved);
             let mut grew = false;
-            for (room, k) in order.iter().skip(allowance) {
+            for (room, k) in order.iter().skip(allowance.saturating_sub(games)) {
                 let Some(rs) = self.rooms.get(room) else { continue };
                 if rs.mirror.base_unread(&k.0, &k.1) && keep.entry(room.clone()).or_default().insert(k.clone()) {
                     reserved += 1;
@@ -1111,7 +1195,15 @@ impl<L: Launch> FoldShadow<L> {
                 break allowance;
             }
         };
-        let (mut room_left, mut over) = (allowance, 0u64);
+        let (mut room_left, mut over, mut games_over) = (allowance, 0u64, 0u64);
+        for (_, _, view) in rooms.iter_mut() {
+            if let Some(view) = view {
+                let kept = view.games.len().min(room_left);
+                games_over += (view.games.len() - kept) as u64;
+                view.games.truncate(kept);
+                room_left -= kept;
+            }
+        }
         for (_, _, view) in rooms.iter_mut() {
             if let Some(view) = view {
                 let kept = view.tables.len().min(room_left);
@@ -1121,6 +1213,7 @@ impl<L: Launch> FoldShadow<L> {
             }
         }
         self.over = over;
+        self.games_over = games_over;
         let none = BTreeSet::new();
         let mut listed = BTreeSet::new();
         for (room, doc, view) in rooms {
@@ -1156,7 +1249,9 @@ impl<L: Launch> FoldShadow<L> {
         }
         // The tables followed are the ones the mirrors hold now, after the follow and the release: those the plan names and
         // those kept for a checkpoint that may yet come (a place of the worker's each, whatever the plan says).
-        self.followed = self.rooms.values().map(|rs| rs.mirror.tables().count() as u64).sum();
+        let (games_followed, followed) = self.rooms.values().flat_map(|rs| rs.mirror.tables()).fold((0u64, 0u64), |(g, t), c| if ha::is_fair_only_inc(&c.inc) { (g + 1, t) } else { (g, t + 1) });
+        self.followed = followed;
+        self.games_followed = games_followed;
         // The worker holds `places` tables (FOLD_TABLES), whatever the shadow meant to follow: a table kept after the view let it go, because
         // its checkpoint came after the places were counted, is held all the same. A table it does not hold yet waits
         // for a place, and takes it when those are let go of (their checkpoints compared on a later tick).
@@ -1193,6 +1288,12 @@ impl<L: Launch> FoldShadow<L> {
         self.rooms.values().fold(self.gone, |c, rs| c.plus(rs.feed.counts()))
     }
 
+    /// 🔒 The latest answer for FAIR ONLY game `(t, inc)` of `room` that was the game as the mirror had last read it
+    /// ([`GameAnswer`]), while the plan names the game.
+    pub fn game_answer(&self, room: &str, t: &str, inc: &str) -> Option<&GameAnswer> {
+        self.rooms.get(room)?.answers.get(&(t.to_string(), inc.to_string()))
+    }
+
     /// `/api/fingerprint`'s `houseFold`.
     pub fn report(&self) -> HouseFoldReport {
         let c = self.counts();
@@ -1214,6 +1315,9 @@ impl<L: Launch> FoldShadow<L> {
             rooms: self.rooms.len() as u64,
             tables: self.followed,
             tables_over: self.over,
+            games: self.games_followed,
+            games_over: self.games_over,
+            game_answers: self.rooms.values().map(|rs| rs.answers.len() as u64).sum(),
             off: self.sup.off().map(str::to_string),
             recent_mismatches: self.log.mismatches.iter().cloned().collect(),
             recent_skips: self.log.skips.iter().cloned().collect(),

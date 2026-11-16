@@ -17,7 +17,10 @@
 //! next changes wait in the mirror and go together after. So an answer is
 //! always for the last frame sent, and its `version` (the mirror's number for
 //! the table when the frame was taken) says whether the table has moved on
-//! since.
+//! since. 🔒 A FAIR ONLY game's frames carry its own rules version and houses
+//! by round (`fair`), and no set of the room's houses; what each table was
+//! last sent with is its own, so a change of one game's houses is a `Warm` of
+//! that game alone.
 //!
 //! WHEN THE WORKER LOSES A TABLE. An answer that says the table is dirty, a
 //! crash that names it, a result the node cannot use: the table is no longer
@@ -47,7 +50,7 @@ use std::time::Instant;
 use crate::fold_supervisor::{backoff, Clock, Event, Launch, Post, State, Supervisor};
 use crate::fold_wire::{is_result_too_big, Cold, Req, Resp, Warm};
 use crate::house_bytes::{CVal, Ctx};
-use crate::house_fold::FoldSummary;
+use crate::house_fold::{FairHouses, FoldSummary};
 use crate::house_mirror::RoomMirror;
 
 /// About how much of a table's changes go in one frame (by the mirror's
@@ -66,11 +69,14 @@ pub const MAX_PENDING_PASSES: u32 = 256;
 
 /// What the worker needs of the room for every table in it: the keys of the
 /// houses, and the key pinned for each player, as (pid, key). Sorted here, so
-/// a list that comes in another order is not a change.
+/// a list that comes in another order is not a change. 🔒 And each FAIR ONLY
+/// game's own: its rules version and who its houses are by round, which it is
+/// folded with in place of the room's houses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
     pub houses: Vec<String>,
     pub pins: Vec<(String, String)>,
+    pub fair: BTreeMap<(String, String), FairHouses>,
 }
 
 impl Inputs {
@@ -79,8 +85,40 @@ impl Inputs {
         houses.dedup();
         pins.sort();
         pins.dedup();
-        Inputs { houses, pins }
+        Inputs { houses, pins, fair: BTreeMap::new() }
     }
+
+    /// 🔒 These, with the FAIR ONLY games' own houses by round.
+    pub fn with_fair(mut self, fair: BTreeMap<(String, String), FairHouses>) -> Inputs {
+        self.fair = fair;
+        self
+    }
+
+    /// What table `k` is folded with under these.
+    fn given(&self, k: &(String, String)) -> Given {
+        match self.fair.get(k) {
+            Some(fair) => Given { houses: Vec::new(), pins: self.pins.clone(), fair: Some(fair.clone()) },
+            None => Given { houses: self.houses.clone(), pins: self.pins.clone(), fair: None },
+        }
+    }
+
+    /// Whether `given` is what table `k` is folded with under these (as [`Inputs::given`], with nothing copied).
+    fn gives(&self, k: &(String, String), given: &Given) -> bool {
+        given.pins == self.pins
+            && match self.fair.get(k) {
+                Some(fair) => given.fair.as_ref() == Some(fair) && given.houses.is_empty(),
+                None => given.fair.is_none() && given.houses == self.houses,
+            }
+    }
+}
+
+/// What a table's frame carried: the room's houses and the pins, or (🔒 a FAIR ONLY game) the game's own houses by
+/// round and the pins ([`Inputs::given`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Given {
+    houses: Vec<String>,
+    pins: Vec<(String, String)>,
+    fair: Option<FairHouses>,
 }
 
 /// What the feed has done, for `/api/fingerprint` and the log.
@@ -148,7 +186,7 @@ struct Unsent {
     version: u64,
     generation: u64,
     /// The houses and pins it carries.
-    given: Inputs,
+    given: Given,
 }
 
 struct Slot {
@@ -161,7 +199,7 @@ struct Slot {
     /// Frames posted to the worker for this slot.
     frames: u64,
     /// The houses and pins as last posted.
-    given: Inputs,
+    given: Given,
     unsent: Option<Unsent>,
     answer: Option<Answer>,
     /// Not before this (a table that came back dirty).
@@ -185,7 +223,7 @@ impl Slot {
             generation: 0,
             sent_version: 0,
             frames: 0,
-            given: Inputs::default(),
+            given: Given::default(),
             unsent: None,
             answer: None,
             retry_at: None,
@@ -333,7 +371,7 @@ impl Feed {
         let slot = self.slots.get(&(t.to_string(), inc.to_string()))?;
         let answer = slot.answer.as_ref()?;
         let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
-        (slot.open && slot.given == *inputs && answer.version == slot.sent_version && slot.unsent.is_none() && !sup.owes(&ctx)).then_some(answer.frame)
+        (slot.open && inputs.gives(&key(&ctx), &slot.given) && answer.version == slot.sent_version && slot.unsent.is_none() && !sup.owes(&ctx)).then_some(answer.frame)
     }
 
     /// The latest answer covers everything the mirror had read as of its last
@@ -494,19 +532,22 @@ impl Feed {
                     // more of its signatures.)
                     let more_to_check = slot.pending_streak < *max_pending
                         && slot.answer.as_ref().is_some_and(|a| a.summary.pending && a.version == slot.sent_version);
-                    if !st.announcing && st.queued == 0 && slot.given == *inputs && st.version == slot.sent_version && !more_to_check {
+                    if !st.announcing && st.queued == 0 && inputs.gives(&key(&ctx), &slot.given) && st.version == slot.sent_version && !more_to_check {
                         continue;
                     }
                     let Some(taken) = mirror.take(&ctx.t, &ctx.inc, FRAME_BYTES) else { continue };
                     let (version, generation) = (taken.version, taken.generation);
+                    // (🔒 A FAIR ONLY game is folded with its own houses by round, and no set of the room's.)
+                    let given = inputs.given(&key(&ctx));
+                    let (houses, fair, pins) = (given.houses.clone(), given.fair.clone(), given.pins.clone());
                     let req = if taken.reset {
                         // (A record that came and went before the first take is no record to start with.)
                         let records: Vec<(String, CVal)> = taken.changes.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-                        Req::Cold(Cold { ctx: ctx.clone(), version, base: taken.base, houses: inputs.houses.clone(), fair: None, pins: inputs.pins.clone(), records })
+                        Req::Cold(Cold { ctx: ctx.clone(), version, base: taken.base, houses, fair, pins, records })
                     } else {
-                        Req::Warm(Warm { ctx: ctx.clone(), version, houses: inputs.houses.clone(), fair: None, pins: inputs.pins.clone(), changes: taken.changes })
+                        Req::Warm(Warm { ctx: ctx.clone(), version, houses, fair, pins, changes: taken.changes })
                     };
-                    Unsent { req, version, generation, given: inputs.clone() }
+                    Unsent { req, version, generation, given }
                 }
             };
             let held = slot.open;

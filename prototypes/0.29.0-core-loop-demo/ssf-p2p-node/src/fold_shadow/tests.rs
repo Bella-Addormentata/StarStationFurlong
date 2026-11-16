@@ -448,7 +448,7 @@ impl Bench {
         let bench = Bench {
             shadow: FoldShadow::new(launch, now),
             doc: Doc::new(),
-            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false }),
+            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] }),
             case,
             now,
             log,
@@ -697,7 +697,7 @@ fn a_room_that_is_no_longer_followed_has_its_tables_forgotten_and_goes() {
     assert_eq!(b.forgets(), 1, "the worker was told");
     assert_eq!(b.shadow.counts().cold, before.cold, "what the room did stays counted");
     // It is followed afresh when there is something again.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
     b.until("followed again", |b| b.caught_up());
     assert_eq!(b.shadow.counts().cold, before.cold + 1);
 }
@@ -809,7 +809,7 @@ fn a_room_followed_again_before_it_was_let_go_of_is_kept() {
     b.view = None;
     b.ticks(3);
     // The house finds the room and its table again while the worker still has to be told.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
     b.shadow.sup.unclog(QUEUE_BYTES);
     for _ in 0..6 {
         b.tick();
@@ -1025,7 +1025,7 @@ fn the_tables_a_worker_can_hold_are_shared_between_the_rooms_in_room_order() {
                 comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
             }
         }
-        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
+        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
         docs.push((room.to_string(), doc, Some(view)));
     }
     for _ in 0..200 {
@@ -1323,7 +1323,7 @@ fn every_table_to_go_is_let_go_of_in_every_room_before_a_new_one_is_asked_for() 
         }
     };
     let names = |p: &str, from: usize, to: usize| -> Vec<String> { (from..to).map(|i| format!("{p}{i}")).collect() };
-    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
+    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
     // Room a has 7 tables and room b 7: the worker is full.
     let (a1, b1) = (names("a", 0, 7), names("b", 0, 7));
     make(&docs[0].1, "room-a", &names("a", 0, 10));
@@ -1390,7 +1390,7 @@ fn a_forget_the_worker_could_not_take_holds_back_the_new_tables_of_every_room() 
     };
     make(&docs[0].1, "room-a", &[long.clone()]);
     make(&docs[1].1, "room-b", &["b0".to_string(), "b1".to_string()]);
-    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
+    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
     for _ in 0..300 {
         b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[&long]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0"])))]);
         thread::sleep(Duration::from_millis(2));
@@ -1455,7 +1455,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
     everyone.extend(b.case.pins.iter().filter(|(p, _)| p != OWNER).cloned());
     everyone.sort();
     let shadow = Mutex::new(b.shadow);
-    let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false };
+    let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false, games: vec![] };
     let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
     // A room with a plan and no table is watched; one with no plan is not.
     tick_shadow(&shadow, docs(&["with", "without"]), Instant::now(), |r| (r == "with").then(|| plan.clone())).unwrap();
@@ -1490,7 +1490,7 @@ fn a_view_is_settled_only_with_a_plan_that_is_complete_and_pins_that_are() {
     let wrong = b.wrong_trim(&b.answer());
     let shadow = Mutex::new(b.shadow);
     let go = |complete: bool| {
-        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete, gapped: false };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete, gapped: false, games: vec![] };
         tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
     };
     let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
@@ -1858,7 +1858,7 @@ fn a_trim_is_held_against_the_node_through_its_own_watch_of_the_players() {
         let live = format!("ses:{}:{}:{}", tables[0].0, tables[0].1, crate::house_bytes::next_sid(&b.case.ctx, Some(&wrong)).unwrap());
         let shadow = Mutex::new(b.shadow);
         let go = || {
-            let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped: false };
+            let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped: false, games: vec![] };
             tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
         };
         let confirmed = || shadow.lock().unwrap().rooms.get(&room).map_or(0, |rs| rs.confirmed.len());
@@ -2030,7 +2030,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     // (The players of the vector are in the room, besides its owner.)
     let others = b.case.pins.iter().filter(|(p, _)| p != OWNER).count();
     let mut shadow = b.shadow;
-    let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
+    let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false, games: vec![] };
     let first = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     let watch = first.watch.clone().expect("the watch of the players");
     assert_eq!(watch.epoch(), first.pins_epoch);
@@ -2326,7 +2326,7 @@ fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
         let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
         let mut shadow = b.shadow;
         shadow.pin_walk_time = timed.then_some(Duration::ZERO);
-        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false, games: vec![] };
         let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
         assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
         // (The 200 players, the owner and the players of the vector.)
@@ -2655,7 +2655,7 @@ fn a_delegation_replaced_in_a_room_with_a_plan_and_no_table_yet_is_seen() {
 fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_under() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
-    let plan = |owner: &str| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
+    let plan = |owner: &str| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false, games: vec![] };
     let mut shadow = b.shadow;
     assert!(shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the holder the doc names");
     assert!(!shadow.view_of(&room, &doc, plan("someone else"), PIN_WALK_KEYS).settled, "a plan made under another");
@@ -2687,7 +2687,7 @@ fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_
 fn a_view_is_settled_only_while_the_watch_pins_the_key_the_plan_was_made_with_for_the_deed_holder() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
-    let plan = |owner: &str, key: &str| HousePlan { owner: owner.to_string(), owner_key: key.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
+    let plan = |owner: &str, key: &str| HousePlan { owner: owner.to_string(), owner_key: key.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false, games: vec![] };
     let mut shadow = b.shadow;
     assert!(shadow.view_of(&room, &doc, plan(OWNER, OWNER_KEY), PIN_WALK_KEYS).settled, "the key the watch has pinned for the holder");
     assert!(!shadow.view_of(&room, &doc, plan(OWNER, "the key before"), PIN_WALK_KEYS).settled, "a plan made under another key of the holder");
@@ -3629,7 +3629,7 @@ fn a_plan_that_says_it_came_back_after_a_gap_is_not_shown_whole() {
     let tables = vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())];
     let shadow = Mutex::new(b.shadow);
     let go = |gapped: bool| {
-        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped, games: vec![] };
         tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
     };
     let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
@@ -3649,4 +3649,228 @@ fn a_plan_that_says_it_came_back_after_a_gap_is_not_shown_whole() {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(confirmed(), 0, "and the delegations stay churned for good");
+}
+
+// ── 🔒 FAIR ONLY games: followed on the base the plan gives, compared with nothing ──
+
+/// The FAIR ONLY vector of real signatures, as a game the house serves: its session (the vector's records, then its
+/// changes) over the base it folds from, and a view that follows the game as the house's plan names it, with no house
+/// table. The plan's game, too.
+fn game_bench() -> (Bench, GamePlan) {
+    game_bench_with(|_| vec![])
+}
+
+/// As `game_bench`, with the signatures of the records `hold` names left unchecked for good (by their hashes).
+fn game_bench_with(hold: impl FnOnce(&Case) -> Vec<String>) -> (Bench, GamePlan) {
+    let mut case = cases().into_iter().find(|c| c.name.starts_with("fair only, real signatures")).expect("the FAIR ONLY real-signature vector");
+    case.hold = hold(&case);
+    let fair = case.fair.clone().expect("a FAIR ONLY vector");
+    let base = case.cp.clone().expect("its base");
+    let sid = crate::house_bytes::next_sid3(&case.ctx, &base).unwrap();
+    let plan = GamePlan {
+        t: case.ctx.t.clone(),
+        inc: case.ctx.inc.clone(),
+        rv: fair.rv.clone(),
+        base_key: format!("ck:{}:{}:{}", case.ctx.t, case.ctx.inc, "b".repeat(32)),
+        base,
+        sid: sid.clone(),
+        spans: fair.spans.clone(),
+    };
+    let launch = ThreadLaunch::new(engine_maker(&case));
+    let (log, refuse) = (launch.log.clone(), launch.refuse.clone());
+    let now = Instant::now();
+    let doc = Doc::new();
+    {
+        let comp = doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = doc.transact_mut();
+        let m = comp.insert(&mut txn, format!("ses:{}:{}:{sid}", case.ctx.t, case.ctx.inc), MapPrelim::default());
+        for (k, v) in &case.records {
+            m.insert(&mut txn, k.as_str(), to_any(v));
+        }
+        for batch in &case.warm {
+            for (k, v) in batch {
+                match v {
+                    Some(v) => {
+                        m.insert(&mut txn, k.as_str(), to_any(v));
+                    }
+                    None => {
+                        m.remove(&mut txn, k.as_str());
+                    }
+                }
+            }
+        }
+    }
+    let view = FoldView { tables: vec![], houses: vec![], pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![plan.clone()] };
+    let bench = Bench { shadow: FoldShadow::new(launch, now), doc, view: Some(view), case, now, log, refuse, listed: true };
+    (bench, plan)
+}
+
+impl Bench {
+    /// The latest answer kept for the bench's game.
+    fn game_answer(&self) -> Option<GameAnswer> {
+        self.shadow.game_answer(self.room(), &self.case.ctx.t, &self.case.ctx.inc).cloned()
+    }
+
+    /// The frames the worker has been sent for the bench's table, once its thread has read all that was posted.
+    fn frames(&self) -> Vec<Req> {
+        self.forgets();
+        self.log.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn a_game_the_plan_names_is_folded_on_its_base_with_its_houses_by_round_and_its_answer_kept() {
+    let (mut b, plan) = game_bench();
+    let want: FoldSummary = serde_json::from_str(&b.case.summary).unwrap();
+    assert!(want.rounds.iter().any(|r| r.decided.as_deref() == Some("house")), "a round its house decided, or the test proves nothing");
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    let answer = b.game_answer().unwrap();
+    assert_eq!((answer.base_key.as_str(), answer.sid.as_str(), &answer.spans), (plan.base_key.as_str(), plan.sid.as_str(), &plan.spans));
+    assert_eq!(answer.summary, want, "the pages' own answer");
+    // Its frames carried the game's houses by round and no set of houses.
+    let fair = FairHouses { rv: plan.rv.clone(), spans: plan.spans.clone() };
+    let colds: Vec<Req> = b.frames().into_iter().filter(|r| matches!(r, Req::Cold(_))).collect();
+    assert_eq!(colds.len(), 1);
+    let Req::Cold(cold) = &colds[0] else { unreachable!() };
+    assert_eq!((cold.fair.as_ref(), cold.houses.is_empty()), (Some(&fair), true));
+    // Followed as a game: counted so, and compared with nothing.
+    let r = b.shadow.report();
+    assert_eq!((r.games, r.games_over, r.game_answers, r.tables), (1, 0, 1, 0));
+    assert_eq!(b.shadow.tally, Tally::default());
+
+    // Its houses by round change (the house that decided it is no house of it now): a Warm says so, and the answer
+    // kept is the new one once it comes.
+    let mut none = plan.clone();
+    none.spans = vec![];
+    b.view.as_mut().unwrap().games = vec![none];
+    // (Until the worker has folded it under them, the answer kept is the one under the houses it was folded under:
+    // never the old fold said to be under the new houses.)
+    b.until("the answer under the new houses", |b| {
+        let a = b.game_answer().unwrap();
+        assert!(a.spans == plan.spans || a.summary != want, "an answer under houses it was not folded under");
+        a.spans.is_empty()
+    });
+    let after = b.game_answer().unwrap();
+    assert!(!after.summary.rounds.iter().any(|r| r.decided.as_deref() == Some("house")), "no house of it decides a round");
+    assert!(after.spans.is_empty(), "the houses it was folded under");
+    assert!(b.frames().iter().any(|r| matches!(r, Req::Warm(w) if w.fair == Some(FairHouses { rv: plan.rv.clone(), spans: vec![] }))));
+    // And back.
+    b.view.as_mut().unwrap().games = vec![plan.clone()];
+    b.until("the answer under the houses again", |b| b.game_answer().is_some_and(|a| a.summary == want));
+
+    // The plan names it no more: let go of at once (no checkpoint of a game is waited for), its answer with it.
+    b.view.as_mut().unwrap().games = vec![];
+    b.until("let go", |b| b.shadow.report().games == 0);
+    assert!(b.game_answer().is_none());
+    assert_eq!(b.shadow.report().game_answers, 0);
+    assert_eq!(b.forgets(), 1, "the worker was told");
+}
+
+#[test]
+fn a_games_answer_is_kept_only_while_it_is_the_game_as_the_node_last_read_it() {
+    let (mut b, plan) = game_bench();
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    let first = b.game_answer().unwrap();
+    // A record comes into the session: the answer kept stays the one it was until the new one is the game as read.
+    let live = format!("ses:{}:{}:{}", plan.t, plan.inc, plan.sid);
+    {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &live) else { panic!("no live session") };
+        m.insert(&mut txn, format!("x:9:nobody:{}", "7".repeat(32)).as_str(), to_any(&obj(vec![("p", s("nobody"))])));
+    }
+    let rs = &b.shadow.rooms[b.room()];
+    assert!(!rs.mirror.current(&plan.t, &plan.inc), "the doc moved on");
+    assert_eq!(b.game_answer(), Some(first.clone()), "kept as it was meanwhile");
+    b.until("the new answer", |b| b.game_answer().is_some_and(|a| a.frame > first.frame));
+
+    // Another base given (a trim): no answer of the old base is the new one's. Its session is not in the doc yet, so
+    // nothing is folded on it, and the old answer stays the last that was the game as read.
+    let mut trimmed = plan.clone();
+    let CVal::Obj(mut fields) = plan.base.clone() else { panic!() };
+    fields.retain(|(k, _)| k != "u");
+    fields.push(("u".into(), CVal::Int(1)));
+    trimmed.base = CVal::Obj(fields);
+    trimmed.base_key = format!("ck:{}:{}:{}", plan.t, plan.inc, "c".repeat(32));
+    trimmed.sid = crate::house_bytes::next_sid3(&b.case.ctx, &trimmed.base).unwrap();
+    let kept = b.game_answer().unwrap();
+    b.view.as_mut().unwrap().games = vec![trimmed.clone()];
+    b.ticks(30);
+    assert_eq!(b.game_answer(), Some(kept), "no answer on the new base yet");
+    // Its session comes, empty: the answer is of the new base.
+    {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        comp.insert(&mut txn, format!("ses:{}:{}:{}", trimmed.t, trimmed.inc, trimmed.sid), MapPrelim::default());
+    }
+    b.until("the answer on the new base", |b| b.game_answer().is_some_and(|a| a.base_key == trimmed.base_key));
+    let a = b.game_answer().unwrap();
+    assert_eq!((a.sid.as_str(), a.summary.base.u), (trimmed.sid.as_str(), 1));
+    // A game's checkpoints are its house's own: no base it took, this one neither, is compared.
+    assert_eq!(b.shadow.tally, Tally::default());
+}
+
+#[test]
+fn a_game_takes_its_place_in_the_worker_before_the_house_tables() {
+    let (mut b, plan) = game_bench();
+    // As many house tables as the worker has places for the shadow, each with an empty session, in the same room.
+    let names: Vec<String> = (0..MAX_SHADOW_TABLES).map(|i| format!("h{i:02}")).collect();
+    let inc = "r0123456789abcdef01234567".to_string();
+    {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        for t in &names {
+            let c = crate::house_bytes::Ctx { room: b.case.ctx.room.clone(), t: t.clone(), inc: inc.clone() };
+            comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
+        }
+    }
+    b.view.as_mut().unwrap().tables = names.iter().map(|t| (t.clone(), inc.clone())).collect();
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    let r = b.shadow.report();
+    assert_eq!((r.games, r.games_over), (1, 0), "the game has its place");
+    assert_eq!((r.tables, r.tables_over), (MAX_SHADOW_TABLES as u64 - 1, 1), "the last house table waits");
+    assert_eq!(b.game_answer().unwrap().base_key, plan.base_key);
+}
+
+/// An answer that comes back in a tick in which the doc has changed since the frame it answers is not kept: it is not
+/// the game as the doc has it now, and the answer kept stays the one before until one is.
+#[test]
+fn an_answer_that_comes_after_the_doc_moved_on_is_not_kept() {
+    let (mut b, plan) = game_bench();
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    b.ticks(3);
+    let first = b.game_answer().unwrap();
+    let live = format!("ses:{}:{}:{}", plan.t, plan.inc, plan.sid);
+    let put = |b: &Bench, c: char| {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &live) else { panic!("no live session") };
+        m.insert(&mut txn, format!("x:9:nobody:{}", c.to_string().repeat(32)).as_str(), to_any(&obj(vec![("p", s("nobody"))])));
+    };
+    // A record comes: read, and sent to the worker, whose answer is in the pipe before the next tick takes it.
+    put(&b, '7');
+    b.tick();
+    thread::sleep(Duration::from_millis(300));
+    // Another comes before that tick: the answer it takes is of the doc before it.
+    put(&b, '8');
+    b.tick();
+    assert_eq!(b.game_answer(), Some(first.clone()), "not the game as the doc has it now");
+    b.until("the answer to both", |b| b.game_answer().is_some_and(|a| a.frame > first.frame));
+}
+
+/// A game whose fold is not finished (a signature not checked yet) has no answer kept: a trim goes by none of it.
+#[test]
+fn a_game_whose_fold_is_not_finished_has_no_answer_kept() {
+    let (mut b, plan) = game_bench_with(|case| {
+        let keys = case.records.iter().map(|(k, _)| k).chain(case.warm.iter().flatten().map(|(k, _)| k));
+        let reveal = keys.into_iter().find(|k| k.starts_with("h:")).expect("a house reveal").clone();
+        vec![reveal.rsplit(':').next().unwrap().to_string()]
+    });
+    let (t, inc) = (plan.t.clone(), plan.inc.clone());
+    b.until("folded", |b| b.shadow.rooms.get(b.room()).and_then(|rs| rs.feed.fold(&t, &inc)).is_some());
+    b.ticks(20);
+    let fold = b.shadow.rooms[b.room()].feed.fold(&t, &inc).unwrap();
+    assert!(fold.summary.pending, "(its reveal's signature is held)");
+    assert!(b.game_answer().is_none());
+    assert_eq!(b.shadow.report().game_answers, 0);
 }
