@@ -212,6 +212,15 @@ describe('the simulations\' house, as house.rs', () => {
     expect(room.recs('h:2:').map((v) => v.x)).toEqual([[d.hash]]);
   });
 
+  it('a gap between its ticks holds nothing at a house table (a hold is a FAIR ONLY game\'s): a close it first reads after one is revealed', () => {
+    const room = new TwinRoom().start();
+    room.tick(15_000);
+    room.closedOnTheJoin();
+    room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.tick(15_000);
+    expect(room.recs('h:1:')).toHaveLength(1);
+  });
+
   it('counts its heartbeat on from the doc only as it signed it', () => {
     const room = new TwinRoom().start();
     const key = beatKey(H.pub);

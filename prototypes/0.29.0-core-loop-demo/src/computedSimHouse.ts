@@ -40,6 +40,24 @@
  * tableDuties). That reveal carries its house's commitment for the round, so
  * a join made before it counts for nothing. The house that plays keeps the
  * game until it steps down or a round of its own is voided.
+ *
+ * 🔒 The node's half of FAIR ONLY (ssf-p2p-node house.rs and house_index.rs,
+ * #454, #455, #459, #461) has the reads, joins, reveals and step-downs at a
+ * game, and this twin follows it there: it settles again after a gap from
+ * its next read of the game's session; a spell in which it reads no close of
+ * a game it holds memory of (it serves none of the game's rounds, the game
+ * has no base or no record at all, or its session's map is gone) is a hold,
+ * so a close it first reads after it counts as there since the spell began,
+ * for the cutoff; and at the put-back's turn it puts back a lost session map
+ * with its own records in it, a transfer the doc holds only inside a
+ * checkpoint, one delegation of this house under its key for the whole room
+ * (wanted only by a game whose base does not carry it), and deletes forged
+ * records, while it keeps the delegations it served each game by. The trim,
+ * the sweep, the end and the checkpoint rows are still this twin's alone
+ * (the node's n-4 and n-5). Not mirrored: what only the node's read budget
+ * makes matter (its index's passes, a game counted as last read through), its
+ * serve switch, and the first join noted in its state file (this twin's never
+ * fails to write).
  */
 
 import * as Y from 'yjs';
@@ -53,7 +71,7 @@ import {
   signBytes, slipCommit, TableFold,
 } from './computedFold';
 import type { FoldCtx, FoldResult, RoundView, SignedKind } from './computedFold';
-import { beatKey, delegationKey, fairAfter, HEARTBEAT_MS, HOUSE_HEARD_MS, housePubOf, houseSeedOf, houseSign, roomSignBytes } from './computedHouse';
+import { asDelegation, beatKey, delegationKey, fairAfter, HEARTBEAT_MS, HOUSE_HEARD_MS, housePubOf, houseSeedOf, houseSign, roomSignBytes } from './computedHouse';
 import type { DelegationRec, FairSettingRec, RoomKind } from './computedHouse';
 import { verifyIdentityStrict } from './keypair';
 
@@ -164,14 +182,38 @@ interface TableRead {
 }
 
 interface TableMem {
-  firstSeen: Map<string, number>;
+  /** When it first saw each close naming its commitment, and when the hold
+   *  just before began, if there was one (else the same): the grace runs from
+   *  the first, REVEAL_CUTOFF_MS from the second (house.rs first_seen). */
+  firstSeen: Map<string, [number, number]>;
   blocked: Set<string>;
   seedSeen: Map<string, number>;
   refused: Set<number>;
   /** Its own session records this run: [session key, key, record]. */
   written: [string, string, Record<string, unknown>][];
-  /** When it first read the table this run (SETTLE_MS). */
-  firstRead: number;
+  /** When it first read the table this run (SETTLE_MS). 🔒 At a FAIR ONLY
+   *  game, when it first read the game's session after it was last away from
+   *  it (cut off for HOUSE_HEARD_MS): null until then (house.rs first_read). */
+  firstRead: number | null;
+  /** 🔒 At a FAIR ONLY game, when the last spell it read no close of the game
+   *  began: the spell it served none of the game's rounds, or its session's
+   *  map was gone, or it found the game with no base (or over, or under rules
+   *  this build does not know), or with no record at all. A close it first
+   *  reads once the spell is over counts as there since then for
+   *  REVEAL_CUTOFF_MS, as the pages voided it meanwhile (house.rs
+   *  held_since). Taken at its next read. */
+  heldSince: number | null;
+  /** 🔒 At a FAIR ONLY game, the delegation it was last a house of the game
+   *  by, and one for each other holder of the game it was a house of it for
+   *  (the last it went by): given to the resolution after the room's, so they
+   *  count while the doc lacks them, as the pages keep theirs (casinoDoc
+   *  keepHouses; house.rs deleg and earlier, keep_earlier). For the run. */
+  deleg: DelegationRec | null;
+  earlier: DelegationRec[];
+  /** 🔒 Whether that delegation wants this house's key (design §8.5 N5): the
+   *  game's base does not carry it, and the house served the game by it when
+   *  a tick last found whether it serves the game (house.rs keyed). */
+  keyed: boolean;
   /** 🔒 A FAIR ONLY game's (the rest are its trims'). */
   fo: boolean;
   /** When each close was decided, as this house saw it: its own reveal, as it
@@ -237,7 +279,14 @@ type Write =
    *  checkpoint opens in with its copies. */
   | { trim: { t: string; inc: string; key: string; value: CkRec; ses: string | null; copies: [string, unknown][] } }
   /** 🔒 Write::NewSession: the live session's map, when the doc lost it. */
-  | { newSession: string };
+  | { newSession: string }
+  /** 🔒 Write::Delete: a FAIR ONLY game's forged record (design §8.4 P7). */
+  | { del: string };
+
+/** 🔒 house.rs FORGED_DELETE_MAX: the most forged records it deletes at one
+ *  put-back's turn, across the room (casinoDoc FORGED_DELETE_MAX, the pages'
+ *  cap). */
+export const HOUSE_FORGED_DELETE_MAX = 256;
 
 /** What one tick wrote, by kind (for a scenario's counters). */
 export interface HouseTickOut { joins: number; reveals: number; stepDowns: number; beats: number; putBacks: number }
@@ -269,6 +318,8 @@ export class SimHouse {
   ends = 0;
   rowPutBacks = 0;
   newSessions = 0;
+  /** 🔒 Forged records of FAIR ONLY games it deleted (design §8.4 P7). */
+  forgedDeletes = 0;
   crossCheckMismatches = 0;
   /** 🔒 For a spec: change a trim's body before the cross-check sees it (a
    *  planted engine fault). */
@@ -382,6 +433,8 @@ export class SimHouse {
           }
         } else if ('newSession' in w) {
           if (!(comp.get(w.newSession) instanceof Y.Map)) comp.set(w.newSession, new Y.Map());
+        } else if ('del' in w) {
+          comp.delete(w.del);
         } else if (w.ses === null) {
           comp.set(w.key, w.value);
         } else {
@@ -402,10 +455,12 @@ export class SimHouse {
     }
     // 🔒 Cut off for HOUSE_HEARD_MS (no tick: the sim ticks it only while its
     // page hears the room): it settles at each FAIR ONLY game again, so it
-    // reads before it reveals (design §8.5 N1).
+    // reads before it reveals (design §8.5 N1), from its next read of the
+    // game's session, as what it reads until then it has not read since
+    // (house.rs settle_games_again).
     const last = this.lastTick.get(room);
     this.lastTick.set(room, now);
-    if (last !== undefined && now - last >= HOUSE_HEARD_MS) for (const table of mem.tables.values()) if (table.fo) table.firstRead = now;
+    if (last !== undefined && now - last >= HOUSE_HEARD_MS) for (const table of mem.tables.values()) if (table.fo) table.firstRead = null;
 
     // The room's house tables (r/d), while the deed holder delegates this house.
     const rd = this.houseTables(room, doc, comp, mem, now, writes, out);
@@ -452,6 +507,15 @@ export class SimHouse {
           }
         }
       }
+      // 🔒 (A game's session map it puts back is there for its own records,
+      // which go into it in the same write: house.rs.)
+      const newMaps = new Set<string>();
+      for (const w of fo.reput) {
+        if (!('newSession' in w)) continue;
+        newMaps.add(w.newSession);
+        this.newSessions += 1;
+        writes.push(w);
+      }
       for (const table of mem.tables.values()) {
         // (A house table's, only while this house is the room's.)
         if (!table.fo && !rd) continue;
@@ -459,18 +523,32 @@ export class SimHouse {
           // There as it wrote it: junk under its key reads as nothing on
           // every page, and goes too.
           const m = comp.get(ses);
-          const present = m instanceof Y.Map ? same(m.get(key), value) : true;
+          const present = m instanceof Y.Map ? same(m.get(key), value) : !newMaps.has(ses);
           if (!present && !writes.some((w) => 'ses' in w && w.ses !== null && w.key === key)) {
             writes.push({ ses, key, value });
             out.putBacks += 1;
           }
         }
       }
-      // 🔒 A game's checkpoint, session map and delegation (design §8.5 N5).
+      // 🔒 What the FAIR ONLY games lost (design §8.5 N5): a checkpoint, a
+      // transfer, this house's delegation, and their forged records (§8.4 P7).
+      // Not this house's delegation while it is a house of the room's house
+      // tables: that key is theirs then (one value under `hk:<house>`, design
+      // 6c-4b-2a limit 4), and a game goes by the delegation it holds or its
+      // checkpoint carries. At most HOUSE_FORGED_DELETE_MAX deletes a turn.
+      let deletes = 0;
       for (const w of fo.reput) {
-        if ('newSession' in w) this.newSessions += 1;
-        else if ('ses' in w && w.key.startsWith('ck:')) this.rowPutBacks += 1;
-        else out.putBacks += 1;
+        if ('newSession' in w) continue;
+        if ('del' in w) {
+          if (++deletes > HOUSE_FORGED_DELETE_MAX) continue;
+          this.forgedDeletes += 1;
+        } else if ('ses' in w && w.key.startsWith('ck:')) {
+          this.rowPutBacks += 1;
+        } else if ('ses' in w && rd && w.key === delegationKey(this.pub)) {
+          continue;
+        } else {
+          out.putBacks += 1;
+        }
         writes.push(w);
       }
     }
@@ -565,10 +643,13 @@ export class SimHouse {
       if (!g) byGame.set(key, g = { t, inc, cks: [], xfs: [], fin: undefined });
       return g;
     };
+    // (A delegation counts only under its own house's key, as an honest writer
+    // stores one and as the pages take them, casinoDoc fedDelegation: one of
+    // this house under another's key is nothing to a game.)
     const delegations: unknown[] = [];
     for (const [key, v] of comp.entries()) {
       if (key.startsWith('hk:')) {
-        delegations.push(v);
+        if (isPlain(v) && typeof v.h === 'string' && key === delegationKey(v.h)) delegations.push(v);
         continue;
       }
       if (!key.startsWith('ck:') && !key.startsWith('xf:') && !key.startsWith('fin:')) continue;
@@ -579,6 +660,11 @@ export class SimHouse {
       else if (pk.kind === 'xf') g.xfs.push([key, v]);
       else g.fin = v;
     }
+    // 🔒 A game it holds memory of whose every record went: as one whose base
+    // is gone, a hold (below), from the tick that found it so (house.rs, from
+    // its index's take_gone).
+    const inDoc = new Set(byGame.keys());
+    for (const [key, table] of mem.tables) if (table.fo && !inDoc.has(key)) table.heldSince ??= now;
     // (A game the doc holds nothing of any more, whose last checkpoint it signed.)
     for (const [at, row] of this.rows) {
       if (!at.startsWith(`${room}|`)) continue;
@@ -591,13 +677,36 @@ export class SimHouse {
     for (const key of [...byGame.keys()].sort()) {
       const { t, inc, cks, xfs, fin } = byGame.get(key)!;
       const row = this.rows.get(`${room}|${t}|${inc}`);
-      const rec: AuthRecords = { cks: row ? [...cks, [row.key, row.value]] : cks, xfs, fin, delegations };
+      // (The delegations it was a house of the game by, as the doc held them,
+      // after the doc's: one of the doc's goes first.)
+      const table0 = mem.tables.get(key);
+      const held = table0 ? [...(table0.deleg ? [table0.deleg] : []), ...table0.earlier] : [];
+      const rec: AuthRecords = { cks: row ? [...cks, [row.key, row.value]] : cks, xfs, fin, delegations: [...delegations, ...held] };
       const res = resolveGame({ room, sig: (id, pub, bytes, sig) => this.verified(['auth', room, id, '', ''], pub, bytes, sig) }, t, inc, rec);
       // N5: its last checkpoint, gone from the doc or with something else under
       // its key, while no authority's stands above it.
-      const held = row ? comp.get(row.key) : undefined;
-      if (row && !(isPlain(held) && recHash(held) === recHash(row.value)) && res.base?.key === row.key) reput.push({ ses: null, key: row.key, value: row.value as unknown as Record<string, unknown> });
-      if (res.newer || res.pending || !res.live || !res.base) continue;
+      const there = row ? comp.get(row.key) : undefined;
+      if (row && !(isPlain(there) && recHash(there) === recHash(row.value)) && res.base?.key === row.key) reput.push({ ses: null, key: row.key, value: row.value as unknown as Record<string, unknown> });
+      // 🔒 Its forged records (a `ck:` or an `xf:` whose own signature fails
+      // under the key it claims, and every checkpoint that carries such a
+      // transfer: they can never count), deleted at the put-back's turn as the
+      // pages delete them (design §8.4 P7), whether the resolution waits or
+      // not: a flood of them is what holds it off. Not while the doc holds part
+      // of an update, as on the pages.
+      if (!partial) for (const k of res.invalid) reput.push({ del: k });
+      if (res.pending) continue;
+      if (res.newer || !res.live || !res.base) {
+        if (table0) {
+          // (Over, or under rules this build does not know: its delegation
+          // wants no key. A game whose base the doc lost is neither.)
+          if (res.base) table0.keyed = false;
+          // 🔒 Meanwhile it reads no close of the game: a hold, as when its
+          // session's map is gone (only at a game it holds memory of: one it
+          // does not, it settles at, design B2).
+          table0.heldSince ??= now;
+        }
+        continue;
+      }
       const B = res.base.ck;
       // 🔒 Whose game (design §8.5 N1, §8.7): this house is a house of the
       // rounds its delegator holds the game for. Delegated by the game's
@@ -612,34 +721,58 @@ export class SimHouse {
       let by = now_;
       // (A base at or past the round an earlier holder left at gives none: the first round past it is not theirs.)
       for (let i = last - 1; !by && now_ === null && i >= 0; i--) by = res.houseBy(this.pub, Math.max(B.u, res.chain[i].from) + 1);
-      if (!by) continue;
+      if (by === undefined) continue;
+      if (by === null) {
+        // 🔒 A house of none of the game's rounds to come or in flight (handed
+        // on, or its delegation gone): it reads no close made from now on as
+        // their house, so one it first reads once it serves the game again
+        // counts as there since now, for the cutoff, as after a hold; a spell
+        // of a tick costs nothing (house.rs HouseBy::No). Not a new settle: a
+        // reset anyone could cause by deleting a record for a tick would hold
+        // back every close it first read then.
+        if (table0) {
+          table0.heldSince ??= now;
+          table0.keyed = false;
+        }
+        continue;
+      }
       const current = now_ !== null && now_ !== undefined;
+      const ctx: FoldCtx = { room, t, inc };
+      // 🔒 The chain's transfers the doc holds only inside a checkpoint's `x`,
+      // back under their own keys (design §8.5 N5), as the pages put back the
+      // ones they hold.
+      for (const h of res.chain.slice(1)) if (h.step && h.step.key === undefined) reput.push({ ses: null, key: `xf:${t}:${inc}:${h.step.id}`, value: h.step.xf as unknown as Record<string, unknown> });
+      const table = this.tableMem(mem, ctx, now);
+      // (Not the one the base carries: a game needs no key for it, and the
+      // pages hold none such, casinoDoc keepHouses.)
+      table.keyed = (B.dl === undefined ? null : recHash(B.dl)) !== by.hash;
+      keepEarlier(table, by.value, res.chain);
       // (Only a game it serves counts for the room's beat: a game that has
       // left its key never settles here, and would hold the beat off the
       // games this house still serves for as long as its base stays under
       // the transfer's round.)
       if (current) serving += 1;
-      const ctx: FoldCtx = { room, t, inc };
       const sid = nextSid3(ctx, B);
       const sesKey = `ses:${t}:${inc}:${sid}`;
       if (!(comp.get(sesKey) instanceof Y.Map)) {
-        // (Not while the doc holds part of an update: the map may be in the part to come.)
+        // 🔒 The session's map gone: it goes back at the put-back's turn with
+        // this house's records of it in it (its reveals from before a restart
+        // among them), but not while the doc holds part of an update (the map
+        // may be in the part to come). Meanwhile it reads no close of the
+        // game, so this is a hold: a close it first reads once the map is
+        // back counts as there since now, for the cutoff (the pages void one
+        // they saw that long). Nothing at the game meanwhile, and not settled
+        // there.
+        table.heldSince ??= now;
         if (!partial) reput.push({ newSession: sesKey });
         continue;
-      }
-      // (Its delegation under its key, where the doc holds none of this house
-      // there: nothing, or something that is no delegation of it. One of it
-      // that differs from the root's stays: the deed holder's newer one.)
-      const dNow = comp.get(delegationKey(this.pub));
-      if (!(isPlain(dNow) && hasFields(dNow, ['v', 'h', 'k', 'g']) && dNow.v === 1 && dNow.h === this.pub)) {
-        reput.push({ ses: null, key: delegationKey(this.pub), value: by.value as unknown as Record<string, unknown> });
       }
       const read = this.readTable(comp, ctx, { u: B.u, h: B.h, sid }, (k, r) => res.houseAt(k, r) === true);
       if (!read) continue;
       this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true, current);
       // (A house of a key the game has left writes no checkpoint, and is heard at the game no more.)
       if (!current) continue;
-      if (now - mem.tables.get(`${t}|${inc}`)!.firstRead >= SETTLE_MS) settled += 1;
+      if (now - (table.firstRead ?? now) >= SETTLE_MS) settled += 1;
       // 🔒 No checkpoint from a doc that holds part of an update (Yjs parks
       // what came out of order): a close, or a frozen slip a page is putting
       // back, may be in the part to come, and a trim, a sweep or an end
@@ -648,12 +781,34 @@ export class SimHouse {
       // afresh after: a wait stands only through folds that read its thing
       // gone, and through this one it may have come back and gone again.
       if (partial) {
-        mem.tables.get(`${t}|${inc}`)!.waits.clear();
+        table.waits.clear();
         continue;
       }
       const g: Game = { ctx, res, base: res.base, dl: by.value, sesKey, x: res.chain.slice(1).map((h) => h.step!.xf), from: holderNow.from };
       if (res.fin === null) this.trimDuty(doc, mem, g, read, now, writes);
       else this.endDuty(doc, mem, g, read, res.fin, now, writes);
+    }
+    // 🔒 This house's key holds one value (`hk:<house>`), and each game it
+    // serves by a delegation that game's base does not carry wants its own
+    // there. One goes back only over what no game can go by: nothing, junk,
+    // another house's, or one of this house whose signature fails. A good
+    // delegation of this house stays, whoever signed it: it may be a new
+    // holder's (an earlier holder's, or a stranger's, the pages write over,
+    // casinoDoc hkOver). Of the ones wanted, the one of lowest hash, so two
+    // games handed to different holders never write over each other's; the
+    // others go by the delegation the house holds for them. (Only of the games
+    // the doc holds records of. And the put-back's turn writes none while this
+    // house is a house of the room's house tables: the key is theirs then.)
+    let best: { hash: string; d: DelegationRec } | null = null;
+    for (const [key, table] of mem.tables) {
+      if (!table.keyed || !table.deleg || !inDoc.has(key)) continue;
+      const hash = recHash(table.deleg);
+      if (hash !== null && (best === null || hash < best.hash)) best = { hash, d: table.deleg };
+    }
+    if (best) {
+      const mine = asDelegation(comp.get(delegationKey(this.pub)));
+      const good = mine !== null && mine.h === this.pub && this.roomOk('hkey', room, '', mine as unknown as Record<string, unknown>, mine.k);
+      if (!good) reput.push({ ses: null, key: delegationKey(this.pub), value: best.d as unknown as Record<string, unknown> });
     }
     return { settled, serving, reput };
   }
@@ -890,6 +1045,23 @@ export class SimHouse {
     return kept.slice(-MAX_KEPT);
   }
 
+  /** Table ctx's memory in room `room`, made the first time it reads the
+   *  table or holds it: after a start, its reveals from before go back as this
+   *  run's do (house.rs own_from_before). */
+  private tableMem(room: RoomMem, ctx: FoldCtx, now: number): TableMem {
+    const tkey = `${ctx.t}|${ctx.inc}`;
+    let mem = room.tables.get(tkey);
+    if (!mem) {
+      room.tables.set(tkey, mem = {
+        firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: null, heldSince: null,
+        deleg: null, earlier: [], keyed: false,
+        fo: isFairOnlyInc(ctx.inc), decidedAt: new Map(), waits: new Map(), keys: -1, lastNewKey: now, lastFold: null, kept: 0, lastSweep: null, carried: null,
+      });
+      for (const k of this.lastOf(ctx)?.kept ?? []) mem.written.push([k.ses, k.key, k.rec]);
+    }
+    return mem;
+  }
+
   /** One table's reveal, step-down and join (house.rs table_duties). */
   private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true, joins = true): void {
     const { ctx } = read;
@@ -909,21 +1081,17 @@ export class SimHouse {
     const closesAt = (r: number): Close[] => read.closes.filter((c) => c.r === r);
     const nextRound = (): number => Math.max(read.baseU, ...read.closes.map((c) => c.r)) + 1;
     const fo = isFairOnlyInc(ctx.inc);
-    const tkey = `${ctx.t}|${ctx.inc}`;
-    let mem = room.tables.get(tkey);
-    if (!mem) {
-      room.tables.set(tkey, mem = {
-        firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: now,
-        fo, decidedAt: new Map(), waits: new Map(), keys: read.keys, lastNewKey: now, lastFold: null, kept: 0, lastSweep: null, carried: null,
-      });
-      // After a start: its reveals from before go back as this run's do.
-      for (const k of this.lastOf(ctx)?.kept ?? []) mem.written.push([k.ses, k.key, k.rec]);
-    }
+    const mem = this.tableMem(room, ctx, now);
     if (read.keys !== mem.keys) {
       mem.keys = read.keys;
       mem.lastNewKey = now;
     }
+    mem.firstRead ??= now;
     const settling = now - mem.firstRead < SETTLE_MS;
+    // 🔒 (After a hold, a close first seen counts as there since it began, for
+    // the cutoff.)
+    const thereFrom = mem.heldSince === null ? now : Math.min(mem.heldSince, now);
+    mem.heldSince = null;
     // A trim opened a new session: what went into the old one is the trim's.
     mem.written = mem.written.filter(([ses]) => ses === read.sesKey);
     // Seeds as they come.
@@ -942,7 +1110,7 @@ export class SimHouse {
       const listed: Close[] = [];
       for (const c of closesAt(r).filter((x) => x.h === commit)) {
         if (!mem.firstSeen.has(c.hash)) {
-          mem.firstSeen.set(c.hash, now);
+          mem.firstSeen.set(c.hash, [now, thereFrom]);
           // 🔒 At a FAIR ONLY game only a close first seen while settling is
           // blocked (design B2): an abandon, or a later close, would let anyone
           // hold the house off a round, which there nobody else can decide.
@@ -965,22 +1133,23 @@ export class SimHouse {
         this.refusals += 1;
         continue;
       }
-      const t0 = Math.min(...listed.map((c) => mem!.firstSeen.get(c.hash)!));
-      if (now - t0 > REVEAL_CUTOFF_MS) {
+      const t0 = Math.min(...listed.map((c) => mem.firstSeen.get(c.hash)![0]));
+      const there = Math.min(...listed.map((c) => mem.firstSeen.get(c.hash)![1]));
+      if (now - there > REVEAL_CUTOFF_MS) {
         mem.refused.add(r);
         this.refusals += 1;
         continue;
       }
       const best = listed[0];
-      const allIn = best.f.every(([, sh]) => mem!.seedSeen.has(sh));
-      const times = best.f.map(([, sh]) => mem!.seedSeen.get(sh)).filter((x): x is number => x !== undefined);
+      const allIn = best.f.every(([, sh]) => mem.seedSeen.has(sh));
+      const times = best.f.map(([, sh]) => mem.seedSeen.get(sh)).filter((x): x is number => x !== undefined);
       const due = allIn || now >= t0 + graceOf(t0, times);
       if (this.steppingDown && !allIn) break;
       if (!due) break;
       // The best-ranked close alone, and the slips it froze whose seeds it
       // saw: listing a rival too would show both outcomes, and let a bettor
       // carry on the one they liked.
-      const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem!.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
+      const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
       // (No commitment for a round that is not its own: the game has changed hands at this one.)
       const next = !friendly && !this.steppingDown && mine(r + 1);
       const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x: [best.hash], n };
@@ -1033,10 +1202,10 @@ export class SimHouse {
     if (mem.written.some(([, k]) => k.startsWith(`o:${r}:`))) return;
     const before = this.commit(ctx, r - 1);
     const toReveal = r - 1 > done && !mem.refused.has(r - 1)
-      && closesAt(r - 1).some((c) => c.h === before && !mem!.blocked.has(c.hash));
+      && closesAt(r - 1).some((c) => c.h === before && !mem.blocked.has(c.hash));
     if (toReveal) return;
-    // 🏠🏠 Nor, at a FAIR ONLY game (whose node half is still to be written:
-    // this is its rule; house.rs at the house tables joins as it did), while
+    // 🏠🏠 Nor, at a FAIR ONLY game (house.rs has this rule there since #455;
+    // at the house tables it joins as it did), while
     // the round before waits on another house: a close of it
     // names the commitment of another house of that round, nobody abandoned
     // it, and no reveal of the round is in. That house's reveal will carry
@@ -1419,6 +1588,19 @@ export class SimHouse {
 }
 
 /** computedFold steppedDown: a house's step-down at round r opened `h`. */
+/** 🔒 What a game's memory keeps of this house's delegations: the one it
+ *  serves the game by now (`now`), and the one it went by before among the
+ *  earlier ones; of those, the ones whose signers are holders of the game
+ *  (`chain`), but for the signer of `now`: one each (house.rs keep_earlier).
+ *  After a hand-over at the round in flight, that round is still the
+ *  seller's, and its reveal counts by the seller's delegation, which the doc's
+ *  key may no longer hold and the base need not carry. */
+function keepEarlier(mem: TableMem, now: DelegationRec, chain: readonly { k: string }[]): void {
+  if (mem.deleg !== null) mem.earlier.push(mem.deleg);
+  mem.deleg = now;
+  mem.earlier = mem.earlier.filter((d) => d.k !== now.k && chain.some((h) => h.k === d.k));
+}
+
 function steppedDown(read: TableRead, r: number, h: string): boolean {
   return read.reveals.some((e) => e.r === r && e.x.length === 0 && e.commit === h);
 }
