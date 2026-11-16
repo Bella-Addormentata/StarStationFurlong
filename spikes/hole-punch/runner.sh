@@ -81,7 +81,7 @@ trap cleanup EXIT
 say "role=$ROLE knock=$KNOCK minutes=$MINUTES run=$RUN"
 
 # --- the node: as the knock proof ran it (no chain lane, no mDNS, no relay) --
-export SSF_NO_CHIA_LANE=1 SSF_NO_MDNS=1 SSF_IROH_PORT=44452
+export SSF_NO_CHIA_LANE=1 SSF_NO_MDNS=1 SSF_IROH_PORT=44452 SSF_NO_PORTMAP=1
 unset SSF_EXTERNAL_ADDRS
 [ "$KNOCK" = off ] && export SSF_DHT_KNOCK=0
 mkdir -p "$OUT/node"

@@ -1990,6 +1990,14 @@ async fn node_main() -> Result<()> {
         .secret_key(secret_key.clone())
         .alpns(vec![b"ssf".to_vec(), iroh_blobs::ALPN.to_vec()]); // Ensure B3 is resolved so we do not reject inbound ALPN; 📦 the blob lane's beside it
 
+    // 🧪 Probe branch only (never to merge): SSF_NO_PORTMAP=1 keeps iroh from
+    // asking the router for a port (UPnP/NAT-PMP/PCP), so a hole-punch test
+    // meets the NAT as it is rather than a port the router opened by itself.
+    if std::env::var("SSF_NO_PORTMAP").as_deref() == Ok("1") {
+        builder = builder.portmapper_config(iroh::endpoint::PortmapperConfig::Disabled);
+        println!("🧪 SSF_NO_PORTMAP=1: the router is not asked for a port");
+    }
+
     // Configure relay map from SSF_RELAYS (comma-separated URLs).
     // Placeholder defaults are intentionally removed: operators provide real relays.
     let configured_relays = load_configured_relays_from_env();
