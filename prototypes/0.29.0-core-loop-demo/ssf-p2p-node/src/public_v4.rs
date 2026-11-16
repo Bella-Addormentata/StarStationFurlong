@@ -5,12 +5,13 @@
 //! Every DHT node that answers a query may say, in its answer's `ip` field
 //! (BEP 42), the address it saw the query come from. The node's DHT client
 //! (`n0-mainline`) counts those as votes over each lookup and keeps the
-//! address most of a lookup's answers named (`Info::public_address`). The DHT
-//! knock's lookups every 30 s keep it fresh; [`advertise`] makes one lookup of
-//! its own every [`REFRESH`], for a node whose knock is off. Measured on
-//! GitHub's Linux, Windows and macOS machines (2026-11-16, branch
-//! `claude/ip-sources-probe`): the first address came 2.1 to 2.6 s after start
-//! and named the same IP as the website on 72 reads of 72.
+//! address most of a lookup's answers named (`Info::public_address`), until a
+//! later lookup's answers name another. The DHT knock's lookups every 30 s
+//! keep it fresh; [`advertise`] makes one lookup of its own every [`REFRESH`],
+//! for a node whose knock is off. Measured on GitHub's Linux, Windows and
+//! macOS machines (2026-11-16, branch `claude/ip-sources-probe`): the first
+//! address came 2.1 to 2.6 s after start and named the same IP as the website
+//! on 72 reads of 72.
 //!
 //! What it gives is the IP the DHT's nodes see. The port it comes with is the
 //! DHT socket's, not the game's, so the game's own UDP port is advertised with
@@ -20,8 +21,10 @@
 //!
 //! A lie costs as much as a forged website answer did: one address nobody
 //! answers at, since a connection is checked by node key. To move an address
-//! already advertised, a new IP must be the vote of two reads in a row
-//! ([`Votes`]), so one lookup whose answers were mostly a liar's cannot.
+//! already advertised, a new IP must be the vote of two lookups ([`Votes`]):
+//! the one that named it first, and then one [`advertise`] makes itself and
+//! waits for. The vote is a kept value, so reading it twice is not two
+//! lookups; one lookup whose answers were mostly a liar's cannot move it.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -33,15 +36,16 @@ use n0_mainline::{Dht, Id};
 use crate::ReachState;
 
 /// How often the vote is read once an address is known (or the first wait is
-/// over). A change of IP is advertised two reads after it shows, so within
-/// about a minute.
+/// over). A change of IP is advertised at the next read after it shows, once
+/// a lookup made for it names it too, so within about a minute.
 pub(crate) const READ_GAP: Duration = Duration::from_secs(30);
 /// How often the vote is read while none has come yet, for [`FIRST_WAIT`].
 pub(crate) const FIRST_READ_GAP: Duration = Duration::from_secs(1);
 /// How long the vote is read every [`FIRST_READ_GAP`] after start.
 pub(crate) const FIRST_WAIT: Duration = Duration::from_secs(60);
 /// How often [`advertise`] makes a lookup of its own, so the vote stays fresh
-/// with the knock off (the website was asked this often).
+/// with the knock off (the website was asked this often). It makes one at
+/// every read as well while a new IP waits for its second lookup.
 pub(crate) const REFRESH: Duration = Duration::from_secs(300);
 /// The longest one such lookup is waited for.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -66,23 +70,32 @@ pub(crate) struct Votes {
 }
 
 impl Votes {
-    /// One read of the DHT client's vote. The first IP is taken at once, since
-    /// nothing is advertised yet to protect; a different one only when two
-    /// reads in a row name it. A read with no vote changes nothing: the DHT
-    /// asked nobody since, and the address stands.
-    pub(crate) fn read(&mut self, vote: Option<Ipv4Addr>) -> Step {
+    /// One read of the DHT client's vote. `fresh` says a lookup finished
+    /// since the read before, one [`advertise`] made and waited for.
+    ///
+    /// The first IP is taken at once, since nothing is advertised yet to
+    /// protect. A different one waits, and is taken when a fresh read names it
+    /// again: the client keeps its vote until a lookup changes it, so a second
+    /// read with no lookup between is the same lookup's word twice and
+    /// confirms nothing. A read with no vote changes nothing either.
+    pub(crate) fn read(&mut self, vote: Option<Ipv4Addr>, fresh: bool) -> Step {
         let Some(ip) = vote else { return Step::Keep };
         if self.current == Some(ip) {
             self.waiting = None;
             return Step::Keep;
         }
-        if self.current.is_none() || self.waiting == Some(ip) {
+        if self.current.is_none() || (fresh && self.waiting == Some(ip)) {
             self.current = Some(ip);
             self.waiting = None;
             return Step::Take(ip);
         }
         self.waiting = Some(ip);
         Step::Keep
+    }
+
+    /// Whether a new IP waits for a lookup to name it again.
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
     }
 }
 
@@ -98,8 +111,12 @@ pub(crate) async fn advertise(dht: Dht, ep: iroh::Endpoint, reach: Arc<ReachStat
     let mut said_waiting = false;
     let mut looked = Instant::now();
     loop {
-        if looked.elapsed() >= REFRESH {
-            let _ = tokio::time::timeout(LOOKUP_TIMEOUT, dht.find_node(Id::random())).await;
+        // A lookup of its own: every REFRESH, and at every read while a new IP
+        // waits, since only a lookup that finished since can confirm it.
+        let mut fresh = false;
+        if votes.is_waiting() || looked.elapsed() >= REFRESH {
+            let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, dht.find_node(Id::random())).await;
+            fresh = matches!(looked_up, Ok(Ok(_)));
             looked = Instant::now();
         }
         let vote = match dht.info().await {
@@ -109,7 +126,7 @@ pub(crate) async fn advertise(dht: Dht, ep: iroh::Endpoint, reach: Arc<ReachStat
                 return;
             }
         };
-        if let Step::Take(ip) = votes.read(vote) {
+        if let Step::Take(ip) = votes.read(vote, fresh) {
             taken = true;
             if let Some(old) = announced.take() {
                 let _ = ep.remove_external_addr(&old).await;
@@ -160,59 +177,93 @@ mod tests {
     #[test]
     fn the_first_vote_is_taken_at_once() {
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
-        assert_eq!(votes.read(Some(A)), Step::Keep);
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(A), true), Step::Keep);
     }
 
     #[test]
     fn no_vote_changes_nothing() {
         let mut votes = Votes::default();
-        assert_eq!(votes.read(None), Step::Keep);
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
-        assert_eq!(votes.read(None), Step::Keep);
-        assert_eq!(votes.read(Some(A)), Step::Keep);
+        assert_eq!(votes.read(None, true), Step::Keep);
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(None, true), Step::Keep);
+        assert_eq!(votes.read(Some(A), true), Step::Keep);
     }
 
     #[test]
-    fn a_new_ip_needs_two_reads_in_a_row() {
+    fn a_new_ip_needs_two_lookups() {
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
-        assert_eq!(votes.read(Some(B)), Step::Keep);
-        assert_eq!(votes.read(Some(B)), Step::Take(B));
-        assert_eq!(votes.read(Some(B)), Step::Keep);
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
+        assert_eq!(votes.read(Some(B), true), Step::Take(B));
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
     }
 
     #[test]
     fn one_stray_read_moves_nothing() {
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
         for _ in 0..5 {
-            assert_eq!(votes.read(Some(B)), Step::Keep);
-            assert_eq!(votes.read(Some(A)), Step::Keep);
+            assert_eq!(votes.read(Some(B), true), Step::Keep);
+            assert_eq!(votes.read(Some(A), true), Step::Keep);
         }
     }
 
     #[test]
     fn a_read_with_no_vote_does_not_break_the_pair() {
-        // The two reads in a row are two that named an IP: a read in between
-        // that named none (the DHT asked nobody since) neither counts nor
-        // starts the wait over.
+        // The two lookups are two that named an IP: a read in between that
+        // named none neither counts nor starts the wait over.
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
-        assert_eq!(votes.read(Some(B)), Step::Keep);
-        assert_eq!(votes.read(None), Step::Keep);
-        assert_eq!(votes.read(Some(B)), Step::Take(B));
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
+        assert_eq!(votes.read(None, true), Step::Keep);
+        assert_eq!(votes.read(Some(B), true), Step::Take(B));
+    }
+
+    #[test]
+    fn rereading_the_kept_vote_confirms_nothing() {
+        // One lookup names B, and the client keeps that vote. Reading it again
+        // with no lookup between is still that one lookup, however often; a
+        // lookup that finished since, naming B too, takes it.
+        let mut votes = Votes::default();
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(B), false), Step::Keep);
+        assert!(votes.is_waiting());
+        for _ in 0..10 {
+            assert_eq!(votes.read(Some(B), false), Step::Keep);
+        }
+        assert!(votes.is_waiting(), "a new IP keeps asking for its own lookup");
+        assert_eq!(votes.read(Some(B), true), Step::Take(B));
+        assert!(!votes.is_waiting());
+    }
+
+    #[test]
+    fn the_lookup_that_named_it_first_does_not_count_twice() {
+        // B shows on a fresh read: that lookup is its first. It still needs a
+        // second lookup, so a cached reread after it moves nothing.
+        let mut votes = Votes::default();
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
+        assert_eq!(votes.read(Some(B), false), Step::Keep);
+        assert_eq!(votes.read(Some(B), true), Step::Take(B));
+    }
+
+    #[test]
+    fn the_first_vote_needs_no_lookup_of_its_own() {
+        let mut votes = Votes::default();
+        assert_eq!(votes.read(Some(A), false), Step::Take(A));
+        assert!(!votes.is_waiting());
     }
 
     #[test]
     fn the_wait_starts_over_on_a_third_ip() {
         let c = Ipv4Addr::new(192, 0, 2, 44);
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
-        assert_eq!(votes.read(Some(B)), Step::Keep);
-        assert_eq!(votes.read(Some(c)), Step::Keep);
-        assert_eq!(votes.read(Some(B)), Step::Keep);
-        assert_eq!(votes.read(Some(B)), Step::Take(B));
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
+        assert_eq!(votes.read(Some(c), true), Step::Keep);
+        assert_eq!(votes.read(Some(B), true), Step::Keep);
+        assert_eq!(votes.read(Some(B), true), Step::Take(B));
     }
 
     #[test]
@@ -221,10 +272,10 @@ mod tests {
         // public IP then needs its two reads like any change.
         let shared = Ipv4Addr::new(100, 64, 3, 2);
         let mut votes = Votes::default();
-        assert_eq!(votes.read(Some(shared)), Step::Take(shared));
+        assert_eq!(votes.read(Some(shared), true), Step::Take(shared));
         assert!(!crate::ipv4_is_public(shared));
-        assert_eq!(votes.read(Some(A)), Step::Keep);
-        assert_eq!(votes.read(Some(A)), Step::Take(A));
+        assert_eq!(votes.read(Some(A), true), Step::Keep);
+        assert_eq!(votes.read(Some(A), true), Step::Take(A));
     }
 
     /// The node's source, read as text, with the needles joined from pieces
