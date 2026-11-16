@@ -2685,3 +2685,38 @@ fn a_game_gone_from_the_doc_wants_its_key_no_more() {
     }
     assert_eq!(game.hk_hash(), hb::rec_hash(stays));
 }
+
+#[test]
+fn the_rooms_one_delegation_waits_for_a_pass_that_reads_every_delegation_of_the_room_clear() {
+    // 🔒 Handed on from the buyer to carol, who delegates this house under its key. Until a pass has read the room's
+    // delegations, each clear, it cannot tell that the key holds hers, and puts back none over it (the one it holds
+    // is the buyer's). First hers in a form a page may read otherwise: it goes back as read, and carol's round is
+    // served by it.
+    let (buyer, carol) = (who("buyer"), who("carol"));
+    let mut game = Game::new("hk-new-holder-proto");
+    game.handed_to_the_buyer();
+    game.transfer_of(&game.ctx, &buyer, &carol, 0, "fedcba9876543210fedcba98");
+    let hk = format!("hk:{}", game.house.public());
+    let hers = delegation(&carol, game.house.public());
+    game.put_top_any(&hk, padded(&hers, Any::Null));
+    game.tick(REPUT_MS);
+    assert_eq!(game.hk_hash(), hb::rec_hash(&hers), "back as read, and not the buyer's over it");
+    game.ticks();
+    game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    assert_eq!(game.records("h:1:").len(), 1, "carol's round, by hers");
+    // Then the tick's reads spent once the room's keys are counted, before its delegations are read.
+    let mut game = Game::new("hk-new-holder-spent");
+    game.handed_to_the_buyer();
+    game.transfer_of(&game.ctx, &buyer, &carol, 0, "fedcba9876543210fedcba98");
+    game.put_top(&hk, &hers);
+    let txn = game.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    game.house.read_left = comp.iter(&txn).map(|(k, _)| k.len() + VISIT_BYTES).sum();
+    game.house.read_out = false;
+    let (mut writes, mut reput) = (Vec::new(), Vec::new());
+    assert!(game.house.walk_games(ROOM, &txn, &comp, game.now, &mut writes, &mut reput).is_some(), "the keys all counted");
+    assert!(game.house.read_out, "and the reads spent");
+    assert!(!reput.iter().any(|w| matches!(w, Write::Top { key, .. } if *key == hk)));
+}

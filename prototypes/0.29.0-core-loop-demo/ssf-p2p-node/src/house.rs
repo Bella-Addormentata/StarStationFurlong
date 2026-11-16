@@ -2031,6 +2031,7 @@ impl House {
         }
         let mut delegations: Vec<CVal> = Vec::new();
         let mut hk_unclear = false;
+        let mut hk_read = true;
         let mut hk_heals: Vec<Write> = Vec::new();
         for (key, value) in hk_keys {
             let theirs = |v: &CVal| str_of(v, "h") == key.strip_prefix("hk:");
@@ -2051,7 +2052,10 @@ impl House {
                     continue;
                 }
                 // (The tick's reads spent: so is each game's read, which is then short.)
-                Read::Spent => break,
+                Read::Spent => {
+                    hk_read = false;
+                    break;
+                }
                 Read::Absent | Read::Heavy => continue,
             };
             if theirs(&v) {
@@ -2302,10 +2306,11 @@ impl House {
         // does not carry wants its own there. Where the doc holds none of theirs, the one of lowest hash goes back: the
         // same whichever games a pass gets to, so two games handed to different holders never write over each other's.
         // The others go by the delegation the house holds for them ([`TableMem::deleg`]). (Only of the games the doc
-        // holds records of.)
+        // holds records of; and only from a pass that read every delegation of the room, clear: until then the key may
+        // hold one of theirs the pass could not tell, a new holder's say, which the one it holds must not go over.)
         let tables = &self.rooms[room].tables;
         let wanted: Vec<(String, &CVal)> = seen.iter().filter_map(|k| tables.get(k)).filter(|m| m.keyed).filter_map(|m| m.deleg.as_ref()).filter_map(|d| Some((hb::rec_hash(d)?, d))).collect();
-        if !wanted.iter().any(|(hash, _)| in_doc.contains(hash)) {
+        if hk_read && !hk_unclear && !wanted.iter().any(|(hash, _)| in_doc.contains(hash)) {
             if let Some((_, d)) = wanted.iter().min_by(|a, b| a.0.cmp(&b.0)) {
                 reput.push(Write::Top { key: format!("hk:{me}"), value: (*d).clone() });
             }
