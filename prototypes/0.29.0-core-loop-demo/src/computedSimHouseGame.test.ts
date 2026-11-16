@@ -8,21 +8,25 @@
  * that changes hands (N1, PR 6c-5c-2): which rounds are the seller's house's
  * and which the buyer's, and whose checkpoints carry what.
  *
- * The node's house job has no `p`/`q` half yet: this twin is written from the
- * design first, and the node's half is to be held to these rules.
+ * The node's house job has its `p`/`q` half's reads, joins, reveals, holds
+ * and put-backs since #454, #455, #459 and #461; this twin follows it there
+ * (the specs of holds, settling and put-backs below), and is ahead of it with
+ * the trim, the sweep, the end and the rows, which the node's half is to be
+ * held to.
  */
 
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { basisOf, canonFelt } from './computedCraps';
-import { ckKey, faironlyInc, readCk, sealCk, sealFin } from './computedFairOnly';
+import { ckKey, faironlyInc, readCk, sealCk, sealFin, xfId } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
-import { resolveGame } from './computedFairOnlyAuth';
-import { authEnv, buyer, delegation, DL_HOUSE, hex, house as H, house2 as H2, NAME, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, third, trimOf, xferOf } from './computedFairOnlyKit';
+import { MAX_FORGED_XFS, resolveGame } from './computedFairOnlyAuth';
+import { authEnv, buyer, changed, delegation, DL_HOUSE, hex, house as H, house2 as H2, NAME, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, stranger, T, third, trimOf, xferOf } from './computedFairOnlyKit';
 import { foldGameOf, MAX_HELD_ROUNDS, nextSid3, recHash, TableFold } from './computedFold';
 import type { CloseRec, FoldCtx, FoldResult, SlipRec } from './computedFold';
-import { beatKey, delegationKey, HEARTBEAT_MS } from './computedHouse';
-import { HOUSE_IDLE_MS, HOUSE_SWEEP_BYTES, HOUSE_SWEEP_KEYS, HOUSE_SWEEP_MIN_MS, HOUSE_TRIM_AFTER_MS, HOUSE_TRIM_ROUNDS, REVEAL_CUTOFF_MS, SETTLE_MS, SimHouse } from './computedSimHouse';
+import { FORGED_DELETE_MAX } from './casinoDoc';
+import { beatKey, delegationKey, HEARTBEAT_MS, HOUSE_HEARD_MS, houseSign } from './computedHouse';
+import { HOUSE_FORGED_DELETE_MAX, HOUSE_IDLE_MS, HOUSE_SWEEP_BYTES, HOUSE_SWEEP_KEYS, HOUSE_SWEEP_MIN_MS, HOUSE_TRIM_AFTER_MS, HOUSE_TRIM_ROUNDS, REVEAL_CUTOFF_MS, SETTLE_MS, SimHouse } from './computedSimHouse';
 import { ComputedKit, red, testIdentity, trustAll } from './computedTestKit';
 import type { Built } from './computedTestKit';
 
@@ -143,6 +147,30 @@ class GameRoom {
 
 /** The game's records in the doc, resolved as a page resolves them. */
 const resolved = (room: GameRoom) => resolveGame(authEnv().env, T, P.inc, recordsOf([...room.top().entries()].map(([key, value]) => ({ key, value }))));
+
+/** The game opened with its root delegating the second house: this house serves it by the owner's delegation the
+ *  room holds under its key (the base does not carry it), and has settled and joined round 1. */
+const ROOT_H2 = rootOf(P, 'p', { dl: delegation(owner, H2.pub) });
+function keyedRoom(): GameRoom {
+  const room = new GameRoom(ROOT_H2);
+  room.doc.transact(() => room.top().set(delegationKey(H.pub), DL_HOUSE));
+  return room.start();
+}
+
+/** The room's doc holding part of an update (the second of two alone: Yjs parks it until the first comes); the
+ *  rest, when called. */
+function park(room: GameRoom): () => void {
+  const other = new Y.Doc();
+  const ups: Uint8Array[] = [];
+  other.on('update', (u: Uint8Array) => ups.push(u));
+  other.transact(() => other.getMap('scratch').set('a', 1));
+  other.transact(() => other.getMap('scratch').set('b', 2));
+  Y.applyUpdate(room.doc, ups[1]);
+  return () => Y.applyUpdate(room.doc, ups[0]);
+}
+
+/** A signature of other bytes, as a forger's. */
+const BAD_SIG = houseSign(H.secret, new Uint8Array([1, 2, 3]));
 
 describe("the simulations' house at a FAIR ONLY game: whose game, and its rounds", () => {
   it('serves the game whose root delegates it, with no deed holder in the room: once it has settled, and not before, it beats and joins round 1', () => {
@@ -882,8 +910,9 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
     // As a page resolves the game now: over, from that checkpoint.
     expect(resolved(room)).toMatchObject({ live: false, base: { key }, pending: false });
     expect(room.sesKeys()).toEqual([]);
-    // (Nothing else either: the room's map holds the end, the order, the house's delegation and its beat.)
-    expect([...room.top().keys()].map((k) => k.slice(0, k.indexOf(':'))).sort()).toEqual(['ck', 'fin', 'hb', 'hk']);
+    // (Nothing else either: the room's map holds the end, the order and the house's beat; no delegation under its
+    // key, which no game wants, the root carrying it.)
+    expect([...room.top().keys()].map((k) => k.slice(0, k.indexOf(':'))).sort()).toEqual(['ck', 'fin', 'hb']);
     expect(room.house.rows.get(`${ROOM}|${T}|${P.inc}`)).toEqual({ key, value: ck });
     // …and it writes nothing more at the game.
     const top = [...room.top().keys()].filter((k) => !k.startsWith('hb:')).sort();
@@ -1134,16 +1163,6 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
   }
 
   it('no checkpoint from a doc that holds part of an update: no trim, no sweep and no end until the rest is in', () => {
-    // (The second of two updates alone: the doc parks it until the first comes.)
-    const park = (room: GameRoom): (() => void) => {
-      const other = new Y.Doc();
-      const ups: Uint8Array[] = [];
-      other.on('update', (u: Uint8Array) => ups.push(u));
-      other.transact(() => other.getMap('scratch').set('a', 1));
-      other.transact(() => other.getMap('scratch').set('b', 2));
-      Y.applyUpdate(room.doc, ups[1]);
-      return () => Y.applyUpdate(room.doc, ups[0]);
-    };
     // An end.
     const { room } = lastRound();
     const rest = park(room);
@@ -1361,25 +1380,133 @@ describe("the simulations' house at a FAIR ONLY game: what it puts back", () => 
     expect(room.recs('h:2:').map((v) => v.x)).toEqual([[r2.c.hash]]);
   });
 
-  it('its delegation under its key, when the room holds none there; and its own session records', () => {
+  it('its own session records, and nothing under its key while the base carries its delegation (no game wants one there)', () => {
     const room = new GameRoom().start();
     room.run(1_200);
-    expect(room.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
-    // Also where something that is no delegation of it lies there; one of it that differs stays (the deed holder's newer one).
-    for (const junk of ['junk', { v: 1 }, { ...DL_HOUSE, h: H2.pub }]) {
-      room.doc.transact(() => room.top().set(delegationKey(H.pub), junk));
-      room.run(1_200);
-      expect(room.top().get(delegationKey(H.pub)), JSON.stringify(junk)).toEqual(DL_HOUSE);
-    }
-    const newer = delegation(owner, H.pub);
-    const other = { ...newer, g: `${newer.g.slice(0, -2)}AA` };
-    room.doc.transact(() => room.top().set(delegationKey(H.pub), other));
-    room.run(1_200);
-    expect(room.top().get(delegationKey(H.pub))).toEqual(other);
+    expect(room.top().has(delegationKey(H.pub))).toBe(false);
     const [join] = room.keys('o:1:');
     room.doc.transact(() => room.ses().delete(join));
     room.run(1_200);
     expect(room.keys('o:1:')).toEqual([join]);
+    expect(room.top().has(delegationKey(H.pub))).toBe(false);
+  });
+
+  it('its delegation under its key for a game whose base does not carry it: over nothing, junk, another house\'s and a forged one of it, but not over a good one of it whoever signed it; meanwhile it serves the game by the one it holds', () => {
+    const room = keyedRoom();
+    expect(room.recs('o:1:').map((v) => v.c)).toEqual([kit.houseCommit(H, 1)]);
+    room.doc.transact(() => room.top().delete(delegationKey(H.pub)));
+    room.run(1_200);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
+    const forged = { ...DL_HOUSE, g: `${DL_HOUSE.g.slice(0, -2)}AA` };
+    for (const junk of ['junk', { v: 1 }, { ...DL_HOUSE, h: H2.pub }, delegation(owner, H2.pub), forged]) {
+      room.doc.transact(() => room.top().set(delegationKey(H.pub), junk));
+      room.run(1_200);
+      expect(room.top().get(delegationKey(H.pub)), JSON.stringify(junk)).toEqual(DL_HOUSE);
+    }
+    // A stranger's delegation of it stays (the pages write over one of a key that does not hold the game), and the
+    // house plays on by the owner's, which it holds.
+    const strangers = delegation(stranger, H.pub);
+    room.doc.transact(() => room.top().set(delegationKey(H.pub), strangers));
+    room.run(1_200);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(strangers);
+    const r1 = room.played(1, room.sid());
+    expect(r1.h.c).toBe(kit.houseCommit(H, 2));
+    room.played(2, r1.c.hash);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(strangers);
+  });
+
+  it('while it is a house of the room\'s house tables it leaves its key to them: one put-back there, theirs', () => {
+    const room = keyedRoom();
+    room.doc.transact(() => room.doc.getMap('roomInfo').set('owner', owner.pid));
+    room.run(1_200);
+    const before = room.house.wrote.putBacks;
+    room.doc.transact(() => room.top().delete(delegationKey(H.pub)));
+    room.run(2_400);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
+    expect(room.house.wrote.putBacks - before).toBe(1);
+    // (Without the house tables, the game's own put-back: one too.)
+    const alone = keyedRoom();
+    alone.run(1_200);
+    const was = alone.house.wrote.putBacks;
+    alone.doc.transact(() => alone.top().delete(delegationKey(H.pub)));
+    alone.run(2_400);
+    expect(alone.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
+    expect(alone.house.wrote.putBacks - was).toBe(1);
+  });
+
+  it('of two games that each want a delegation of their own under its key, the one of lowest hash goes back, every time; and none of a game the doc holds no record of', () => {
+    const room = keyedRoom();
+    // A second game, Q, handed at its first round to the buyer, who delegates this house: under its key now.
+    const DLB = delegation(buyer, H.pub);
+    const q = rootOf(Q, 'q', { dl: delegation(owner, H2.pub) });
+    const xq = xferOf(Q, owner, buyer, 0);
+    room.doc.transact(() => {
+      room.top().set(q.key, q.value);
+      room.top().set(`ses:${T}:${Q.inc}:${nextSid3(Q, q.value)}`, new Y.Map());
+      room.top().set(xq.key, xq.value);
+      room.top().set(delegationKey(H.pub), DLB);
+    });
+    room.run(SETTLE_MS + 1_200);
+    const qses = room.top().get(`ses:${T}:${Q.inc}:${nextSid3(Q, q.value)}`) as Y.Map<unknown>;
+    expect([...qses.keys()].filter((k) => k.startsWith('o:1:'))).toHaveLength(1);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(DLB);
+    const low = [DL_HOUSE, DLB].sort((a, b) => (recHash(a)! < recHash(b)! ? -1 : 1))[0];
+    for (let i = 0; i < 3; i++) {
+      room.doc.transact(() => room.top().delete(delegationKey(H.pub)));
+      room.run(1_200);
+      expect(room.top().get(delegationKey(H.pub)), `${i}`).toEqual(low);
+    }
+    // The records of the game whose delegation that is gone: the other's alone is wanted.
+    const [gone, stays] = low === DLB ? [[q.key, xq.key], DL_HOUSE] : [[ROOT_H2.key], DLB];
+    room.doc.transact(() => {
+      for (const k of gone) room.top().delete(k);
+      room.top().set(delegationKey(H.pub), 'junk');
+    });
+    room.run(1_200);
+    expect(room.top().get(delegationKey(H.pub))).toEqual(stays);
+  });
+
+  it("the live session's map, when the doc has lost it, with its own records in it in the same write: after a restart, its reveals from before", () => {
+    const room = new GameRoom().start();
+    room.played(1, SID);
+    const own = [...room.keys('o:1:'), ...room.keys('h:1:')];
+    expect(own).toHaveLength(2);
+    const lose = (): void => {
+      const n = room.house.newSessions;
+      room.doc.transact(() => room.top().delete(`ses:${T}:${P.inc}:${SID}`));
+      for (let i = 0; i < 10 && room.house.newSessions === n; i++) room.tick(TICK);
+      expect(room.house.newSessions).toBe(n + 1);
+    };
+    lose();
+    expect([...room.ses().keys()].sort()).toEqual(own.sort());
+    room.house.restart();
+    lose();
+    expect([...room.ses().keys()]).toEqual(room.keys('h:1:'));
+    expect(room.keys('h:1:')).toHaveLength(1);
+  });
+
+  it(`its forged records go at the put-back's turn, at most ${HOUSE_FORGED_DELETE_MAX} a turn as on the pages, and none while the doc holds part of an update`, () => {
+    expect(HOUSE_FORGED_DELETE_MAX).toBe(FORGED_DELETE_MAX);
+    const room = new GameRoom().start();
+    const forged = Array.from({ length: HOUSE_FORGED_DELETE_MAX + 44 }, (_, i) => changed(P, trimOf(P, 'p', { u: 20 + i, l: hex('e', 32) }), { g: BAD_SIG }));
+    const rest = park(room);
+    room.doc.transact(() => {
+      for (const f of forged) room.top().set(f.key, f.value);
+    });
+    expect(resolved(room).invalid).toHaveLength(forged.length);
+    room.run(3_000);
+    expect(room.house.forgedDeletes).toBe(0);
+    rest();
+    let left = forged.length;
+    for (let i = 0; i < 10 && left === forged.length; i++) {
+      room.tick(TICK);
+      left = forged.filter((f) => room.top().has(f.key)).length;
+    }
+    expect(left).toBe(44);
+    room.run(1_200);
+    expect(forged.filter((f) => room.top().has(f.key))).toEqual([]);
+    expect(room.house.forgedDeletes).toBe(forged.length);
+    expect(room.top().get(ROOT.key)).toEqual(ROOT.value);
   });
 
   it('a checkpoint key of the game under a made-up id is not one of its rows: it writes nothing there', () => {
@@ -1661,6 +1788,24 @@ describe("the simulations' houses at a FAIR ONLY game that changes hands (N1)", 
     expect(ck).toMatchObject({ u: 3, w: 1, dl: DL2, k: H2.pub, x: [xf.value] });
     expect(resolved(room)).toMatchObject({ live: true, holder: buyer.pub, base: { key }, pending: false, invalid: [] });
   });
+
+  it("a transfer the doc holds only inside its checkpoint's x goes back under its key", () => {
+    const { room, xf, c } = midRound();
+    room.seeded(3, c.hash, H2);
+    room.junk(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_TRIM_AFTER_MS + 1_400);
+    expect(room.house2.trims).toBe(1);
+    expect(room.cks()[0].ck.x).toEqual([xf.value]);
+    // (Only one the doc lacks: one under its key is left be.)
+    const before = room.house2.wrote.putBacks;
+    room.run(2_400);
+    expect(room.house2.wrote.putBacks).toBe(before);
+    room.doc.transact(() => room.top().delete(xf.key));
+    expect(resolved(room).chain[1].step?.key).toBeUndefined();
+    room.run(1_200);
+    expect(room.top().get(xf.key)).toEqual(xf.value);
+    expect(resolved(room).chain[1].step?.key).toBe(xf.key);
+  });
 });
 
 describe("the simulations' houses at a FAIR ONLY game with two houses of its holder", () => {
@@ -1821,5 +1966,206 @@ describe("the simulations' houses at a FAIR ONLY game with two houses of its hol
     room.put(kit.abandon(alice, 2, c.hash));
     room.tick(TICK);
     expect(by2(room, 'o:3:')).toHaveLength(1);
+  });
+});
+
+describe("the simulations' house at a FAIR ONLY game: holds and settling, as the node's half has them (#455, #459, #461)", () => {
+  /** Round 1 played; then the game's root out of the doc for `ms` (nothing else of the game in it, or a transfer
+   *  too: a spell with no base), back with a close of round 2 on the house's commitment, both seeds in. */
+  function rootAway(ms: number, opts: { gap?: boolean; xf?: boolean; seeds?: ('alice' | 'bob')[] } = {}) {
+    const room = new GameRoom().start();
+    const r1 = room.played(1, SID);
+    const xf = xferOf(P, owner, buyer, 50);
+    room.doc.transact(() => {
+      room.top().delete(ROOT.key);
+      if (opts.xf) room.top().set(xf.key, xf.value);
+    });
+    if (opts.gap) room.tick(HOUSE_HEARD_MS);
+    room.run(ms);
+    room.doc.transact(() => room.top().set(ROOT.key, ROOT.value));
+    const r2 = room.closed(2, r1.c.hash);
+    room.put(...(opts.seeds ?? ['alice', 'bob']).map((p) => kit.reveal(2, p)));
+    return Object.assign(room, { r2 });
+  }
+
+  it('a game whose every record went: a close it first reads once they are back counts as there since they went, for the cutoff (the pages voided it meanwhile)', () => {
+    const soon = rootAway(REVEAL_CUTOFF_MS - 1_200);
+    soon.tick(TICK);
+    const [h2] = soon.recs('h:2:');
+    expect(h2).toBeDefined();
+    // (The hold is spent at that read: a close of the next round, in well past the cutoff from the spell, is revealed.)
+    soon.run(REVEAL_CUTOFF_MS);
+    soon.played(3, soon.r2.c.hash);
+    const late = rootAway(REVEAL_CUTOFF_MS + 400);
+    const refusals = late.house.refusals;
+    late.run(2_000);
+    expect(late.recs('h:2:')).toHaveLength(0);
+    expect(late.house.refusals).toBe(refusals + 1);
+  });
+
+  it('…and so does a spell with no base, other records of the game left', () => {
+    const soon = rootAway(REVEAL_CUTOFF_MS - 1_200, { xf: true });
+    soon.tick(TICK);
+    expect(soon.recs('h:2:')).toHaveLength(1);
+    const late = rootAway(REVEAL_CUTOFF_MS + 400, { xf: true });
+    late.run(2_000);
+    expect(late.recs('h:2:')).toHaveLength(0);
+  });
+
+  it('cut off for HOUSE_HEARD_MS while its game was gone, it settles from its next read of the session, not from the tick it came back: a close it first reads then is not revealed', () => {
+    // (Away SETTLE_MS and more after the gap: a settle from the tick it came back would be over by then.)
+    const room = rootAway(SETTLE_MS + 1_000, { gap: true });
+    const blocked = room.house.blockedSeen;
+    room.run(SETTLE_MS + 2_000);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    expect(room.house.blockedSeen).toBe(blocked + 1);
+    // (The same spell without the gap: no settle, and well inside the cutoff.)
+    const ticking = rootAway(SETTLE_MS + 1_000);
+    ticking.tick(TICK);
+    expect(ticking.recs('h:2:')).toHaveLength(1);
+  });
+
+  it('a spell it serves none of the game\'s rounds (handed on and back), held, not settled anew: a close of its round in after the spell is revealed at once inside the cutoff, and refused past it', () => {
+    const run = (ms: number) => {
+      const room = new GameRoom().start();
+      const [join] = room.recs('o:1:');
+      expect(join.c).toBe(kit.houseCommit(H, 1));
+      const away = xferOf(P, owner, buyer, 0);
+      const back = xferOf(P, buyer, owner, 0, { nonce: 'fedcba9876543210fedcba98' });
+      room.doc.transact(() => room.top().set(away.key, away.value));
+      room.run(ms);
+      room.doc.transact(() => room.top().set(back.key, back.value));
+      expect(resolved(room).chain.map((h) => h.k)).toEqual([owner.pub, buyer.pub, owner.pub]);
+      room.closed(1, SID);
+      room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+      return room;
+    };
+    const soon = run(REVEAL_CUTOFF_MS - 1_200);
+    const blocked = soon.house.blockedSeen;
+    soon.tick(TICK);
+    expect(soon.recs('h:1:')).toHaveLength(1);
+    expect(soon.house.blockedSeen).toBe(blocked);
+    const late = run(REVEAL_CUTOFF_MS + 400);
+    late.run(2_000);
+    expect(late.recs('h:1:')).toHaveLength(0);
+  });
+
+  it("its grace still runs from when it first saw the close: a hold never cuts a seed's time", () => {
+    const room = rootAway(8_000, { seeds: ['alice'] });
+    room.run(2_000);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    room.put(kit.reveal(2, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:2:').map((v) => (v.n as string[]).length)).toEqual([2]);
+  });
+
+  it("the session's map gone while the doc holds part of an update is not put back then, and is a hold: a close it first reads with the map back counts as there since it went", () => {
+    const run = (ms: number) => {
+      const room = new GameRoom().start();
+      const r1 = room.played(1, SID);
+      const house = [...room.ses().entries()].filter(([k]) => k.startsWith('o:') || k.startsWith('h:'));
+      const rest = park(room);
+      room.doc.transact(() => room.top().delete(`ses:${T}:${P.inc}:${SID}`));
+      room.run(ms);
+      expect(room.sesKeys()).toEqual([]);
+      expect(room.house.newSessions).toBe(0);
+      // The rest in, and a page puts the map back with round 1's records (the house's among them) and a close of round 2 (at once: the hold
+      // is spent at the house's first read of the map).
+      rest();
+      room.doc.transact(() => {
+        room.top().set(`ses:${T}:${P.inc}:${SID}`, new Y.Map());
+        for (const [k, v] of house) room.ses().set(k, v);
+      });
+      room.put(r1.a, r1.b, r1.c, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+      room.closed(2, r1.c.hash);
+      room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+      return room;
+    };
+    const soon = run(REVEAL_CUTOFF_MS - 1_200);
+    soon.tick(TICK);
+    expect(soon.recs('h:2:')).toHaveLength(1);
+    const late = run(REVEAL_CUTOFF_MS + 400);
+    late.run(2_000);
+    expect(late.recs('h:2:')).toHaveLength(0);
+  });
+
+  it('what wants its key: a game it serves by a delegation its base does not carry, until the game is over or handed on; a game whose base the doc lost still does', () => {
+    const lost = (room: GameRoom): void => {
+      room.doc.transact(() => room.top().delete(delegationKey(H.pub)));
+      room.run(1_200);
+    };
+    // Over: its end carries its delegation, and the game wants nothing.
+    const ended = keyedRoom();
+    const fin = sealFin(P, owner.pub, owner.sign);
+    ended.doc.transact(() => ended.top().set(fin.key, fin.value));
+    ended.played(1, ended.sid());
+    ended.run(HOUSE_TRIM_AFTER_MS + 1_400);
+    expect(ended.house.ends).toBe(1);
+    lost(ended);
+    expect(ended.top().has(delegationKey(H.pub))).toBe(false);
+    // Handed on: the house serves none of its rounds.
+    const handed = keyedRoom();
+    const away = xferOf(P, owner, buyer, 0);
+    handed.doc.transact(() => handed.top().set(away.key, away.value));
+    handed.run(1_200);
+    lost(handed);
+    expect(handed.top().has(delegationKey(H.pub))).toBe(false);
+    // The base lost, a transfer of the game left: still wanted (the base is the pages' to put back).
+    const based = keyedRoom();
+    const later = xferOf(P, owner, buyer, 50);
+    based.doc.transact(() => {
+      based.top().set(later.key, later.value);
+      based.top().delete(ROOT_H2.key);
+    });
+    based.run(1_200);
+    lost(based);
+    expect(based.top().get(delegationKey(H.pub))).toEqual(DL_HOUSE);
+  });
+
+  it('a game whose resolution waits (more forged transfers than it walks past) is not served until they go: nothing there while the doc holds part of an update, which keeps them', () => {
+    const room = new GameRoom().start();
+    const forged = Array.from({ length: MAX_FORGED_XFS + 1 }, (_, i) => {
+      const value = { ...xferOf(P, owner, buyer, 1 + i).value, g: BAD_SIG };
+      return { key: `xf:${T}:${P.inc}:${xfId(value)}`, value };
+    });
+    const rest = park(room);
+    room.doc.transact(() => {
+      for (const f of forged) room.top().set(f.key, f.value);
+    });
+    expect(resolved(room)).toMatchObject({ pending: true, live: true });
+    room.closed(1, SID);
+    room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.run(3_000);
+    expect(room.recs('h:1:')).toHaveLength(0);
+    rest();
+    room.run(1_200);
+    expect(forged.filter((f) => room.top().has(f.key))).toEqual([]);
+    expect(room.recs('h:1:')).toHaveLength(1);
+  });
+
+  it("a delegation counts only under its own house's key, as the pages take them: one of this house under another's is nothing", () => {
+    for (const under of [H.pub, H2.pub, stranger.pub]) {
+      const room = new GameRoom(ROOT_H2);
+      room.doc.transact(() => room.top().set(delegationKey(under), DL_HOUSE));
+      room.start();
+      expect(room.recs('o:1:'), under).toHaveLength(under === H.pub ? 1 : 0);
+    }
+  });
+
+  it("handed over at the round in flight to a buyer who delegates this same house over the seller's delegation, the base carrying neither: it still reveals the seller's round, by the seller's delegation it keeps", () => {
+    const room = keyedRoom();
+    const r1 = room.played(1, room.sid());
+    const { c } = room.closed(2, r1.c.hash);
+    room.tick(TICK);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    const xf = xferOf(P, owner, buyer, 2);
+    room.doc.transact(() => {
+      room.top().set(xf.key, xf.value);
+      room.top().set(delegationKey(H.pub), delegation(buyer, H.pub));
+    });
+    room.run(3 * TICK);
+    room.put(kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    room.tick(TICK);
+    expect(room.recs('h:2:').map((v) => v.x)).toEqual([[c.hash]]);
   });
 });
