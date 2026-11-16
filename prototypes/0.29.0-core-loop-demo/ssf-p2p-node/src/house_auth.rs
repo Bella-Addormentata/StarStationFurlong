@@ -899,8 +899,20 @@ impl Resolution {
     /// `round` signed and whose check passes. A key holds the game for a
     /// round after the round it took the game, up to the round it gave it.
     pub fn house_by(&self, house: &str, round: i64, sig: &mut SigCheck) -> HouseBy {
+        self.house_by_with(house, round, None, sig)
+    }
+
+    /// [`Resolution::house_by`], with `room` weighed first, as the room's
+    /// delegations come first among those a resolution is given: the room's
+    /// delegation under `house`'s key and its hash, for a caller that keeps
+    /// the room's delegations apart and gives each only for the house it asks
+    /// of (the node's index of a room, house_index.rs). (So checkpoints that
+    /// carry forged delegations of the house spend no check before it.)
+    pub fn house_by_with(&self, house: &str, round: i64, room: Option<(&CVal, &str)>, sig: &mut SigCheck) -> HouseBy {
         let mut waiting = false;
-        for (d, hash) in &self.delegations {
+        let room = room.filter(|(d, _)| small_delegation(d));
+        let given = self.delegations.iter().map(|(d, hash)| (d, hash.as_str())).filter(|(_, hash)| room.is_none_or(|(_, h)| h != *hash));
+        for (d, hash) in room.into_iter().chain(given) {
             if str_of(d, "h") != Some(house) {
                 continue;
             }
@@ -911,7 +923,7 @@ impl Resolution {
                 continue;
             }
             match sig(&sig_id("hkey", &self.t, &self.inc, hash), k, &|| hb::room_sign_bytes("hkey", &self.room, "", d).map(|b| b.to_vec()), str_of(d, "g").unwrap_or("")) {
-                Some(true) => return HouseBy::Yes { value: d.clone(), hash: hash.clone() },
+                Some(true) => return HouseBy::Yes { value: d.clone(), hash: hash.to_string() },
                 None => waiting = true,
                 Some(false) => {}
             }
@@ -922,7 +934,12 @@ impl Resolution {
     /// Whether `house` decides round `round` of this game; None while the
     /// delegation's check is put off.
     pub fn house_at(&self, house: &str, round: i64, sig: &mut SigCheck) -> Option<bool> {
-        match self.house_by(house, round, sig) {
+        self.house_at_with(house, round, None, sig)
+    }
+
+    /// [`Resolution::house_at`], with `room` weighed too ([`Resolution::house_by_with`]).
+    pub fn house_at_with(&self, house: &str, round: i64, room: Option<(&CVal, &str)>, sig: &mut SigCheck) -> Option<bool> {
+        match self.house_by_with(house, round, room, sig) {
             HouseBy::Yes { .. } => Some(true),
             HouseBy::No => Some(false),
             HouseBy::Pending => None,
@@ -1281,6 +1298,58 @@ mod tests {
         let other = v["games"][0]["inc"].as_str().unwrap();
         let res = resolve_game(s(&v, "room"), s(&v, "t"), other, None, &rec, &mut |_, _, _, _| Some(true));
         assert!(!res.newer && res.name.is_none());
+    }
+
+    #[test]
+    fn the_rooms_delegation_of_a_house_is_weighed_first() {
+        // 🔒 Given apart (the node's index of a room), the room's delegation of a house is weighed before the ones the
+        // resolution was given, as the room's come first among those: forged ones of the house that the game's
+        // checkpoints carry spend no check before it. (And once, though one of them is the same.)
+        let key = |c: char| format!("{c}{}", "A".repeat(42));
+        let sig = |c: char| format!("{c}{}", "A".repeat(85));
+        let deleg = |h: &str, g: char| CVal::Obj(vec![("v".into(), CVal::Int(1)), ("h".into(), CVal::Str(h.into())), ("k".into(), CVal::Str(key('B'))), ("g".into(), CVal::Str(sig(g)))]);
+        let house = key('C');
+        let (forged, room) = (deleg(&house, 'F'), deleg(&house, 'R'));
+        assert!(small_delegation(&forged) && small_delegation(&room));
+        let res = Resolution {
+            t: "t".into(),
+            inc: "p".into(),
+            letter: 'p',
+            newer: false,
+            name: None,
+            chain: vec![Holder { k: key('B'), from: 0, step: None }],
+            holder: Some(key('B')),
+            base: None,
+            fin: None,
+            live: true,
+            unlooked: false,
+            invalid: Vec::new(),
+            pending: false,
+            delegations: vec![(forged.clone(), "f".into()), (room.clone(), "r".into())],
+            room: "room".into(),
+        };
+        let mut asked: Vec<String> = Vec::new();
+        let got = res.house_by_with(&house, 1, Some((&room, "r")), &mut |id, _, _, _| {
+            asked.push(id.to_string());
+            Some(id == "hkey|r")
+        });
+        assert_eq!(got, HouseBy::Yes { value: room.clone(), hash: "r".into() });
+        assert_eq!(asked, ["hkey|r"], "the room's first, and it alone");
+        // (Its check put off: the others are weighed meanwhile, and it is not weighed twice.)
+        let mut asked: Vec<String> = Vec::new();
+        let got = res.house_by_with(&house, 1, Some((&room, "r")), &mut |id, _, _, _| {
+            asked.push(id.to_string());
+            (id != "hkey|r").then_some(false)
+        });
+        assert_eq!(got, HouseBy::Pending);
+        assert_eq!(asked, ["hkey|r", "hkey|f"]);
+        // (None given apart: as given.)
+        let mut asked: Vec<String> = Vec::new();
+        res.house_by_with(&house, 1, None, &mut |id, _, _, _| {
+            asked.push(id.to_string());
+            Some(false)
+        });
+        assert_eq!(asked, ["hkey|f", "hkey|r"]);
     }
 
     #[test]
