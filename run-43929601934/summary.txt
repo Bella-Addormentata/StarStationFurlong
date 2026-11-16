@@ -1,0 +1,52 @@
+📌 iroh IPv4 socket pinned to UDP 44452 (SSF_IROH_PORT) — forward UDP 44452 on your router for direct reachability
+📌 iroh IPv6 socket pinned to UDP 44452 — allow inbound UDP 44452 on your IPv6 firewall for direct reachability
+📌 SSF_EXTERNAL_ADDRS not set — the public IPv4 the DHT's nodes see is advertised by default (R1; no website is asked); set SSF_EXTERNAL_ADDRS=off to opt out
+🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)
+📌 Board bundles on — carrying 0 sealed bundle(s) from the last run (board-bundles/)
+📌 External address advertised: <v4>:44452, where the DHT's nodes see this computer (2.0 s after start; no website is asked) — the router must forward UDP 44452 here, or keep it
+🚪 DHT knock: joined the DHT; looking for knocks every 30 s
+🤝 Local browser session secured from <v4>:52281
+🚪 DHT knock: knocked on 1d0e20b7… through the DHT (port 44452, 33.0 s); it opens toward this computer when it sees the knock
+🚪 DHT knock: knocked on 1d0e20b7… through the DHT (port 44452, 13.0 s); it opens toward this computer when it sees the knock
+⚠️ Local peer connection closed with error (<v4>:52281): connection closed by peer: 0
+--- page ---
+[18:35:49Z +   9s] guest: invite read: {"roomId":"home-242dc09d0786","memberHints":1,"cards":1,"directAddrs":4,"relays":0}
+[18:35:50Z +  11s] guest: page open with the invite, waiting for the host's live state of room home-242dc09d0786
+[18:38:50Z + 191s] guest: not linked to the host after 180 s (no live route yet); staying, the node keeps dialling
+[18:38:50Z + 191s] status changed: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:39:05Z + 206s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:39:20Z + 221s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:39:35Z + 236s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:39:50Z + 251s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:40:06Z + 266s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:40:21Z + 281s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:40:36Z + 296s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:40:51Z + 311s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:41:06Z + 326s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:41:21Z + 341s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:41:36Z + 356s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:41:51Z + 371s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:42:06Z + 386s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:42:21Z + 401s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:42:36Z + 416s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:42:51Z + 431s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:43:06Z + 446s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:43:21Z + 461s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:43:36Z + 476s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:43:51Z + 491s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:44:06Z + 506s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:44:21Z + 521s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:44:36Z + 536s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:44:51Z + 551s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:45:06Z + 566s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:45:21Z + 581s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:45:36Z + 596s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:45:51Z + 611s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:46:06Z + 626s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:46:21Z + 641s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:46:36Z + 656s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:46:51Z + 671s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:47:06Z + 686s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:47:21Z + 701s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:47:36Z + 716s] status: {"room":"home-242dc09d0786","ownerKnown":false,"linked":false,"mode":"direct-unreliable","players":1,"nodeCard":false}
+[18:47:51Z + 731s] time is up (12 min)
