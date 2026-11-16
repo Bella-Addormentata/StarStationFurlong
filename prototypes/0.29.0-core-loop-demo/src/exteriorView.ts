@@ -105,7 +105,17 @@ let lastStationExtent = 0;
  *  inside the frustum (clickable, not clipped). */
 function exteriorZoomFactor(): number {
   const needed = lastStationExtent + 14; // farthest module + its own half + margin
-  return Math.min(0.42, 0.42 * (16 / Math.max(16, needed)));
+  return Math.min(MODULE_ZOOM_FACTOR, MODULE_ZOOM_FACTOR * (16 / Math.max(16, needed)));
+}
+
+/** The base pull-back: the station view framed on the home module alone. */
+const MODULE_ZOOM_FACTOR = 0.42;
+
+/** 🎬 The station view's zoom framed on the module at the centre alone,
+ *  before a big atlas pulls back further (the arrival closes in on it,
+ *  arrivalSequence.ts); null while the view is not up. */
+export function exteriorModuleZoom(): number | null {
+  return savedZoom !== null ? savedZoom * MODULE_ZOOM_FACTOR : null;
 }
 
 function applyExteriorZoom(): void {

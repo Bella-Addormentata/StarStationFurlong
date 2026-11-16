@@ -12,8 +12,10 @@ import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import {
   APPROACH_END_TIMES,
+  APPROACH_SETTLE_SECONDS,
   APPROACH_START_TIMES,
   ARRIVAL_SECONDS,
+  ATLAS_CLOSE,
   ATLAS_START_ZOOM,
   ATLAS_ZOOM_SECONDS,
   ArrivalSequence,
@@ -24,6 +26,9 @@ import {
   MAX_STEP_SECONDS,
   PAIRED_CLICK_MS,
   SHOTS,
+  SPACE_DRIFT_EASE_SECONDS,
+  SPACE_DRIFT_RATE,
+  SPACE_HOLD_MAX_SECONDS,
   VAT_FADE_IN_SECONDS,
   VAT_LOOK_Y,
   VAT_START_ZOOM,
@@ -32,10 +37,12 @@ import {
   blackAt,
   ease,
   hintShownAt,
+  holdDrift,
   shotAt,
   spaceLook,
   swallowPairedClick,
   vatFrame,
+  waitingLine,
   type ArrivalDeps,
 } from './arrivalSequence';
 
@@ -116,11 +123,43 @@ describe('the shots', () => {
     }
   });
 
-  it('the atlas zooms in from far out over its first seconds, then holds', () => {
-    expect(atlasZoom(0)).toBe(ATLAS_START_ZOOM);
-    expect(atlasZoom(ATLAS_ZOOM_SECONDS)).toBe(1);
-    expect(atlasZoom(SHOTS[2].seconds)).toBe(1);
-    expect(atlasZoom(ATLAS_ZOOM_SECONDS / 2)).toBeCloseTo((ATLAS_START_ZOOM + 1) / 2, 9);
+  it('the atlas starts on the whole station and closes in on the module at its centre, then holds', () => {
+    // The welcome station: the view pulls back to frame it all (0.074), far
+    // wider than one module (0.42).
+    expect(atlasZoom(0, 0.074, 0.42)).toBeCloseTo(0.074, 12);
+    expect(atlasZoom(ATLAS_ZOOM_SECONDS, 0.074, 0.42)).toBeCloseTo(0.42 * ATLAS_CLOSE, 12);
+    expect(atlasZoom(SHOTS[2].seconds, 0.074, 0.42)).toBeCloseTo(0.42 * ATLAS_CLOSE, 12);
+    // Geometric: halfway in time is halfway in ratio.
+    expect(atlasZoom(ATLAS_ZOOM_SECONDS / 2, 0.074, 0.42)).toBeCloseTo(Math.sqrt(0.074 * 0.42 * ATLAS_CLOSE), 12);
+    let last = 0;
+    for (let i = 0; i <= 40; i++) {
+      const z = atlasZoom((i / 40) * ATLAS_ZOOM_SECONDS, 0.074, 0.42);
+      expect(z).toBeGreaterThanOrEqual(last);
+      last = z;
+    }
+    // One module alone: still starts out from it and closes in.
+    expect(atlasZoom(0, 0.42, 0.42)).toBeCloseTo(0.42 * ATLAS_START_ZOOM, 12);
+    expect(atlasZoom(ATLAS_ZOOM_SECONDS, 0.42, 0.42)).toBeCloseTo(0.42 * ATLAS_CLOSE, 12);
+    // No module framing known: the station view's own stands in for it.
+    expect(atlasZoom(ATLAS_ZOOM_SECONDS, 0.3, null)).toBeCloseTo(0.3 * ATLAS_CLOSE, 12);
+    expect(atlasZoom(1, 0.3, Number.NaN)).toBe(atlasZoom(1, 0.3, null));
+    // A camera without a sane zoom is left as it is.
+    expect(atlasZoom(1, 0, 0.42)).toBe(0);
+  });
+
+  it('the held sky drifts from rest, then steadily', () => {
+    expect(holdDrift(0)).toBe(0);
+    expect(holdDrift(-1)).toBe(0);
+    expect(holdDrift(Number.NaN)).toBe(0);
+    expect(holdDrift(0.05) / 0.05).toBeLessThan(SPACE_DRIFT_RATE / 100);
+    const later = SPACE_DRIFT_EASE_SECONDS + 5;
+    expect(holdDrift(later + 1) - holdDrift(later)).toBeCloseTo(SPACE_DRIFT_RATE, 12);
+    expect(holdDrift(SPACE_HOLD_MAX_SECONDS)).toBeLessThan(0.5);
+  });
+
+  it('the waiting line names the room', () => {
+    expect(waitingLine('SSF-WELCOME')).toBe('Finding SSF-WELCOME\u2026');
+    expect(waitingLine('')).toBe('Finding the room\u2026');
   });
 
   it('the vat shot starts close on the vat and ends on the room view exactly', () => {
@@ -167,7 +206,7 @@ describe('the shots', () => {
 const L2 = new THREE.Vector3(22, 26, 22);
 const L3 = new THREE.Vector3(34, 38, 34);
 
-function stage(opts: { failStepOut?: boolean; noVat?: boolean } = {}) {
+function stage(opts: { failStepOut?: boolean; noVat?: boolean; roomHere?: boolean; moduleZoom?: number | null } = {}) {
   const ortho = new THREE.OrthographicCamera(-10, 10, 7, -7, 0.1, 1000);
   ortho.zoom = 0.42; // the station view's own zoom, as exteriorView sets it
   ortho.position.copy(L3);
@@ -175,7 +214,14 @@ function stage(opts: { failStepOut?: boolean; noVat?: boolean } = {}) {
   const view = { level: 3, planet: false, camera: ortho as THREE.Camera, skyOnly: false, eye: null as number | null };
   const black: number[] = [];
   const hints: boolean[] = [];
-  const screen = { setBlack: vi.fn((o: number) => { black.push(o); }), setHint: vi.fn((v: boolean) => { hints.push(v); }), remove: vi.fn() };
+  const room = { here: opts.roomHere ?? true };
+  const waiting = { on: false, times: 0 };
+  const screen = {
+    setBlack: vi.fn((o: number) => { black.push(o); }),
+    setHint: vi.fn((v: boolean) => { hints.push(v); }),
+    setWaiting: vi.fn((on: boolean) => { if (on && !waiting.on) waiting.times++; waiting.on = on; }),
+    remove: vi.fn(),
+  };
   const onDone = vi.fn();
   const deps: ArrivalDeps = {
     camera: () => view.camera,
@@ -203,6 +249,8 @@ function stage(opts: { failStepOut?: boolean; noVat?: boolean } = {}) {
     farPass: { setSkyOnly: (on) => { view.skyOnly = on; }, setEyeDistance: (km) => { view.eye = km; } },
     isoOffset: (level, out) => out.copy(level === 2 ? L2 : L3),
     vatCentre: () => (opts.noVat ? null : { x: -5, z: -5 }),
+    roomHere: () => room.here,
+    moduleZoom: () => (opts.moduleZoom === undefined ? 0.42 : opts.moduleZoom),
     screen,
     onDone,
   };
@@ -210,7 +258,11 @@ function stage(opts: { failStepOut?: boolean; noVat?: boolean } = {}) {
   const runTo = (t: number) => {
     while (seq.isPlaying() && seq.elapsed() < t - 1e-9) seq.update(Math.min(1 / 60, t - seq.elapsed()));
   };
-  return { seq, view, ortho, screen, black, hints, onDone, runTo };
+  /** Frames for `seconds` of wall time, whatever the timeline does. */
+  const runFor = (seconds: number) => {
+    for (let i = 0; i < Math.round(seconds * 60); i++) seq.update(1 / 60);
+  };
+  return { seq, view, ortho, screen, black, hints, onDone, runTo, runFor, room, waiting };
 }
 
 describe('the arrival, played out', () => {
@@ -243,9 +295,11 @@ describe('the arrival, played out', () => {
     expect(s.view.level).toBe(3);
     expect(s.view.eye).toBeNull();
     expect(s.ortho.zoom).toBeGreaterThan(0.42 * ATLAS_START_ZOOM);
-    expect(s.ortho.zoom).toBeLessThan(0.42);
+    expect(s.ortho.zoom).toBeLessThan(0.42 * ATLAS_CLOSE);
+    // Looking at the module at the centre.
+    expect(s.ortho.getWorldDirection(new THREE.Vector3()).angleTo(L3.clone().negate())).toBeLessThan(1e-6);
     s.runTo(startOf('fade') + 0.5);
-    expect(s.ortho.zoom).toBeCloseTo(0.42, 9);
+    expect(s.ortho.zoom).toBeCloseTo(0.42 * ATLAS_CLOSE, 9);
 
     s.runTo(startOf('black') + 0.1);
     expect(s.view.level).toBe(2);
@@ -264,6 +318,22 @@ describe('the arrival, played out', () => {
     expect(s.seq.isPlaying()).toBe(false);
     expect(s.onDone).toHaveBeenCalledTimes(1);
     expect(s.screen.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('a whole station: the atlas starts on all of it and closes in on the module at the centre', () => {
+    const s = stage({ moduleZoom: 0.42 });
+    s.runTo(startOf('atlas') - 1);
+    // The station view frames the whole known station, further out than one
+    // module (exteriorView applies it as the view comes back).
+    s.ortho.zoom = 0.074;
+    s.runTo(startOf('atlas') + 0.05);
+    expect(s.ortho.zoom).toBeLessThan(0.08);
+    s.runTo(startOf('fade') + 0.5);
+    expect(s.ortho.zoom).toBeCloseTo(0.42 * ATLAS_CLOSE, 9);
+    // Under the black, the station view's own zoom goes back before the step in.
+    s.runTo(startOf('black') + 0.1);
+    expect(s.view.level).toBe(2);
+    expect(s.ortho.zoom).toBeCloseTo(VAT_START_ZOOM, 9);
   });
 
   it('ends on the room view exactly where the rig keeps it: no jump at the hand-back', () => {
@@ -300,6 +370,80 @@ describe('the arrival, played out', () => {
     s.seq.update(Number.NaN);
     s.seq.update(-5);
     expect(s.seq.elapsed()).toBeCloseTo(MAX_STEP_SECONDS, 9);
+  });
+});
+
+describe('waiting in space for the room', () => {
+  it('holds the sky at the end of its shot until the room is here, saying so, then goes on', () => {
+    const s = stage({ roomHere: false });
+    s.runTo(SHOTS[0].seconds - 0.5);
+    expect(s.waiting.on).toBe(false);
+    s.runFor(5);
+    expect(s.seq.elapsed()).toBe(SHOTS[0].seconds);
+    expect(s.seq.heldSeconds()).toBeGreaterThan(4.4);
+    expect(s.waiting.on).toBe(true);
+    expect(s.view.camera).toBeInstanceOf(THREE.PerspectiveCamera);
+    expect(s.view.skyOnly).toBe(true);
+    expect(s.view.planet).toBe(false);
+    expect(s.hints[s.hints.length - 1]).toBe(true);
+    // Drifting: off the station's direction by the drift so far.
+    const dir = () => (s.view.camera as THREE.PerspectiveCamera).getWorldDirection(new THREE.Vector3());
+    const forward = L3.clone().negate().normalize();
+    expect(dir().angleTo(forward)).toBeGreaterThan(0.01);
+
+    s.room.here = true;
+    const held = s.seq.heldSeconds();
+    s.seq.update(1 / 60);
+    expect(s.waiting.on).toBe(false);
+    expect(s.waiting.times).toBe(1);
+    expect(s.seq.heldSeconds()).toBe(held);
+    s.runTo(startOf('approach') + 0.1);
+    expect(s.view.planet).toBe(true);
+    expect(s.view.skyOnly).toBe(false);
+    // The approach turns back onto the station's direction, smoothly.
+    expect(dir().angleTo(forward)).toBeGreaterThan(0.005);
+    s.runTo(startOf('approach') + APPROACH_SETTLE_SECONDS + 0.1);
+    expect(dir().angleTo(forward)).toBeLessThan(1e-6);
+    s.runTo(ARRIVAL_SECONDS + 1);
+    expect(s.seq.isPlaying()).toBe(false);
+    expect(s.ortho.position.toArray()).toEqual(L2.toArray());
+    expect(s.ortho.zoom).toBe(1);
+  });
+
+  it('never holds when the room is already here', () => {
+    const s = stage();
+    s.runTo(startOf('approach') + 0.1);
+    expect(s.seq.heldSeconds()).toBe(0);
+    expect(s.waiting.times).toBe(0);
+    expect(s.view.planet).toBe(true);
+  });
+
+  it('goes on without the room once the hold runs out', () => {
+    const s = stage({ roomHere: false });
+    s.runTo(SHOTS[0].seconds - 0.5);
+    s.runFor(SPACE_HOLD_MAX_SECONDS + 2);
+    expect(s.seq.heldSeconds()).toBeGreaterThanOrEqual(SPACE_HOLD_MAX_SECONDS);
+    expect(s.seq.heldSeconds()).toBeLessThan(SPACE_HOLD_MAX_SECONDS + 0.1);
+    expect(s.waiting.on).toBe(false);
+    expect(s.seq.elapsed()).toBeGreaterThan(SHOTS[0].seconds);
+    expect(s.view.planet).toBe(true);
+    s.runTo(ARRIVAL_SECONDS + 1);
+    expect(s.onDone).toHaveBeenCalledTimes(1);
+    expect(s.view.level).toBe(2);
+  });
+
+  it('a skip while it holds goes straight to the room view', () => {
+    const s = stage({ roomHere: false });
+    s.runTo(SHOTS[0].seconds - 0.5);
+    s.runFor(3);
+    s.seq.skip();
+    expect(s.seq.isPlaying()).toBe(false);
+    expect(s.view.level).toBe(2);
+    expect(s.view.camera).toBe(s.ortho);
+    expect(s.view.skyOnly).toBe(false);
+    expect(s.ortho.position.toArray()).toEqual(L2.toArray());
+    expect(s.ortho.zoom).toBe(1);
+    expect(s.onDone).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -434,6 +578,18 @@ describe('the wiring', () => {
     for (const id of ['exterior-enter-bubble', 'camera-rotate-hud', 'dev-menu-btn', 'spacephone-container']) {
       expect(css).toContain(`body.arrival-playing #${id}`);
     }
+  });
+
+  it('waits for the welcome room as the title does, and closes in on the station view\'s own module framing', () => {
+    const fn = main.slice(main.indexOf('function arrivalRoomHere(): boolean {'), main.indexOf('function startArrival('));
+    expect(fn).toContain('if (!welcomeSeeking()) return true;');
+    expect(fn).toContain('return room !== null && room !== DEFAULT_STATION.welcomeRoomId;');
+    expect(main).toContain('    roomHere: arrivalRoomHere,');
+    expect(main).toContain('    moduleZoom: exteriorModuleZoom,');
+    expect(main).toContain('screen: domArrivalScreen(() => arrival?.skip(), DEFAULT_STATION.name),');
+    const ext = src('./exteriorView.ts');
+    expect(ext).toContain('return savedZoom !== null ? savedZoom * MODULE_ZOOM_FACTOR : null;');
+    expect(ext).toContain('return Math.min(MODULE_ZOOM_FACTOR, MODULE_ZOOM_FACTOR * (16 / Math.max(16, needed)));');
   });
 
   it('a skipping press swallows its own click, and the skip line is spoken', () => {

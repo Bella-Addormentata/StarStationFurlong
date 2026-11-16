@@ -5,11 +5,17 @@
  * player's own fox at any window size:
  *
  *  1. SPACE: about ten seconds looking out into space, the sky alone,
- *     turning slowly toward the planet;
+ *     turning slowly toward the planet. On a first start the arrival lands
+ *     in the welcome room, which fills in only once a computer that holds
+ *     it answers; until it has, the sky holds there, drifting, for up to
+ *     SPACE_HOLD_MAX_SECONDS more, with a line saying so, so the shots
+ *     after it show the welcome room's own module and inside (owner,
+ *     2026-11-15) rather than the stand-in the page draws before;
  *  2. APPROACH: the planet view (issue 218) from far off, closing in on the
  *     planet until it is large, the station just past its limb;
  *  3. ATLAS: a quick dip through black to the station from outside (the
- *     level-3 atlas view), zooming in on the whole station;
+ *     level-3 atlas view): the whole known station first, then closing in
+ *     on the room's own module at its centre;
  *  4. FADE and BLACK: a fade to black, and under it the step into the room;
  *  5. VAT: back from black on a close view of the clone vat, then slowly out
  *     to the normal isometric room view while the vat drains and opens and
@@ -60,10 +66,14 @@ export const APPROACH_END_TIMES = 2;
  *  down over the approach's last moment, up over the atlas's first. */
 export const CUT_DIP_OUT_SECONDS = 0.15;
 export const CUT_DIP_IN_SECONDS = 0.25;
-/** The atlas shot starts this far out (a fraction of the view's own zoom)
- *  and zooms in over its first seconds, then holds. */
-export const ATLAS_START_ZOOM = 0.3;
-export const ATLAS_ZOOM_SECONDS = 3;
+/** The atlas shot starts on the whole known station, as the station view
+ *  frames it, and closes in on the room's module at the centre over its
+ *  first ATLAS_ZOOM_SECONDS, ending ATLAS_CLOSE times as close as the view's
+ *  framing of one module alone. With only the one module known, it starts
+ *  ATLAS_START_ZOOM of that framing out, so the shot still closes in. */
+export const ATLAS_START_ZOOM = 0.5;
+export const ATLAS_CLOSE = 1.5;
+export const ATLAS_ZOOM_SECONDS = 4;
 /** The vat shot starts this much closer than the room view, framed on the
  *  vat a little above the floor, and comes back from black over the first
  *  second. */
@@ -73,6 +83,17 @@ export const VAT_FADE_IN_SECONDS = 1;
 /** The sky shot turns this far (radians) onto the planet's direction. */
 export const SPACE_TURN_YAW = 0.7;
 export const SPACE_TURN_PITCH = 0.35;
+/** When the sky shot ends before the room the arrival lands in is here, the
+ *  sky holds, for at most this long; then the arrival goes on, and the room
+ *  fills in by itself when a computer that holds it answers. */
+export const SPACE_HOLD_MAX_SECONDS = 30;
+/** While it holds, the sky drifts about the vertical this fast (radians a
+ *  second), getting going over SPACE_DRIFT_EASE_SECONDS; the approach turns
+ *  it back onto the station's direction over its first
+ *  APPROACH_SETTLE_SECONDS. */
+export const SPACE_DRIFT_RATE = 0.01;
+export const SPACE_DRIFT_EASE_SECONDS = 2;
+export const APPROACH_SETTLE_SECONDS = 1.5;
 /** The perspective camera's field of view: the far pass's own, so the sky
  *  and the far scene agree. */
 export const ARRIVAL_FOV_DEG = 40;
@@ -127,9 +148,24 @@ export function spaceLook(p: number, forward: THREE.Vector3, out = new THREE.Vec
   return out.set(Math.sin(y) * Math.cos(pt), Math.sin(pt), Math.cos(y) * Math.cos(pt));
 }
 
-/** The atlas shot's zoom, as a fraction of the station view's own. */
-export function atlasZoom(at: number): number {
-  return lerp(ATLAS_START_ZOOM, 1, ease(at / ATLAS_ZOOM_SECONDS));
+/** How far the held sky has drifted (radians) after `heldSeconds`: from
+ *  rest, then SPACE_DRIFT_RATE a second. */
+export function holdDrift(heldSeconds: number): number {
+  const h = Number.isFinite(heldSeconds) ? Math.max(0, heldSeconds) : 0;
+  return SPACE_DRIFT_RATE * h * ease(h / SPACE_DRIFT_EASE_SECONDS);
+}
+
+/** The atlas shot's zoom at `at` seconds into it, from the station view's
+ *  own zoom (`station`, which frames the whole known station) to close on
+ *  the module at the centre (`module`, the view's framing of one module
+ *  alone; the station's when unknown). Geometric, so the closing speed
+ *  feels even however far out it starts. */
+export function atlasZoom(at: number, station: number, module: number | null): number {
+  const m = module !== null && Number.isFinite(module) && module > 0 ? module : station;
+  const from = Math.min(station, m * ATLAS_START_ZOOM);
+  const to = m * ATLAS_CLOSE;
+  if (!(from > 0) || !(to > 0)) return station;
+  return from * Math.pow(to / from, ease(at / ATLAS_ZOOM_SECONDS));
 }
 
 /** The black's opacity at `t` seconds into the arrival: a quick dip at the
@@ -174,6 +210,8 @@ export function vatFrame(p: number, vat: { x: number; z: number } | null): { loo
 export interface ArrivalScreen {
   setBlack(opacity: number): void;
   setHint(visible: boolean): void;
+  /** The line saying the sky waits for the room. */
+  setWaiting(on: boolean): void;
   remove(): void;
 }
 
@@ -190,6 +228,11 @@ export interface ArrivalDeps {
   isoOffset(level: 2 | 3, out: THREE.Vector3): THREE.Vector3;
   /** Where the clone vat stands, or null in a room without one. */
   vatCentre(): { x: number; z: number } | null;
+  /** The room the arrival lands in is here: its state has reached this
+   *  page, or there is nothing to wait for. */
+  roomHere(): boolean;
+  /** The station view's zoom framed on one module alone, or null. */
+  moduleZoom(): number | null;
   screen: ArrivalScreen;
   /** Called once, when the arrival is over (played out or skipped). */
   onDone(): void;
@@ -203,7 +246,12 @@ export class ArrivalSequence {
   private persp: THREE.PerspectiveCamera | null = null;
   /** The station view's zoom and the room view's, read as each begins. */
   private atlasBase: number | null = null;
+  private atlasModule: number | null = null;
   private roomBase: number | null = null;
+  /** Seconds the sky held for the room, and whether it has stopped holding
+   *  (the room is here, or the hold ran out). */
+  private held = 0;
+  private released = false;
   private vat: { x: number; z: number } | null = null;
   private readonly tmp = new THREE.Vector3();
   private readonly tmp2 = new THREE.Vector3();
@@ -214,9 +262,14 @@ export class ArrivalSequence {
     return !this.done;
   }
 
-  /** Seconds into the arrival. */
+  /** Seconds into the arrival's timeline (the sky's hold not counted). */
   elapsed(): number {
     return this.t;
+  }
+
+  /** Seconds the sky has held for the room. */
+  heldSeconds(): number {
+    return this.held;
   }
 
   /** One frame: advance, enter a new shot when one begins, pose its camera.
@@ -224,7 +277,24 @@ export class ArrivalSequence {
   update(dt: number): void {
     if (this.done) return;
     try {
-      this.t += Math.min(MAX_STEP_SECONDS, Math.max(0, Number.isFinite(dt) ? dt : 0));
+      const step = Math.min(MAX_STEP_SECONDS, Math.max(0, Number.isFinite(dt) ? dt : 0));
+      const spaceEnd = SHOTS[0].seconds;
+      if (!this.released && this.t + step >= spaceEnd && this.shot === 0) {
+        if (this.deps.roomHere() || this.held >= SPACE_HOLD_MAX_SECONDS) {
+          this.released = true;
+          this.deps.screen.setWaiting(false);
+        } else {
+          // The sky shot's end, held until the room is here.
+          this.held += this.t + step - spaceEnd;
+          this.t = spaceEnd;
+          this.posePersp(spaceLook(1, this.forward(), this.tmp2).applyAxisAngle(UP, holdDrift(this.held)));
+          this.deps.screen.setBlack(0);
+          this.deps.screen.setHint(true);
+          this.deps.screen.setWaiting(true);
+          return;
+        }
+      }
+      this.t += step;
       const s = shotAt(this.t);
       if (!s) {
         this.finish();
@@ -294,6 +364,8 @@ export class ArrivalSequence {
         if (d.isPlanetView()) d.zoom.stepIn();
         if (this.ortho) d.setCamera(this.ortho);
         this.atlasBase = zoomOf(this.ortho);
+        const m = d.moduleZoom();
+        this.atlasModule = m !== null && Number.isFinite(m) && m > 0 ? m : null;
         break;
       }
       case 'fade':
@@ -317,15 +389,18 @@ export class ArrivalSequence {
       case 'space':
         this.posePersp(spaceLook(p, this.forward(), this.tmp2));
         return;
-      case 'approach':
+      case 'approach': {
         this.deps.farPass.setEyeDistance(approachEyeKm(p));
-        this.posePersp(this.forward());
+        // A held sky drifted off the station's direction: turned back on.
+        const back = holdDrift(this.held) * (1 - ease(at / APPROACH_SETTLE_SECONDS));
+        this.posePersp(back !== 0 ? this.forward().applyAxisAngle(UP, back) : this.forward());
         return;
+      }
       case 'atlas':
-        this.poseAtlas(atlasZoom(at));
+        this.poseAtlas(at);
         return;
       case 'fade':
-        this.poseAtlas(1);
+        this.poseAtlas(ATLAS_ZOOM_SECONDS);
         return;
       case 'black':
         this.poseRoom(0);
@@ -356,12 +431,14 @@ export class ArrivalSequence {
     cam.updateMatrixWorld();
   }
 
-  private poseAtlas(zoom: number): void {
+  /** The atlas shot `at` seconds in: the station view's camera, closing in
+   *  on the module at the centre. */
+  private poseAtlas(at: number): void {
     const cam = this.ortho;
     if (!cam) return;
     cam.position.copy(this.deps.isoOffset(3, this.tmp));
     cam.lookAt(0, 0, 0);
-    if (this.atlasBase !== null) setZoom(cam, this.atlasBase * zoom);
+    if (this.atlasBase !== null) setZoom(cam, atlasZoom(at, this.atlasBase, this.atlasModule));
   }
 
   /** The vat shot at `p` (0 the close view, 1 the room view the rig keeps). */
@@ -374,6 +451,8 @@ export class ArrivalSequence {
     if (this.roomBase !== null) setZoom(cam, this.roomBase * zoom);
   }
 }
+
+const UP = new THREE.Vector3(0, 1, 0);
 
 function zoomOf(cam: THREE.Camera | null): number | null {
   const z = (cam as { zoom?: unknown } | null)?.zoom;
@@ -433,11 +512,17 @@ export function swallowPairedClick(
 export const SKIP_LINE = 'Click or press any key to skip';
 export const SKIP_SPOKEN_PREFIX = 'The arrival is playing. ';
 
+/** The line over the skip line while the sky waits for the room. */
+export function waitingLine(roomName: string): string {
+  return roomName ? `Finding ${roomName}\u2026` : 'Finding the room\u2026';
+}
+
 /** The overlay in the page: a black layer the arrival fades, a quiet line
- *  saying how to skip (a polite status, so screen readers say it too), and a
- *  surface that takes every click and tap (the keys are caught on the window
- *  by `onSkip`'s listener). */
-export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
+ *  saying how to skip (a polite status, so screen readers say it too), over
+ *  it a line while the sky waits for `roomName`, and a surface that takes
+ *  every click and tap (the keys are caught on the window by `onSkip`'s
+ *  listener). */
+export function domArrivalScreen(onSkip: () => void, roomName = ''): ArrivalScreen {
   const root = document.createElement('div');
   root.id = 'arrival-screen';
   root.style.cssText = 'position:fixed; inset:0; z-index:9000; pointer-events:auto; cursor:default; background:transparent;';
@@ -449,6 +534,8 @@ export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
   const hint = document.createElement('div');
   hint.setAttribute('role', 'status');
   hint.setAttribute('aria-live', 'polite');
+  const waiting = document.createElement('div');
+  waiting.style.cssText = 'color:rgba(220,230,255,0.8); margin-bottom:4px;';
   hint.style.cssText =
     'position:absolute; left:0; right:0; bottom:28px; text-align:center; pointer-events:none; ' +
     'font:500 12px/1.4 system-ui, sans-serif; letter-spacing:0.5px; color:rgba(220,230,255,0.55); ' +
@@ -470,6 +557,8 @@ export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
   window.addEventListener('keydown', onKey, true);
   let opacity = -1;
   let hinted: boolean | null = null;
+  let worded = false;
+  let waits: boolean | null = null;
   return {
     setBlack(o) {
       const v = Math.round(Math.min(1, Math.max(0, o)) * 1000) / 1000;
@@ -480,14 +569,20 @@ export function domArrivalScreen(onSkip: () => void): ArrivalScreen {
     setHint(visible) {
       if (visible === hinted) return;
       hinted = visible;
-      if (visible && !hint.hasChildNodes()) {
+      if (visible && !worded) {
+        worded = true;
         const spoken = document.createElement('span');
         spoken.textContent = SKIP_SPOKEN_PREFIX;
         spoken.style.cssText =
           'position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap;';
-        hint.append(spoken, SKIP_LINE);
+        hint.append(waiting, spoken, SKIP_LINE);
       }
       hint.style.opacity = visible ? '1' : '0';
+    },
+    setWaiting(on) {
+      if (on === waits) return;
+      waits = on;
+      waiting.textContent = on ? waitingLine(roomName) : '';
     },
     remove() {
       root.removeEventListener('pointerdown', onPointer);

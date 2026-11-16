@@ -463,6 +463,7 @@ import {
   showEnterRoomBubble,
   isExteriorActive,
   isExteriorOrbitView,
+  exteriorModuleZoom,
   tickExterior,
 } from "./exteriorView";
 import {
@@ -12603,6 +12604,15 @@ function prefersReducedMotion(): boolean {
  * the camera comes back to the room view. `onDone` runs once it is over,
  * played out or skipped.
  */
+/** 🎬 The room the arrival lands in is here, so its shots can show it: the
+ *  welcome room's state has reached this page, or this start does not seek
+ *  it (the title's own test, setupClickToEnter's waitsForWelcome). */
+function arrivalRoomHere(): boolean {
+  if (!welcomeSeeking()) return true;
+  const room = activeBootstrap?.roomId ?? pendingBootstrapOverride?.roomId ?? null;
+  return room !== null && room !== DEFAULT_STATION.welcomeRoomId;
+}
+
 function startArrival(onDone: () => void): void {
   document.body.classList.add("arrival-playing");
   const size = new THREE.Vector2();
@@ -12624,7 +12634,9 @@ function startArrival(onDone: () => void): void {
     farPass: { setSkyOnly: setFarPassSkyOnly, setEyeDistance: setFarEyeDistance },
     isoOffset: (level, out) => rotatedLevelOffset(level, out),
     vatCentre: () => world?.getSpawnVatCentre() ?? null,
-    screen: domArrivalScreen(() => arrival?.skip()),
+    roomHere: arrivalRoomHere,
+    moduleZoom: exteriorModuleZoom,
+    screen: domArrivalScreen(() => arrival?.skip(), DEFAULT_STATION.name),
     onDone: () => {
       arrival = null;
       document.body.classList.remove("arrival-playing");
