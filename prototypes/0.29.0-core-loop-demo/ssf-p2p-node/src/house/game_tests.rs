@@ -2242,10 +2242,12 @@ impl Game {
 }
 
 #[test]
-fn its_delegation_goes_back_under_its_key_whatever_took_its_place_and_it_serves_on_meanwhile() {
-    // 🔒 The one its rounds go by, which it holds for the game: over nothing, junk, a stranger's delegation of it, a
-    // forged one, another house's, or one of an earlier holder of the game's. (The deed is the owner's still, so this
-    // is no house of the room's house tables: the key is the game's to keep.)
+fn its_delegation_goes_back_under_its_key_over_what_no_game_goes_by_and_it_serves_on_meanwhile() {
+    // 🔒 The one its rounds go by, which it holds for the game: over nothing, junk, a forged one, one with a field
+    // too many (signed, and still no delegation), or another house's. A good delegation of this house stays,
+    // whoever signed it (a game this pass could not resolve may go by it: a new holder's): a stranger's, or one of an
+    // earlier holder of the game's, which the pages write over. (The deed is the owner's still, so this is no house
+    // of the room's house tables: the key is the game's to keep.)
     let buyer = who("buyer");
     let mut game = Game::new("hk-back");
     game.handed_to_the_buyer();
@@ -2253,26 +2255,34 @@ fn its_delegation_goes_back_under_its_key_whatever_took_its_place_and_it_serves_
     let want = hb::rec_hash(&mine);
     let other = House::open(&[9u8; 32], None).unwrap();
     let forged = with(&mine, "g", str_of(&delegation(&buyer, other.public()), "g").map(s).unwrap());
-    let cases: Vec<(&str, Option<CVal>)> = vec![
-        ("nothing", None),
-        ("junk", Some(obj(vec![("v", CVal::Int(1))]))),
-        ("a stranger's", Some(delegation(&who("landlord"), game.house.public()))),
-        ("a forged one", Some(forged)),
-        ("another house's", Some(delegation(&buyer, other.public()))),
-        ("the earlier holder's", Some(delegation(&game.owner, game.house.public()))),
+    let extra = {
+        let body = obj(vec![("v", CVal::Int(1)), ("h", s(game.house.public())), ("k", s(&buyer.public)), ("x", CVal::Int(1))]);
+        let g = sign(&buyer, &hb::room_sign_bytes("hkey", ROOM, "", &body).unwrap());
+        with(&body, "g", s(&g))
+    };
+    let (strangers, earlier) = (delegation(&who("landlord"), game.house.public()), delegation(&game.owner, game.house.public()));
+    let cases: Vec<(&str, Option<CVal>, bool)> = vec![
+        ("nothing", None, true),
+        ("junk", Some(obj(vec![("v", CVal::Int(1))])), true),
+        ("a forged one", Some(forged), true),
+        ("one with a field too many", Some(extra), true),
+        ("another house's", Some(delegation(&buyer, other.public())), true),
+        ("a stranger's", Some(strangers), false),
+        ("the earlier holder's", Some(earlier), false),
     ];
     let key = format!("hk:{}", game.house.public());
-    for (what, value) in cases {
+    for (what, value, back) in cases {
         match &value {
             Some(v) => game.put_top(&key, v),
             None => game.delete_top(&key),
         }
-        // (A forged one's check is asked for at the first turn: put back at the next.)
+        // (A check of what is there is asked for at the first turn: put back at the next.)
         for _ in 0..2 {
             game.tick(REPUT_MS);
             game.ticks();
         }
-        assert_eq!(game.hk_hash(), want, "put back over {what}");
+        let there = if back { want.clone() } else { value.as_ref().and_then(hb::rec_hash) };
+        assert_eq!(game.hk_hash(), there, "{what}: put back {back}");
     }
     // Served all along: a close on its join is revealed.
     game.closed(1, &game.sid(), &game.commit(1));
@@ -2324,6 +2334,10 @@ fn while_it_is_a_house_of_the_rooms_house_tables_their_delegation_keeps_its_key(
         game.tick(REPUT_MS);
         assert_eq!(game.hk_hash(), room, "the room's delegation, put back by the house tables, stays");
     }
+    // (And with the key emptied, the room's goes back, not the game's.)
+    game.delete_top(&format!("hk:{}", game.house.public()));
+    game.tick(REPUT_MS);
+    assert_eq!(game.hk_hash(), room, "the room's again");
     game.closed(1, &game.sid(), &game.commit(1));
     game.seeds(1);
     game.ticks();
@@ -2483,6 +2497,11 @@ fn once_the_games_records_and_its_delegation_are_back_a_put_backs_turn_writes_no
         let out = game.tick(REPUT_MS);
         assert_eq!(out.wrote, usize::from(game.beat() != before), "only a beat");
     }
+    // (And its own key emptied, its own goes back, the other houses' good delegations in the room beside.)
+    let want = game.hk_hash();
+    game.delete_top(&format!("hk:{}", game.house.public()));
+    game.tick(REPUT_MS);
+    assert_eq!(game.hk_hash(), want);
 }
 
 #[test]
@@ -2649,22 +2668,21 @@ fn an_ended_game_wants_its_key_no_more() {
 }
 
 #[test]
-fn a_game_whose_base_the_doc_lost_keeps_its_delegation_under_the_key() {
-    // (A spell without a base, which the pages put back, is no change of the game's: the key stays the buyer's game's
-    // and carol's does not take it meanwhile.)
+fn a_game_whose_base_the_doc_lost_still_wants_its_delegation_under_the_key() {
+    // (A spell without a base, which the pages put back, is no change of the game's: the key emptied meanwhile, the
+    // one of lowest hash goes back still, of the game whose base is gone or not.)
     let mut game = Game::new("two-holders-base");
-    let (_, _, theirs, _) = game.two_holders();
-    let base = game.ck_key(&game.base.clone());
-    let root = game.base.clone();
-    game.delete_top(&base);
-    for _ in 0..4 {
+    let (ctx2, _, theirs, hers) = game.two_holders();
+    let (lost, lowest) = if hb::rec_hash(&theirs) < hb::rec_hash(&hers) { (&game.ctx.clone(), &theirs) } else { (&ctx2, &hers) };
+    let base = game.top_keys(&format!("ck:{}:{}:", lost.t, lost.inc));
+    assert_eq!(base.len(), 1);
+    game.delete_top(&base[0]);
+    game.delete_top(&format!("hk:{}", game.house.public()));
+    for _ in 0..3 {
         game.tick(REPUT_MS);
         game.ticks();
-        assert_eq!(game.hk_hash(), hb::rec_hash(&theirs));
     }
-    game.put_top(&base, &root);
-    game.ticks();
-    assert_eq!(game.hk_hash(), hb::rec_hash(&theirs));
+    assert_eq!(game.hk_hash(), hb::rec_hash(lowest));
 }
 
 #[test]
@@ -2719,4 +2737,30 @@ fn the_rooms_one_delegation_waits_for_a_pass_that_reads_every_delegation_of_the_
     assert!(game.house.walk_games(ROOM, &txn, &comp, game.now, &mut writes, &mut reput).is_some(), "the keys all counted");
     assert!(game.house.read_out, "and the reads spent");
     assert!(!reput.iter().any(|w| matches!(w, Write::Top { key, .. } if *key == hk)));
+}
+
+#[test]
+fn a_new_holders_good_delegation_stays_while_the_hand_over_is_not_yet_resolved() {
+    // 🔒 Handed on from the buyer to carol, whose delegation of this house comes under its key in the same moment:
+    // a put-back's turn on a pass that resolves neither the transfer nor hers (no check to spare) puts nothing over
+    // it, though the delegation the house holds for the game is still the buyer's; and carol's round is served by
+    // hers once the checks are made.
+    let (buyer, carol) = (who("buyer"), who("carol"));
+    let mut game = Game::new("hk-new-holder-pending");
+    game.handed_to_the_buyer();
+    game.transfer_of(&game.ctx, &buyer, &carol, 0, "fedcba9876543210fedcba98");
+    let hers = delegation(&carol, game.house.public());
+    game.put_top(&format!("hk:{}", game.house.public()), &hers);
+    game.now += REPUT_MS;
+    game.house.tick_with(ROOM, &game.doc, game.now, 1_700_000_000_000 + game.now, 0, 1);
+    assert_eq!(game.hk_hash(), hb::rec_hash(&hers), "nothing over hers");
+    game.ticks();
+    for _ in 0..2 {
+        game.tick(REPUT_MS);
+        assert_eq!(game.hk_hash(), hb::rec_hash(&hers));
+    }
+    game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    assert_eq!(game.records("h:1:").len(), 1, "carol's round, by hers");
 }

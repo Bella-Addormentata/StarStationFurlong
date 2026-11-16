@@ -2033,6 +2033,9 @@ impl House {
         let mut hk_unclear = false;
         let mut hk_read = true;
         let mut hk_heals: Vec<Write> = Vec::new();
+        // (What this house's own key holds, when it names this house.)
+        let my_hk = format!("hk:{me}");
+        let mut mine: Option<CVal> = None;
         for (key, value) in hk_keys {
             let theirs = |v: &CVal| str_of(v, "h") == key.strip_prefix("hk:");
             let v = match self.read_charged(0, Some(value), ha::MAX_SMALL_RECORD_BYTES) {
@@ -2059,11 +2062,12 @@ impl House {
                 Read::Absent | Read::Heavy => continue,
             };
             if theirs(&v) {
+                if key == my_hk {
+                    mine = Some(v.clone());
+                }
                 delegations.push(v);
             }
         }
-        // (The ones the doc holds, by hash: a delegation of this house among them is under its key.)
-        let in_doc: HashSet<String> = delegations.iter().filter_map(hb::rec_hash).collect();
         let hk_healed = !hk_heals.is_empty();
         writes.append(&mut hk_heals);
         let seen: Vec<(String, String)> = by_game.keys().cloned().collect();
@@ -2303,16 +2307,31 @@ impl House {
             through!(current, settled);
         }
         // 🔒 This house's key holds one value (`hk:<house>`), and each game it serves by a delegation that game's base
-        // does not carry wants its own there. Where the doc holds none of theirs, the one of lowest hash goes back: the
-        // same whichever games a pass gets to, so two games handed to different holders never write over each other's.
-        // The others go by the delegation the house holds for them ([`TableMem::deleg`]). (Only of the games the doc
-        // holds records of; and only from a pass that read every delegation of the room, clear: until then the key may
-        // hold one of theirs the pass could not tell, a new holder's say, which the one it holds must not go over.)
-        let tables = &self.rooms[room].tables;
-        let wanted: Vec<(String, &CVal)> = seen.iter().filter_map(|k| tables.get(k)).filter(|m| m.keyed).filter_map(|m| m.deleg.as_ref()).filter_map(|d| Some((hb::rec_hash(d)?, d))).collect();
-        if hk_read && !hk_unclear && !wanted.iter().any(|(hash, _)| in_doc.contains(hash)) {
-            if let Some((_, d)) = wanted.iter().min_by(|a, b| a.0.cmp(&b.0)) {
-                reput.push(Write::Top { key: format!("hk:{me}"), value: (*d).clone() });
+        // does not carry wants its own there. One goes back only over what no game can go by: nothing, junk, another
+        // house's, or one of this house whose signature fails. A good delegation of this house stays, whoever signed
+        // it: it may be a new holder's that a game this pass could not resolve goes by (an earlier holder's, or a
+        // stranger's, the pages write over, casinoDoc hkOver). Of the ones wanted, the one of lowest hash, the same
+        // whichever games a pass gets to, so two games handed to different holders never write over each other's; the
+        // others go by the delegation the house holds for them ([`TableMem::deleg`]). (Only of the games the doc holds
+        // records of; and only from a pass that read every delegation of the room, clear: until then the key may hold
+        // one the pass could not tell.)
+        if hk_read && !hk_unclear {
+            let tables = &self.rooms[room].tables;
+            let wanted = seen.iter().filter_map(|k| tables.get(k)).filter(|m| m.keyed).filter_map(|m| m.deleg.as_ref());
+            let best = wanted.filter_map(|d| Some((hb::rec_hash(d)?, d))).min_by(|a, b| a.0.cmp(&b.0)).map(|(_, d)| d.clone());
+            if let Some(best) = best {
+                // (Its check put off: the next pass.)
+                let good = match mine.as_ref().filter(|m| ha::as_delegation(m)) {
+                    Some(m) => {
+                        let hash = hb::rec_hash(m).unwrap_or_default();
+                        let g = str_of(m, "g").unwrap_or("");
+                        self.verified_auth(room, &ha::sig_id("hkey", "", "", &hash), str_of(m, "k").unwrap_or(""), &|| hb::room_sign_bytes("hkey", room, "", m).map(|b| b.to_vec()), g)
+                    }
+                    None => Some(false),
+                };
+                if good == Some(false) {
+                    reput.push(Write::Top { key: my_hk, value: best });
+                }
             }
         }
         Some(seen)
