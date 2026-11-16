@@ -2060,23 +2060,33 @@ impl House {
         // charged, when its turn comes; and the room's delegations, read once each after it changed, which every game
         // reads. (A page takes one only under its house's key, casinoDoc fedDelegation: anything under another is
         // nothing to a game.) A key of any other name costs the walk nothing.
-        let drained = ix.drain(txn, comp, &mut |n, admitted| {
+        let drained = ix.drain(txn, comp, now, &mut |n, admitted| {
             if admitted {
                 self.admit(n);
                 return true;
             }
             self.charge(n)
         });
+        // 🔒 A game whose every record went, at a game it holds memory of: as one whose base is gone, a hold (below), from
+        // the pass that found it so, though that pass, or this one, could not look at every change. And at the first
+        // listing of the room's keys (another doc of the room, say), each game it holds memory of that the doc holds no
+        // record of.
+        if let Some(mem) = self.rooms.get_mut(room) {
+            for (key, since) in ix.take_gone() {
+                if let Some(table) = mem.tables.get_mut(&key) {
+                    table.held_since = Some(table.held_since.map_or(since, |h| h.min(since)));
+                }
+            }
+            if ix.take_listed() {
+                for (_, table) in mem.tables.iter_mut().filter(|(key, _)| ha::is_fair_only_inc(&key.1) && !ix.games.contains_key(*key)) {
+                    table.held_since.get_or_insert(now);
+                }
+            }
+        }
         // (The keys noted not all looked at: nothing at its games this pass, for one may lack its own record.)
         if !drained {
             self.short = true;
             return false;
-        }
-        // 🔒 A game whose last record went: as one whose base is gone, a hold (below), at a game it holds memory of.
-        for key in ix.take_gone() {
-            if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
-                table.held_since.get_or_insert(now);
-            }
         }
         let mut hk_unclear = false;
         let mut hk_read = true;
@@ -2122,16 +2132,19 @@ impl House {
         }
         // 🔒 What stands under this house's own key, which is the only one of the room's that can name it: a delegation
         // there whose signature holds wakes the games none of whose rounds were this house's that its signer holds a
-        // round of ([`FairIndex::mine_is`], [`Quiet::Mine`]). Its check put off, or the key not read this pass: as it
-        // was until a pass has it, and short meanwhile, for a game it would wake may be this house's.
+        // round of after their base ([`FairIndex::mine_is`], [`Quiet::Mine`]), a visit of the tick's reads each, as many as
+        // they cover (short while any is left). Its check put off: as it was until a pass has it, and short meanwhile,
+        // for a game it would wake may be this house's. (Not read this pass: short already, and none.)
         let good = match ix.hk.get(&my_hk) {
             Some(Hk::Theirs(v, hash)) => self.room_delegation_good(room, v, hash).map(|good| good.then(|| (hash.clone(), str_of(v, "k").unwrap_or("").to_string()))),
-            Some(Hk::Unread) => None,
-            Some(Hk::Nothing | Hk::Unknown | Hk::Whole(_)) | None => Some(None),
+            Some(Hk::Unread | Hk::Nothing | Hk::Unknown | Hk::Whole(_)) | None => Some(None),
         };
         match good {
             Some(now) => ix.mine_is(now),
             None => self.short = true,
+        }
+        if !ix.wake_queued(&mut || self.charge(VISIT_BYTES)) {
+            self.short = true;
         }
         let hk_healed = !hk_heals.is_empty();
         writes.append(&mut hk_heals);
@@ -2313,10 +2326,12 @@ impl House {
                         table.keyed = false;
                     }
                     // (So until a record of the game changes, or this house's key holds a delegation whose signature holds
-                    // that a key holding one of its rounds signed: no other delegation of the room's names it, the ones its
-                    // own records carry are its records, and one of any other key makes none of its rounds this house's.)
+                    // that a key holding one of its rounds after its base signed: no other delegation of the room's names
+                    // it, the ones its own records carry are its records, and one of any other key, an earlier holder's
+                    // whose rounds are over among them, makes none of its rounds this house's.)
                     if tidy {
-                        hushed.push((key.clone(), Quiet::Mine(res.chain.iter().map(|h| h.k.clone()).collect())));
+                        let holders = res.chain.iter().enumerate().filter(|(i, _)| res.chain.get(i + 1).is_none_or(|next| next.from > base_u));
+                        hushed.push((key.clone(), Quiet::Mine(holders.map(|(_, h)| h.k.clone()).collect())));
                     }
                     through!(false, false)
                 }

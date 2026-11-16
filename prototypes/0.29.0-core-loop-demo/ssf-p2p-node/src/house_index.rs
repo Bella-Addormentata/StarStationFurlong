@@ -30,13 +30,18 @@
 //! A GAME THAT HAS NOTHING FOR THIS HOUSE ([`Quiet`]). A game the walk found over, or with no base, or under rules this
 //! build does not know, stays so until one of its own records changes; and one whose rounds to come are none of this
 //! house's stays so until then, or until this house's own key holds a delegation whose signature holds that a key
-//! holding one of the game's rounds signed, other than the one it held when the game was passed by (no other
-//! delegation of the room names this house, and no other could make the game its: [`FairIndex::mine_is`]). The walk
-//! reads only the games awake ([`FairIndex::awake`]), from the one whose turn it is ([`FairIndex::order`]), so a game
-//! that has nothing for the house costs a pass nothing, not even a look, till then; and a pass looks at no more of the
-//! games, or of a game's keys, than it reads.
+//! holding one of the game's rounds after its base signed, other than the one it held when the game was passed by (no
+//! other delegation of the room names this house, and no other could make the game its: [`FairIndex::mine_is`]). Those
+//! wake a visit's worth of the tick's reads each, as many as it has ([`FairIndex::wake_queued`]). The walk reads only
+//! the games awake ([`FairIndex::awake`]), from the one whose turn it is ([`FairIndex::order`]), so a game that has
+//! nothing for the house costs a pass nothing, not even a look, till then; and a pass looks at no more of the games,
+//! or of a game's keys, than it reads.
+//!
+//! A GAME GONE ([`FairIndex::take_gone`]). One a drain finds with no record left, and no key of it left to look at
+//! that may hold one, is gone since that drain, though it was cut short after: the walk holds it from then. (One whose
+//! checkpoint is written over by another is not gone in between.)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use yrs::types::{DeepObservable, Event, Events};
@@ -101,7 +106,7 @@ pub(crate) enum Quiet {
     /// Over, with no base, or under rules this build does not know: until its records change.
     Records,
     /// None of its rounds to come or in flight are this house's: until its records change, or this house's own key holds
-    /// a delegation that one of these keys, the ones holding its rounds, signed ([`FairIndex::mine_is`]).
+    /// a delegation that one of these keys, the ones holding its rounds after its base, signed ([`FairIndex::mine_is`]).
     Mine(BTreeSet<String>),
 }
 
@@ -123,8 +128,12 @@ pub(crate) struct FairIndex {
     _sub: Subscription,
     /// No pass has listed the room's keys yet.
     cold: bool,
+    /// The last drain listed them ([`FairIndex::take_listed`]).
+    listed: bool,
     /// Noted keys a drain has not looked at yet.
     pending: BTreeSet<String>,
+    /// How many of them are each game's.
+    pending_of: BTreeMap<GameKey, usize>,
     pub games: BTreeMap<GameKey, Game>,
     /// The games the walk reads ([`Game::quiet`] none): the others cost a pass nothing, not even a look.
     pub awake: BTreeSet<GameKey>,
@@ -135,8 +144,12 @@ pub(crate) struct FairIndex {
     mine_at: Option<String>,
     /// The game whose turn it is, or the first after it (none: the first; [`FairIndex::order`]).
     turn_at: Option<GameKey>,
-    /// The games whose last record went since a drain was last taken through ([`FairIndex::take_gone`]).
-    gone: BTreeSet<GameKey>,
+    /// The games a drain found with no record left while a key of theirs waited to be looked at, and when.
+    maybe_gone: BTreeMap<GameKey, u64>,
+    /// And the ones gone since it was last asked, and since when ([`FairIndex::take_gone`]).
+    gone: Vec<(GameKey, u64)>,
+    /// The games [`FairIndex::mine_is`] woke that have not been yet ([`FairIndex::wake_queued`]).
+    waking: VecDeque<BTreeSet<GameKey>>,
     pub hk: BTreeMap<String, Hk>,
 }
 
@@ -152,13 +165,17 @@ impl FairIndex {
             noted,
             _sub: sub,
             cold: true,
+            listed: false,
             pending: BTreeSet::new(),
+            pending_of: BTreeMap::new(),
             games: BTreeMap::new(),
             awake: BTreeSet::new(),
             mine_quiet: BTreeMap::new(),
             mine_at: None,
             turn_at: None,
-            gone: BTreeSet::new(),
+            maybe_gone: BTreeMap::new(),
+            gone: Vec::new(),
+            waking: VecDeque::new(),
             hk: BTreeMap::new(),
         }
     }
@@ -168,15 +185,16 @@ impl FairIndex {
         self.doc == doc.guid()
     }
 
-    /// Bring the index up to what `comp` holds in `txn`: the room's keys listed on the first pass, then the keys noted
-    /// since, a visit charged each to `charge` (`charge(n, false)` says whether the read may go on; `charge(n, true)`,
-    /// for the listing, is charged whatever is left, and the keys are listed to their end). False when it could not get
-    /// to all of them: they wait for the next pass, and so do the games.
-    pub fn drain<T: ReadTxn>(&mut self, txn: &T, comp: &MapRef, charge: &mut dyn FnMut(usize, bool) -> bool) -> bool {
+    /// Bring the index up to what `comp` holds in `txn`, at `now`: the room's keys listed on the first pass, then the
+    /// keys noted since, a visit charged each to `charge` (`charge(n, false)` says whether the read may go on;
+    /// `charge(n, true)`, for the listing, is charged whatever is left, and the keys are listed to their end). False when
+    /// it could not get to all of them: they wait for the next pass, and so do the games.
+    pub fn drain<T: ReadTxn>(&mut self, txn: &T, comp: &MapRef, now: u64, charge: &mut dyn FnMut(usize, bool) -> bool) -> bool {
         let noted = std::mem::take(&mut *self.noted.lock().unwrap_or_else(|e| e.into_inner()));
         if self.cold {
             // (Every key there now is listed: what was noted before is in it. Nothing is pending yet: this is the first.)
             self.cold = false;
+            self.listed = true;
             for key in comp.keys(txn) {
                 charge(key.len() + VISIT_BYTES, true);
                 if let Some(of) = of(key) {
@@ -185,25 +203,62 @@ impl FairIndex {
             }
             return true;
         }
-        self.pending.extend(noted);
+        for key in noted {
+            if let Some(Of::Game(t, inc, _)) = of(&key).filter(|_| !self.pending.contains(&key)) {
+                *self.pending_of.entry((t, inc)).or_default() += 1;
+            }
+            self.pending.insert(key);
+        }
         while let Some(key) = self.pending.first() {
             if !charge(key.len() + VISIT_BYTES, false) {
                 return false;
             }
             let key = self.pending.pop_first().unwrap();
             let Some(of) = of(&key) else { continue };
+            let game = match &of {
+                Of::Game(t, inc, _) => Some((t.clone(), inc.clone())),
+                Of::Hk => None,
+            };
             if comp.get(txn, &key).is_some() {
                 self.put(&key, of);
             } else {
-                self.drop_key(&key, of);
+                self.drop_key(&key, of, now);
+            }
+            if let Some(game) = game {
+                self.looked_at(game);
             }
         }
         true
     }
 
-    /// The games whose last record went since this was last asked (a drain taken through since then, or not).
-    pub fn take_gone(&mut self) -> BTreeSet<GameKey> {
+    /// One of game `k`'s keys looked at: back, if it holds a record now; gone, if it holds none and no key of it is left
+    /// to look at, since the drain that first found it with none.
+    fn looked_at(&mut self, k: GameKey) {
+        let left = self.pending_of.get_mut(&k).map_or(0, |n| {
+            *n -= 1;
+            *n
+        });
+        if left == 0 {
+            self.pending_of.remove(&k);
+        }
+        if self.games.contains_key(&k) {
+            self.maybe_gone.remove(&k);
+        } else if left == 0 {
+            if let Some(since) = self.maybe_gone.remove(&k) {
+                self.gone.push((k, since));
+            }
+        }
+    }
+
+    /// The games gone since this was last asked, each with when a drain found it with no record left (module docs).
+    pub fn take_gone(&mut self) -> Vec<(GameKey, u64)> {
         std::mem::take(&mut self.gone)
+    }
+
+    /// Whether the room's keys were listed since this was last asked: what the listing does not hold of the games the
+    /// house remembers is gone (the room's doc another one, say).
+    pub fn take_listed(&mut self) -> bool {
+        std::mem::take(&mut self.listed)
     }
 
     /// The awake games, from the one whose turn it is round to the one before it.
@@ -246,12 +301,29 @@ impl FairIndex {
         if hash == self.mine_at {
             return;
         }
-        if let Some((_, signer)) = now {
-            for key in self.mine_quiet.remove(&signer).unwrap_or_default() {
+        if let Some(games) = now.and_then(|(_, signer)| self.mine_quiet.remove(&signer)) {
+            self.waking.push_back(games);
+        }
+        self.mine_at = hash;
+    }
+
+    /// Wake the games [`FairIndex::mine_is`] woke, each once `charge` lets it (a visit of the tick's reads, which may run
+    /// out): whether none is left. (One woken meanwhile, by its records, or passed by for them, is let be.)
+    pub fn wake_queued(&mut self, charge: &mut dyn FnMut() -> bool) -> bool {
+        while let Some(games) = self.waking.front_mut() {
+            let Some(key) = games.first().cloned() else {
+                self.waking.pop_front();
+                continue;
+            };
+            if !charge() {
+                return false;
+            }
+            games.remove(&key);
+            if matches!(self.games.get(&key).and_then(|g| g.quiet.as_ref()), Some(Quiet::Mine(_))) {
                 self.wake(key);
             }
         }
-        self.mine_at = hash;
+        true
     }
 
     /// Game `key` to be read again.
@@ -276,8 +348,8 @@ impl FairIndex {
         }
     }
 
-    /// Key `key` gone.
-    fn drop_key(&mut self, key: &str, of: Of) {
+    /// Key `key` gone, as a drain at `now` found.
+    fn drop_key(&mut self, key: &str, of: Of, now: u64) {
         match of {
             Of::Game(t, inc, _) => {
                 let k = (t, inc);
@@ -288,7 +360,7 @@ impl FairIndex {
                     unmine(&mut self.mine_quiet, &k, quiet);
                     self.games.remove(&k);
                     self.awake.remove(&k);
-                    self.gone.insert(k);
+                    self.maybe_gone.entry(k).or_insert(now);
                 } else {
                     self.wake(k);
                 }
@@ -371,11 +443,31 @@ mod tests {
         let comp = doc.get_or_insert_map(COMPUTED_MAP);
         let txn = doc.transact();
         let (mut charged, mut admitted) = (0, 0);
-        let done = ix.drain(&txn, &comp, &mut |n, listing| {
+        let done = ix.drain(&txn, &comp, 0, &mut |n, listing| {
             *(if listing { &mut admitted } else { &mut charged }) += n;
             true
         });
         (done, charged, admitted)
+    }
+
+    /// A drain at `now` that may look at `keys` keys: whether it got through.
+    fn drain_some(ix: &mut FairIndex, doc: &Doc, now: u64, keys: usize) -> bool {
+        let comp = doc.get_or_insert_map(COMPUTED_MAP);
+        let txn = doc.transact();
+        let mut left = keys;
+        ix.drain(&txn, &comp, now, &mut |_, _| {
+            if left == 0 {
+                return false;
+            }
+            left -= 1;
+            true
+        })
+    }
+
+    /// What this house's own key holds, as a pass found it, and the games it woke woken (none left).
+    fn mine_is(ix: &mut FairIndex, now: Option<(String, String)>) {
+        ix.mine_is(now);
+        assert!(ix.wake_queued(&mut || true));
     }
 
     fn keys_of(ix: &FairIndex, t: &str) -> Vec<String> {
@@ -475,7 +567,7 @@ mod tests {
         delete(&doc, &ck("t2", 1));
         drain(&mut ix, &doc);
         assert!(!ix.games.contains_key(&t2) && !ix.awake.contains(&t2) && ix.mine_quiet.is_empty());
-        assert_eq!(ix.take_gone(), BTreeSet::from([t2.clone()]));
+        assert_eq!(ix.take_gone(), vec![(t2.clone(), 0)]);
         assert!(ix.take_gone().is_empty());
         // (A delegation key gone is gone.)
         delete(&doc, &hk);
@@ -520,7 +612,7 @@ mod tests {
         {
             let txn = doc.transact();
             let mut left = 4 * one;
-            let done = ix.drain(&txn, &comp, &mut |n, listing| {
+            let done = ix.drain(&txn, &comp, 0, &mut |n, listing| {
                 assert!(!listing, "no listing");
                 if n > left {
                     return false;
@@ -552,21 +644,21 @@ mod tests {
         let good = |hash: &str, k: &str| Some((hash.to_string(), k.to_string()));
         let awake = |ix: &FairIndex| ix.awake.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>();
         assert_eq!(ix.awake.len(), 4, "every game awake at first");
-        ix.mine_is(good("a", "ann"));
+        mine_is(&mut ix, good("a", "ann"));
         ix.hush(&key("t1"), held(&["ann", "bob"]));
         ix.hush(&key("t2"), Quiet::Records);
         ix.hush(&key("t4"), held(&["cat"]));
         assert_eq!(awake(&ix), ["t3"]);
-        ix.mine_is(good("a", "ann"));
+        mine_is(&mut ix, good("a", "ann"));
         assert_eq!(awake(&ix), ["t3"], "the same: nothing wakes");
         // (None there, or one whose signature fails: nothing wakes, however often it changes.)
-        ix.mine_is(None);
+        mine_is(&mut ix, None);
         assert_eq!(awake(&ix), ["t3"]);
         // (Another, signed by a key holding none of their rounds: nothing wakes either.)
-        ix.mine_is(good("d", "dan"));
+        mine_is(&mut ix, good("d", "dan"));
         assert_eq!(awake(&ix), ["t3"]);
         // One a key holding one of t1's rounds signed: t1 wakes, and out from under every key it was passed by under.
-        ix.mine_is(good("b", "bob"));
+        mine_is(&mut ix, good("b", "bob"));
         assert_eq!(awake(&ix), ["t1", "t3"]);
         assert_eq!(ix.games[&key("t1")].quiet, None);
         assert_eq!(ix.games[&key("t2")].quiet, Some(Quiet::Records));
@@ -580,7 +672,7 @@ mod tests {
         drain(&mut ix, &doc);
         // (Hushed again under it, it sleeps until the next change.)
         ix.hush(&key("t1"), held(&["bob"]));
-        ix.mine_is(good("b", "bob"));
+        mine_is(&mut ix, good("b", "bob"));
         assert_eq!(awake(&ix), ["t3"]);
         // (One woken by a record of its own is no longer among them: passed by after for its records, a change of the
         // key does not wake it.)
@@ -588,11 +680,90 @@ mod tests {
         drain(&mut ix, &doc);
         assert!(!ix.mine_quiet.contains_key("bob"));
         ix.hush(&key("t1"), Quiet::Records);
-        ix.mine_is(good("c", "bob"));
+        mine_is(&mut ix, good("c", "bob"));
         assert_eq!(awake(&ix), ["t3"]);
-        ix.mine_is(good("e", "cat"));
+        mine_is(&mut ix, good("e", "cat"));
         assert_eq!(awake(&ix), ["t3", "t4"]);
         assert!(ix.mine_quiet.is_empty());
+    }
+
+    #[test]
+    fn the_games_woken_wake_as_the_tick_allows() {
+        let doc = Doc::new();
+        for t in ["t1", "t2", "t3"] {
+            put(&doc, &ck(t, 1), Any::Bool(true));
+        }
+        let mut ix = FairIndex::attach(&doc);
+        drain(&mut ix, &doc);
+        let key = |t: &str| (t.to_string(), INC.to_string());
+        for t in ["t1", "t2", "t3"] {
+            ix.hush(&key(t), Quiet::Mine(BTreeSet::from(["ann".to_string()])));
+        }
+        ix.mine_is(Some(("a".into(), "ann".into())));
+        assert!(ix.awake.is_empty(), "none yet");
+        let mut left = 2;
+        let mut charge = || {
+            if left == 0 {
+                return false;
+            }
+            left -= 1;
+            true
+        };
+        assert!(!ix.wake_queued(&mut charge), "one left");
+        assert_eq!(ix.awake.len(), 2);
+        // (One woken by its records meanwhile, and passed by for them: let be, and still a visit.)
+        put(&doc, &ck("t3", 1), Any::Bool(false));
+        drain(&mut ix, &doc);
+        ix.hush(&key("t3"), Quiet::Records);
+        let mut looked = 0;
+        assert!(ix.wake_queued(&mut || {
+            looked += 1;
+            true
+        }));
+        assert_eq!(looked, 1);
+        assert_eq!(ix.awake.len(), 2);
+        assert_eq!(ix.games[&key("t3")].quiet, Some(Quiet::Records));
+        assert!(ix.wake_queued(&mut || panic!("nothing left")));
+    }
+
+    #[test]
+    fn a_game_is_gone_once_no_key_of_it_is_left_to_look_at() {
+        let doc = Doc::new();
+        put(&doc, &ck("t1", 1), Any::Bool(true));
+        let mut ix = FairIndex::attach(&doc);
+        drain(&mut ix, &doc);
+        let t1 = ("t1".to_string(), INC.to_string());
+        // (Its checkpoint written over by another in one go: not gone.)
+        delete(&doc, &ck("t1", 1));
+        put(&doc, &ck("t1", 2), Any::Bool(true));
+        assert!(drain_some(&mut ix, &doc, 10, 9));
+        assert!(ix.take_gone().is_empty());
+        // (Nor when a drain is cut short between the one going and the one coming: back once the next gets to it.)
+        delete(&doc, &ck("t1", 2));
+        put(&doc, &ck("t1", 3), Any::Bool(true));
+        assert!(!drain_some(&mut ix, &doc, 20, 1));
+        assert!(!ix.games.contains_key(&t1));
+        assert!(ix.take_gone().is_empty());
+        assert!(drain_some(&mut ix, &doc, 30, 9));
+        assert!(ix.games.contains_key(&t1) && ix.take_gone().is_empty());
+        // Gone, with no key of it left to look at: since that drain, though it was cut short after.
+        delete(&doc, &ck("t1", 3));
+        put(&doc, &ck("t2", 1), Any::Bool(true));
+        assert!(!drain_some(&mut ix, &doc, 40, 1));
+        assert_eq!(ix.take_gone(), vec![(t1.clone(), 40)]);
+        assert!(drain_some(&mut ix, &doc, 50, 9));
+        assert!(ix.take_gone().is_empty());
+        // And one found with none while a key of it waits, which a later drain finds gone too: since the first.
+        put(&doc, &ck("t1", 4), Any::Bool(true));
+        drain(&mut ix, &doc);
+        delete(&doc, &ck("t1", 4));
+        put(&doc, &ck("t1", 5), Any::Bool(true));
+        assert!(!drain_some(&mut ix, &doc, 60, 1));
+        delete(&doc, &ck("t1", 5));
+        assert!(ix.take_gone().is_empty());
+        assert!(drain_some(&mut ix, &doc, 70, 9));
+        assert_eq!(ix.take_gone(), vec![(t1.clone(), 60)]);
+        assert!(ix.pending_of.is_empty() && ix.maybe_gone.is_empty());
     }
 
     #[test]
