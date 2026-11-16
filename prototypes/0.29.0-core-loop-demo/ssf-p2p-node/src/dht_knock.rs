@@ -50,7 +50,9 @@ use std::time::{Duration, Instant};
 
 use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, SecretKey, TransportAddr};
 use n0_future::StreamExt;
-use n0_mainline::{Dht, DhtBuilder, Id};
+use n0_mainline::{Dht, Id};
+#[cfg(test)]
+use n0_mainline::DhtBuilder;
 
 use crate::SharedHub;
 
@@ -369,7 +371,8 @@ impl OpeningBook {
 
 /// The node's own client on the Mainline DHT for knocks, with the holder's
 /// book. The address lookup keeps the client it publishes and resolves with
-/// to itself, so this is a second one, on a socket of its own.
+/// to itself, so this is a second one, on a socket of its own, which the
+/// public-IPv4 votes (public_v4.rs) read too (main.rs `own_dht`).
 pub struct KnockDht {
     dht: Dht,
     book: Mutex<OpeningBook>,
@@ -381,10 +384,16 @@ pub struct KnockDht {
 }
 
 impl KnockDht {
-    /// Join the DHT with `builder` (the library's bootstrap hosts, or the
-    /// operator's). The join itself goes on in the background.
+    /// Knock on `dht`, the node's own DHT client (main.rs `own_dht`), whose
+    /// join goes on in the background.
+    pub(crate) fn on(dht: Dht) -> Self {
+        Self { dht, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0) }
+    }
+
+    /// Join the DHT with `builder` on a client of the test's own.
+    #[cfg(test)]
     pub(crate) fn start(builder: &DhtBuilder) -> std::io::Result<Self> {
-        Ok(Self { dht: builder.build()?, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0) })
+        Ok(Self::on(builder.build()?))
     }
 
     /// Is a knock of ours out now?

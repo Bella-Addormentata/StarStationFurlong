@@ -95,6 +95,9 @@ mod chia_knock;
 // node holds in the read build.
 #[cfg(feature = "chia-read")]
 mod dht_knock;
+// 📌 This computer's public IPv4 as the Mainline DHT's nodes see it (BEP 42
+// votes), in place of the IP-echo websites the node asked before.
+mod public_v4;
 // The faucet dish's coin (#231 onboarding phase): per-room address, status,
 // and — in a publish build — the keyless claim and the give spend.
 #[cfg(feature = "chia-read")]
@@ -736,8 +739,8 @@ pub struct HubState {
     /// A key is claimed here before spawning the dial and released when it
     /// resolves (success, exhaustion, or already-linked).
     pub dialing: Mutex<std::collections::HashSet<PublicKey>>,
-    /// R1: live reachability posture — written by the auto echo loop (and the
-    /// explicit SSF_EXTERNAL_ADDRS parser), read by the fingerprint API.
+    /// R1: live reachability posture — written by the auto loop (public_v4.rs)
+    /// and the explicit SSF_EXTERNAL_ADDRS parser, read by the fingerprint API.
     pub reach: Arc<ReachState>,
     /// Per-room key + flags the LOCAL browser hands us over the `cap` lane
     /// (public-room = N8 guard, share-card = P6b), so the node can derive the
@@ -897,16 +900,16 @@ pub struct HubState {
     pub board_bundles: Mutex<board_bundles::BoardLane>,
 }
 
-/// R1 live reachability posture. The auto public-IP echo loop writes here as
+/// R1 live reachability posture. The auto public-IP loop (public_v4.rs) writes here as
 /// it advertises/withdraws addresses and detects CGNAT; the fingerprint API
 /// reads it per request so the browser HUD always shows the CURRENT state.
 pub struct ReachState {
-    /// Public v4 sockets WE advertised ourselves — via the echo auto loop or
+    /// Public v4 sockets WE advertised ourselves — via the auto loop (the DHT's vote) or
     /// explicit `SSF_EXTERNAL_ADDRS` entries. Needed to tell "iroh discovered
     /// a public v4 on its own" (portmapper/QAD) apart from "we merely claimed
     /// one" in [`classify_reachability`].
     pub self_advertised: Mutex<std::collections::HashSet<SocketAddr>>,
-    /// The last echo answer was a CGNAT/private WAN address (100.64.0.0/10
+    /// The last address the DHT's nodes saw was a CGNAT/private one (100.64.0.0/10
     /// etc.) — a router port-forward cannot produce inbound reachability
     /// there, so the node refuses to advertise (unchanged since 0.22.0) and
     /// now also SURFACES the condition instead of logging console-only.
@@ -935,8 +938,8 @@ impl ReachState {
 /// advertise ourselves must have been produced by iroh — the portmapper
 /// (UPnP/NAT-PMP/PCP) or a QAD-observed reflexive address. Both mean iroh
 /// derived/verified a public v4 route, so the inference ranks them above our
-/// own unverified echo advert and reports "port-mapped". Known limit: if the
-/// portmapper maps the exact ip:port we also echo-advertised, it is
+/// own unverified advert and reports "port-mapped". Known limit: if the
+/// portmapper maps the exact ip:port we also advertised, it is
 /// indistinguishable from our own advert and reports "advertised"
 /// (understated, never overstated).
 pub fn classify_reachability(reach: &ReachState, live_direct_addrs: &[String]) -> String {
@@ -1712,25 +1715,6 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
     private_file::load_or_create_node_key(std::path::Path::new(private_file::NODE_KEY_FILE))
 }
 
-/// Default public-IPv4 echo services for `SSF_EXTERNAL_ADDRS=auto` — queried
-/// over plain HTTP/1.0. The response is only our own public IP: nothing secret
-/// leaves the machine, and a poisoned answer can at worst add one dead dial
-/// hint (iroh connections are authenticated by node key regardless).
-/// Operators can substitute their own echo with `SSF_IP_ECHO=host1,host2`.
-///
-/// IMPORTANT — R1 POSTURE FLIP (deliberate owner decision, demo phase):
-/// 0.22.0 shipped `auto` as OPT-IN — "no third-party calls unless an `auto`
-/// entry is explicitly configured" (sovereignty posture, v006 §10.2). R1
-/// flips this to OPT-OUT so internet connectivity works with ZERO terminal
-/// setup: an UNSET `SSF_EXTERNAL_ADDRS` now behaves exactly like `auto`, and
-/// these hosts ARE contacted by default. Full opt-out (today's old silence,
-/// no echo calls at all): `SSF_EXTERNAL_ADDRS=off` (or `none` / `0`,
-/// case-insensitive). `SSF_IP_ECHO` still overrides the echo hosts; CGNAT
-/// detection/refusal is unchanged.
-const DEFAULT_IP_ECHO_HOSTS: &[&str] = &["api.ipify.org", "checkip.amazonaws.com"];
-/// How often `auto` re-checks the public IP (ISP rotations heal within this).
-const AUTO_ADDR_RECHECK_SECS: u64 = 300;
-
 /// True when the address is usable as an internet-facing dial hint — rejects
 /// private/loopback/link-local/documentation ranges, CGNAT (100.64.0.0/10),
 /// where a home-router port-forward cannot produce inbound reachability, and
@@ -1932,71 +1916,6 @@ mod chia_addr_filter_tests {
     }
 }
 
-/// Outcome of one public-IPv4 echo round. CGNAT is split out from plain
-/// failure (R1) so the fingerprint can classify reachability honestly —
-/// "the echo answered but the WAN is CGNAT" is actionable ("needs relay"),
-/// "the echo never answered" is not.
-enum PublicIpv4Outcome {
-    /// A public IPv4 usable as an internet-facing dial hint.
-    Public(std::net::Ipv4Addr),
-    /// The echo answered with a CGNAT/private WAN address — advertising is
-    /// refused (unchanged since 0.22.0): no router port-forward can produce
-    /// inbound reachability from there.
-    Cgnat(std::net::Ipv4Addr),
-    /// No echo service produced a usable answer (offline, blocked, timeout).
-    Failed(anyhow::Error),
-}
-
-/// Resolves the current public IPv4 via the first echo service that answers
-/// with a public address. Tries `SSF_IP_ECHO` hosts (comma-separated) if set,
-/// else the defaults; 10 s timeout per host.
-async fn discover_public_ipv4() -> PublicIpv4Outcome {
-    let hosts_env = std::env::var("SSF_IP_ECHO").ok();
-    let hosts: Vec<&str> = match hosts_env.as_deref() {
-        Some(raw) => raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
-        None => DEFAULT_IP_ECHO_HOSTS.to_vec(),
-    };
-    let mut cgnat_ip: Option<std::net::Ipv4Addr> = None;
-    let mut last_err = anyhow!("no IP echo services configured");
-    for host in hosts {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), query_ip_echo(host)).await {
-            Ok(Ok(ip)) if ipv4_is_public(ip) => return PublicIpv4Outcome::Public(ip),
-            Ok(Ok(ip)) => {
-                cgnat_ip = Some(ip);
-                last_err = anyhow!("{host} reports non-public address {ip} — this looks like CGNAT/private WAN; a router port-forward cannot make you reachable from there")
-            }
-            Ok(Err(e)) => last_err = e,
-            Err(_) => last_err = anyhow!("{host}: timed out"),
-        }
-    }
-    match cgnat_ip {
-        Some(ip) => PublicIpv4Outcome::Cgnat(ip),
-        None => PublicIpv4Outcome::Failed(last_err),
-    }
-}
-
-/// Minimal plain-HTTP/1.0 GET returning the echoed IPv4 body (bounded read;
-/// HTTP/1.0 + Connection: close sidesteps chunked encoding entirely).
-async fn query_ip_echo(host: &str) -> Result<std::net::Ipv4Addr> {
-    let mut stream = tokio::net::TcpStream::connect((host, 80)).await?;
-    let req = format!("GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: ssf-p2p-node\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await?;
-    let mut resp = Vec::with_capacity(512);
-    let mut limited = stream.take(4096);
-    limited.read_to_end(&mut resp).await?;
-    let text = String::from_utf8_lossy(&resp);
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("{host}: malformed HTTP response"))?;
-    let status_ok = head.lines().next().map(|l| l.contains(" 200 ")).unwrap_or(false);
-    if !status_ok {
-        return Err(anyhow!("{host}: non-200 echo response"));
-    }
-    body.trim()
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|e| anyhow!("{host}: echo body is not an IPv4 address: {e}"))
-}
-
 fn main() -> Result<()> {
     // 🧮 Started as `ssf-p2p-node --fold-worker`, this process is the fold's
     // child (fold_worker.rs): nothing else of the node starts, nothing is
@@ -2178,26 +2097,25 @@ async fn node_main() -> Result<()> {
     }
 
     // 📌 External-address advertising: manually-known public addresses (e.g.
-    // after a router port-forward) and `auto` / `auto:<port>` entries that
-    // resolve the CURRENT public IPv4 via an HTTP echo (SSF_IP_ECHO overrides
-    // the service list) and re-check every 5 minutes — dynamic-IP rotations
-    // heal live, no restart, no stale invites.
+    // after a router port-forward) and `auto` / `auto:<port>` entries, which
+    // advertise the public IPv4 the Mainline DHT's nodes see this computer at
+    // (public_v4.rs, BEP 42 votes) with the game's UDP port, re-read every
+    // 30 s, so a dynamic-IP rotation heals live, with no restart and no stale
+    // invite. No website is asked: the IP-echo websites the node asked until
+    // now are gone (External Infrastructure Register §7, Dorkmo 2026-10-12).
     //
-    // IMPORTANT — R1 POSTURE FLIP (deliberate owner decision, demo phase —
-    // "as easy as possible"): the 0.22.0 opt-in echo posture is now OPT-OUT.
-    // UNSET SSF_EXTERNAL_ADDRS behaves exactly like `auto`; the full opt-out
-    // (no echo calls — the pre-R1 unset behavior) is SSF_EXTERNAL_ADDRS=off
-    // (or `none` / `0`, case-insensitive). Explicit values keep their exact
-    // 0.22.0 semantics. SSF_IP_ECHO still overrides the echo hosts; CGNAT
-    // detection/refusal is unchanged.
+    // An UNSET SSF_EXTERNAL_ADDRS behaves exactly like `auto` (the R1 "as easy
+    // as possible" default); SSF_EXTERNAL_ADDRS=off (or `none` / `0`,
+    // case-insensitive) advertises no public address at all. Explicit values
+    // keep their exact 0.22.0 semantics. CGNAT refusal is unchanged.
     let reach = Arc::new(ReachState::new());
     let external_addrs_cfg: Option<String> = match std::env::var("SSF_EXTERNAL_ADDRS") {
         Err(_) => {
-            println!("📌 SSF_EXTERNAL_ADDRS not set — public-IP auto-advertising is ON by default (R1); set SSF_EXTERNAL_ADDRS=off to opt out");
+            println!("📌 SSF_EXTERNAL_ADDRS not set — the public IPv4 the DHT's nodes see is advertised by default (R1; no website is asked); set SSF_EXTERNAL_ADDRS=off to opt out");
             Some("auto".to_string())
         }
         Ok(raw) if matches!(raw.trim().to_ascii_lowercase().as_str(), "off" | "none" | "0" | "") => {
-            println!("📌 External-address advertising OFF (SSF_EXTERNAL_ADDRS={}) — no public-IP echo calls will be made", raw.trim());
+            println!("📌 External-address advertising OFF (SSF_EXTERNAL_ADDRS={}) — no public address is advertised", raw.trim());
             None
         }
         Ok(raw) => Some(raw),
@@ -2247,86 +2165,57 @@ async fn node_main() -> Result<()> {
         .map(|s| s.port())
         .unwrap_or(DEFAULT_IROH_PORT);
 
-    // 🚪 The DHT knock (dht_knock.rs), on with the DHT: a client of its own on
-    // the Mainline DHT (the address lookup keeps its client to itself), by
-    // the same way in. `SSF_DHT_KNOCK=0` holds the knock alone off.
-    #[cfg(feature = "chia-read")]
-    let dht_knock = if !dht_on {
-        None
-    } else if dht_knock::knock_off(std::env::var("SSF_DHT_KNOCK").ok().as_deref()) {
-        println!("🚪 DHT knock OFF (SSF_DHT_KNOCK=0): no knock is sent and none is looked for");
+    // 🌐 The node's own client on the Mainline DHT (the address lookup keeps
+    // its client to itself), by the same way in, whenever the DHT is on: the
+    // DHT knock's announces and lookups, and the votes on this computer's
+    // public IPv4 that the DHT's answers carry (public_v4.rs).
+    let own_dht: Option<n0_mainline::Dht> = if !dht_on {
         None
     } else {
         let mut dht_builder = n0_mainline::DhtBuilder::default();
         if let Some(hosts) = &dht_bootstrap {
             dht_builder.bootstrap(hosts);
         }
-        match dht_knock::KnockDht::start(&dht_builder) {
-            Ok(knock) => {
-                println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)");
-                Some(knock)
-            }
+        match dht_builder.build() {
+            Ok(dht) => Some(dht),
             Err(e) => {
-                eprintln!("⚠️ DHT knock: its DHT client could not start ({e}); no knock is sent and none is looked for");
+                eprintln!("⚠️ The node's DHT client could not start ({e}): no knock is sent or looked for, and no public IPv4 is learned from the DHT");
                 None
             }
         }
     };
 
+    // 🚪 The DHT knock (dht_knock.rs), on with the DHT, on the client above.
+    // `SSF_DHT_KNOCK=0` holds the knock alone off; the client stays for the
+    // address.
+    #[cfg(feature = "chia-read")]
+    let dht_knock = match &own_dht {
+        None => None,
+        Some(_) if dht_knock::knock_off(std::env::var("SSF_DHT_KNOCK").ok().as_deref()) => {
+            println!("🚪 DHT knock OFF (SSF_DHT_KNOCK=0): no knock is sent and none is looked for");
+            None
+        }
+        Some(dht) => {
+            println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)");
+            Some(dht_knock::KnockDht::on(dht.clone()))
+        }
+    };
+
     // 🔄 Dynamic public-IP advertising (default `auto` since R1; also
-    // auto:<port>): resolve now, then re-check every AUTO_ADDR_RECHECK_SECS.
-    // On ISP rotation the stale address is swapped LIVE via
-    // Endpoint::{add,remove}_external_addr — the DHT record and freshly-minted
-    // invite hints follow automatically. Invites are durable across IP changes
-    // anyway (room key + node ID; DHT re-resolves).
+    // auto:<port>): the DHT's vote now, then re-read every 30 s
+    // (public_v4.rs). On an ISP rotation the stale address is swapped LIVE
+    // via Endpoint::{add,remove}_external_addr — the DHT record and
+    // freshly-minted invite hints follow automatically. Invites are durable
+    // across IP changes anyway (room key + node ID; DHT re-resolves).
     if !auto_ports.is_empty() {
-        for port_override in auto_ports {
-            let port = port_override.unwrap_or(bound_v4_port);
-            let ep = iroh_endpoint.clone();
-            let reach_auto = reach.clone();
-            tokio::spawn(async move {
-                let mut announced: Option<SocketAddr> = None;
-                loop {
-                    match discover_public_ipv4().await {
-                        PublicIpv4Outcome::Public(ip) => {
-                            reach_auto.cgnat_detected.store(false, std::sync::atomic::Ordering::Relaxed);
-                            let addr = SocketAddr::from((ip, port));
-                            if announced != Some(addr) {
-                                if let Some(old) = announced.take() {
-                                    let _ = ep.remove_external_addr(&old).await;
-                                    // Deliberately NOT removed from self_advertised: iroh's
-                                    // live snapshot can report the old addr for a beat after
-                                    // remove_external_addr, and a fingerprint request in that
-                                    // window would misclassify it as "port-mapped" (green).
-                                    // Stale set entries can only ever UNDERSTATE (R1 review L1).
-                                    println!("🔄 Public IP changed — un-advertised stale external address {old}");
-                                }
-                                ep.add_external_addr(addr).await;
-                                reach_auto.self_advertised.lock().unwrap().insert(addr);
-                                announced = Some(addr);
-                                println!("📌 External address advertised (auto): {addr} — re-checked every {AUTO_ADDR_RECHECK_SECS}s; router must forward UDP {port} here");
-                            }
-                        }
-                        PublicIpv4Outcome::Cgnat(ip) => {
-                            // CGNAT refusal unchanged since 0.22.0 — never advertise a
-                            // CGNAT/private WAN address. R1 additionally SURFACES the
-                            // condition (fingerprint reachability: "cgnat") instead of
-                            // leaving it console-only.
-                            reach_auto.cgnat_detected.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(old) = announced.take() {
-                                let _ = ep.remove_external_addr(&old).await;
-                                // Kept in self_advertised — same transient-window rationale
-                                // as the rotation branch (R1 review L1); cgnat_detected
-                                // dominates classification anyway.
-                                println!("🔄 WAN fell behind CGNAT — un-advertised stale external address {old}");
-                            }
-                            eprintln!("⚠️ Public-IP echo reports CGNAT/private WAN address {ip} — refusing to advertise it (a router port-forward cannot make you reachable from there; direct inbound dials need a relay); re-checking in {AUTO_ADDR_RECHECK_SECS}s");
-                        }
-                        PublicIpv4Outcome::Failed(e) => eprintln!("⚠️ Public-IP auto-discovery failed (will retry in {AUTO_ADDR_RECHECK_SECS}s): {e}"),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(AUTO_ADDR_RECHECK_SECS)).await;
+        match &own_dht {
+            None => println!("📌 No DHT client in this run: no public IPv4 is learned; only a mapping from the router, or SSF_EXTERNAL_ADDRS=ip:port, is advertised"),
+            Some(dht) => {
+                for port_override in auto_ports {
+                    let port = port_override.unwrap_or(bound_v4_port);
+                    tokio::spawn(public_v4::advertise(dht.clone(), iroh_endpoint.clone(), reach.clone(), port));
                 }
-            });
+            }
         }
     }
 
@@ -2641,7 +2530,7 @@ async fn node_main() -> Result<()> {
         .map_err(|e| anyhow!("Failed to generate self-signed identity: {:?}", e))?;
     
     // R1: seed the fingerprint with the reachability known NOW (usually
-    // "local-only" — the first echo round is still in flight); the HTTP API
+    // "local-only" — the DHT's first vote is still to come); the HTTP API
     // re-classifies per request, exactly like the direct-addr hint refresh.
     let initial_reachability = classify_reachability(&reach, &iroh_direct_addrs);
     let fingerprint = compute_fingerprint(
@@ -8076,7 +7965,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                         fp.iroh_direct_addrs = live_direct_addrs;
                     }
                     // R1: reachability is classified LIVE per request too —
-                    // the echo loop and the portmapper both change state
+                    // the auto loop and the portmapper both change state
                     // minutes after startup.
                     fp.reachability = classify_reachability(&hub_clone.reach, &fp.iroh_direct_addrs);
                     // #231 P6b: whether this node hands out its card, live too
