@@ -807,9 +807,10 @@ impl KnockDht {
         for _ in 0..3 {
             let read = self.read_note(&public, read_within).await.ok_or("the DHT client stopped")?;
             let versions = opened_versions(&key, &read.items);
+            let now = crate::chia_resolve::unix_now();
             if let Some(entries) = written {
                 if note_settled(&versions, mine) {
-                    return Ok(note_entries(&versions).len());
+                    return Ok(note_entries(&versions, now).len());
                 }
                 // A read that saw nothing in time says nothing either way.
                 if read.items.is_empty() && !read.complete {
@@ -819,9 +820,8 @@ impl KnockDht {
             } else if read.items.is_empty() && !read.complete {
                 return Err(format!("the note could not be read within {} s; the next knock writes it", read_within.as_secs()));
             }
-            let now = crate::chia_resolve::unix_now();
             let cas = read.items.iter().map(MutableItem::seq).max();
-            let entries = merge_v6_note(&note_entries(&versions), mine, now);
+            let entries = merge_v6_note(&note_entries(&versions, now), mine, now);
             let item = MutableItem::new(&signer, &seal_v6_note(&key, &entries), note_seq(cas), None);
             match self.dht.put_mutable(item, cas).await {
                 Ok(_) => {
@@ -855,12 +855,16 @@ pub(crate) fn opened_versions(key: &[u8; 32], items: &[MutableItem]) -> Vec<(i64
     items.iter().filter_map(|item| open_v6_note(key, item.value()).map(|entries| (item.seq(), entries))).collect()
 }
 
-/// Every entry of every version, one per address, the one that stands longest.
-/// The holder opens toward all of them: nodes may hold two versions side by
-/// side for a while (two knockers wrote at once), and each names a knocker.
-pub(crate) fn note_entries(versions: &[(i64, Vec<V6Entry>)]) -> Vec<V6Entry> {
+/// Every entry of every version that stands at `now` ([`v6_entry_stands`]),
+/// one per address, the one that stands longest. The holder opens toward all
+/// of them: nodes may hold two versions side by side for a while (two
+/// knockers wrote at once), and each names a knocker. Entries that do not
+/// stand are passed over before two of one address are made one, so an
+/// entry too far ahead (an old version from a clock that ran fast) cannot
+/// stand in for one that is good.
+pub(crate) fn note_entries(versions: &[(i64, Vec<V6Entry>)], now: u64) -> Vec<V6Entry> {
     let mut out: Vec<V6Entry> = Vec::new();
-    for entry in versions.iter().flat_map(|(_, entries)| entries) {
+    for entry in versions.iter().flat_map(|(_, entries)| entries).filter(|entry| v6_entry_stands(entry, now)) {
         match out.iter_mut().find(|kept| kept.addr == entry.addr) {
             Some(kept) => kept.until = kept.until.max(entry.until),
             None => out.push(*entry),
@@ -1093,7 +1097,7 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         let now = crate::chia_resolve::unix_now();
         for (room_id, key, found) in noted {
             let Some(read) = found else { continue };
-            let entries = note_entries(&opened_versions(&key, &read.items));
+            let entries = note_entries(&opened_versions(&key, &read.items), now);
             for addr in v6_openings(&entries, now, &own6, crate::ipv6_is_public) {
                 knocked.push((room_id.clone(), SocketAddr::V6(addr)));
             }
@@ -2248,8 +2252,8 @@ mod tests {
         assert_eq!(first.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], LOOKUP_TIMEOUT).await, Ok(1));
         assert_eq!(second.leave_v6_note(&room, &me, hour, &[pub6(2, 44452), pub6(3, 44452)], LOOKUP_TIMEOUT).await, Ok(3));
         let read = holder.read_note(&public, LOOKUP_TIMEOUT).await.expect("a lookup");
-        let entries = note_entries(&opened_versions(&seal, &read.items));
         let now = crate::chia_resolve::unix_now();
+        let entries = note_entries(&opened_versions(&seal, &read.items), now);
         let mut opened = v6_openings(&entries, now, &HashSet::new(), crate::ipv6_is_public);
         opened.sort();
         assert_eq!(opened, vec![pub6(1, 44442), pub6(2, 44452), pub6(3, 44452)]);
@@ -2271,7 +2275,8 @@ mod tests {
     /// The addresses of every version of the note a read sees, sorted.
     async fn noted_addrs(dht: &KnockDht, public: &[u8; 32], seal: &[u8; 32]) -> Vec<SocketAddrV6> {
         let read = dht.read_note(public, LOOKUP_TIMEOUT).await.expect("a lookup");
-        let mut addrs: Vec<SocketAddrV6> = note_entries(&opened_versions(seal, &read.items)).iter().map(|entry| entry.addr).collect();
+        let now = crate::chia_resolve::unix_now();
+        let mut addrs: Vec<SocketAddrV6> = note_entries(&opened_versions(seal, &read.items), now).iter().map(|entry| entry.addr).collect();
         addrs.sort();
         addrs
     }
@@ -2284,12 +2289,19 @@ mod tests {
         // either writer, and the holder opens toward both.
         let crossed = vec![(5, vec![at(a, 100)]), (5, vec![at(b, 100)])];
         assert!(!note_settled(&crossed, &[a]) && !note_settled(&crossed, &[b]));
-        assert_eq!(note_entries(&crossed), vec![at(a, 100), at(b, 100)]);
+        assert_eq!(note_entries(&crossed, 50), vec![at(a, 100), at(b, 100)]);
         // One newest version with ours in it: settled, whatever older ones say.
         let merged = vec![(6, vec![at(b, 100), at(a, 200)]), (5, vec![at(a, 100)])];
         assert!(note_settled(&merged, &[a]) && note_settled(&merged, &[b]));
         // One address in two versions is one entry, the one that stands longest.
-        assert_eq!(note_entries(&merged), vec![at(b, 100), at(a, 200)]);
+        assert_eq!(note_entries(&merged, 50), vec![at(b, 100), at(a, 200)]);
+        // But only among those that stand: one too far ahead (an old version
+        // from a fast clock) is passed over, not kept in place of a good one,
+        // and one whose time is up is gone.
+        let now = 1_000_000;
+        let ahead = vec![(9, vec![at(a, now + 600)]), (8, vec![at(a, now + 1800), at(b, now - 1)])];
+        assert_eq!(note_entries(&ahead, now), vec![at(a, now + 600)]);
+        assert_eq!(v6_openings(&note_entries(&ahead, now), now, &HashSet::new(), |_| true), vec![a]);
         // Ours dropped by a newer write: not settled.
         assert!(!note_settled(&[(7, vec![at(b, 100)]), (6, vec![at(a, 100), at(b, 100)])], &[a]));
         // No version at all: nothing is settled.
