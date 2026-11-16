@@ -4063,6 +4063,15 @@ async fn dial_peer_inner(
         // `CameIn`).
         #[cfg(feature = "chia-read")]
         if let Some(knock) = hub.dht_knock.as_ref() {
+            // The IPs this dial goes to: its hints, and what the endpoint has
+            // learned for the target by itself (the DHT's address record, for
+            // a dial that came with a node id alone).
+            if let Some(info) = iroh_ep.remote_info(target_pub_key).await {
+                hinted.extend(info.addrs().filter_map(|known| match known.addr() {
+                    iroh::TransportAddr::Ip(ip) => Some(*ip),
+                    _ => None,
+                }));
+            }
             for back in knock.dial_back(&hinted) {
                 if dialed_back.insert(back) {
                     println!("🚪 DHT knock: the computer we knocked on opened toward us from {back}; dialing it back there");

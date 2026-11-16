@@ -111,6 +111,11 @@ pub(crate) const OPENING_WINDOW: Duration = Duration::from_secs(180);
 /// than this is not dialed back.
 pub(crate) const DIAL_BACK_FOR: Duration = Duration::from_secs(60);
 
+/// The most addresses [`CameIn`] keeps. Each one is an opening that came in
+/// while a knock of ours was out, so a handful is plenty; the bound keeps a
+/// stream of stray inbound dials from growing it.
+pub(crate) const CAME_IN_MAX: usize = 16;
+
 /// An opening dial is let go after this long: its packets left at once, and
 /// nothing more is wanted of it.
 const OPENING_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
@@ -399,15 +404,25 @@ impl OpeningBook {
 /// Pure: the clock is handed in.
 #[derive(Default)]
 pub(crate) struct CameIn {
-    /// Per IPv4 address, the last address an opening came in from, and when.
-    from: HashMap<Ipv4Addr, (SocketAddrV4, Instant)>,
+    /// The addresses openings came in from, and when the last one from each
+    /// did. Several per IP: two holders behind one public address each open
+    /// from a port of their own, and neither may push the other's out.
+    from: HashMap<SocketAddrV4, Instant>,
 }
 
 impl CameIn {
-    /// An opening dial came in from `addr` at `now`.
+    /// An opening dial came in from `addr` at `now`. At most [`CAME_IN_MAX`]
+    /// addresses are kept, the ones heard from last.
     pub(crate) fn note(&mut self, addr: SocketAddrV4, now: Instant) {
-        self.from.retain(|_, (_, at)| now.duration_since(*at) < DIAL_BACK_FOR);
-        self.from.insert(*addr.ip(), (addr, now));
+        self.from.retain(|_, at| now.duration_since(*at) < DIAL_BACK_FOR);
+        self.from.insert(addr, now);
+        while self.from.len() > CAME_IN_MAX {
+            let oldest = self.from.iter().min_by_key(|(addr, at)| (**at, **addr)).map(|(addr, _)| *addr);
+            match oldest {
+                Some(addr) => self.from.remove(&addr),
+                None => break,
+            };
+        }
     }
 
     /// The addresses to dial back for a dial whose hints name `ips`: those an
@@ -416,12 +431,12 @@ impl CameIn {
     /// the dial does not name is not followed: the dial would only go where
     /// nobody it means is.
     pub(crate) fn dial_back(&mut self, ips: &HashSet<Ipv4Addr>, known: &HashSet<SocketAddr>, now: Instant) -> Vec<SocketAddrV4> {
-        self.from.retain(|_, (_, at)| now.duration_since(*at) < DIAL_BACK_FOR);
+        self.from.retain(|_, at| now.duration_since(*at) < DIAL_BACK_FOR);
         let mut back: Vec<SocketAddrV4> = self
             .from
-            .values()
-            .filter(|(addr, _)| ips.contains(addr.ip()) && !known.contains(&SocketAddr::V4(*addr)))
-            .map(|(addr, _)| *addr)
+            .keys()
+            .filter(|addr| ips.contains(addr.ip()) && !known.contains(&SocketAddr::V4(**addr)))
+            .copied()
             .collect();
         back.sort();
         back
@@ -968,10 +983,27 @@ mod tests {
         let ips: HashSet<Ipv4Addr> = [*holder.ip()].into();
         let known: HashSet<SocketAddr> = [SocketAddr::V4(holder)].into();
         assert_eq!(came.dial_back(&ips, &known, now + Duration::from_secs(5)), vec![mapped]);
-        // The latest opening from an IP is the one followed.
-        let later = v4(203, 0, 113, 7, 61040);
-        came.note(later, now + Duration::from_secs(15));
-        assert_eq!(came.dial_back(&ips, &known, now + Duration::from_secs(16)), vec![later]);
+        // Another holder behind the same public address opens from a port of
+        // its own: both are dialed back, neither pushes the other out.
+        let other = v4(203, 0, 113, 7, 61040);
+        came.note(other, now + Duration::from_secs(15));
+        assert_eq!(came.dial_back(&ips, &known, now + Duration::from_secs(16)), vec![mapped, other]);
+    }
+
+    #[test]
+    fn the_book_of_openings_keeps_the_last_few_only() {
+        let now = Instant::now();
+        let mut came = CameIn::default();
+        let count = CAME_IN_MAX as u16 + 4;
+        for i in 0..count {
+            came.note(v4(203, 0, 113, 7, 40000 + i), now + Duration::from_millis(u64::from(i)));
+        }
+        let ips: HashSet<Ipv4Addr> = [Ipv4Addr::new(203, 0, 113, 7)].into();
+        let back = came.dial_back(&ips, &HashSet::new(), now + Duration::from_secs(1));
+        assert_eq!(back.len(), CAME_IN_MAX);
+        // The oldest went first.
+        assert_eq!(back.first().map(|a| a.port()), Some(40000 + 4));
+        assert_eq!(back.last().map(|a| a.port()), Some(40000 + count - 1));
     }
 
     #[test]
