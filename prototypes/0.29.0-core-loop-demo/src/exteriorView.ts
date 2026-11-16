@@ -118,6 +118,14 @@ export function exteriorModuleZoom(): number | null {
   return savedZoom !== null ? savedZoom * MODULE_ZOOM_FACTOR : null;
 }
 
+/** 🎬 The station view's zoom framing the whole known station as it stands
+ *  now (what applyExteriorZoom puts on the camera); null while the view is
+ *  not up. The arrival reads it as its atlas shot begins: while its own
+ *  camera was live, a refresh reframed that camera, not the station view's. */
+export function exteriorStationZoom(): number | null {
+  return savedZoom !== null ? savedZoom * exteriorZoomFactor() : null;
+}
+
 function applyExteriorZoom(): void {
   const camera = gr().camera as
     | (THREE.OrthographicCamera & { zoom: number })

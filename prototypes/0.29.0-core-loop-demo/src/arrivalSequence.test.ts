@@ -206,7 +206,7 @@ describe('the shots', () => {
 const L2 = new THREE.Vector3(22, 26, 22);
 const L3 = new THREE.Vector3(34, 38, 34);
 
-function stage(opts: { failStepOut?: boolean; noVat?: boolean; roomHere?: boolean; moduleZoom?: number | null } = {}) {
+function stage(opts: { failStepOut?: boolean; noVat?: boolean; roomHere?: boolean; moduleZoom?: number | null; stationZoom?: number | null } = {}) {
   const ortho = new THREE.OrthographicCamera(-10, 10, 7, -7, 0.1, 1000);
   ortho.zoom = 0.42; // the station view's own zoom, as exteriorView sets it
   ortho.position.copy(L3);
@@ -251,6 +251,8 @@ function stage(opts: { failStepOut?: boolean; noVat?: boolean; roomHere?: boolea
     vatCentre: () => (opts.noVat ? null : { x: -5, z: -5 }),
     roomHere: () => room.here,
     moduleZoom: () => (opts.moduleZoom === undefined ? 0.42 : opts.moduleZoom),
+    // By default none: the ortho camera's own zoom stands in.
+    stationZoom: () => (opts.stationZoom === undefined ? null : opts.stationZoom),
     screen,
     onDone,
   };
@@ -321,11 +323,12 @@ describe('the arrival, played out', () => {
   });
 
   it('a whole station: the atlas starts on all of it and closes in on the module at the centre', () => {
-    const s = stage({ moduleZoom: 0.42 });
-    s.runTo(startOf('atlas') - 1);
     // The station view frames the whole known station, further out than one
-    // module (exteriorView applies it as the view comes back).
-    s.ortho.zoom = 0.074;
+    // module. The station grew while the arrival's own camera was up, so the
+    // ortho camera still holds the old framing (0.42): the current one wins.
+    const s = stage({ moduleZoom: 0.42, stationZoom: 0.074 });
+    s.runTo(startOf('atlas') - 1);
+    expect(s.ortho.zoom).toBe(0.42);
     s.runTo(startOf('atlas') + 0.05);
     expect(s.ortho.zoom).toBeLessThan(0.08);
     s.runTo(startOf('fade') + 0.5);
@@ -586,9 +589,11 @@ describe('the wiring', () => {
     expect(fn).toContain('return room !== null && room !== DEFAULT_STATION.welcomeRoomId;');
     expect(main).toContain('    roomHere: arrivalRoomHere,');
     expect(main).toContain('    moduleZoom: exteriorModuleZoom,');
+    expect(main).toContain('    stationZoom: exteriorStationZoom,');
     expect(main).toContain('screen: domArrivalScreen(() => arrival?.skip(), DEFAULT_STATION.name),');
     const ext = src('./exteriorView.ts');
     expect(ext).toContain('return savedZoom !== null ? savedZoom * MODULE_ZOOM_FACTOR : null;');
+    expect(ext).toContain('return savedZoom !== null ? savedZoom * exteriorZoomFactor() : null;');
     expect(ext).toContain('return Math.min(MODULE_ZOOM_FACTOR, MODULE_ZOOM_FACTOR * (16 / Math.max(16, needed)));');
   });
 

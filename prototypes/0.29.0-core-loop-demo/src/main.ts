@@ -464,6 +464,7 @@ import {
   isExteriorActive,
   isExteriorOrbitView,
   exteriorModuleZoom,
+  exteriorStationZoom,
   tickExterior,
 } from "./exteriorView";
 import {
@@ -12636,6 +12637,7 @@ function startArrival(onDone: () => void): void {
     vatCentre: () => world?.getSpawnVatCentre() ?? null,
     roomHere: arrivalRoomHere,
     moduleZoom: exteriorModuleZoom,
+    stationZoom: exteriorStationZoom,
     screen: domArrivalScreen(() => arrival?.skip(), DEFAULT_STATION.name),
     onDone: () => {
       arrival = null;

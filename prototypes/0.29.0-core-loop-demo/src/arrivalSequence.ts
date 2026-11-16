@@ -231,8 +231,12 @@ export interface ArrivalDeps {
   /** The room the arrival lands in is here: its state has reached this
    *  page, or there is nothing to wait for. */
   roomHere(): boolean;
-  /** The station view's zoom framed on one module alone, or null. */
+  /** The station view's zoom framed on one module alone, and on the whole
+   *  known station as it stands now, or null. Read as the atlas shot
+   *  begins: the station may have grown while the arrival's own camera was
+   *  up, which the station view's framing then never reached. */
   moduleZoom(): number | null;
+  stationZoom(): number | null;
   screen: ArrivalScreen;
   /** Called once, when the arrival is over (played out or skipped). */
   onDone(): void;
@@ -363,7 +367,8 @@ export class ArrivalSequence {
         d.farPass.setEyeDistance(null);
         if (d.isPlanetView()) d.zoom.stepIn();
         if (this.ortho) d.setCamera(this.ortho);
-        this.atlasBase = zoomOf(this.ortho);
+        const st = d.stationZoom();
+        this.atlasBase = st !== null && Number.isFinite(st) && st > 0 ? st : zoomOf(this.ortho);
         const m = d.moduleZoom();
         this.atlasModule = m !== null && Number.isFinite(m) && m > 0 ? m : null;
         break;
