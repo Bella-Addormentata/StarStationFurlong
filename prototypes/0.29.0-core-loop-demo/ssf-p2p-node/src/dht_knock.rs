@@ -26,6 +26,15 @@
 //!   address a connection that came in from it still stands to, nor toward
 //!   one a link in any room has a direct path to, whichever side dialed it
 //!   ([`linked_addrs`]; [`OpeningBook::begin`] has the other limits).
+//! - **The dial back**: the holder's own router may give its game socket a
+//!   different outside port for every destination (GitHub's machines do), so
+//!   the knocker's dial to the holder's port never meets it. The opening dial
+//!   arrives FROM that mapping, though: while a knock is out, the knocker
+//!   keeps where an opening came in from ([`CameIn`]), and its dial to that IP
+//!   goes there too, on the pair of addresses both routers already let
+//!   through. It lands wherever the opening got in at all (2026-11-16: a
+//!   GitHub machine held, a home computer whose router had opened a port
+//!   knocked, and they linked 33 s after the invite was opened).
 //!
 //! What it does not do: it does not find a holder's address (the dial does
 //! that, from the pass and the DHT's address record), and it reads and writes
@@ -33,7 +42,10 @@
 //! game's socket an outside port the node does not know: a different one for
 //! every destination, or one fixed other port the router never told it. The
 //! knock names the outside port as far as it is known ([`knock_port`]), and
-//! the holder's router lets in only what comes from the port it sent to.
+//! the holder's router lets in only what comes from the port it sent to. Nor,
+//! for the same reason, where the holder's router is the one with a port for
+//! every destination and the knocker's lets in only what it asked for: its
+//! opening never gets in, so there is nothing to dial back to.
 //!
 //! Who can see what: a knocker's address and port are stored by the DHT nodes
 //! nearest the knock point, and handed to anyone who asks at that point. The
