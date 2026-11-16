@@ -1,0 +1,13 @@
+# Probe on the branch claude/ip-sources-probe alone: never to merge.
+[package]
+name = "ip-sources-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+n0-mainline = "=0.5.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+anyhow = "1"
+
+[workspace]

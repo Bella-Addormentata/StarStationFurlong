@@ -1,0 +1,48 @@
+name: "🧪 IP sources probe (probe branch, never to merge)"
+
+# Can the Mainline DHT tell a computer its public IPv4 instead of the IP-echo
+# websites the node asks today (api.ipify.org, checkip.amazonaws.com)? On each
+# of GitHub's three machine kinds: how soon the DHT client has an address,
+# whether its IP is the website's, whether it holds over four minutes, and
+# whether the machine's NAT kept the DHT socket's port.
+#
+# The tool is spikes/ip-sources-probe. It asks the website once, only to
+# compare, and the DHT through the four bootstrap hosts the node already uses
+# (External Infrastructure Register §3). No address is printed.
+#
+# It lives on the branch claude/ip-sources-probe alone and is not meant to
+# reach main.
+
+on:
+  push:
+    branches: [claude/ip-sources-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: ip-sources-probe
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: DHT address on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the probe
+        run: cargo build --locked --manifest-path spikes/ip-sources-probe/Cargo.toml
+
+      - name: Run the probe
+        run: cargo run --locked --quiet --manifest-path spikes/ip-sources-probe/Cargo.toml
