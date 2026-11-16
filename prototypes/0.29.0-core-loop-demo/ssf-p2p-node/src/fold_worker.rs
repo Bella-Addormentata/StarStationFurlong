@@ -84,8 +84,11 @@ impl EngineFolder {
         EngineFolder::new(Box::new(strict_check))
     }
 
-    /// An error is the table's: its context is gone (the engine dropped it) and so is what we knew of it.
+    /// An error is the table's: its context is gone and so is what we knew of it. (The engine drops
+    /// the context of a call that fails; an error found here, before any call, drops it too, or a
+    /// later `Warm` would fold on in a context the table no longer has.)
     fn fail(&mut self, ctx: &Ctx, e: FoldError) -> String {
+        self.engine.forget(ctx);
         self.given.remove(&key(ctx));
         e.to_string()
     }
@@ -127,8 +130,10 @@ impl Folder for EngineFolder {
         }
         let given = self.given.get(&key(&w.ctx)).cloned().unwrap_or_default();
         let run = |e: &mut FoldEngine| -> Result<String, FoldError> {
-            // 🔒 (A FAIR ONLY game's houses are by round; a Warm that says otherwise of a table makes it dirty.)
+            // 🔒 (A FAIR ONLY game's houses are by round and its rules are its name's: a Warm that
+            // says otherwise of a table makes it dirty, until a Cold opens it again.)
             match (&given.1, &w.fair) {
+                (Some(g), Some(fair)) if g.rv != fair.rv => return Err(FoldError::Exception("a FAIR ONLY game's rules version changed".into())),
                 (_, Some(fair)) if given.1.as_ref().map(|g| &g.spans) != Some(&fair.spans) => e.set_spans(&w.ctx, &fair.spans)?,
                 (Some(_), None) => return Err(FoldError::Exception("a FAIR ONLY game's houses are by round".into())),
                 (None, None) if given.0 != w.houses => e.set_houses(&w.ctx, &w.houses)?,

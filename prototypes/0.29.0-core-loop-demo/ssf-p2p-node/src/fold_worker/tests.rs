@@ -120,6 +120,18 @@ fn a_fair_only_games_houses_given_with_a_warm_are_applied() {
     assert_eq!(text(&got[2]), c.summary);
     assert_eq!(text(&got[3]), c.summary, "the same houses again: nothing changes");
     assert!(matches!(&got[4], Resp::Dirty { version: 5, reason, .. } if reason.contains("by round")), "{:?}", got[4]);
+    // Dirty means no context: the next Warm, whatever it says, folds nothing until a Cold.
+    let got = run(&mut engine_for(c), &[cold(c, 1), warm(2, None), warm(3, None), warm(4, Some(fair.clone())), cold(c, 5)]);
+    assert!(matches!(&got[1], Resp::Dirty { version: 2, reason, .. } if reason.contains("by round")), "{:?}", got[1]);
+    assert!(matches!(&got[2], Resp::Dirty { version: 3, .. }), "{:?}", got[2]);
+    assert!(matches!(&got[3], Resp::Dirty { version: 4, .. }), "{:?}", got[3]);
+    assert_eq!(text(&got[4]), c.summary);
+    // A Warm that names other rules than the game was opened with is dirty too, and stays so.
+    let other = FairHouses { rv: "f9".into(), ..fair.clone() };
+    let got = run(&mut engine_for(c), &[cold(c, 1), warm(2, Some(other)), warm(3, Some(fair.clone())), cold(c, 4)]);
+    assert!(matches!(&got[1], Resp::Dirty { version: 2, reason, .. } if reason.contains("rules version")), "{:?}", got[1]);
+    assert!(matches!(&got[2], Resp::Dirty { version: 3, .. }), "{:?}", got[2]);
+    assert_eq!(text(&got[3]), c.summary);
     let Req::Cold(whole) = cold(c, 6) else { unreachable!() };
     let got = run(&mut engine_for(c), &[Req::Cold(Cold { fair: None, ..whole })]);
     assert!(matches!(&got[0], Resp::Dirty { version: 6, .. }), "{:?}", got[0]);
