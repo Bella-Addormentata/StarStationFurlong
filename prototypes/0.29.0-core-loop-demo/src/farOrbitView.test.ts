@@ -20,8 +20,10 @@ let setFarPassOrbit: typeof import('./farOrbitView').setFarPassOrbit;
 let shapeOfPlan: typeof import('./farOrbitView').shapeOfPlan;
 let fallbackShape: typeof import('./farOrbitView').fallbackShape;
 let bodyKey: typeof import('./farOrbitView').bodyKey;
+let setFarPassSkyOnly: typeof import('./farOrbitView').setFarPassSkyOnly;
+let setFarEyeDistance: typeof import('./farOrbitView').setFarEyeDistance;
 beforeAll(async () => {
-  ({ SKY_LAYER, renderWithFarPass, setFarPassActive, setFarPassOrbit, shapeOfPlan, fallbackShape, bodyKey } = await import('./farOrbitView'));
+  ({ SKY_LAYER, renderWithFarPass, setFarPassActive, setFarPassOrbit, shapeOfPlan, fallbackShape, bodyKey, setFarPassSkyOnly, setFarEyeDistance } = await import('./farOrbitView'));
 });
 
 /** What one render call saw. */
@@ -194,6 +196,43 @@ describe('renderWithFarPass', () => {
     t.render();
     expect(t.log).toHaveLength(1);
     expect(t.log[0]).toMatchObject({ scene: 'main', mask: t.cameraMask, background: t.background });
+  });
+
+  it('🎬 the arrival\'s sky shot: the sky alone, nothing in front of it, in either view', () => {
+    const t = setup();
+    setFarPassActive(true);
+    setFarPassSkyOnly(true);
+    t.render();
+    const skyOnly = new THREE.Layers();
+    skyOnly.set(SKY_LAYER);
+    expect(t.log).toEqual([
+      { scene: 'main', mask: skyOnly.mask, skyVisible: [true, true], planetVisible: false, background: t.background, autoClear: true },
+    ]);
+    setFarPassOrbit(true);
+    t.log.length = 0;
+    t.render();
+    expect(t.log).toHaveLength(1);
+    // Everything put back, as after any pass.
+    expect(t.sky.map((o) => o.visible)).toEqual([false, false]);
+    expect(t.camera.layers.mask).toBe(t.cameraMask);
+    expect(t.renderer.autoClear).toBe(true);
+    // Off again: the planet view's far scene is back.
+    setFarPassSkyOnly(false);
+    t.log.length = 0;
+    t.render();
+    expect(t.log.filter((e) => e !== 'clearDepth').map((e) => (e as Seen).scene)).toEqual(['main', 'far']);
+  });
+
+  it('🎬 the arrival\'s settings never outlive the space view', () => {
+    const t = setup();
+    setFarPassActive(true);
+    setFarPassSkyOnly(true);
+    setFarEyeDistance(420_000);
+    setFarPassActive(false);
+    setFarPassActive(true);
+    t.render();
+    // The station view's two passes again: sky-only was cleared.
+    expect(t.log.filter((e) => e !== 'clearDepth')).toHaveLength(2);
   });
 });
 

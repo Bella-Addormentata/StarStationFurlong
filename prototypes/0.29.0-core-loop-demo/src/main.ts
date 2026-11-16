@@ -7,7 +7,7 @@ import { pickSettingsGear } from "./gearCardParts";
 import * as THREE from "three";
 import "./style.css";
 import { updateDebugHUD, showHint } from "./hud";
-import { renderWithFarPass } from "./farOrbitView";
+import { renderWithFarPass, setFarEyeDistance, setFarPassSkyOnly } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
@@ -68,7 +68,7 @@ import { routeArcadeTick, setArcadeSender } from "./arcadeNesSession";
 import { routeNativeArcadeTick, setNativeArcadeSender } from "./arcadeNativeSession";
 import { isArcadeTickFlags } from "./arcadeNet";
 import { MultiScaleZoomView, setCameraModeLock } from "./zoom";
-import { initCameraRig, updateCameraRig } from "./cameraRig";
+import { initCameraRig, rotatedLevelOffset, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
 import { laneFromEnvelope, laneOfPeerId, looksByLane, type PeerDress } from "./peerLooks";
 import { cleanLook, loadSavedLook, lookParts, saveLook, type FoxLook } from "./foxLook";
@@ -462,6 +462,9 @@ import {
   setPlacementFramingRelease,
   showEnterRoomBubble,
   isExteriorActive,
+  isExteriorOrbitView,
+  exteriorModuleZoom,
+  exteriorStationZoom,
   tickExterior,
 } from "./exteriorView";
 import {
@@ -514,6 +517,7 @@ import {
 } from "./firstRunSteps";
 import type { FirstRunFacts, ReportLog } from "./firstRunSteps";
 import { focusInView, mountFoxChooser, nextTabStop, startingLook, type FoxChooser } from "./foxChooser";
+import { ArrivalSequence, domArrivalScreen } from "./arrivalSequence";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -675,6 +679,9 @@ let fpsUpdateTime = 0;
 let hasEntered = false;
 let controlsHintShown = false;
 let multiScaleZoom: MultiScaleZoomView;
+/** 🎬 The arrival a new player sees after ENTER NOW (arrivalSequence.ts),
+ *  while it plays; null otherwise. */
+let arrival: ArrivalSequence | null = null;
 
 // ── Raycasting (point-and-click navigation) ───────────────────────────────────
 const raycaster = new THREE.Raycaster();
@@ -12544,7 +12551,8 @@ async function init() {
   // zoom.ts (which imports it for rotated level snaps) nor deviceFocus.ts.
   initCameraRig({
     getZoomLevel: () => (multiScaleZoom ? multiScaleZoom.getLevel() : 2),
-    isCameraBusy: () => isDeviceFocusActive(),
+    // 🎬 The arrival poses the camera itself while it plays.
+    isCameraBusy: () => isDeviceFocusActive() || (arrival?.isPlaying() ?? false),
     // 🎬 The rig adds the slow station drift while the space view is up.
     isExteriorDrifting: () => isExteriorActive(),
     // ➕➖ #223: the HUD cross's zoom buttons, the same steps as +/-.
@@ -12582,6 +12590,64 @@ async function init() {
  * interaction. A click during the title skips the minimum dwell — but never
  * outruns the exterior.
  */
+/** The browser asks pages to keep motion down. */
+function prefersReducedMotion(): boolean {
+  try {
+    return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 🎬 Play the arrival (arrivalSequence.ts): space, the approach to the
+ * planet, the station from outside, black, and the clone vat opening while
+ * the camera comes back to the room view. `onDone` runs once it is over,
+ * played out or skipped.
+ */
+/** 🎬 The room the arrival lands in is here, so its shots can show it: the
+ *  welcome room's state has reached this page, or this start does not seek
+ *  it (the title's own test, setupClickToEnter's waitsForWelcome). */
+function arrivalRoomHere(): boolean {
+  if (!welcomeSeeking()) return true;
+  const room = activeBootstrap?.roomId ?? pendingBootstrapOverride?.roomId ?? null;
+  return room !== null && room !== DEFAULT_STATION.welcomeRoomId;
+}
+
+function startArrival(onDone: () => void): void {
+  document.body.classList.add("arrival-playing");
+  const size = new THREE.Vector2();
+  arrival = new ArrivalSequence({
+    camera: () => window.gameRenderer.camera,
+    setCamera: (c) => {
+      (window.gameRenderer as { camera: THREE.Camera }).camera = c;
+    },
+    viewSize: () => {
+      window.gameRenderer.renderer.getSize(size);
+      return { width: size.x, height: size.y };
+    },
+    zoom: {
+      getLevel: () => multiScaleZoom?.getLevel() ?? 2,
+      stepIn: () => multiScaleZoom?.stepIn(),
+      stepOut: () => multiScaleZoom?.stepOut(),
+    },
+    isPlanetView: () => isExteriorOrbitView(),
+    farPass: { setSkyOnly: setFarPassSkyOnly, setEyeDistance: setFarEyeDistance },
+    isoOffset: (level, out) => rotatedLevelOffset(level, out),
+    vatCentre: () => world?.getSpawnVatCentre() ?? null,
+    roomHere: arrivalRoomHere,
+    moduleZoom: exteriorModuleZoom,
+    stationZoom: exteriorStationZoom,
+    screen: domArrivalScreen(() => arrival?.skip(), DEFAULT_STATION.name),
+    onDone: () => {
+      arrival = null;
+      document.body.classList.remove("arrival-playing");
+      onDone();
+    },
+  });
+  (window as any).__arrival = arrival; // debug handle: where the arrival stands (`elapsed()`), `skip()`
+}
+
 function setupClickToEnter() {
   const MIN_DWELL_MS = 2800; // long enough to read the title + let sync start
   let dwellDone = false;
@@ -12593,14 +12659,29 @@ function setupClickToEnter() {
   // returning install auto-reveals its station as before (proceedChosen = true).
   const firstRun = IS_FIRST_RUN_INSTALL;
   let proceedChosen = !firstRun;
+  /** 🎬 The player entered from the fox chooser (a first start's NEW
+   *  PLAYER): the arrival plays (arrivalSequence.ts). */
+  let arrivalChosen = false;
+
+  /** Point-and-click navigation arms only once the world is actually
+   *  visible — intro clicks can never raycast through the curtain. */
+  const armPointer = () => {
+    window.addEventListener("click", onCanvasClick);
+    window.addEventListener("pointermove", onCanvasPointerMove); // 🏙️ tube hover
+    window.addEventListener("pointerout", onPagePointerOut);
+  };
 
   const maybeFade = () => {
     if (faded || !dwellDone || !exteriorReady || !proceedChosen) return;
     faded = true;
+    // 🎬 The arrival, unless the browser asks for less motion: the station
+    // is then revealed from space as before.
+    const playArrival = arrivalChosen && !prefersReducedMotion();
     // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
     // SpacePhone tip) become eligible again — the exterior-active gate keeps
-    // them hidden until the player actually enters the room.
-    document.body.classList.remove("pre-entry");
+    // them hidden until the player actually enters the room. With the
+    // arrival it ends when the arrival does.
+    if (!playArrival) document.body.classList.remove("pre-entry");
     const welcome = document.getElementById("welcome");
     if (welcome) {
       welcome.style.transition = "opacity 0.9s ease";
@@ -12609,11 +12690,14 @@ function setupClickToEnter() {
         welcome.style.display = "none";
       }, 950);
     }
-    // Point-and-click navigation arms only once the world is actually
-    // visible — intro clicks can never raycast through the curtain.
-    window.addEventListener("click", onCanvasClick);
-    window.addEventListener("pointermove", onCanvasPointerMove); // 🏙️ tube hover
-    window.addEventListener("pointerout", onPagePointerOut);
+    if (playArrival) {
+      startArrival(() => {
+        document.body.classList.remove("pre-entry");
+        armPointer();
+      });
+      return;
+    }
+    armPointer();
   };
 
   // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
@@ -12686,6 +12770,7 @@ function setupClickToEnter() {
         firstRunRepaint = null;
         // 🦊 The fox the player chose is theirs from here on.
         if (chooser) {
+          arrivalChosen = true;
           applyOwnLook(chooser.look());
           chooser.dispose();
           chooser = null;
@@ -13357,6 +13442,10 @@ function animate() {
   // camera while it owns the view (levels 2–4, no device focus). Runs after
   // the zoom tick so a level snap and the rig agree within the same frame.
   updateCameraRig(deltaTime);
+  // 🎬 The arrival's shot for this frame, after the rig (which it holds off)
+  // and before the render.
+  const arrivalThisFrame = arrival !== null;
+  arrival?.update(deltaTime);
   // 🏙️ The near tube under the pointer, against where the camera now is.
   world?.setHoveredVestibule(hoveredVestibuleDoor());
 
@@ -13532,8 +13621,10 @@ function animate() {
   // 🚪🔒 While the airlock is sealed only the closed vestibule is drawn: the
   // room is being swapped behind it.
   const airlock = world.getAirlockScene();
-  if (airlock) renderer.render(airlock, camera);
-  else renderWithFarPass(renderer, scene, camera);
+  // 🎬 The arrival may change the camera this frame: draw the live one.
+  const drawCamera = arrivalThisFrame ? window.gameRenderer.camera : camera;
+  if (airlock) renderer.render(airlock, drawCamera);
+  else renderWithFarPass(renderer, scene, drawCamera);
   // 📷 #319: a shot reads the frame just drawn, before the browser shows it
   // (the drawing buffer isn't kept).
   if (shotPending()) servePendingShot(renderer.domElement);

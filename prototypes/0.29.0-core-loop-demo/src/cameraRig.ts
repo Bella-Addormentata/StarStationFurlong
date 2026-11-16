@@ -216,6 +216,16 @@ export function rotateIsoOffset(
   return out.copy(base).applyAxisAngle(UP, currentYaw + currentBias);
 }
 
+/** 🎬 Where the rig puts the orthographic camera at `level`, from the point
+ *  it looks at, turned to the rig's yaw: the arrival (arrivalSequence.ts)
+ *  poses the camera the rig would, so it hands back without a jump. */
+export function rotatedLevelOffset(
+  level: 2 | 3 | 4,
+  out: THREE.Vector3 = new THREE.Vector3()
+): THREE.Vector3 {
+  return rotateIsoOffset(LEVEL_OFFSETS[level], out);
+}
+
 // ── Rotation control ──────────────────────────────────────────────────────────
 
 /** The rig only steers at ortho room scales (2–4) and never during focus. */
