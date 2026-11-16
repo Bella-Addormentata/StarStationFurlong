@@ -502,9 +502,9 @@ impl Feed {
                     let req = if taken.reset {
                         // (A record that came and went before the first take is no record to start with.)
                         let records: Vec<(String, CVal)> = taken.changes.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-                        Req::Cold(Cold { ctx: ctx.clone(), version, base: taken.base, houses: inputs.houses.clone(), pins: inputs.pins.clone(), records })
+                        Req::Cold(Cold { ctx: ctx.clone(), version, base: taken.base, houses: inputs.houses.clone(), fair: None, pins: inputs.pins.clone(), records })
                     } else {
-                        Req::Warm(Warm { ctx: ctx.clone(), version, houses: inputs.houses.clone(), pins: inputs.pins.clone(), changes: taken.changes })
+                        Req::Warm(Warm { ctx: ctx.clone(), version, houses: inputs.houses.clone(), fair: None, pins: inputs.pins.clone(), changes: taken.changes })
                     };
                     Unsent { req, version, generation, given: inputs.clone() }
                 }

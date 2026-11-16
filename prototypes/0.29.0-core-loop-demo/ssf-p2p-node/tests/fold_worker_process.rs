@@ -86,6 +86,27 @@ fn cold_frame(c: &Value, version: u64) -> Vec<u8> {
     for h in houses {
         put_str(&mut b, h.as_str().unwrap());
     }
+    // 🔒 A FAIR ONLY game's rules version and houses by round: 0, or 1, the version, then (key, from, 0 or 1 and to) each.
+    match c.get("fair") {
+        None => b.push(0),
+        Some(fair) => {
+            b.push(1);
+            put_str(&mut b, fair["rv"].as_str().unwrap());
+            let spans = fair["spans"].as_array().unwrap();
+            put_u32(&mut b, spans.len());
+            for span in spans {
+                put_str(&mut b, span[0].as_str().unwrap());
+                b.extend_from_slice(&span[1].as_i64().unwrap().to_le_bytes());
+                match span[2].as_i64() {
+                    Some(to) => {
+                        b.push(1);
+                        b.extend_from_slice(&to.to_le_bytes());
+                    }
+                    None => b.push(0),
+                }
+            }
+        }
+    }
     let pins = c["pins"].as_array().unwrap();
     put_u32(&mut b, pins.len());
     for p in pins {
@@ -107,6 +128,8 @@ fn warm_frame(ctx: &Value, version: u64) -> Vec<u8> {
     put_ctx(&mut b, ctx);
     put_version(&mut b, version);
     put_u32(&mut b, 0);
+    // (No FAIR ONLY houses: a Warm of a FAIR ONLY game carries them, or the worker calls the table dirty.)
+    b.push(0);
     put_u32(&mut b, 0);
     put_u32(&mut b, 0);
     frame(b)
@@ -183,9 +206,14 @@ impl Worker {
 }
 
 fn real_case() -> Value {
+    real_case_where(false)
+}
+
+/// The first case with real signatures at a FAIR ONLY game (`fair`) or at another table.
+fn real_case_where(fair: bool) -> Value {
     let raw = std::fs::read_to_string(VECTORS).unwrap();
     let file: Value = serde_json::from_str(&raw).unwrap();
-    file["cases"].as_array().unwrap().iter().find(|c| c["sigs"] == "real").expect("a case with real signatures").clone()
+    file["cases"].as_array().unwrap().iter().find(|c| c["sigs"] == "real" && c.get("fair").is_some() == fair).expect("a case with real signatures").clone()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -214,6 +242,26 @@ fn fold_worker_process_folds_a_signed_table_to_the_pages_bytes_and_leaves_when_t
     assert!(rest.is_empty(), "nothing else on stdout, which is the frames' pipe: {rest:?}");
     assert_eq!(err, "", "and nothing on stderr");
     assert_eq!(code, Some(0), "a closed pipe is the node going, not a failure");
+}
+
+/// 🔒 A FAIR ONLY game, its houses by round on the wire: the pages' bytes, and a Warm that names none is a dirty table.
+#[test]
+fn fold_worker_process_folds_a_fair_only_game_to_the_pages_bytes() {
+    let c = real_case_where(true);
+    let mut w = start();
+    w.send(&cold_frame(&c, 5));
+    let (tag, version, text) = read_answer(&mut w.stdout, &c["ctx"]);
+    assert_eq!((tag, version), (0x81, 5));
+    assert_eq!(text, c["summary"].as_str().unwrap(), "the bytes the pages' own fold made");
+    assert!(text.contains(r#""decided":"house""#), "a round its house decided: {text}");
+    w.send(&warm_frame(&c["ctx"], 6));
+    let (tag, version, why) = read_answer(&mut w.stdout, &c["ctx"]);
+    assert_eq!((tag, version), (0x82, 6));
+    assert!(why.contains("by round"), "{why}");
+    let (rest, err, code) = w.finish();
+    assert!(rest.is_empty(), "{rest:?}");
+    assert_eq!(err, "");
+    assert_eq!(code, Some(0));
 }
 
 #[test]

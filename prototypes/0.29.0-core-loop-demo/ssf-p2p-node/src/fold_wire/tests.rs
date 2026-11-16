@@ -34,20 +34,33 @@ fn values() -> Vec<CVal> {
 fn requests() -> Vec<Req> {
     let vs = values();
     vec![
-        Req::Cold(Cold { ctx: ctx(), version: 0, base: None, houses: vec![], pins: vec![], records: vec![] }),
+        Req::Cold(Cold { ctx: ctx(), version: 0, base: None, houses: vec![], fair: None, pins: vec![], records: vec![] }),
         Req::Cold(Cold {
             ctx: ctx(),
             version: u64::MAX,
             base: Some(vs[10].clone()),
             houses: vec![s("hk1"), s("hk2")],
+            fair: None,
             pins: vec![(s("pid-a"), s("key-a")), (s("pid-b"), s("key-b"))],
             records: vs.iter().enumerate().map(|(i, v)| (format!("rec:{i}"), v.clone())).collect(),
         }),
-        Req::Warm(Warm { ctx: ctx(), version: 7, houses: vec![], pins: vec![], changes: vec![] }),
+        Req::Warm(Warm { ctx: ctx(), version: 7, houses: vec![], fair: None, pins: vec![], changes: vec![] }),
+        // 🔒 A FAIR ONLY game, opened with its rules version and houses by round.
+        Req::Cold(Cold {
+            ctx: ctx(),
+            version: 9,
+            base: Some(vs[10].clone()),
+            houses: vec![],
+            fair: Some(FairHouses { rv: s("f1"), spans: vec![(s("hk1"), 3, Some(5)), (s("hk2"), 5, None)] }),
+            pins: vec![],
+            records: vec![],
+        }),
+        Req::Warm(Warm { ctx: ctx(), version: 10, houses: vec![], fair: Some(FairHouses { rv: s("f1"), spans: vec![] }), pins: vec![], changes: vec![] }),
         Req::Warm(Warm {
             ctx: ctx(),
             version: 8,
             houses: vec![s("hk1")],
+            fair: Some(FairHouses { rv: s("f1"), spans: vec![(s("hk1"), 0, None), (s("hk2"), i64::MIN, Some(i64::MAX)), (s(""), 7, Some(-1))] }),
             pins: vec![(s("pid-a"), s("key-a"))],
             changes: vec![(s("rec:1"), Some(vs[11].clone())), (s("rec:2"), None), (s("rec:3"), Some(CVal::Undef)), (s("rec:4"), Some(CVal::Junk))],
         }),
@@ -120,6 +133,7 @@ fn the_bytes_are_pinned() {
         ctx: c.clone(),
         version: 0x0102,
         houses: vec![s("h")],
+        fair: None,
         pins: vec![(s("p"), s("k"))],
         changes: vec![(s("a"), Some(CVal::Int(-2))), (s("b"), None), (s("c"), Some(CVal::Obj(vec![(s("f"), CVal::Junk)])))],
     }))
@@ -131,6 +145,7 @@ fn the_bytes_are_pinned() {
     }
     want.extend_from_slice(&[0x02, 0x01, 0, 0, 0, 0, 0, 0]); // version
     want.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, b'h']); // houses
+    want.push(0); // no FAIR ONLY houses
     want.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, b'p', 1, 0, 0, 0, b'k']); // pins
     want.extend_from_slice(&[3, 0, 0, 0]); // changes
     want.extend_from_slice(&[1, 0, 0, 0, b'a', 1, 1, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // Int(-2)
@@ -192,11 +207,20 @@ fn a_tag_that_names_nothing_is_refused() {
         b.extend_from_slice(&[1, 0, 0, 0, x.as_bytes()[0]]);
     }
     b.extend_from_slice(&[0; 8]); // version
-    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // no houses, no pins
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // no houses, no FAIR ONLY houses, no pins
     b.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, b'k', 1, 9]); // a record whose value tag is 9
     assert_eq!(decode_req(&b), Err(WireError::BadTag(9)));
     let n = b.len();
     b[n - 2] = 2; // a presence flag of 2
+    assert_eq!(decode_req(&b), Err(WireError::BadTag(2)));
+    // 🔒 A FAIR ONLY flag of 2, and a span whose end flag is 2.
+    let mut b = head(REQ_WARM);
+    b.extend_from_slice(&[0, 0, 0, 0, 2]);
+    assert_eq!(decode_req(&b), Err(WireError::BadTag(2)));
+    let mut b = head(REQ_WARM);
+    b.extend_from_slice(&[0, 0, 0, 0, 1, 2, 0, 0, 0, b'f', b'1', 1, 0, 0, 0, 1, 0, 0, 0, b'h']);
+    b.extend_from_slice(&3i64.to_le_bytes());
+    b.push(2);
     assert_eq!(decode_req(&b), Err(WireError::BadTag(2)));
 }
 
@@ -227,7 +251,7 @@ fn head(tag: u8) -> Vec<u8> {
 /// A Warm with no houses and no pins and one record under "k" whose value starts with these bytes.
 fn warm_with_value(value: &[u8]) -> Vec<u8> {
     let mut b = head(REQ_WARM);
-    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // no houses, no pins
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // no houses, no FAIR ONLY houses, no pins
     b.extend_from_slice(&[1, 0, 0, 0]); // one change
     b.extend_from_slice(&[1, 0, 0, 0, b'k', 1]); // "k", present
     b.extend_from_slice(value);
@@ -239,20 +263,24 @@ fn a_count_larger_than_the_frame_is_refused_without_looping_toward_it() {
     let huge = u32::MAX.to_le_bytes();
     // Cold: no base, no houses, no pins, 4 billion records and no bytes for them.
     let mut b = head(REQ_COLD);
-    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // no base, no houses, no pins
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // no base, no houses, no FAIR ONLY houses, no pins
     b.extend_from_slice(&huge);
     assert_eq!(decode_req(&b), Err(WireError::Truncated));
-    // Houses: 4 billion of them. Pins: 4 billion.
+    // Houses: 4 billion of them. FAIR ONLY spans: 4 billion. Pins: 4 billion.
     let mut b = head(REQ_WARM);
     b.extend_from_slice(&huge);
     assert_eq!(decode_req(&b), Err(WireError::Truncated));
     let mut b = head(REQ_WARM);
-    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(&[0, 0, 0, 0, 1, 2, 0, 0, 0, b'f', b'1']);
+    b.extend_from_slice(&huge);
+    assert_eq!(decode_req(&b), Err(WireError::Truncated));
+    let mut b = head(REQ_WARM);
+    b.extend_from_slice(&[0, 0, 0, 0, 0]);
     b.extend_from_slice(&huge);
     assert_eq!(decode_req(&b), Err(WireError::Truncated));
     // Changes: 4 billion.
     let mut b = head(REQ_WARM);
-    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]);
     b.extend_from_slice(&huge);
     assert_eq!(decode_req(&b), Err(WireError::Truncated));
     // An array of 4 billion, an object of 4 billion, a string of 4 GiB, in a record.
@@ -274,7 +302,7 @@ fn nested(depth: usize) -> Vec<u8> {
         b.extend_from_slice(&[1, 0, 0, 0, x.as_bytes()[0]]);
     }
     b.extend_from_slice(&[0; 8]);
-    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]);
     b.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, b'k', 1]);
     for _ in 0..depth {
         b.extend_from_slice(&[V_ARR, 1, 0, 0, 0]);
@@ -298,18 +326,18 @@ fn a_value_that_nests_too_deep_is_not_sent() {
     for _ in 0..=WIRE_DEPTH + 1 {
         v = CVal::Arr(vec![v]);
     }
-    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], pins: vec![], changes: vec![(s("k"), Some(v))] });
+    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], fair: None, pins: vec![], changes: vec![(s("k"), Some(v))] });
     assert_eq!(encode_req(&r), Err(WireError::TooDeep));
 }
 
 #[test]
 fn a_frame_past_the_limit_is_not_sent() {
     let big = CVal::Str("x".repeat(MAX_FRAME));
-    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], pins: vec![], changes: vec![(s("k"), Some(big))] });
+    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], fair: None, pins: vec![], changes: vec![(s("k"), Some(big))] });
     assert!(matches!(encode_req(&r), Err(WireError::BadSize(n)) if n > MAX_FRAME));
     // One that just fits is sent.
     let fits = CVal::Str("x".repeat(MAX_FRAME - 200));
-    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], pins: vec![], changes: vec![(s("k"), Some(fits))] });
+    let r = Req::Warm(Warm { ctx: ctx(), version: 1, houses: vec![], fair: None, pins: vec![], changes: vec![(s("k"), Some(fits))] });
     let frame = encode_req(&r).unwrap();
     assert!(frame.len() - 4 <= MAX_FRAME);
     assert!(decode_req(&frame[4..]).is_ok());
@@ -477,7 +505,7 @@ fn a_room_table_or_incarnation_id_past_the_limit_is_not_sent() {
             _ => c.inc = long.clone(),
         }
         assert_eq!(encode_req(&Req::Forget { ctx: c.clone() }), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "request, field {field}");
-        let cold = Req::Cold(Cold { ctx: c.clone(), version: 1, base: None, houses: vec![], pins: vec![], records: vec![] });
+        let cold = Req::Cold(Cold { ctx: c.clone(), version: 1, base: None, houses: vec![], fair: None, pins: vec![], records: vec![] });
         assert_eq!(encode_req(&cold), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "cold, field {field}");
         let resp = Resp::Dirty { ctx: c, version: 1, reason: s("x") };
         assert_eq!(encode_resp(&resp), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "answer, field {field}");

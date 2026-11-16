@@ -31,6 +31,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use crate::house_bytes::{CVal, Ctx, MAX_DEPTH};
+use crate::house_fold::FairHouses;
 
 /// The most bytes one frame may hold. The fold's memory limit is 64 MiB, so a
 /// request near this is already one the fold would refuse; the node splits a
@@ -72,6 +73,9 @@ pub struct Cold {
     pub version: u64,
     pub base: Option<CVal>,
     pub houses: Vec<String>,
+    /// 🔒 A FAIR ONLY game's rules version and houses by round (none at any
+    /// other table): the worker opens it as one ([`crate::house_fold::FoldEngine::open_fair_only`]).
+    pub fair: Option<FairHouses>,
     pub pins: Vec<(String, String)>,
     pub records: Vec<(String, CVal)>,
 }
@@ -83,6 +87,8 @@ pub struct Warm {
     pub ctx: Ctx,
     pub version: u64,
     pub houses: Vec<String>,
+    /// 🔒 A FAIR ONLY game's, as they now stand (none at any other table).
+    pub fair: Option<FairHouses>,
     pub pins: Vec<(String, String)>,
     pub changes: Vec<(String, Option<CVal>)>,
 }
@@ -230,6 +236,27 @@ impl Out {
             self.str(b);
         }
     }
+    /// 🔒 0, or 1 and the rules version and the spans (key, from, then 0 or 1 and to).
+    fn fair(&mut self, f: &Option<FairHouses>) {
+        let Some(f) = f else {
+            self.u8(0);
+            return;
+        };
+        self.u8(1);
+        self.str(&f.rv);
+        self.u32(f.spans.len());
+        for (k, from, to) in &f.spans {
+            self.str(k);
+            self.bytes(&from.to_le_bytes());
+            match to {
+                Some(to) => {
+                    self.u8(1);
+                    self.bytes(&to.to_le_bytes());
+                }
+                None => self.u8(0),
+            }
+        }
+    }
     fn val(&mut self, v: &CVal, depth: usize) -> Result<(), WireError> {
         if depth > WIRE_DEPTH {
             return Err(WireError::TooDeep);
@@ -299,6 +326,7 @@ pub fn encode_req(req: &Req) -> Result<Vec<u8>, WireError> {
                 None => o.u8(0),
             }
             o.strs(&c.houses);
+            o.fair(&c.fair);
             o.pairs(&c.pins);
             o.u32(c.records.len());
             for (k, v) in &c.records {
@@ -311,6 +339,7 @@ pub fn encode_req(req: &Req) -> Result<Vec<u8>, WireError> {
             o.ctx(&w.ctx);
             o.u64(w.version);
             o.strs(&w.houses);
+            o.fair(&w.fair);
             o.pairs(&w.pins);
             o.u32(w.changes.len());
             for (k, v) in &w.changes {
@@ -404,6 +433,29 @@ impl<'a> In<'a> {
         let n = self.u32()?;
         (0..n).map(|_| Ok((self.str()?, self.str()?))).collect()
     }
+    fn fair(&mut self) -> Result<Option<FairHouses>, WireError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let rv = self.str()?;
+                let n = self.u32()?;
+                let spans = (0..n)
+                    .map(|_| {
+                        let k = self.str()?;
+                        let from = self.i64()?;
+                        let to = match self.u8()? {
+                            0 => None,
+                            1 => Some(self.i64()?),
+                            t => return Err(WireError::BadTag(t)),
+                        };
+                        Ok((k, from, to))
+                    })
+                    .collect::<Result<_, WireError>>()?;
+                Ok(Some(FairHouses { rv, spans }))
+            }
+            t => Err(WireError::BadTag(t)),
+        }
+    }
     fn val(&mut self, depth: usize) -> Result<CVal, WireError> {
         if depth > WIRE_DEPTH {
             return Err(WireError::TooDeep);
@@ -446,15 +498,17 @@ pub fn decode_req(body: &[u8]) -> Result<Req, WireError> {
                 t => return Err(WireError::BadTag(t)),
             };
             let houses = i.strs()?;
+            let fair = i.fair()?;
             let pins = i.pairs()?;
             let n = i.u32()?;
             let records = (0..n).map(|_| Ok((i.str()?, i.val(0)?))).collect::<Result<_, WireError>>()?;
-            Req::Cold(Cold { ctx, version, base, houses, pins, records })
+            Req::Cold(Cold { ctx, version, base, houses, fair, pins, records })
         }
         REQ_WARM => {
             let ctx = i.ctx()?;
             let version = i.u64()?;
             let houses = i.strs()?;
+            let fair = i.fair()?;
             let pins = i.pairs()?;
             let n = i.u32()?;
             let changes = (0..n)
@@ -468,7 +522,7 @@ pub fn decode_req(body: &[u8]) -> Result<Req, WireError> {
                     Ok((k, v))
                 })
                 .collect::<Result<_, WireError>>()?;
-            Req::Warm(Warm { ctx, version, houses, pins, changes })
+            Req::Warm(Warm { ctx, version, houses, fair, pins, changes })
         }
         REQ_FORGET => Req::Forget { ctx: i.ctx()? },
         t => return Err(WireError::BadTag(t)),
