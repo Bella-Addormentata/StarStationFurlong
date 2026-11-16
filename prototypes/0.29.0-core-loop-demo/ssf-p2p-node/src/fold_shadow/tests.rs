@@ -233,7 +233,7 @@ fn a_fold_that_has_not_got_there_is_skipped() {
     let last = last_decided(&sum).unwrap();
     // A round the fold has not decided.
     let mut ahead = sum.clone();
-    ahead.rounds.push(crate::house_fold::RoundSummary {
+    ahead.rounds.push(crate::fold_summary::RoundSummary {
         r: last + 1,
         close: "e".repeat(32),
         decided: None,
@@ -3806,6 +3806,9 @@ fn a_games_answer_is_kept_only_while_it_is_the_game_as_the_node_last_read_it() {
     b.until("the answer on the new base", |b| b.game_answer().is_some_and(|a| a.base_key == trimmed.base_key));
     let a = b.game_answer().unwrap();
     assert_eq!((a.sid.as_str(), a.summary.base.u), (trimmed.sid.as_str(), 1));
+    // 🔒 Of the records of its own session, none of the old one's: what the house's read of it gives.
+    assert_eq!(a.digest, b.session_digest(&trimmed));
+    assert_eq!(a.digest, crate::fold_summary::records_digest([]));
     // A game's checkpoints are its house's own: no base it took, this one neither, is compared.
     assert_eq!(b.shadow.tally, Tally::default());
 }
@@ -3873,4 +3876,129 @@ fn a_game_whose_fold_is_not_finished_has_no_answer_kept() {
     assert!(fold.summary.pending, "(its reveal's signature is held)");
     assert!(b.game_answer().is_none());
     assert_eq!(b.shadow.report().game_answers, 0);
+}
+
+impl Bench {
+    /// The digest of the records the game's live session holds in the doc now: the keys under which it holds its own
+    /// record (`house::own_record`), sorted. What the house's own read of it gives.
+    fn session_digest(&self, plan: &GamePlan) -> String {
+        let keys: Vec<String> = self.session_records(plan).into_iter().map(|(k, _)| k).collect();
+        crate::fold_summary::records_digest(keys.iter().map(String::as_str))
+    }
+
+    /// The records the game's live session holds in the doc now, each under its own key, by key.
+    fn session_records(&self, plan: &GamePlan) -> Vec<(String, CVal)> {
+        use yrs::ReadTxn;
+        let txn = self.doc.transact();
+        let comp = txn.get_map(crate::house::COMPUTED_MAP).unwrap();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &format!("ses:{}:{}:{}", plan.t, plan.inc, plan.sid)) else { panic!("no live session") };
+        let mut recs: Vec<(String, CVal)> = m
+            .iter(&txn)
+            .filter_map(|(k, v)| match v {
+                // (One a page may read otherwise is no record to the mirror, nor to the house.)
+                yrs::Out::Any(a) if crate::house_bytes::clarity(&a) == crate::house_bytes::Clarity::Clear => Some((k.to_string(), CVal::from_any(&a))).filter(|(k, v)| crate::house::own_record(k, v)),
+                _ => None,
+            })
+            .collect();
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        recs
+    }
+
+    /// Change the game's live session: `put` and `gone` keys.
+    fn change_session(&self, plan: &GamePlan, put: Vec<(String, CVal)>, gone: Vec<String>) {
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &format!("ses:{}:{}:{}", plan.t, plan.inc, plan.sid)) else { panic!("no live session") };
+        for (k, v) in put {
+            m.insert(&mut txn, k.as_str(), to_any(&v));
+        }
+        for k in gone {
+            m.remove(&mut txn, k.as_str());
+        }
+    }
+}
+
+#[test]
+fn a_games_answer_goes_where_the_house_reads_it_with_the_digest_of_the_records_it_was_folded_from() {
+    let (mut b, plan) = game_bench();
+    let shared = GameAnswers::default();
+    b.shadow.share_answers(shared.clone());
+    let at = (b.room().to_string(), plan.t.clone(), plan.inc.clone());
+    let there = |shared: &GameAnswers| shared.lock().unwrap().get(&at).cloned();
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    let first = b.game_answer().unwrap();
+    assert_eq!(there(&shared), Some(first.clone()), "put where the house reads it, at the end of the pass");
+    assert_eq!(first.digest, b.session_digest(&plan), "the digest of the session's records as the doc holds them");
+    assert_ne!(first.digest, crate::fold_summary::records_digest([]), "a session with records, or the test proves nothing");
+
+    // Junk beside the records: a key no record goes under, one a record goes under whose body is another's, and a
+    // record of the session again under a key that is not its own. None is a record: the digest is the same, whatever
+    // answer the fold gives.
+    let (own_key, own) = b.session_records(&plan).into_iter().next().expect("a record of its own");
+    let other = format!("{}{}", &own_key[..own_key.len() - 32], if own_key.ends_with('0') { "1".repeat(32) } else { "0".repeat(32) });
+    let junk = vec![("zz:junk".to_string(), obj(vec![("p", s("nobody"))])), (other.clone(), own.clone()), (format!("x:9:nobody:{}", "7".repeat(32)), obj(vec![("p", s("nobody"))]))];
+    b.change_session(&plan, junk, vec![]);
+    assert_eq!(b.session_digest(&plan), first.digest, "junk is no record");
+    b.until("the answer with the junk read", |b| b.game_answer().is_some_and(|a| a.frame > first.frame || a.born > first.born));
+    let junked = b.game_answer().unwrap();
+    assert_eq!(junked.digest, first.digest, "the same records");
+    assert_eq!(there(&shared), Some(junked.clone()));
+
+    // A record's key given another's body: the digest of the answer that comes is of the records left, and so is the
+    // house's read.
+    b.change_session(&plan, vec![(own_key.clone(), obj(vec![("p", s("nobody"))]))], vec![]);
+    let left = b.session_digest(&plan);
+    assert_ne!(left, first.digest);
+    b.until("the answer without it", |b| b.game_answer().is_some_and(|a| a.digest == left));
+    assert_eq!(there(&shared).map(|a| a.digest), Some(left.clone()));
+    // Back again, under its own key: as it was.
+    b.change_session(&plan, vec![(own_key.clone(), own.clone())], vec![other]);
+    b.until("the answer with it again", |b| b.game_answer().is_some_and(|a| a.digest == first.digest));
+    assert_eq!(there(&shared).map(|a| a.digest), Some(first.digest.clone()));
+    // Its body again, with a `__proto__` field that is no object, which a page reads as the record or as junk: no record
+    // to the house's read, and the mirror holds the table (no fold of a session a page may read otherwise). The answer
+    // kept stays the one before, whose records are not the house's read: nothing to sign from.
+    let proto = {
+        let yrs::Any::Map(m) = to_any(&own) else { panic!("a record") };
+        let mut m = (*m).clone();
+        m.insert("__proto__".to_string(), yrs::Any::Null);
+        yrs::Any::Map(Arc::new(m))
+    };
+    {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &format!("ses:{}:{}:{}", plan.t, plan.inc, plan.sid)) else { panic!("no live session") };
+        m.insert(&mut txn, own_key.as_str(), proto);
+    }
+    assert_eq!(b.session_digest(&plan), left);
+    let before = b.game_answer().unwrap();
+    b.ticks(50);
+    assert_eq!(b.game_answer(), Some(before.clone()), "held");
+    assert_eq!(there(&shared), Some(before.clone()));
+    assert_ne!(before.digest, left, "not the house's read");
+    b.change_session(&plan, vec![(own_key.clone(), own.clone())], vec![]);
+    b.until("the answer with it once more", |b| b.game_answer().is_some_and(|a| a.digest == first.digest && a.frame > before.frame));
+    // And gone.
+    b.change_session(&plan, vec![], vec![own_key.clone()]);
+    assert_eq!(b.session_digest(&plan), left);
+    b.until("the answer with it gone", |b| b.game_answer().is_some_and(|a| a.digest == left));
+    assert_eq!(there(&shared).map(|a| a.digest), Some(left.clone()));
+
+    // The plan names it no more: gone from where the house reads it with the shadow's answer.
+    b.view.as_mut().unwrap().games = vec![];
+    b.until("let go", |b| b.shadow.report().games == 0);
+    assert_eq!(there(&shared), None);
+}
+
+#[test]
+fn the_answers_the_house_reads_go_when_the_fold_goes_off() {
+    let (mut b, plan) = game_bench();
+    let shared = GameAnswers::default();
+    b.shadow.share_answers(shared.clone());
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    assert_eq!(shared.lock().unwrap().len(), 1);
+    b.shadow.sup.go_off();
+    b.tick();
+    assert!(shared.lock().unwrap().is_empty(), "no answer of a fold that is off");
+    let _ = plan;
 }
