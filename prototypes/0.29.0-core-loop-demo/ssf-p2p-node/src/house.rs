@@ -741,6 +741,12 @@ struct TableMem {
     /// 🔒 At a FAIR ONLY game, the delegation it was last a house of the game by: given to the resolution after the
     /// room's, so it counts while the doc lacks it, as the pages hold the delegations a count goes by. For the run.
     deleg: Option<CVal>,
+    /// 🔒 And the ones it was a house of the game by for its other holders, one each (the last it went by), while
+    /// they are holders of the game: given to the resolution with it. After a hand-over at the round in flight, that
+    /// round is still the seller's, and its reveal counts by the seller's delegation, which the doc's key may no
+    /// longer hold (the buyer's is written over it) and the base need not carry; the pages keep both (casinoDoc
+    /// keepHouses). At most one per holder the game has had. For the run.
+    earlier: Vec<CVal>,
     /// 🔒 Whether that delegation wants this house's key (design-final section 8.5 N5): the game's base does not carry
     /// it, and the house served the game by it when a pass last found whether it serves the game at all. (Not when it
     /// found the game over, or that the house serves none of its rounds.)
@@ -2169,7 +2175,7 @@ impl House {
             self.deferred = false;
             // (The delegation this house was last a house of the game by, as the doc held it where the doc lacks it:
             // after the doc's, so one of the doc's goes first.)
-            let held = self.rooms[room].tables.get(&key).and_then(|m| m.deleg.clone());
+            let held: Vec<CVal> = self.rooms[room].tables.get(&key).map(|m| m.deleg.iter().chain(&m.earlier).cloned().collect()).unwrap_or_default();
             let res = {
                 let rec = ha::AuthRecords {
                     cks: recs.cks.iter().map(|(k, v)| (k.as_str(), v)).collect(),
@@ -2238,7 +2244,7 @@ impl House {
                     let carried = res.base.as_ref().and_then(|b| b.ck.get("dl")).and_then(hb::rec_hash);
                     let table = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
                     table.keyed = carried.as_deref() != Some(hash.as_str());
-                    table.deleg = Some(value.clone());
+                    keep_earlier(table, value.clone(), &res.chain);
                 }
             }
             let ctx = Ctx { room: room.to_string(), t, inc };
@@ -3268,6 +3274,19 @@ pub fn to_any(v: &CVal) -> Any {
 /// Write `writes` in one transaction; the update to send (None: nothing).
 /// 🔒 The transfers of game `t`/`inc`'s chain that its resolution found only inside a checkpoint (`x`), into `reput`
 /// under their keys for the put-back's turn (design-final section 8.5 N5), as the pages put back the ones they hold.
+/// 🔒 What a game's memory keeps of this house's delegations: the one it serves the game by now (`now`), and the
+/// one it went by before among the earlier ones ([`TableMem::earlier`]); of those, the ones whose signers are
+/// holders of the game (`chain`), but for the signer of `now`. (So one each: none of the signer it goes by now, and
+/// the one it went by before is of another, or goes.)
+fn keep_earlier(table: &mut TableMem, now: CVal, chain: &[ha::Holder]) {
+    let signer = |d: &CVal| str_of(d, "k").map(str::to_string);
+    if let Some(was) = table.deleg.replace(now) {
+        table.earlier.push(was);
+    }
+    let current = table.deleg.as_ref().and_then(signer);
+    table.earlier.retain(|d| signer(d) != current && chain.iter().any(|h| signer(d).as_deref() == Some(h.k.as_str())));
+}
+
 fn chain_put_backs(t: &str, inc: &str, res: &ha::Resolution, reput: &mut Vec<Write>) {
     for holder in res.chain.iter().skip(1) {
         if let Some(step) = holder.step.as_ref().filter(|s| s.key.is_none()) {

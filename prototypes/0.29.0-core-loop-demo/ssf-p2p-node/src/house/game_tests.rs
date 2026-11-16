@@ -2740,6 +2740,60 @@ fn the_rooms_one_delegation_waits_for_a_pass_that_reads_every_delegation_of_the_
 }
 
 #[test]
+fn handed_on_at_the_round_in_flight_it_reveals_that_round_by_the_sellers_delegation_once_the_seeds_come() {
+    // 🔒 The buyer hands the game on to carol at round 1, which this house joined as the buyer's house and which waits
+    // for its seeds; carol delegates this same house, and hers is written over the buyer's under its key. No
+    // checkpoint carries the buyer's (the base is the opener's root). Round 1 is still the buyer's, and once the
+    // seeds come, passes later, the house reveals it by the buyer's delegation, which it keeps for the game.
+    let (buyer, carol) = (who("buyer"), who("carol"));
+    let mut game = Game::new("in-flight-delayed-seeds");
+    game.handed_to_the_buyer();
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.transfer_of(&game.ctx, &buyer, &carol, 1, "fedcba9876543210fedcba98");
+    let hers = delegation(&carol, game.house.public());
+    game.put_top(&format!("hk:{}", game.house.public()), &hers);
+    // (Passes enough to go by hers from the first, short of the seeds' grace.)
+    game.ticks();
+    for _ in 0..2 {
+        game.tick(REPUT_MS);
+    }
+    assert_eq!(game.hk_hash(), hb::rec_hash(&hers), "hers under the key");
+    assert!(game.records("h:1:").is_empty(), "no reveal before the seeds");
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1, "round 1 revealed, by the buyer's delegation");
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c.clone()]);
+    // (Round 2 is carol's, and this house is hers too: the reveal carries its commitment, and the house joins it.)
+    assert_eq!(str_of(&reveals[0].1, "c"), Some(game.commit(2).as_str()));
+}
+
+#[test]
+fn a_games_memory_keeps_one_delegation_of_each_other_holder_of_the_game() {
+    // 🔒 The one it went by before is kept beside the one it goes by now, unless it is of the same signer; one of a
+    // key that holds the game no more goes.
+    let (a, b, c) = (who("buyer"), who("carol"), who("mallory"));
+    let house = House::open(&NODE, None).unwrap();
+    let by = |w: &Who, n: i64| with(&delegation(w, house.public()), "x", CVal::Int(n));
+    let holders = |ws: &[&Who]| ws.iter().map(|w| ha::Holder { k: w.public.clone(), from: 0, step: None }).collect::<Vec<_>>();
+    let all = holders(&[&a, &b, &c]);
+    let mut table = TableMem::default();
+    let kept = |t: &TableMem| (t.deleg.clone(), t.earlier.clone());
+    keep_earlier(&mut table, by(&a, 1), &all);
+    assert_eq!(kept(&table), (Some(by(&a, 1)), vec![]));
+    keep_earlier(&mut table, by(&b, 1), &all);
+    assert_eq!(kept(&table), (Some(by(&b, 1)), vec![by(&a, 1)]), "the buyer's kept beside carol's");
+    keep_earlier(&mut table, by(&b, 2), &all);
+    assert_eq!(kept(&table), (Some(by(&b, 2)), vec![by(&a, 1)]), "carol's earlier one goes");
+    keep_earlier(&mut table, by(&a, 2), &all);
+    assert_eq!(kept(&table), (Some(by(&a, 2)), vec![by(&b, 2)]), "the buyer's earlier one goes");
+    keep_earlier(&mut table, by(&c, 1), &all);
+    assert_eq!(kept(&table), (Some(by(&c, 1)), vec![by(&b, 2), by(&a, 2)]));
+    keep_earlier(&mut table, by(&c, 2), &holders(&[&a, &c]));
+    assert_eq!(kept(&table), (Some(by(&c, 2)), vec![by(&a, 2)]), "carol holds the game no more");
+}
+
+#[test]
 fn a_new_holders_good_delegation_stays_while_the_hand_over_is_not_yet_resolved() {
     // 🔒 Handed on from the buyer to carol, whose delegation of this house comes under its key in the same moment:
     // a put-back's turn on a pass that resolves neither the transfer nor hers (no check to spare) puts nothing over
