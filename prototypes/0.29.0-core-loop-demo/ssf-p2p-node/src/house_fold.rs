@@ -69,6 +69,28 @@ pub fn rules_id(inc: &str) -> Option<&'static str> {
     }
 }
 
+/// 🔒 The rules versions of FAIR ONLY games (the `rv` a game's name binds) this
+/// build folds: foldEntry.ts `FAIR_ONLY_RULES`, which the pages pin to their
+/// own known versions, and house_auth.rs's (a test pins both). A FAIR ONLY game's
+/// incarnation id is a hash of its name, so the letter alone does not say its
+/// rules: [`FoldEngine::open_fair_only`] is given them.
+pub const FAIR_ONLY_RULES: &[&str] = &["f1"];
+
+/// 🔒 Who is a house of a FAIR ONLY game, for which rounds: (key, from, to), a
+/// house of every round r with from < r <= to (no `to`: every round after
+/// `from`). One for each delegation of a house by a key that held the game,
+/// from the round that key took the game to the round it gave it away, as the
+/// authority resolver reads them (foldEntry.ts `HouseSpan`).
+pub type HouseSpan = (String, i64, Option<i64>);
+
+/// 🔒 What a FAIR ONLY game is folded under besides its records: its name's rules
+/// version and its houses by round.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FairHouses {
+    pub rv: String,
+    pub spans: Vec<HouseSpan>,
+}
+
 /// Memory the whole runtime (every table's context) may use.
 pub const MEMORY_LIMIT: usize = 64 << 20;
 /// The JS stack.
@@ -308,6 +330,21 @@ impl FoldEngine {
     /// is forgotten and folded afresh. Evicts the least recently used table
     /// when `FOLD_TABLES` are open.
     pub fn open(&mut self, ctx: &Ctx, cp: Option<&CVal>, houses: &[String], pins: &[(String, String)]) -> Result<(), FoldError> {
+        self.open_with(ctx, |js, table| {
+            let cp = match cp {
+                Some(v) => to_js(js, v)?,
+                None => Value::new_null(js.clone()),
+            };
+            let keys = Array::new(js.clone())?;
+            for (i, h) in houses.iter().enumerate() {
+                keys.set(i, h.as_str())?;
+            }
+            entry(js, "open")?.call::<_, ()>((table, cp, keys, string_pairs(js, pins)?, "host"))
+        })
+    }
+
+    /// A fresh context for the table with the bundle in it, and `start` called with its ids (`{room, t, inc}`).
+    fn open_with(&mut self, ctx: &Ctx, start: impl for<'js> FnOnce(&JsCtx<'js>, Object<'js>) -> rquickjs::Result<()>) -> Result<(), FoldError> {
         let key = key_of(ctx);
         self.remove_slot(&key);
         if self.slots.len() >= FOLD_TABLES {
@@ -341,19 +378,27 @@ impl FoldEngine {
             table.set("room", room)?;
             table.set("t", t)?;
             table.set("inc", inc)?;
+            start(js, table)
+        })
+    }
+
+    /// 🔒 Start folding a FAIR ONLY game (`p`/`q`): its name's rules version and
+    /// houses by round ([`FairHouses`]), the base the authority resolver chose
+    /// (none: the game is not open, and the fold counts nothing) and the key
+    /// pinned for each player. A rules version this build does not fold
+    /// ([`FAIR_ONLY_RULES`]) is refused, and the table is dirty. As [`Self::open`] otherwise.
+    pub fn open_fair_only(&mut self, ctx: &Ctx, fair: &FairHouses, cp: Option<&CVal>, pins: &[(String, String)]) -> Result<(), FoldError> {
+        self.open_with(ctx, |js, table| {
             let cp = match cp {
                 Some(v) => to_js(js, v)?,
                 None => Value::new_null(js.clone()),
             };
-            let keys = Array::new(js.clone())?;
-            for (i, h) in houses.iter().enumerate() {
-                keys.set(i, h.as_str())?;
-            }
-            entry(js, "open")?.call::<_, ()>((table, cp, keys, string_pairs(js, pins)?, "host"))
+            entry(js, "openFairOnly")?.call::<_, ()>((table, fair.rv.as_str(), cp, spans_js(js, &fair.spans)?, string_pairs(js, pins)?, "host"))
         })
     }
 
     /// The checkpoint the live session follows changed (none: no checkpoint).
+    /// 🔒 At a FAIR ONLY game, the base the authority resolver chose.
     pub fn set_base(&mut self, ctx: &Ctx, cp: Option<&CVal>) -> Result<(), FoldError> {
         self.call(&key_of(ctx), COLD_BUDGET, |js| {
             let cp = match cp {
@@ -375,6 +420,11 @@ impl FoldEngine {
             }
             entry(js, "setHouses")?.call::<_, ()>((keys,))
         })
+    }
+
+    /// 🔒 A FAIR ONLY game's houses by round changed: all of them.
+    pub fn set_spans(&mut self, ctx: &Ctx, spans: &[HouseSpan]) -> Result<(), FoldError> {
+        self.call(&key_of(ctx), WARM_BUDGET, |js| entry(js, "setSpans")?.call::<_, ()>((spans_js(js, spans)?,)))
     }
 
     /// The keys pinned for the players changed (one showed up): all of them, as (pid, key).
@@ -522,6 +572,23 @@ fn string_pairs<'js>(js: &JsCtx<'js>, items: &[(String, String)]) -> rquickjs::R
     Ok(list)
 }
 
+/// 🔒 [[key, from, to | null], …]: a FAIR ONLY game's houses by round. (Rounds as
+/// numbers: a round past 2^53 is not one any page counts.)
+fn spans_js<'js>(js: &JsCtx<'js>, spans: &[HouseSpan]) -> rquickjs::Result<Array<'js>> {
+    let list = Array::new(js.clone())?;
+    for (i, (k, from, to)) in spans.iter().enumerate() {
+        let span = Array::new(js.clone())?;
+        span.set(0, k.as_str())?;
+        span.set(1, *from as f64)?;
+        match to {
+            Some(to) => span.set(2, *to as f64)?,
+            None => span.set(2, Value::new_null(js.clone()))?,
+        }
+        list.set(i, span)?;
+    }
+    Ok(list)
+}
+
 /// [[key, value], …] for the fold: a `None` value is `undefined` (a deletion).
 fn pairs<'a, 'js>(js: &JsCtx<'js>, items: impl Iterator<Item = (&'a str, Option<&'a CVal>)>) -> rquickjs::Result<Array<'js>> {
     let list = Array::new(js.clone())?;
@@ -601,6 +668,22 @@ pub struct FoldSummary {
     pub bytes: i64,
     #[serde(rename = "rawBytes")]
     pub raw_bytes: i64,
+    /// 🔒 A FAIR ONLY game's only (none elsewhere): the weight of the records
+    /// the fold used, and of the open round's felts among them.
+    #[serde(default)]
+    pub kept: Option<i64>,
+    #[serde(default, rename = "feltBytes")]
+    pub felt_bytes: Option<i64>,
+    /// 🔒 How many felts the open round has.
+    #[serde(default)]
+    pub felts: Option<i64>,
+    /// 🔒 The keys of the open round's felts whose seed is not out: what a trim
+    /// or a sweep carries into the session it opens. Sorted.
+    #[serde(default, rename = "carryFelts")]
+    pub carry_felts: Option<Vec<String>>,
+    /// 🔒 The closes of the open round that are not invalid, by hash.
+    #[serde(default, rename = "openCloses")]
+    pub open_closes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -627,6 +710,12 @@ pub struct RoundSummary {
     pub abandon: Option<String>,
     pub copies: Option<Vec<String>>,
     pub dice: Option<[i64; 2]>,
+    /// 🔒 A FAIR ONLY game's only: the frozen slips the round is missing (sorted).
+    #[serde(default)]
+    pub missing: Option<Vec<String>>,
+    /// 🔒 A FAIR ONLY craps game's only: the roll ended the hand.
+    #[serde(default, rename = "sevenOut")]
+    pub seven_out: Option<bool>,
 }
 
 #[cfg(test)]

@@ -245,6 +245,8 @@ fn a_fold_that_has_not_got_there_is_skipped() {
         abandon: None,
         copies: None,
         dice: None,
+        missing: None,
+        seven_out: None,
     });
     let cp = page_cp(&ahead, last + 1, nets_through(&sum, last), true, true);
     assert_eq!(compare(&ahead, &cp, &inc), Verdict::Skip(Skip::Behind), "undecided");

@@ -32,7 +32,7 @@ fn run<F: Folder>(f: &mut F, reqs: &[Req]) -> Vec<Resp> {
 use crate::fold_wire::decode_resp;
 
 fn cold(c: &Case, version: u64) -> Req {
-    Req::Cold(Cold { ctx: c.ctx.clone(), version, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: c.records.clone() })
+    Req::Cold(Cold { ctx: c.ctx.clone(), version, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: c.records.clone() })
 }
 
 fn text(r: &Resp) -> &str {
@@ -60,9 +60,9 @@ fn every_vector_folded_cold_through_the_wire_gives_the_pages_bytes() {
 #[test]
 fn every_vector_folded_warm_through_the_wire_gives_the_pages_bytes() {
     for c in &cases() {
-        let mut reqs = vec![Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: vec![] })];
+        let mut reqs = vec![Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: vec![] })];
         for (i, batch) in c.warm.iter().enumerate() {
-            reqs.push(Req::Warm(Warm { ctx: c.ctx.clone(), version: 2 + i as u64, houses: c.houses.clone(), pins: c.pins.clone(), changes: batch.clone() }));
+            reqs.push(Req::Warm(Warm { ctx: c.ctx.clone(), version: 2 + i as u64, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: batch.clone() }));
         }
         let got = run(&mut engine_for(c), &reqs);
         assert_eq!(got.len(), reqs.len(), "{}: one answer for each", c.name);
@@ -79,8 +79,8 @@ fn a_cold_read_split_over_frames_folds_as_one() {
     // the records and Warms with the rest.
     for c in &cases() {
         let half = c.records.len() / 2;
-        let first = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: c.records[..half].to_vec() });
-        let rest = Req::Warm(Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), pins: c.pins.clone(), changes: c.records[half..].iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect() });
+        let first = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: c.records[..half].to_vec() });
+        let rest = Req::Warm(Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: c.records[half..].iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect() });
         let got = run(&mut engine_for(c), &[first, rest]);
         assert_eq!(text(&got[1]), c.summary, "{}", c.name);
     }
@@ -93,14 +93,36 @@ fn houses_and_pins_given_with_a_warm_are_applied() {
     let all = cases();
     let c = all.iter().find(|c| c.name.starts_with("real signatures")).expect("the real-signature case");
     assert!(!c.houses.is_empty());
-    let open = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: vec![], pins: vec![], records: vec![] });
-    let told = Req::Warm(Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), pins: c.pins.clone(), changes: c.records.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect() });
+    let open = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: vec![], fair: None, pins: vec![], records: vec![] });
+    let told = Req::Warm(Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: c.records.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect() });
     let got = run(&mut engine_for(c), &[open, told]);
     assert_eq!(text(&got[1]), c.summary);
     // And the same records without the houses do not give that result.
-    let open = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: vec![], pins: vec![], records: c.records.clone() });
+    let open = Req::Cold(Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: vec![], fair: None, pins: vec![], records: c.records.clone() });
     let got = run(&mut engine_for(c), &[open]);
     assert_ne!(text(&got[0]), c.summary, "the houses matter to this case, or the test proves nothing");
+}
+
+/// 🔒 A FAIR ONLY game's houses by round given with a Warm are applied (none: its house's round is not the house's; back
+/// again: the first answer), a Warm that names no houses by round for it makes the table dirty, and a Cold that leaves
+/// them out is no fold of the game (the pages' fold opens a FAIR ONLY game only with them).
+#[test]
+fn a_fair_only_games_houses_given_with_a_warm_are_applied() {
+    let all = cases();
+    let c = all.iter().find(|c| c.name.starts_with("fair only, real signatures")).expect("the FAIR ONLY real-signature case");
+    assert!(c.summary.contains(r#""decided":"house""#), "a round its house decided, or the test proves nothing");
+    let fair = c.fair.clone().expect("a FAIR ONLY case");
+    let warm = |version: u64, fair: Option<FairHouses>| Req::Warm(Warm { ctx: c.ctx.clone(), version, houses: vec![], fair, pins: c.pins.clone(), changes: vec![] });
+    let none = FairHouses { spans: vec![], ..fair.clone() };
+    let got = run(&mut engine_for(c), &[cold(c, 1), warm(2, Some(none)), warm(3, Some(fair.clone())), warm(4, Some(fair.clone())), warm(5, None)]);
+    assert_eq!(text(&got[0]), c.summary);
+    assert!(!text(&got[1]).contains(r#""decided":"house""#), "{}", text(&got[1]));
+    assert_eq!(text(&got[2]), c.summary);
+    assert_eq!(text(&got[3]), c.summary, "the same houses again: nothing changes");
+    assert!(matches!(&got[4], Resp::Dirty { version: 5, reason, .. } if reason.contains("by round")), "{:?}", got[4]);
+    let Req::Cold(whole) = cold(c, 6) else { unreachable!() };
+    let got = run(&mut engine_for(c), &[Req::Cold(Cold { fair: None, ..whole })]);
+    assert!(matches!(&got[0], Resp::Dirty { version: 6, .. }), "{:?}", got[0]);
 }
 
 // ── A table the worker cannot fold ──────────────────────────────────────────
@@ -109,7 +131,7 @@ fn houses_and_pins_given_with_a_warm_are_applied() {
 fn a_warm_for_a_table_the_worker_does_not_hold_is_dirty_and_a_cold_mends_it() {
     let all = cases();
     let c = &all[0];
-    let warm = Req::Warm(Warm { ctx: c.ctx.clone(), version: 5, houses: c.houses.clone(), pins: c.pins.clone(), changes: vec![] });
+    let warm = Req::Warm(Warm { ctx: c.ctx.clone(), version: 5, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: vec![] });
     let got = run(&mut engine_for(c), &[warm.clone(), cold(c, 6), warm]);
     assert!(matches!(&got[0], Resp::Dirty { version: 5, .. }), "{:?}", got[0]);
     assert_eq!(text(&got[1]), c.summary);
@@ -120,7 +142,7 @@ fn a_warm_for_a_table_the_worker_does_not_hold_is_dirty_and_a_cold_mends_it() {
 fn a_forgotten_table_is_gone_and_a_forget_has_no_answer() {
     let all = cases();
     let c = &all[0];
-    let warm = Req::Warm(Warm { ctx: c.ctx.clone(), version: 3, houses: c.houses.clone(), pins: c.pins.clone(), changes: vec![] });
+    let warm = Req::Warm(Warm { ctx: c.ctx.clone(), version: 3, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: vec![] });
     let got = run(&mut engine_for(c), &[cold(c, 1), Req::Forget { ctx: c.ctx.clone() }, warm]);
     assert_eq!(got.len(), 2, "the Cold and the Warm are answered, the Forget is not");
     assert!(matches!(&got[1], Resp::Dirty { version: 3, .. }));
@@ -134,15 +156,15 @@ fn a_table_the_engine_let_go_to_make_room_is_dirty_for_the_node_to_send_again() 
     for n in 0..=FOLD_TABLES {
         let mut ctx = c.ctx.clone();
         ctx.t = format!("table-{n}");
-        reqs.push(Req::Cold(Cold { ctx, version: n as u64, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: vec![] }));
+        reqs.push(Req::Cold(Cold { ctx, version: n as u64, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: vec![] }));
     }
     // The first table is the least recently used one, and is out.
     let mut first = c.ctx.clone();
     first.t = "table-0".into();
-    reqs.push(Req::Warm(Warm { ctx: first.clone(), version: 99, houses: c.houses.clone(), pins: c.pins.clone(), changes: vec![] }));
+    reqs.push(Req::Warm(Warm { ctx: first.clone(), version: 99, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: vec![] }));
     let mut last = c.ctx.clone();
     last.t = format!("table-{FOLD_TABLES}");
-    reqs.push(Req::Warm(Warm { ctx: last, version: 100, houses: c.houses.clone(), pins: c.pins.clone(), changes: vec![] }));
+    reqs.push(Req::Warm(Warm { ctx: last, version: 100, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: vec![] }));
     let got = run(&mut engine_for(c), &reqs);
     let n = got.len();
     assert!(matches!(&got[n - 2], Resp::Dirty { version: 99, .. }), "{:?}", got[n - 2]);
@@ -235,11 +257,11 @@ fn ctx(t: &str) -> Ctx {
 }
 
 fn cold_of(t: &str, version: u64) -> Req {
-    Req::Cold(Cold { ctx: ctx(t), version, base: None, houses: vec![], pins: vec![], records: vec![] })
+    Req::Cold(Cold { ctx: ctx(t), version, base: None, houses: vec![], fair: None, pins: vec![], records: vec![] })
 }
 
 fn warm_of(t: &str, version: u64) -> Req {
-    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], pins: vec![], changes: vec![] })
+    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], fair: None, pins: vec![], changes: vec![] })
 }
 
 #[test]
@@ -393,7 +415,7 @@ fn what_was_given_for_a_table_the_engine_let_go_is_let_go_too() {
     for n in 0..FOLD_TABLES + 9 {
         let mut ctx = c.ctx.clone();
         ctx.t = format!("table-{n}");
-        let r = f.cold(&Cold { ctx, version: n as u64, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: vec![] });
+        let r = f.cold(&Cold { ctx, version: n as u64, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: vec![] });
         assert!(r.is_ok());
         assert!(f.given.len() <= FOLD_TABLES, "{} remembered after {} tables", f.given.len(), n + 1);
     }
@@ -402,7 +424,7 @@ fn what_was_given_for_a_table_the_engine_let_go_is_let_go_too() {
     let mut bad = c.ctx.clone();
     bad.t = "bad".into();
     bad.inc = "z-not-an-incarnation".into();
-    let _ = f.cold(&Cold { ctx: bad.clone(), version: 1, base: None, houses: vec![], pins: vec![], records: vec![] });
+    let _ = f.cold(&Cold { ctx: bad.clone(), version: 1, base: None, houses: vec![], fair: None, pins: vec![], records: vec![] });
     assert!(f.given.len() <= FOLD_TABLES);
     assert!(!f.given.contains_key(&key(&bad)) || f.engine.is_open(&bad));
 }
@@ -412,9 +434,9 @@ fn after_a_panic_the_real_engine_is_new_and_holds_no_tables() {
     let all = cases();
     let c = &all[0];
     let mut f = engine_for(c);
-    assert!(f.cold(&Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: c.records.clone() }).is_ok());
+    assert!(f.cold(&Cold { ctx: c.ctx.clone(), version: 1, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: c.records.clone() }).is_ok());
     assert!(f.recover());
-    let warm = Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), pins: c.pins.clone(), changes: vec![] };
+    let warm = Warm { ctx: c.ctx.clone(), version: 2, houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), changes: vec![] };
     assert!(f.warm(&warm).is_err(), "the table went with the old engine");
-    assert!(f.cold(&Cold { ctx: c.ctx.clone(), version: 3, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: c.records.clone() }).is_ok());
+    assert!(f.cold(&Cold { ctx: c.ctx.clone(), version: 3, base: c.cp.clone(), houses: c.houses.clone(), fair: c.fair.clone(), pins: c.pins.clone(), records: c.records.clone() }).is_ok());
 }

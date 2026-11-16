@@ -18,15 +18,15 @@ fn ctx(t: &str) -> Ctx {
 }
 
 fn cold(t: &str, version: u64) -> Req {
-    Req::Cold(Cold { ctx: ctx(t), version, base: None, houses: vec![], pins: vec![], records: vec![] })
+    Req::Cold(Cold { ctx: ctx(t), version, base: None, houses: vec![], fair: None, pins: vec![], records: vec![] })
 }
 
 fn warm(t: &str, version: u64) -> Req {
-    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], pins: vec![], changes: vec![] })
+    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], fair: None, pins: vec![], changes: vec![] })
 }
 
 fn big_warm(t: &str, version: u64, mib: usize) -> Req {
-    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], pins: vec![], changes: vec![("k".into(), Some(CVal::Str("x".repeat(mib << 20))))] })
+    Req::Warm(Warm { ctx: ctx(t), version, houses: vec![], fair: None, pins: vec![], changes: vec![("k".into(), Some(CVal::Str("x".repeat(mib << 20))))] })
 }
 
 fn result(t: &str, version: u64) -> Resp {
@@ -341,7 +341,7 @@ fn a_pipe_clogged_before_the_worker_starts_is_the_pipe_of_the_worker_that_does()
 fn a_frame_too_big_to_send_is_refused_and_starts_nothing() {
     let t0 = Instant::now();
     let (mut s, _m, launched) = with_one_worker(t0);
-    let huge = Req::Warm(Warm { ctx: ctx("a"), version: 1, houses: vec![], pins: vec![], changes: vec![("k".into(), Some(CVal::Str("x".repeat(crate::fold_wire::MAX_FRAME))))] });
+    let huge = Req::Warm(Warm { ctx: ctx("a"), version: 1, houses: vec![], fair: None, pins: vec![], changes: vec![("k".into(), Some(CVal::Str("x".repeat(crate::fold_wire::MAX_FRAME))))] });
     assert!(matches!(s.post(t0, &huge), Post::TooBig(WireError::BadSize(_))));
     assert_eq!(launched.load(Ordering::SeqCst), 0);
     assert_eq!(s.state(), State::Idle);

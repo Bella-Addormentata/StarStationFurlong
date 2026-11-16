@@ -33,7 +33,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fold_wire::{decode_req, encode_resp, read_frame, result_too_big, write_frame, Cold, Req, Resp, Warm, WireError};
 use crate::house_bytes::Ctx;
-use crate::house_fold::{strict_check, CheckFn, FoldEngine, FoldError};
+use crate::house_fold::{strict_check, CheckFn, FairHouses, FoldEngine, FoldError};
 
 /// The argument that makes the node binary a fold worker.
 pub const WORKER_ARG: &str = "--fold-worker";
@@ -62,9 +62,9 @@ fn key(ctx: &Ctx) -> Key {
     (ctx.room.clone(), ctx.t.clone(), ctx.inc.clone())
 }
 
-/// The houses and pins a table was last given, so a `Warm` that repeats them
-/// costs nothing.
-type Given = (Vec<String>, Vec<(String, String)>);
+/// The houses (🔒 by round, at a FAIR ONLY game) and pins a table was last
+/// given, so a `Warm` that repeats them costs nothing.
+type Given = (Vec<String>, Option<FairHouses>, Vec<(String, String)>);
 
 /// The real one: a [`FoldEngine`].
 pub struct EngineFolder {
@@ -101,13 +101,16 @@ impl EngineFolder {
 impl Folder for EngineFolder {
     fn cold(&mut self, c: &Cold) -> Result<String, String> {
         let run = |e: &mut FoldEngine| -> Result<String, FoldError> {
-            e.open(&c.ctx, c.base.as_ref(), &c.houses, &c.pins)?;
+            match &c.fair {
+                Some(fair) => e.open_fair_only(&c.ctx, fair, c.base.as_ref(), &c.pins)?,
+                None => e.open(&c.ctx, c.base.as_ref(), &c.houses, &c.pins)?,
+            }
             e.reset(&c.ctx, &c.records)?;
             e.result_text(&c.ctx)
         };
         let done = match run(&mut self.engine) {
             Ok(text) => {
-                self.given.insert(key(&c.ctx), (c.houses.clone(), c.pins.clone()));
+                self.given.insert(key(&c.ctx), (c.houses.clone(), c.fair.clone(), c.pins.clone()));
                 Ok(text)
             }
             Err(e) => Err(self.fail(&c.ctx, e)),
@@ -124,10 +127,14 @@ impl Folder for EngineFolder {
         }
         let given = self.given.get(&key(&w.ctx)).cloned().unwrap_or_default();
         let run = |e: &mut FoldEngine| -> Result<String, FoldError> {
-            if given.0 != w.houses {
-                e.set_houses(&w.ctx, &w.houses)?;
+            // 🔒 (A FAIR ONLY game's houses are by round; a Warm that says otherwise of a table makes it dirty.)
+            match (&given.1, &w.fair) {
+                (_, Some(fair)) if given.1.as_ref().map(|g| &g.spans) != Some(&fair.spans) => e.set_spans(&w.ctx, &fair.spans)?,
+                (Some(_), None) => return Err(FoldError::Exception("a FAIR ONLY game's houses are by round".into())),
+                (None, None) if given.0 != w.houses => e.set_houses(&w.ctx, &w.houses)?,
+                _ => {}
             }
-            if given.1 != w.pins {
+            if given.2 != w.pins {
                 e.set_pins(&w.ctx, &w.pins)?;
             }
             e.apply(&w.ctx, &w.changes)?;
@@ -135,7 +142,7 @@ impl Folder for EngineFolder {
         };
         match run(&mut self.engine) {
             Ok(text) => {
-                self.given.insert(key(&w.ctx), (w.houses.clone(), w.pins.clone()));
+                self.given.insert(key(&w.ctx), (w.houses.clone(), w.fair.clone(), w.pins.clone()));
                 Ok(text)
             }
             Err(e) => Err(self.fail(&w.ctx, e)),

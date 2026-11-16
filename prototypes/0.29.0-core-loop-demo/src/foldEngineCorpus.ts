@@ -8,8 +8,9 @@
  * house-roulette and craps sessions in the style of computedFoldGolden.test.ts
  * (slips with several versions, rival closes, forks, wrong and missing reveals,
  * forfeits, abandons, signatures that fail or are not checked yet, checkpoints
- * with nets and carried state, house joins, reveals and step-downs, junk), and
- * a few made by hand for the values only a node can be handed (floats, nulls,
+ * with nets and carried state, house joins, reveals and step-downs, junk), the
+ * same at FAIR ONLY games (`p`/`q`: a base the resolver chose, houses by round,
+ * slips a decided round is missing), and a few made by hand for the values only a node can be handed (floats, nulls,
  * booleans, unsafe integers, unusual strings).
  *
  * Used by foldEngineVectors.test.ts, which writes test-vectors/fold-engine-v1.json
@@ -20,8 +21,11 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
-import { closeKey, nextSid, recHash, TableFold } from './computedFold';
-import type { Checkpoint, CloseRec, FoldCtx, SlipRec } from './computedFold';
+import { closeKey, nextSid, nextSid3, recHash, TableFold } from './computedFold';
+import type { Checkpoint, CloseRec, FoldCtx, Sid3Input, SlipRec } from './computedFold';
+import { FAIR_ONLY_RV, faironlyInc, NO_CLOSE } from './computedFairOnly';
+import type { FairOnlyLetter } from './computedFairOnly';
+import type { HouseSpan } from './foldEntry';
 import { basisOf, canonFelt, EMPTY_CARRY } from './computedCraps';
 import type { CrapsCarry } from './computedCraps';
 import { b64url, ComputedKit, fakeIdentity, testHouse, testIdentity } from './computedTestKit';
@@ -33,10 +37,14 @@ import type { RouletteBet, RouletteBetType } from './games/roulette';
 export interface FoldCase {
   name: string;
   ctx: FoldCtx;
-  /** The checkpoint the live session follows (as the doc holds it), or null. */
-  cp: Checkpoint | null;
-  /** The keys that are the room's houses. */
+  /** The checkpoint the live session follows (as the doc holds it), or null.
+   *  At a FAIR ONLY game, the base the authority resolver chose (`fair`). */
+  cp: Checkpoint | Sid3Input | null;
+  /** The keys that are the room's houses (none at a FAIR ONLY game). */
   houses: string[];
+  /** 🔒 A FAIR ONLY game (foldEntry openFairOnly): its name's rules version and
+   *  its houses by round. Absent at other tables. */
+  fair?: { rv: string; spans: HouseSpan[] };
   /** The key pinned for each player, [pid, key] (trust on first use, as the
    *  pages pin: casinoDoc computedPinOf). A slip counts for a felt only if it
    *  is signed by its player's pin; a player with none has no felt. */
@@ -95,6 +103,26 @@ const ctxOf = (letter: 'c' | 'r' | 'k' | 'd'): FoldCtx => ({
   inc: letter + '0123456789abcdef01234567',
 });
 
+/** 🔒 A FAIR ONLY game's context: its incarnation is bound to its name. */
+const fairCtxOf = (letter: FairOnlyLetter): FoldCtx => {
+  const t = letter === 'q' ? 'craps-1' : 'roulette-1';
+  return { room: ROOM, t, inc: faironlyInc(letter, ROOM, t, { rv: FAIR_ONLY_RV, ok: OPENER.pub, j: '0123456789abcdef', ts: 1_700_000_000_000 }) };
+};
+const OPENER = testIdentity('fold-corpus-opener');
+
+/** 🔒 Who a FAIR ONLY game's houses are, by round: the corpus house for every
+ *  round after the base's, but now and then only up to a round, a rogue house
+ *  from there on, or one round's house only. From a stream of its own. */
+function spansOf(u: number, seed: number): HouseSpan[] {
+  const rand = rng(9000 + seed);
+  const roll = rand();
+  if (roll < 0.55) return [[HOUSE.pub, 0, null]];
+  const cut = u + 1 + Math.floor(rand() * 3);
+  if (roll < 0.8) return [[HOUSE.pub, 0, cut], [ROGUE.pub, cut, null]];
+  if (roll < 0.92) return [[HOUSE.pub, u, cut]];
+  return [[ROGUE.pub, 0, null], [HOUSE.pub, u + 1, null]];
+}
+
 /** Warm batches for `records`: a shuffled order, deletes and re-puts. */
 function warmOf(records: [string, unknown][], rand: () => number): FoldCase['warm'] {
   const order = shuffled(records, rand);
@@ -116,7 +144,7 @@ function warmOf(records: [string, unknown][], rand: () => number): FoldCase['war
 }
 
 interface Draft {
-  cp: Checkpoint | null;
+  cp: Checkpoint | Sid3Input | null;
   records: [string, unknown][];
   hold: Set<string>;
   pins: [string, string][];
@@ -130,12 +158,13 @@ function pinsOf(ids: ReadonlyMap<string, TestIdentity>, seed: number): [string, 
   return [...ids].filter(() => rand() >= 0.12).map(([p, id]): [string, string] => [p, id.pub]);
 }
 
-/** A roulette session at `ctx` (c… or r…): the golden style. */
+/** A roulette session at `ctx` (c…, r… or a FAIR ONLY p…): the golden style. */
 function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Draft {
   const rand = rng(1000 + n);
   const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
   const chance = (p: number): boolean => rand() < p;
-  const house = ctx.inc[0] === 'r';
+  const fair = ctx.inc[0] === 'p';
+  const house = ctx.inc[0] === 'r' || fair;
   const kit = new ComputedKit(ctx);
   const names = shuffled(NAMES, rand).slice(0, 2 + Math.floor(rand() * (maxNames - 1)));
   const ids = new Map<string, TestIdentity>(names.map((p) => [p, fakeIdentity(`corpus-${n}-${p}`, p)]));
@@ -156,8 +185,9 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
   const felt = (): RouletteBet[] => (chance(0.1) ? [] : Array.from({ length: 1 + Math.floor(rand() * 3) }, bet));
   const badSig = <R extends { g: string }>(rec: R): R => ({ ...rec, g: b64url(sha512(utf8ToBytes(`bad-${n}-${rand()}`))) });
 
-  let cp: Checkpoint | null = null;
-  if (chance(0.3)) {
+  let cp: Checkpoint | Sid3Input | null = null;
+  if (fair) cp = fairBase(kit, names, rand, n, null);
+  else if (chance(0.3)) {
     const nets: Record<string, bigint> = {};
     for (const p of names) if (chance(0.6)) nets[p] = BigInt(Math.floor(rand() * 400) - 200);
     const b = chance(0.5) ? 'g' : hex(`corpus-sid-${n}`, 24);
@@ -165,7 +195,7 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
     cp = kit.checkpoint(pick([...ids.values()]), b, 1 + Math.floor(rand() * 5), hex(`corpus-l-${n}`, 32), nets, chance(0.1) ? 1 : undefined, undefined, h);
   }
   const u = cp ? cp.u : 0;
-  let parents: string[] = [nextSid(ctx, cp)];
+  let parents: string[] = [fair ? nextSid3(ctx, cp as Sid3Input) : nextSid(ctx, cp as Checkpoint | null)];
   let required: string | null = cp?.h ?? null;
   const rounds = 1 + Math.floor(rand() * maxRounds);
   for (let r = u + 1; r <= u + rounds; r++) {
@@ -185,7 +215,7 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
     }
     // At a house table the house joins a joinable round, or a close names what is required.
     let hc: string | undefined;
-    if (house && chance(0.75)) {
+    if (house && chance(fair ? 0.92 : 0.75)) {
       if (required) hc = required;
       else {
         const j = kit.houseJoin(HOUSE, r);
@@ -202,9 +232,15 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
         const signer = pick(writers);
         const f: Record<string, string> = {};
         for (const p of writers) if (p === signer || chance(0.7)) f[p] = pick(slips.get(p)!).hash;
+        // 🔒 (A close counts only with its closer's own felt in it, with bets on it: at a FAIR ONLY game the closer's is one with bets.)
+        if (fair) {
+          const full = slips.get(signer)!.find((x) => (x.rec as { b: unknown[] }).b.length > 0);
+          if (full) f[signer] = full.hash;
+        }
         if (chance(0.1)) f.zed = 'f'.repeat(32);
         const q = chance(0.08) ? hex(`corpus-q-${n}-${r}-${i}`, 32) : pick(parents);
-        let c = kit.close(ids.get(signer)!, r, q, f, hc !== undefined && chance(0.9) ? hc : undefined);
+        // (At a FAIR ONLY game a close naming no commitment is junk: the house's always does.)
+        let c = kit.close(ids.get(signer)!, r, q, f, hc !== undefined && (fair || chance(0.9)) ? hc : undefined);
         if (chance(0.05)) {
           const rec = badSig(c.rec);
           c = { key: closeKey(rec)!, hash: recHash(rec)!, rec };
@@ -244,11 +280,14 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
     required = null;
     if (house) {
       const mine = closes.filter((c) => c.rec.h && c.rec.h === hc).sort((a, b) => (a.hash < b.hash ? -1 : 1));
-      if (mine.length && chance(0.85)) {
+      if (mine.length && chance(fair ? 0.92 : 0.85)) {
         const carryNext = chance(0.85);
         const frozen = Object.values(mine[0].rec.f);
-        add(kit.houseReveal(HOUSE, r, [mine[0].hash], chance(0.9) ? frozen : frozen.slice(1), carryNext ? {} : { c: null }));
+        const counted = chance(fair ? 0.7 : 0.9) ? frozen : frozen.slice(1);
+        add(kit.houseReveal(HOUSE, r, [mine[0].hash], counted, carryNext ? {} : { c: null }));
         if (carryNext) required = kit.houseCommit(HOUSE, r + 1);
+        // 🔒 (A frozen slip the reveal did not count, gone: the round reads decided without it.)
+        if (fair && counted.length < frozen.length && chance(0.7)) dropOne(records, frozen.slice(0, 1));
       } else if (chance(0.1)) add(kit.stepDown(HOUSE, r));
     }
     if (closes.length) parents = closes.map((c) => c.hash);
@@ -265,7 +304,8 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
   const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
   const chance = (p: number): boolean => rand() < p;
   const kit = new ComputedKit(ctx);
-  const house = ctx.inc[0] === 'd';
+  const fair = ctx.inc[0] === 'q';
+  const house = ctx.inc[0] === 'd' || fair;
   const names = shuffled(NAMES, rand).slice(0, 2 + Math.floor(rand() * (maxNames - 1)));
   const ids = new Map<string, TestIdentity>(names.map((p) => [p, fakeIdentity(`corpus-craps-${n}-${p}`, p)]));
   const records: [string, unknown][] = [];
@@ -282,8 +322,16 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
     if ((type === 'come' || type === 'dontcome') && chance(0.3)) return { type, pick: pick(POINTS), amount };
     return { type, amount };
   };
-  let cp: Checkpoint | null = null;
-  if (chance(0.3)) {
+  let cp: Checkpoint | Sid3Input | null = null;
+  if (fair) cp = fairBase(kit, names, rand, n, () => {
+    const w: Record<string, CrapsBet[]> = {};
+    const p = chance(0.5) ? 0 : pick(POINTS);
+    for (const pid of names) if (chance(0.4)) w[pid] = canonFelt([{ type: p ? 'pass' : 'place', ...(p ? {} : { pick: pick(POINTS) }), amount: 5 + Math.floor(rand() * 20) } as CrapsBet]);
+    const s: CrapsCarry = { p, w };
+    if (chance(0.6)) s.h = pick(names);
+    return s;
+  });
+  else if (chance(0.3)) {
     const nets: Record<string, bigint> = {};
     for (const p of names) if (chance(0.6)) nets[p] = BigInt(Math.floor(rand() * 4000) - 2000);
     const ended = chance(0.1);
@@ -311,11 +359,12 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
   }
   // The carry a round plays from is the fold's own, so the generator folds as it goes.
   const carryNow = (): CrapsCarry => {
-    const probe = new Probe(ctx, cp, records, hold);
+    const probe = new Probe(ctx, cp, records, hold, fair ? spans : null);
     return probe.carry();
   };
+  const spans = spansOf(cp ? cp.u : 0, 77000 + n);
   const u = cp ? cp.u : 0;
-  let parents: string[] = [nextSid(ctx, cp)];
+  let parents: string[] = [fair ? nextSid3(ctx, cp as Sid3Input) : nextSid(ctx, cp as Checkpoint | null)];
   let required: string | null = cp?.h ?? null;
   let carry: CrapsCarry = carryNow();
   const rounds = 1 + Math.floor(rand() * maxRounds);
@@ -341,7 +390,7 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
       slips.set(p, versions);
     }
     let hc: string | undefined;
-    if (house && chance(0.75)) {
+    if (house && chance(fair ? 0.92 : 0.75)) {
       if (required) hc = required;
       else {
         const j = kit.houseJoin(HOUSE, r);
@@ -358,9 +407,14 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
         const signer = pick(writers);
         const f: Record<string, string> = {};
         for (const p of writers) if (p === signer || chance(0.7)) f[p] = pick(slips.get(p)!).hash;
+        // 🔒 (A close counts only with its closer's own felt in it, with bets on it: at a FAIR ONLY game the closer's is one with bets.)
+        if (fair) {
+          const full = slips.get(signer)!.find((x) => (x.rec as { b: unknown[] }).b.length > 0);
+          if (full) f[signer] = full.hash;
+        }
         if (chance(0.1)) f.zed = 'f'.repeat(32);
         const q = chance(0.08) ? hex(`corpus-craps-q-${n}-${r}-${i}`, 32) : pick(parents);
-        const c = kit.close(ids.get(signer)!, r, q, f, hc !== undefined && chance(0.9) ? hc : undefined);
+        const c = kit.close(ids.get(signer)!, r, q, f, hc !== undefined && (fair || chance(0.9)) ? hc : undefined);
         closes.push(c);
         add(c);
       }
@@ -387,12 +441,15 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
     required = null;
     if (house) {
       const mine = closes.filter((c) => c.rec.h && c.rec.h === hc).sort((a, b) => (a.hash < b.hash ? -1 : 1));
-      if (mine.length && chance(0.85)) {
+      if (mine.length && chance(fair ? 0.92 : 0.85)) {
         const c = mine[0];
         const present = Object.values(c.rec.f).filter((h) => [...slips.values()].some((vs) => vs.some((s) => s.hash === h)));
         const carryNext = chance(0.85);
-        add(kit.houseReveal(HOUSE, r, [c.hash], chance(0.9) ? present : present.slice(1), carryNext ? {} : { c: null }));
+        const counted = chance(fair ? 0.7 : 0.9) ? present : present.slice(1);
+        add(kit.houseReveal(HOUSE, r, [c.hash], counted, carryNext ? {} : { c: null }));
         if (carryNext) required = kit.houseCommit(HOUSE, r + 1);
+        // 🔒 (A frozen slip the reveal did not count, gone: the round reads decided without it.)
+        if (fair && counted.length < present.length && chance(0.7)) dropOne(records, present.slice(0, 1));
       } else if (chance(0.1)) add(kit.stepDown(HOUSE, r));
     }
     if (closes.length) parents = closes.map((c) => c.hash);
@@ -402,12 +459,47 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
   return { cp, records, hold, pins: pinsOf(ids, 2000 + n) };
 }
 
+/** 🔒 A FAIR ONLY game's base, as the resolver hands it to the fold: the
+ *  opening root now and then, else a house's checkpoint after a few rounds
+ *  (its nets, the outcome of its last round, at craps the carry `carry` makes,
+ *  the commitment the session's first round must name, now and then a sweep
+ *  count), and rarely one that ended the game. */
+function fairBase(kit: ComputedKit, names: readonly string[], rand: () => number, n: number, carry: (() => CrapsCarry) | null): Sid3Input {
+  const craps = carry !== null;
+  const roll = rand();
+  if (roll < 0.3) return { b: 'g', u: 0, l: NO_CLOSE, n: {}, ...(craps ? { s: { p: 0, w: {} } } : {}) };
+  const u = 1 + Math.floor(rand() * 5);
+  const nets: Record<string, string> = {};
+  for (const p of names) if (rand() < 0.6) nets[p] = String(Math.floor(rand() * 400) - 200);
+  const base: Sid3Input = {
+    b: hex(`corpus-fair-sid-${n}`, 24), u, l: hex(`corpus-fair-l-${n}`, 32), d: `h:${hex(`corpus-fair-d-${n}`, 32)}`,
+    o: craps ? [1 + Math.floor(rand() * 6), 1 + Math.floor(rand() * 6)] : Math.floor(rand() * 37), n: nets,
+  };
+  if (roll < 0.36) return { ...base, e: 1 };
+  if (craps) base.s = carry!();
+  if (rand() < 0.8) base.h = kit.houseCommit(HOUSE, u + 1);
+  if (rand() < 0.2) base.w = 1 + Math.floor(rand() * 2);
+  return base;
+}
+
+/** 🔒 Frozen slips of a round the house revealed, gone from the session. */
+function dropOne(records: [string, unknown][], gone: readonly string[]): void {
+  for (const h of gone) {
+    const at = records.findIndex(([k]) => k.startsWith('s:') && k.endsWith(`:${h}`));
+    if (at >= 0) records.splice(at, 1);
+  }
+}
+
 /** The fold of what a generator has made so far, for the carry the next round plays from. */
 class Probe {
   private readonly res;
-  constructor(ctx: FoldCtx, cp: Checkpoint | null, records: [string, unknown][], hold: Set<string>) {
-    const f = new TableFold(ctx, (hash) => (hold.has(hash) ? undefined : true), undefined, undefined, (pub) => pub === HOUSE.pub);
-    f.setBase(cp);
+  constructor(ctx: FoldCtx, cp: Checkpoint | Sid3Input | null, records: [string, unknown][], hold: Set<string>, spans: readonly HouseSpan[] | null) {
+    const houseOk = spans === null
+      ? (pub: string): boolean => pub === HOUSE.pub
+      : (pub: string, r: number): boolean => spans.some(([k, from, to]) => k === pub && from < r && (to === null || r <= to));
+    const f = new TableFold(ctx, (hash) => (hold.has(hash) ? undefined : true), undefined, undefined, houseOk);
+    if (spans === null) f.setBase(cp as Checkpoint | null);
+    else f.setFairOnlyBase(cp as Sid3Input | null);
     f.reset(records);
     this.res = f.result();
   }
@@ -416,12 +508,13 @@ class Probe {
   }
 }
 
-function caseOf(name: string, ctx: FoldCtx, d: Draft, seed: number): FoldCase {
+function caseOf(name: string, ctx: FoldCtx, d: Draft, seed: number, spans: HouseSpan[] | null = null): FoldCase {
   return {
     name,
     ctx,
     cp: d.cp,
-    houses: [HOUSE.pub],
+    houses: spans === null ? [HOUSE.pub] : [],
+    ...(spans === null ? {} : { fair: { rv: FAIR_ONLY_RV, spans } }),
     pins: d.pins,
     sigs: 'fake',
     hold: [...d.hold].sort(),
@@ -524,9 +617,89 @@ function ended(letter: 'c' | 'k'): FoldCase {
   };
 }
 
+/** 🔒 A FAIR ONLY craps game by hand, so the corpus surely holds what a trim
+ *  reads: from a house's checkpoint with the point on, a roll the house
+ *  decided that sevens out (its seed found by trying), a roll it decided with
+ *  a frozen slip gone that it did not count, a roll its bettor abandoned, and
+ *  an open roll closed and not decided yet, with felts on it. */
+function fairByHand(): FoldCase {
+  const ctx = fairCtxOf('q');
+  const kit = new ComputedKit(ctx);
+  const [alice, bob] = [fakeIdentity('corpus-fair-alice', 'alice'), fakeIdentity('corpus-fair-bob', 'bob')];
+  const spans: HouseSpan[] = [[HOUSE.pub, 0, null]];
+  const pins: [string, string][] = [['alice', alice.pub], ['bob', bob.pub]];
+  const point: CrapsCarry = { p: 6, w: { alice: canonFelt([{ type: 'pass', amount: 10 }]) } };
+  const foldOf = (cp: Sid3Input, records: [string, unknown][]) => {
+    const f = new TableFold(ctx, () => true, (pid) => pins.find((q) => q[0] === pid)?.[1], undefined,
+      (pub, r) => spans.some(([k, from, to]) => k === pub && from < r && (to === null || r <= to)));
+    f.setFairOnlyBase(cp);
+    f.reset(records);
+    return f.result();
+  };
+  for (let i = 0; i < 400; i++) {
+    const seed3 = kit.seed('house', 3, `try${i}`);
+    const cp: Sid3Input = { b: hex('corpus-fair-hand-sid', 24), u: 2, l: hex('corpus-fair-hand-l', 32), d: `h:${hex('corpus-fair-hand-d', 32)}`, o: [3, 3], n: { alice: '20', bob: '-20' }, s: point, h: kit.houseCommit(HOUSE, 3, seed3) };
+    const records: [string, unknown][] = [];
+    const add = (b: Built<unknown>): void => {
+      records.push([b.key, b.rec]);
+    };
+    // Round 3: alice rides her pass line, bob plays the field; the house decides it.
+    const a3 = kit.crapsSlip(alice, 3, canonFelt([{ type: 'pass', amount: 10 }, { type: 'field', amount: 5 }]), basisOf(point, 'alice'));
+    const b3 = kit.crapsSlip(bob, 3, canonFelt([{ type: 'field', amount: 5 }]), basisOf(point, 'bob'));
+    const c3 = kit.close(alice, 3, nextSid3(ctx, cp), [a3, b3] as unknown as Built<SlipRec>[], cp.h);
+    [a3, b3, c3, kit.reveal(3, 'alice'), kit.reveal(3, 'bob')].forEach(add);
+    add(kit.houseReveal(HOUSE, 3, [c3.hash], [a3.hash, b3.hash], { s: seed3 }));
+    const after3 = foldOf(cp, records);
+    if (!after3.rounds[0]?.craps?.sevenOut) continue;
+    // Round 4: both bet; bob's slip is gone and the house counted alice's only.
+    const carry4 = after3.carry as CrapsCarry;
+    const a4 = kit.crapsSlip(alice, 4, canonFelt([{ type: 'pass', amount: 10 }]), basisOf(carry4, 'alice'));
+    const b4 = kit.crapsSlip(bob, 4, canonFelt([{ type: 'pass', amount: 10 }]), basisOf(carry4, 'bob'));
+    const c4 = kit.close(alice, 4, c3.hash, [a4, b4] as unknown as Built<SlipRec>[], kit.houseCommit(HOUSE, 4));
+    [a4, c4, kit.reveal(4, 'alice')].forEach(add);
+    add(kit.houseReveal(HOUSE, 4, [c4.hash], [a4.hash]));
+    const carry5 = foldOf(cp, records).carry as CrapsCarry;
+    // Round 5: closed, and abandoned by its bettor before the house revealed.
+    const a5 = kit.crapsSlip(alice, 5, canonFelt([...(carry5.w.alice ?? []), { type: 'field', amount: 3 }]), basisOf(carry5, 'alice'));
+    const c5 = kit.close(alice, 5, c4.hash, [a5] as unknown as Built<SlipRec>[], kit.houseCommit(HOUSE, 5));
+    [a5, c5, kit.abandon(alice, 5, c5.hash)].forEach(add);
+    // Round 6: the house joins (the abandon left no commitment), both bet, alice closes; nobody has revealed.
+    const j6 = kit.houseJoin(HOUSE, 6);
+    const carry6 = foldOf(cp, records).carry as CrapsCarry;
+    const a6 = kit.crapsSlip(alice, 6, canonFelt([...(carry6.w.alice ?? []), { type: 'field', amount: 2 }]), basisOf(carry6, 'alice'));
+    const b6 = kit.crapsSlip(bob, 6, canonFelt([{ type: 'field', amount: 4 }]), basisOf(carry6, 'bob'));
+    const c6 = kit.close(alice, 6, c5.hash, [a6, b6] as unknown as Built<SlipRec>[], j6.rec.c);
+    [j6, a6, b6, c6].forEach(add);
+    return { name: 'fair only craps by hand: a seven-out, a slip gone, an abandon, a roll in flight', ctx, cp, houses: [], fair: { rv: FAIR_ONLY_RV, spans }, pins, sigs: 'fake', hold: [], records, warm: warmOf(records, rng(6)) };
+  }
+  throw new Error('fairByHand: no house seed of 400 sevens out');
+}
+
+/** 🔒 A real, signed round at a FAIR ONLY roulette game from its opening: slips, a close naming the house's join, the
+ *  house's reveal, and beside them a forged slip and the join of a house that is none of the game's. */
+function fairRealSigned(): FoldCase {
+  const ctx = fairCtxOf('p');
+  const kit = new ComputedKit(ctx);
+  const [alice, bob] = [testIdentity('corpus-fair-real-alice', 'alice'), testIdentity('corpus-fair-real-bob', 'bob')];
+  const cp: Sid3Input = { b: 'g', u: 0, l: NO_CLOSE, n: {} };
+  const a1 = kit.slip(alice, 1, [{ type: 'red', amount: 5 }]);
+  const b1 = kit.slip(bob, 1, [{ type: 'straight', pick: 17, amount: 2 }]);
+  const join = kit.houseJoin(HOUSE, 1);
+  const c1 = kit.close(alice, 1, nextSid3(ctx, cp), [a1, b1], join.rec.c);
+  const reveal = kit.houseReveal(HOUSE, 1, [c1.hash], [a1.hash, b1.hash]);
+  const records: [string, unknown][] = [a1, b1, join, c1, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'), reveal].map((b) => [b.key, b.rec]);
+  const forged = { ...a1.rec, g: b1.rec.g, v: 2 };
+  records.push([`s:1:alice:${recHash(forged)!}`, forged]);
+  records.push([kit.houseJoin(ROGUE, 1).key, kit.houseJoin(ROGUE, 1).rec]);
+  return {
+    name: 'fair only, real signatures: one round decided by the house', ctx, cp, houses: [], fair: { rv: FAIR_ONLY_RV, spans: [[HOUSE.pub, 0, null]] },
+    pins: [['alice', alice.pub], ['bob', bob.pub]], sigs: 'real', hold: [], records, warm: warmOf(records, rng(7)),
+  };
+}
+
 /** The corpus: [size knobs] sessions of each family, then the hand-made ones. */
-export function corpus(opts: { roulette?: number; house?: number; craps?: number; rounds?: number; names?: number } = {}): FoldCase[] {
-  const { roulette: nr = 6, house: nh = 6, craps: nc = 8, rounds = 4, names = 4 } = opts;
+export function corpus(opts: { roulette?: number; house?: number; craps?: number; fair?: number; rounds?: number; names?: number } = {}): FoldCase[] {
+  const { roulette: nr = 6, house: nh = 6, craps: nc = 8, fair: nf = 10, rounds = 4, names = 4 } = opts;
   const out: FoldCase[] = [];
   for (let n = 0; n < nr; n++) out.push(caseOf(`roulette ${n}`, ctxOf('c'), roulette(n, ctxOf('c'), rounds, names), n));
   for (let n = 0; n < nh; n++) out.push(caseOf(`house roulette ${n}`, ctxOf('r'), roulette(100 + n, ctxOf('r'), rounds, names), 100 + n));
@@ -535,5 +708,18 @@ export function corpus(opts: { roulette?: number; house?: number; craps?: number
     out.push(caseOf(`${letter === 'd' ? 'house craps' : 'craps'} ${n}`, ctxOf(letter), craps(n, ctxOf(letter), rounds, names), 200 + n));
   }
   out.push(realSigned(), oddities(), rogue('c'), rogue('r'), ended('c'), ended('k'));
+  // 🔒 FAIR ONLY games, after every older case (whose bytes the vectors pin as they were).
+  for (let n = 0; n < nf; n++) {
+    if (n % 2) {
+      const ctx = fairCtxOf('q');
+      const d = craps(300 + n, ctx, rounds + 2, names);
+      out.push(caseOf(`fair only craps ${n}`, ctx, d, 300 + n, spansOf(d.cp ? d.cp.u : 0, 77300 + n)));
+    } else {
+      const ctx = fairCtxOf('p');
+      const d = roulette(300 + n, ctx, rounds + 2, names);
+      out.push(caseOf(`fair only roulette ${n}`, ctx, d, 300 + n, spansOf(d.cp ? d.cp.u : 0, 1300 + n)));
+    }
+  }
+  out.push(fairByHand(), fairRealSigned());
   return out;
 }

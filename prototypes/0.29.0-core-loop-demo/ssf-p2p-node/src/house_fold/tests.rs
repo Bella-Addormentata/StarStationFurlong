@@ -17,6 +17,8 @@ pub(crate) struct Case {
     pub(crate) ctx: Ctx,
     pub(crate) cp: Option<CVal>,
     pub(crate) houses: Vec<String>,
+    /// 🔒 A FAIR ONLY game's rules version and houses by round (none elsewhere).
+    pub(crate) fair: Option<FairHouses>,
     pub(crate) pins: Vec<(String, String)>,
     pub(crate) real: bool,
     pub(crate) hold: Vec<String>,
@@ -43,6 +45,15 @@ pub(crate) fn cases() -> Vec<Case> {
             ctx: Ctx { room: c["ctx"]["room"].as_str().unwrap().into(), t: c["ctx"]["t"].as_str().unwrap().into(), inc: c["ctx"]["inc"].as_str().unwrap().into() },
             cp: if c["cp"].is_null() { None } else { Some(CVal::from_json(&c["cp"])) },
             houses: strs(&c["houses"]),
+            fair: c.get("fair").map(|f| FairHouses {
+                rv: f["rv"].as_str().unwrap().to_string(),
+                spans: f["spans"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| (s[0].as_str().unwrap().to_string(), s[1].as_i64().unwrap(), s[2].as_i64()))
+                    .collect(),
+            }),
             pins: c["pins"].as_array().unwrap().iter().map(|p| (p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string())).collect(),
             real: c["sigs"] == "real",
             hold: strs(&c["hold"]),
@@ -75,7 +86,15 @@ pub(crate) fn check_for(c: &Case) -> CheckFn {
 }
 
 fn open(e: &mut FoldEngine, c: &Case) {
-    e.open(&c.ctx, c.cp.as_ref(), &c.houses, &c.pins).unwrap_or_else(|err| panic!("{}: open: {err}", c.name));
+    open_as(e, &c.ctx, c, c.cp.as_ref(), &c.pins).unwrap_or_else(|err| panic!("{}: open: {err}", c.name));
+}
+
+/// Table `ctx` opened with case `c`'s houses (🔒 by round at a FAIR ONLY game), base `cp` and `pins`.
+fn open_as(e: &mut FoldEngine, ctx: &Ctx, c: &Case, cp: Option<&CVal>, pins: &[(String, String)]) -> Result<(), FoldError> {
+    match &c.fair {
+        Some(fair) => e.open_fair_only(ctx, fair, cp, pins),
+        None => e.open(ctx, cp, &c.houses, pins),
+    }
 }
 
 fn sha_hex(text: &str) -> String {
@@ -114,7 +133,19 @@ fn every_vector_folds_cold_to_the_pages_bytes() {
         // And the result reads as the shape the node uses.
         let s = e.result(&c.ctx).unwrap_or_else(|err| panic!("{}: parse: {err}", c.name));
         assert_eq!(s.v, 1, "{}", c.name);
-        assert_eq!(s.rules.as_deref(), rules_id(&c.ctx.inc), "{}: rules", c.name);
+        match &c.fair {
+            Some(fair) => {
+                // 🔒 A FAIR ONLY game is folded by its name's rules version, and says what a trim reads.
+                assert_eq!(s.rules.as_deref(), Some(fair.rv.as_str()), "{}: rules", c.name);
+                assert!(s.kept.is_some() && s.felt_bytes.is_some() && s.felts.is_some() && s.carry_felts.is_some() && s.open_closes.is_some(), "{}", c.name);
+                assert!(s.rounds.iter().all(|r| r.missing.is_some()), "{}", c.name);
+            }
+            None => {
+                assert_eq!(s.rules.as_deref(), rules_id(&c.ctx.inc), "{}: rules", c.name);
+                assert!(s.kept.is_none() && s.felt_bytes.is_none() && s.felts.is_none() && s.carry_felts.is_none() && s.open_closes.is_none(), "{}", c.name);
+                assert!(s.rounds.iter().all(|r| r.missing.is_none() && r.seven_out.is_none()), "{}", c.name);
+            }
+        }
     }
 }
 
@@ -147,7 +178,7 @@ fn the_order_of_a_records_fields_changes_nothing() {
     for c in &cases() {
         let mut e = FoldEngine::new(check_for(c)).unwrap();
         let cp = c.cp.as_ref().map(reversed);
-        e.open(&c.ctx, cp.as_ref(), &c.houses, &c.pins).unwrap();
+        open_as(&mut e, &c.ctx, c, cp.as_ref(), &c.pins).unwrap();
         let flipped: Vec<(String, CVal)> = c.records.iter().map(|(k, v)| (k.clone(), reversed(v))).collect();
         e.reset(&c.ctx, &flipped).unwrap();
         assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}: summary", c.name);
@@ -166,11 +197,11 @@ fn a_session_replaced_folds_as_a_new_one() {
     e.result_text(&a.ctx).unwrap();
     // The same table, another session (the engine's check is a's; b is fake-signed too).
     let mut e2 = FoldEngine::new(check_for(b)).unwrap();
-    e2.open(&a.ctx, b.cp.as_ref(), &b.houses, &b.pins).unwrap();
+    open_as(&mut e2, &a.ctx, b, b.cp.as_ref(), &b.pins).unwrap();
     e2.reset(&a.ctx, &a.records).unwrap();
     e2.reset(&a.ctx, &b.records).unwrap();
     let mut e3 = FoldEngine::new(check_for(b)).unwrap();
-    e3.open(&a.ctx, b.cp.as_ref(), &b.houses, &b.pins).unwrap();
+    open_as(&mut e3, &a.ctx, b, b.cp.as_ref(), &b.pins).unwrap();
     e3.reset(&a.ctx, &b.records).unwrap();
     assert_eq!(e2.result_text(&a.ctx).unwrap(), e3.result_text(&a.ctx).unwrap());
 }
@@ -191,17 +222,24 @@ fn a_checkpoint_replaced_or_removed_clears_the_session_and_folds_as_a_fresh_tabl
             }
             // The engine holds src's table, populated and folded.
             let mut e = FoldEngine::new(check_for(dst)).unwrap();
-            e.open(&src.ctx, src.cp.as_ref(), &src.houses, &src.pins).unwrap();
+            open_as(&mut e, &src.ctx, src, src.cp.as_ref(), &src.pins).unwrap();
             e.reset(&src.ctx, &src.records).unwrap();
             let before = e.result(&src.ctx).unwrap();
             assert!(!e.slots[&key_of(&src.ctx)].cold, "{} → {}: folded", src.name, dst.name);
             // The checkpoint changes (or goes): the fold drops the old session; the same checkpoint again is no change.
             e.set_base(&src.ctx, dst.cp.as_ref()).unwrap_or_else(|err| panic!("{} → {}: set_base: {err}", src.name, dst.name));
             e.set_pins(&src.ctx, &dst.pins).unwrap();
+            // 🔒 (Two FAIR ONLY cases of one table have houses of their own.)
+            if let Some(fair) = &dst.fair {
+                e.set_spans(&src.ctx, &fair.spans).unwrap();
+            }
             assert!(e.slots[&key_of(&src.ctx)].cold, "{} → {}: cold again", src.name, dst.name);
             let after = e.result(&src.ctx).unwrap();
             if src.cp == dst.cp {
-                assert_eq!((after.records, after.rounds.len()), (before.records, before.rounds.len()), "{} → {}: same base, same session", src.name, dst.name);
+                assert_eq!(after.records, before.records, "{} → {}: same base, same session", src.name, dst.name);
+                if src.fair == dst.fair {
+                    assert_eq!(after.rounds.len(), before.rounds.len(), "{} → {}: same base, same rounds", src.name, dst.name);
+                }
                 kept += 1;
             } else {
                 assert_eq!((after.records, after.rounds.len()), (0, 0), "{} → {}: the old session is gone", src.name, dst.name);
@@ -227,7 +265,7 @@ fn a_house_key_removed_and_restored_is_decided_as_a_fresh_engine_decides() {
         e.result_text(&c.ctx).unwrap()
     };
     let mut changed = 0;
-    for c in &all {
+    for c in all.iter().filter(|c| c.fair.is_none()) {
         let mut e = FoldEngine::new(check_for(c)).unwrap();
         open(&mut e, c);
         e.reset(&c.ctx, &c.records).unwrap();
@@ -247,6 +285,90 @@ fn a_house_key_removed_and_restored_is_decided_as_a_fresh_engine_decides() {
         assert_eq!(e.result_text(&c.ctx).unwrap(), fresh(c, &["not-a-house-key".to_string()]), "{}: another key", c.name);
     }
     assert!(changed >= 2, "only {changed} sessions depend on the house: the test has no teeth");
+}
+
+/// 🔒 The same at a FAIR ONLY game, whose houses are given by round.
+#[test]
+fn a_fair_only_games_houses_changed_and_restored_are_decided_as_a_fresh_engine_decides() {
+    let all = cases();
+    let fresh = |c: &Case, spans: &[HouseSpan]| -> String {
+        let mut e = FoldEngine::new(check_for(c)).unwrap();
+        let fair = FairHouses { rv: c.fair.as_ref().unwrap().rv.clone(), spans: spans.to_vec() };
+        e.open_fair_only(&c.ctx, &fair, c.cp.as_ref(), &c.pins).unwrap();
+        e.reset(&c.ctx, &c.records).unwrap();
+        e.result_text(&c.ctx).unwrap()
+    };
+    let (mut games, mut changed) = (0, 0);
+    for c in all.iter().filter(|c| c.fair.is_some()) {
+        games += 1;
+        let spans = &c.fair.as_ref().unwrap().spans;
+        let mut e = FoldEngine::new(check_for(c)).unwrap();
+        open(&mut e, c);
+        e.reset(&c.ctx, &c.records).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}", c.name);
+        // No houses: what their reveals decided is undecided, as a fresh fold without them sees it.
+        e.set_spans(&c.ctx, &[]).unwrap_or_else(|err| panic!("{}: set_spans: {err}", c.name));
+        let without = e.result_text(&c.ctx).unwrap();
+        assert_eq!(without, fresh(c, &[]), "{}: without the houses", c.name);
+        if without != c.summary {
+            changed += 1;
+        }
+        // Each house only from a round past every one in the session: the same as none.
+        let late: Vec<HouseSpan> = spans.iter().map(|(k, _, _)| (k.clone(), 1_000, None)).collect();
+        e.set_spans(&c.ctx, &late).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), without, "{}: houses of later rounds only", c.name);
+        // And back: the first answer again.
+        e.set_spans(&c.ctx, spans).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}: the houses restored", c.name);
+        // A FAIR ONLY game has no set of houses, and a rules version this build does not fold is not opened.
+        assert!(e.set_houses(&c.ctx, &[]).is_err(), "{}", c.name);
+        let mut other = FoldEngine::new(check_for(c)).unwrap();
+        let newer = FairHouses { rv: "f9".into(), spans: spans.clone() };
+        assert!(other.open_fair_only(&c.ctx, &newer, c.cp.as_ref(), &c.pins).is_err(), "{}: rules version f9", c.name);
+        assert!(!other.is_open(&c.ctx), "{}: dirty", c.name);
+    }
+    assert!(games >= 8 && changed >= 3, "{games} FAIR ONLY games, {changed} depend on their houses: the test has no teeth");
+    // Nor is another table opened as a FAIR ONLY game, nor a FAIR ONLY game as another table.
+    let plain = all.iter().find(|c| c.fair.is_none()).unwrap();
+    let fair = all.iter().find(|c| c.fair.is_some()).unwrap();
+    let mut e = FoldEngine::new(check_for(plain)).unwrap();
+    assert!(e.open_fair_only(&plain.ctx, fair.fair.as_ref().unwrap(), None, &[]).is_err());
+    assert!(e.open(&fair.ctx, None, &[], &[]).is_err());
+}
+
+/// 🔒 A span makes its key a house of the rounds after `from` through `to`, and no other key (as the pages' fold reads
+/// it: foldEngineVectors.test.ts), with the rounds handed to QuickJS as they are.
+#[test]
+fn a_fair_only_span_reaches_through_its_last_round_from_the_one_after_its_first() {
+    let all = cases();
+    let c = all.iter().find(|c| c.name.starts_with("fair only, real signatures")).expect("the FAIR ONLY real-signature case");
+    let house = c.fair.as_ref().unwrap().spans[0].0.clone();
+    let mut e = FoldEngine::new(check_for(c)).unwrap();
+    open(&mut e, c);
+    e.reset(&c.ctx, &c.records).unwrap();
+    let mut first = |spans: &[HouseSpan]| -> Option<String> {
+        e.set_spans(&c.ctx, spans).unwrap();
+        let s: FoldSummary = serde_json::from_str(&e.result_text(&c.ctx).unwrap()).unwrap();
+        s.rounds.first().and_then(|r| r.decided.clone())
+    };
+    let house_ = Some("house".to_string());
+    assert_eq!(first(&[(house.clone(), 0, None)]), house_, "round 1, from the opening");
+    assert_eq!(first(&[(house.clone(), 0, Some(1))]), house_, "through `to`");
+    assert_ne!(first(&[(house.clone(), 1, None)]), house_, "not at `from`");
+    assert_ne!(first(&[(house.clone(), 0, Some(0))]), house_, "not after `to`");
+    assert_ne!(first(&[("someone else".into(), 0, None)]), house_, "another key");
+    assert_eq!(first(&[("someone else".into(), 0, Some(1)), (house.clone(), 0, Some(1))]), house_);
+}
+
+/// 🔒 The rules versions the engine folds are the pages' and the resolver's.
+#[test]
+fn fair_only_rules_are_the_bundles_and_the_resolvers() {
+    let ctx = ctx_n(0);
+    let mut e = engine_with(&ctx);
+    let from_js = eval_str(&mut e, &ctx, "JSON.stringify(SSFFold.FAIR_ONLY_RULES)").unwrap();
+    let from_rust = serde_json::to_string(FAIR_ONLY_RULES).unwrap();
+    assert_eq!(from_js, from_rust);
+    assert_eq!(FAIR_ONLY_RULES, &[crate::house_auth::FAIR_ONLY_RV]);
 }
 
 fn held_of(summary: &FoldSummary) -> Vec<(String, String)> {
