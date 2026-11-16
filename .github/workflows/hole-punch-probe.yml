@@ -1,0 +1,56 @@
+name: "🧪 Hole-punch probe (probe branch, never to merge)"
+
+# One side of a two-computer link test with the owner's computer on the other
+# side: can the DHT knock link a home computer with a machine behind a NAT that
+# gives every destination its own outside port (GitHub's)? config.env says
+# which side this machine plays; spikes/hole-punch/runner.sh plays it.
+#
+# The log is public: the script blanks every address, and an invite crosses
+# only sealed (see runner.sh). Small files go through the branch
+# claude/hole-punch-io. This lives on claude/hole-punch-probe alone and is not
+# meant to reach main.
+
+on:
+  push:
+    branches: [claude/hole-punch-probe]
+
+concurrency:
+  group: hole-punch-probe
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  side:
+    name: GitHub machine's side
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: prototypes/0.29.0-core-loop-demo/ssf-p2p-node
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Build the node (release, chia-publish, as the knock proof ran it)
+        run: cargo build --release --locked --features chia-publish --manifest-path prototypes/0.29.0-core-loop-demo/ssf-p2p-node/Cargo.toml
+
+      - name: Page dependencies
+        working-directory: prototypes/0.29.0-core-loop-demo
+        run: |
+          npm ci
+          npm i --no-save playwright-core
+
+      - name: Play this machine's side
+        run: bash spikes/hole-punch/runner.sh
