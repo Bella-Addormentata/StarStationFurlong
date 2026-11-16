@@ -2336,9 +2336,17 @@ mod tests {
         let public = v6_note_signer(&room, &me, hour).verifying_key().to_bytes();
         let seal = v6_note_key(&room, &me, hour);
 
-        // A read given no time at all finds nothing and finishes nothing.
-        let unfinished = first.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], Duration::ZERO).await;
-        assert!(unfinished.is_err(), "{unfinished:?}");
+        // A read that cannot finish in its time writes nothing. Its only node
+        // never answers, and the DHT client waits 500 ms at least for an
+        // answer, so a read given 100 ms always ends unfinished. (A read
+        // given no time at all is no such test: on a busy computer the
+        // lookup can end before it is first looked at.)
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket that never answers");
+        let mut builder = DhtBuilder::default();
+        builder.bootstrap(&[silent.local_addr().expect("its address").to_string()]);
+        let unheard = KnockDht::start(&builder).expect("a DHT client");
+        let unfinished = unheard.leave_v6_note(&room, &me, hour, &[pub6(1, 44442)], Duration::from_millis(100)).await;
+        assert!(unfinished.as_ref().is_err_and(|why| why.starts_with("the note could not be read")), "{unfinished:?}");
         assert!(nothing_at(&holder, &public).await, "nothing was written");
 
         // Both at once.
