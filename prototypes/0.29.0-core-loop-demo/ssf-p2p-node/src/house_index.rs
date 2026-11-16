@@ -17,9 +17,10 @@
 //!
 //! WHAT A PASS READS ([`FairIndex::drain`]). The first lists the room's keys once (keys only: admitted when it comes,
 //! and charged, so the tick may have nothing left for the games then), and each after looks at the keys noted since:
-//! whether each is still there (a visit charged each), and the delegation key's value is to be read again. What a tick
-//! cannot get to waits for the next, and until then the games wait ([`FairIndex::drain`] says so): a game read from an
-//! index that is behind could miss its own record. (The listing is one pass over the names of the room's keys, once per
+//! whether each is still there (a visit charged each), and the delegation key's value is to be read again, one key at a
+//! time: the observer keeps the keys, and how many of them are each game's ([`Noted`]), so a drain does nothing for a
+//! key before its turn. What a tick cannot get to waits for the next, and until then the games wait
+//! ([`FairIndex::drain`] says so): a game read from an index that is behind could miss its own record. (The listing is one pass over the names of the room's keys, once per
 //! room and doc for the life of the process: some 0.4 s for a million keys in a debug build, less than what loading
 //! them took. It cannot be cut into slices: a Yjs map's keys come in no order that holds between transactions.)
 //!
@@ -42,7 +43,7 @@
 //! checkpoint is written over by another is not gone in between.)
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use yrs::types::{DeepObservable, Event, Events};
 use yrs::{Doc, Map, MapRef, ReadTxn, Subscription, TransactionMut, Uuid};
@@ -120,20 +121,36 @@ pub(crate) struct Game {
 /// A game's name: its table and incarnation.
 pub(crate) type GameKey = (String, String);
 
+/// What the observer noted that no drain has looked at yet: the keys, and how many of them are each game's (so a game a
+/// drain finds with no record left is gone only once none is left: [`FairIndex::take_gone`]). Kept as each change
+/// comes, so a drain takes the keys one at a time, each on its turn.
+#[derive(Default)]
+pub(crate) struct Noted {
+    keys: BTreeSet<String>,
+    pub of_game: BTreeMap<GameKey, usize>,
+}
+
+impl Noted {
+    fn add(&mut self, key: String, of: Of) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        if let Of::Game(t, inc, _) = of {
+            *self.of_game.entry((t, inc)).or_default() += 1;
+        }
+    }
+}
+
 /// The keys of one room's FAIR ONLY records (module docs).
 pub(crate) struct FairIndex {
     doc: Uuid,
-    /// The keys the observer noted since the last drain took them.
-    noted: Arc<Mutex<BTreeSet<String>>>,
+    /// The keys the observer noted that no drain has looked at yet.
+    noted: Arc<Mutex<Noted>>,
     _sub: Subscription,
     /// No pass has listed the room's keys yet.
     cold: bool,
     /// The last drain listed them ([`FairIndex::take_listed`]).
     listed: bool,
-    /// Noted keys a drain has not looked at yet.
-    pending: BTreeSet<String>,
-    /// How many of them are each game's.
-    pending_of: BTreeMap<GameKey, usize>,
     pub games: BTreeMap<GameKey, Game>,
     /// The games the walk reads ([`Game::quiet`] none): the others cost a pass nothing, not even a look.
     pub awake: BTreeSet<GameKey>,
@@ -157,7 +174,7 @@ impl FairIndex {
     /// Follow `doc`'s `casinoComputed` map. Call it with no transaction open on `doc`.
     pub fn attach(doc: &Doc) -> FairIndex {
         let comp = doc.get_or_insert_map(COMPUTED_MAP);
-        let noted = Arc::new(Mutex::new(BTreeSet::new()));
+        let noted = Arc::new(Mutex::new(Noted::default()));
         let cb = noted.clone();
         let sub = comp.observe_deep(move |txn, events| note(&cb, txn, events));
         FairIndex {
@@ -166,8 +183,6 @@ impl FairIndex {
             _sub: sub,
             cold: true,
             listed: false,
-            pending: BTreeSet::new(),
-            pending_of: BTreeMap::new(),
             games: BTreeMap::new(),
             awake: BTreeSet::new(),
             mine_quiet: BTreeMap::new(),
@@ -190,9 +205,9 @@ impl FairIndex {
     /// `charge(n, true)`, for the listing, is charged whatever is left, and the keys are listed to their end). False when
     /// it could not get to all of them: they wait for the next pass, and so do the games.
     pub fn drain<T: ReadTxn>(&mut self, txn: &T, comp: &MapRef, now: u64, charge: &mut dyn FnMut(usize, bool) -> bool) -> bool {
-        let noted = std::mem::take(&mut *self.noted.lock().unwrap_or_else(|e| e.into_inner()));
         if self.cold {
-            // (Every key there now is listed: what was noted before is in it. Nothing is pending yet: this is the first.)
+            // (Every key there now is listed: what was noted before is in it.)
+            *self.noted() = Noted::default();
             self.cold = false;
             self.listed = true;
             for key in comp.keys(txn) {
@@ -203,17 +218,12 @@ impl FairIndex {
             }
             return true;
         }
-        for key in noted {
-            if let Some(Of::Game(t, inc, _)) = of(&key).filter(|_| !self.pending.contains(&key)) {
-                *self.pending_of.entry((t, inc)).or_default() += 1;
-            }
-            self.pending.insert(key);
-        }
-        while let Some(key) = self.pending.first() {
+        loop {
+            let Some(key) = self.noted().keys.pop_first() else { return true };
             if !charge(key.len() + VISIT_BYTES, false) {
+                self.noted().keys.insert(key);
                 return false;
             }
-            let key = self.pending.pop_first().unwrap();
             let Some(of) = of(&key) else { continue };
             let game = match &of {
                 Of::Game(t, inc, _) => Some((t.clone(), inc.clone())),
@@ -228,19 +238,27 @@ impl FairIndex {
                 self.looked_at(game);
             }
         }
-        true
+    }
+
+    /// What the observer noted that no drain has looked at yet.
+    pub fn noted(&self) -> MutexGuard<'_, Noted> {
+        self.noted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// One of game `k`'s keys looked at: back, if it holds a record now; gone, if it holds none and no key of it is left
     /// to look at, since the drain that first found it with none.
     fn looked_at(&mut self, k: GameKey) {
-        let left = self.pending_of.get_mut(&k).map_or(0, |n| {
-            *n -= 1;
-            *n
-        });
-        if left == 0 {
-            self.pending_of.remove(&k);
-        }
+        let left = {
+            let mut noted = self.noted();
+            let left = noted.of_game.get_mut(&k).map_or(0, |n| {
+                *n -= 1;
+                *n
+            });
+            if left == 0 {
+                noted.of_game.remove(&k);
+            }
+            left
+        };
         if self.games.contains_key(&k) {
             self.maybe_gone.remove(&k);
         } else if left == 0 {
@@ -395,8 +413,8 @@ pub(crate) fn delegation_of<'a>(hk: &'a BTreeMap<String, Hk>, house: &str) -> Op
 }
 
 /// The observer: the changed keys the index follows, noted.
-fn note(noted: &Mutex<BTreeSet<String>>, txn: &TransactionMut, events: &Events) {
-    let mut keys: Vec<String> = Vec::new();
+fn note(noted: &Mutex<Noted>, txn: &TransactionMut, events: &Events) {
+    let mut keys: Vec<(String, Of)> = Vec::new();
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         // (A change inside a value: no change to it, module docs.)
@@ -404,13 +422,16 @@ fn note(noted: &Mutex<BTreeSet<String>>, txn: &TransactionMut, events: &Events) 
             continue;
         }
         for key in map.keys(txn).keys() {
-            if of(key).is_some() {
-                keys.push(key.to_string());
+            if let Some(of) = of(key) {
+                keys.push((key.to_string(), of));
             }
         }
     }
     if !keys.is_empty() {
-        noted.lock().unwrap_or_else(|e| e.into_inner()).extend(keys);
+        let mut noted = noted.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, of) in keys {
+            noted.add(key, of);
+        }
     }
 }
 
@@ -496,6 +517,14 @@ mod tests {
         assert_eq!(ix.hk.keys().cloned().collect::<Vec<_>>(), vec![format!("hk:{PUB}")]);
         assert_eq!(ix.hk[&format!("hk:{PUB}")], Hk::Unread);
         // (And nothing listed again.)
+        assert_eq!(drain(&mut ix, &doc), (true, 0, 0));
+        // A change noted before the first pass is in its listing: the pass after looks at none.
+        let mut ix = FairIndex::attach(&doc);
+        put(&doc, &ck("t1", 4), Any::Bool(true));
+        assert_eq!(ix.noted().keys.len(), 1);
+        assert!(drain(&mut ix, &doc).0);
+        assert_eq!(keys_of(&ix, "t1").len(), 4);
+        assert!(ix.noted().keys.is_empty() && ix.noted().of_game.is_empty(), "the listing has it");
         assert_eq!(drain(&mut ix, &doc), (true, 0, 0));
     }
 
@@ -763,7 +792,32 @@ mod tests {
         assert!(ix.take_gone().is_empty());
         assert!(drain_some(&mut ix, &doc, 70, 9));
         assert_eq!(ix.take_gone(), vec![(t1.clone(), 60)]);
-        assert!(ix.pending_of.is_empty() && ix.maybe_gone.is_empty());
+        assert!(ix.noted().of_game.is_empty() && ix.maybe_gone.is_empty());
+    }
+
+    #[test]
+    fn the_observer_counts_each_games_keys_once_and_a_drain_takes_them_one_at_a_time() {
+        // 🔒 What a drain has not got to stays where the observer put it, with how many of its keys are each game's: a
+        // drain does nothing for a key before its turn, however many came in one update, or how often each changed.
+        let doc = Doc::new();
+        let mut ix = FairIndex::attach(&doc);
+        drain(&mut ix, &doc);
+        let (t1, t2) = (("t1".to_string(), INC.to_string()), ("t2".to_string(), INC.to_string()));
+        for _ in 0..3 {
+            put(&doc, &ck("t1", 1), Any::Bool(true));
+        }
+        put(&doc, &ck("t1", 2), Any::Bool(true));
+        put(&doc, &ck("t2", 1), Any::Bool(true));
+        put(&doc, &format!("hk:{PUB}"), Any::Bool(true));
+        put(&doc, "zz:junk", Any::Bool(true));
+        assert_eq!(ix.noted().keys.len(), 4);
+        assert_eq!(ix.noted().of_game, BTreeMap::from([(t1.clone(), 2), (t2.clone(), 1)]));
+        assert!(!drain_some(&mut ix, &doc, 0, 1));
+        assert_eq!(ix.noted().keys.len(), 3);
+        assert_eq!(ix.noted().of_game, BTreeMap::from([(t1.clone(), 1), (t2.clone(), 1)]));
+        assert!(drain_some(&mut ix, &doc, 0, 9));
+        assert!(ix.noted().keys.is_empty() && ix.noted().of_game.is_empty());
+        assert!(ix.games.contains_key(&t1) && ix.games.contains_key(&t2));
     }
 
     #[test]

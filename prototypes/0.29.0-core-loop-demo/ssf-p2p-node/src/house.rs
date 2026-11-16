@@ -793,6 +793,12 @@ struct RoomMem {
     /// 🔒 The keys of the room's FAIR ONLY records, kept from the doc's changes while this house serves the games
     /// (house_index.rs): what the walk reads them from.
     index: Option<FairIndex>,
+    /// 🔒 The FAIR ONLY games whose memory says this house served them when a pass last found whether it does
+    /// ([`TableMem::read_through`]), and the ones whose delegation wants this house's key ([`TableMem::keyed`]): kept as
+    /// those are, so a pass counts the games for the room's beat, and picks what goes under the key, without going
+    /// through every table it holds memory of (one for each game it ever held, junk among them).
+    serving_games: BTreeSet<GameKey>,
+    keyed_games: BTreeSet<GameKey>,
 }
 
 impl RoomMem {
@@ -1989,14 +1995,22 @@ impl House {
     /// under one game's keys would stop the room's beat. The games it knows of (that it holds memory or state of, or
     /// read this tick): when the pass brought the room's index up to the doc (`read`), only the ones the doc holds
     /// records of. (A game it knows nothing of counts as none it serves, and so does one the index lets the walk pass
-    /// by, which a pass found so.)
+    /// by, which a pass found so.) Of the games it holds memory of, only the ones whose memory says it serves them can
+    /// count ([`RoomMem::serving_games`]): a pass goes through no other.
     fn games_count(&self, room: &str, read: bool) -> GamesOut {
         let mem = self.rooms.get(room);
-        let tables = mem.map(|mem| &mem.tables);
+        // (In the tests, every count checks the sets against the memory they are kept beside.)
+        #[cfg(test)]
+        if let Some(mem) = mem {
+            let serving: BTreeSet<&GameKey> = mem.tables.iter().filter(|(_, m)| m.read_through.is_some_and(|(s, _)| s)).map(|(k, _)| k).collect();
+            assert_eq!(mem.serving_games.iter().collect::<BTreeSet<_>>(), serving, "serving_games");
+            let keyed: BTreeSet<&GameKey> = mem.tables.iter().filter(|(_, m)| m.keyed).map(|(k, _)| k).collect();
+            assert_eq!(mem.keyed_games.iter().collect::<BTreeSet<_>>(), keyed, "keyed_games");
+        }
         let index = mem.and_then(|mem| mem.index.as_ref()).filter(|_| read);
-        let games: BTreeSet<GameKey> = tables
+        let games: BTreeSet<GameKey> = mem
             .into_iter()
-            .flat_map(|tables| tables.keys().cloned())
+            .flat_map(|mem| mem.serving_games.iter().cloned())
             .chain(self.done.keys().filter(|(r, _, _)| r == room).map(|(_, t, inc)| (t.clone(), inc.clone())))
             .chain(self.games_through.keys().cloned())
             .filter(|(_, inc)| ha::is_fair_only_inc(inc))
@@ -2277,17 +2291,20 @@ impl House {
                 through!(false, false);
             }
             // (A check put off that could not change the answer.)
-            self.deferred = false;
+            let put_off = std::mem::take(&mut self.deferred);
             // (Whether nothing it found here is left to do, should the game be one that has nothing for this house: no
-            // forged record to delete, now or once the doc holds no part of an update. What the rest of an update
-            // brings is a change of the records, which the index notes.)
-            let tidy = res.invalid.is_empty();
+            // forged record to delete, now or once the doc holds no part of an update, and no check put off, which may
+            // find one: when it comes, it changes no record, so the index would not wake the game for it. What the rest
+            // of an update brings is a change of the records, which the index notes.)
+            let tidy = res.invalid.is_empty() && !put_off;
             let Some(base) = res.base.as_ref().filter(|_| !res.newer && res.live) else {
-                if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
+                if let Some(mem) = self.rooms.get_mut(room).filter(|mem| mem.tables.contains_key(&key)) {
+                    let table = mem.tables.get_mut(&key).unwrap();
                     // (Over, or under rules this build does not know: its delegation wants no key. A game whose base the
                     // doc has lost is neither, and its put-back is the pages'.)
                     if res.base.is_some() {
                         table.keyed = false;
+                        mem.keyed_games.remove(&key);
                     }
                     // 🔒 Meanwhile it reads no close of the game, so this is a hold, as when its session's map is gone: a
                     // close it first reads once it serves the game again counts as there since now, for the cutoff
@@ -2321,9 +2338,12 @@ impl House {
                 // counts as there since now, for the cutoff, as after a hold; a spell of a tick (a delegation deleted,
                 // and put back) costs nothing. (Only at a game it holds memory of.)
                 ha::HouseBy::No => {
-                    if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
-                        table.held_since.get_or_insert(now);
-                        table.keyed = false;
+                    if let Some(mem) = self.rooms.get_mut(room) {
+                        if let Some(table) = mem.tables.get_mut(&key) {
+                            table.held_since.get_or_insert(now);
+                            table.keyed = false;
+                            mem.keyed_games.remove(&key);
+                        }
                     }
                     // (So until a record of the game changes, or this house's key holds a delegation whose signature holds
                     // that a key holding one of its rounds after its base signed: no other delegation of the room's names
@@ -2341,9 +2361,16 @@ impl House {
                     // (Not the one the base carries: a game needs no key for it, and the pages hold none such,
                     // casinoDoc keepHouses.)
                     let carried = res.base.as_ref().and_then(|b| b.ck.get("dl")).and_then(hb::rec_hash);
-                    let table = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
-                    table.keyed = carried.as_deref() != Some(hash.as_str());
+                    let keyed = carried.as_deref() != Some(hash.as_str());
+                    let mem = self.rooms.get_mut(room).unwrap();
+                    let table = mem.tables.entry(key.clone()).or_default();
+                    table.keyed = keyed;
                     keep_earlier(table, value.clone(), &res.chain);
+                    if keyed {
+                        mem.keyed_games.insert(key.clone());
+                    } else {
+                        mem.keyed_games.remove(&key);
+                    }
                 }
             }
             let ctx = Ctx { room: room.to_string(), t, inc };
@@ -2424,8 +2451,8 @@ impl House {
         // records of; and only from a pass that read every delegation of the room, clear: until then the key may hold
         // one the pass could not tell.)
         if hk_read && !hk_unclear {
-            let tables = &self.rooms[room].tables;
-            let wanted = tables.iter().filter(|(k, m)| m.keyed && ix.games.contains_key(*k)).filter_map(|(_, m)| m.deleg.as_ref());
+            let mem = &self.rooms[room];
+            let wanted = mem.keyed_games.iter().filter(|k| ix.games.contains_key(*k)).filter_map(|k| mem.tables.get(k)?.deleg.as_ref());
             let best = wanted.filter_map(|d| Some((hb::rec_hash(d)?, d))).min_by(|a, b| a.0.cmp(&b.0)).map(|(_, d)| d.clone());
             if let Some(best) = best {
                 // (Its check put off: the next pass.)
@@ -2453,9 +2480,14 @@ impl House {
     /// house would remember without it, a game it holds nothing of: junk under new names would only grow the memory.)
     fn note_read_through(&mut self, room: &str, key: &(String, String), found: (bool, bool)) {
         let before = self.done.contains_key(&(room.to_string(), key.0.clone(), key.1.clone()));
-        let tables = &mut self.rooms.get_mut(room).unwrap().tables;
-        if tables.contains_key(key) || found != (before, false) {
-            tables.entry(key.clone()).or_default().read_through = Some(found);
+        let mem = self.rooms.get_mut(room).unwrap();
+        if mem.tables.contains_key(key) || found != (before, false) {
+            mem.tables.entry(key.clone()).or_default().read_through = Some(found);
+            if found.0 {
+                mem.serving_games.insert(key.clone());
+            } else {
+                mem.serving_games.remove(key);
+            }
         }
     }
 

@@ -2786,6 +2786,37 @@ fn a_game_whose_house_check_is_put_off_holds_the_beat_while_it_settles_there() {
 }
 
 #[test]
+fn a_check_put_off_at_a_game_with_nothing_for_this_house_keeps_it_read_until_its_forged_record_goes() {
+    // 🔒 A check put off there that cannot change the base may yet find a forged record, and its answer changes no
+    // record (so the index would not wake the game for it): the game is not passed by meanwhile, the next read finds the
+    // record forged, and it goes at the put-back's turn; then the game is passed by. (Handed on at its first round; a
+    // forged root after the root in the order the base is looked for in.)
+    let mut game = Game::new("put-off-forged");
+    game.ticks();
+    game.transfer(&who("buyer"), 0);
+    game.ticks();
+    let key = (T.to_string(), game.ctx.inc.clone());
+    let quiet = |game: &Game| game.house.rooms[ROOM].index.as_ref().unwrap().games[&key].quiet.clone();
+    assert!(matches!(quiet(&game), Some(Quiet::Mine(_))));
+    game.tick(REPUT_MS);
+    let root_id = hb::ck_id(&game.base).unwrap();
+    let forged = (0..)
+        .map(|i: i32| with(&with(&game.base, "dl", delegation(&game.owner, &who(&format!("h{i}")).public)), "g", s(&"A".repeat(86))))
+        .find(|f| hb::ck_id(f).unwrap() > root_id)
+        .unwrap();
+    let fkey = game.ck_key(&forged);
+    game.put_top(&fkey, &forged);
+    game.tick_with_passes(200, 1);
+    assert_eq!(quiet(&game), None, "not passed by while its check waits");
+    game.ticks();
+    assert!(game.top(&fkey).is_some(), "not before the put-back's turn");
+    game.tick(REPUT_MS);
+    assert!(game.top(&fkey).is_none(), "found forged, and gone at it");
+    game.ticks();
+    assert!(matches!(quiet(&game), Some(Quiet::Mine(_))), "then passed by");
+}
+
+#[test]
 fn a_check_put_off_that_cannot_change_the_base_leaves_the_pass_its_duties() {
     // One pass a tick. On a twin, how many ticks a fresh game takes to be joined; then the same game, with a forged
     // root come in on the tick it is joined (another house delegated, a signature that fails), after the root in the
