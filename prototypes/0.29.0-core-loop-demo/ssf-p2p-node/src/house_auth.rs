@@ -899,8 +899,18 @@ impl Resolution {
     /// `round` signed and whose check passes. A key holds the game for a
     /// round after the round it took the game, up to the round it gave it.
     pub fn house_by(&self, house: &str, round: i64, sig: &mut SigCheck) -> HouseBy {
+        self.house_by_with(house, round, None, sig)
+    }
+
+    /// [`Resolution::house_by`], with `room` weighed after the ones this
+    /// resolution was given, as one given would be: the room's delegation
+    /// under `house`'s key and its hash, for a caller that keeps the room's
+    /// delegations apart and gives each only for the house it asks of (the
+    /// node's index of a room, house_index.rs).
+    pub fn house_by_with(&self, house: &str, round: i64, room: Option<(&CVal, &str)>, sig: &mut SigCheck) -> HouseBy {
         let mut waiting = false;
-        for (d, hash) in &self.delegations {
+        let given = self.delegations.iter().map(|(d, hash)| (d, hash.as_str()));
+        for (d, hash) in given.chain(room.filter(|(d, _)| small_delegation(d))) {
             if str_of(d, "h") != Some(house) {
                 continue;
             }
@@ -911,7 +921,7 @@ impl Resolution {
                 continue;
             }
             match sig(&sig_id("hkey", &self.t, &self.inc, hash), k, &|| hb::room_sign_bytes("hkey", &self.room, "", d).map(|b| b.to_vec()), str_of(d, "g").unwrap_or("")) {
-                Some(true) => return HouseBy::Yes { value: d.clone(), hash: hash.clone() },
+                Some(true) => return HouseBy::Yes { value: d.clone(), hash: hash.to_string() },
                 None => waiting = true,
                 Some(false) => {}
             }
@@ -922,7 +932,12 @@ impl Resolution {
     /// Whether `house` decides round `round` of this game; None while the
     /// delegation's check is put off.
     pub fn house_at(&self, house: &str, round: i64, sig: &mut SigCheck) -> Option<bool> {
-        match self.house_by(house, round, sig) {
+        self.house_at_with(house, round, None, sig)
+    }
+
+    /// [`Resolution::house_at`], with `room` weighed too ([`Resolution::house_by_with`]).
+    pub fn house_at_with(&self, house: &str, round: i64, room: Option<(&CVal, &str)>, sig: &mut SigCheck) -> Option<bool> {
+        match self.house_by_with(house, round, room, sig) {
             HouseBy::Yes { .. } => Some(true),
             HouseBy::No => Some(false),
             HouseBy::Pending => None,

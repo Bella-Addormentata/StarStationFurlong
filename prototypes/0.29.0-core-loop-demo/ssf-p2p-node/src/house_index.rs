@@ -19,12 +19,19 @@
 //! and charged, so the tick may have nothing left for the games then), and each after looks at the keys noted since:
 //! whether each is still there (a visit charged each), and the delegation key's value is to be read again. What a tick
 //! cannot get to waits for the next, and until then the games wait ([`FairIndex::drain`] says so): a game read from an
-//! index that is behind could miss its own record.
+//! index that is behind could miss its own record. (The listing is one pass over the names of the room's keys, once per
+//! room and doc for the life of the process: some 0.4 s for a million keys in a debug build, less than what loading
+//! them took. It cannot be cut into slices: a Yjs map's keys come in no order that holds between transactions.)
+//!
+//! A delegation key's value is kept as read ([`Hk`]): a delegation of the key's house with its hash, or nothing a game
+//! goes by. A game is given this house's own as the room's, and another house's only where it asks of that house
+//! ([`delegation_of`]), so the many a room may hold cost a pass no copies.
 //!
 //! A GAME THAT HAS NOTHING FOR THIS HOUSE ([`Quiet`]). A game the walk found over, or with no base, or under rules this
 //! build does not know, stays so until one of its own records changes; and one whose rounds to come are none of this
 //! house's stays so until then or until what stands under this house's own key changes (no other delegation names this
-//! house). The walk does not read either again till then, so many games that have nothing for the house cost it once.
+//! house). The walk reads only the games awake ([`FairIndex::awake`]) and they take the turns among them, so a game
+//! that has nothing for the house costs a pass nothing, not even a look, till then.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -53,7 +60,8 @@ enum Of {
 
 /// The key's kind, when the index follows it.
 fn of(key: &str) -> Option<Of> {
-    if key.len() > MAX_KEY_BYTES || !hb::utf8(key) {
+    // (The name's first bytes first: a key of any other name costs no more than that.)
+    if !["ck:", "xf:", "fin:", "hk:"].iter().any(|p| key.starts_with(p)) || key.len() > MAX_KEY_BYTES || !hb::utf8(key) {
         return None;
     }
     if let Some(h) = key.strip_prefix("hk:") {
@@ -73,9 +81,9 @@ fn of(key: &str) -> Option<Of> {
 pub(crate) enum Hk {
     /// Not read since it changed.
     Unread,
-    /// A value every page reads alike that names the key's house (`h`): given to every game.
-    Theirs(CVal),
-    /// Nothing a game counts by: none there, junk, too heavy, or another house's.
+    /// A delegation every page reads alike that names the key's house (`h`), and its hash: the house's, for every game.
+    Theirs(CVal, String),
+    /// Nothing a game counts by: none there, junk (no delegation's shape), too heavy, or another house's.
     Nothing,
     /// A value a page may read otherwise that could be anything: the games wait while it stands.
     Unknown,
@@ -90,8 +98,8 @@ pub(crate) enum Quiet {
     /// Over, with no base, or under rules this build does not know: until its records change.
     Records,
     /// None of its rounds to come or in flight are this house's: until its records change, or what this house's own key
-    /// holds (the hash of the delegation of this house there, if any).
-    Mine(Option<String>),
+    /// holds ([`FairIndex::mine_is`]).
+    Mine,
 }
 
 /// One game's record keys, and whether the walk may pass it by.
@@ -100,6 +108,9 @@ pub(crate) struct Game {
     pub keys: BTreeMap<String, Kind>,
     pub quiet: Option<Quiet>,
 }
+
+/// A game's name: its table and incarnation.
+pub(crate) type GameKey = (String, String);
 
 /// The keys of one room's FAIR ONLY records (module docs).
 pub(crate) struct FairIndex {
@@ -111,7 +122,13 @@ pub(crate) struct FairIndex {
     cold: bool,
     /// Noted keys a drain has not looked at yet.
     pending: BTreeSet<String>,
-    pub games: BTreeMap<(String, String), Game>,
+    pub games: BTreeMap<GameKey, Game>,
+    /// The games the walk reads ([`Game::quiet`] none): the others cost a pass nothing, not even a look.
+    pub awake: BTreeSet<GameKey>,
+    /// The games passed by for none of their rounds being this house's ([`Quiet::Mine`]), and what this house's own
+    /// key held when they were ([`FairIndex::mine_is`]).
+    mine_quiet: BTreeSet<GameKey>,
+    mine_at: Option<String>,
     pub hk: BTreeMap<String, Hk>,
 }
 
@@ -122,7 +139,18 @@ impl FairIndex {
         let noted = Arc::new(Mutex::new(BTreeSet::new()));
         let cb = noted.clone();
         let sub = comp.observe_deep(move |txn, events| note(&cb, txn, events));
-        FairIndex { doc: doc.guid(), noted, _sub: sub, cold: true, pending: BTreeSet::new(), games: BTreeMap::new(), hk: BTreeMap::new() }
+        FairIndex {
+            doc: doc.guid(),
+            noted,
+            _sub: sub,
+            cold: true,
+            pending: BTreeSet::new(),
+            games: BTreeMap::new(),
+            awake: BTreeSet::new(),
+            mine_quiet: BTreeSet::new(),
+            mine_at: None,
+            hk: BTreeMap::new(),
+        }
     }
 
     /// Whether this index follows `doc`.
@@ -163,13 +191,47 @@ impl FairIndex {
         true
     }
 
+    /// Game `key` passed by from now on, until what `quiet` says changes.
+    pub fn hush(&mut self, key: &GameKey, quiet: Quiet) {
+        if let Some(game) = self.games.get_mut(key) {
+            if quiet == Quiet::Mine {
+                self.mine_quiet.insert(key.clone());
+            }
+            game.quiet = Some(quiet);
+            self.awake.remove(key);
+        }
+    }
+
+    /// What stands under this house's own key, as a pass found it (any token that changes with it): the games passed
+    /// by for none of their rounds being this house's are read again once it is other than when they were.
+    pub fn mine_is(&mut self, now: Option<String>) {
+        if now != self.mine_at {
+            for key in std::mem::take(&mut self.mine_quiet) {
+                if let Some(game) = self.games.get_mut(&key) {
+                    game.quiet = None;
+                    self.awake.insert(key);
+                }
+            }
+            self.mine_at = now;
+        }
+    }
+
+    /// Game `key` to be read again.
+    fn wake(&mut self, key: GameKey) {
+        if let Some(game) = self.games.get_mut(&key) {
+            game.quiet = None;
+            self.mine_quiet.remove(&key);
+            self.awake.insert(key);
+        }
+    }
+
     /// Key `key` there (again, or with another value).
     fn put(&mut self, key: &str, of: Of) {
         match of {
             Of::Game(t, inc, kind) => {
-                let game = self.games.entry((t, inc)).or_default();
-                game.keys.insert(key.to_string(), kind);
-                game.quiet = None;
+                let k = (t, inc);
+                self.games.entry(k.clone()).or_default().keys.insert(key.to_string(), kind);
+                self.wake(k);
             }
             Of::Hk => {
                 self.hk.insert(key.to_string(), Hk::Unread);
@@ -182,18 +244,29 @@ impl FairIndex {
         match of {
             Of::Game(t, inc, _) => {
                 let k = (t, inc);
-                if let Some(game) = self.games.get_mut(&k) {
-                    game.keys.remove(key);
-                    game.quiet = None;
-                    if game.keys.is_empty() {
-                        self.games.remove(&k);
-                    }
+                let Some(game) = self.games.get_mut(&k) else { return };
+                game.keys.remove(key);
+                if game.keys.is_empty() {
+                    self.games.remove(&k);
+                    self.awake.remove(&k);
+                    self.mine_quiet.remove(&k);
+                } else {
+                    self.wake(k);
                 }
             }
             Of::Hk => {
                 self.hk.remove(key);
             }
         }
+    }
+}
+
+/// The delegation of house `house` the room holds under its key, with its hash, as last read: what a game weighs for
+/// that house besides its own ([`ha::Resolution::house_by_with`]).
+pub(crate) fn delegation_of<'a>(hk: &'a BTreeMap<String, Hk>, house: &str) -> Option<(&'a CVal, &'a str)> {
+    match hk.get(&format!("hk:{house}")) {
+        Some(Hk::Theirs(v, hash)) => Some((v, hash.as_str())),
+        _ => None,
     }
 }
 
@@ -318,25 +391,35 @@ mod tests {
         put(&doc, &hk, Any::Bool(true));
         let mut ix = FairIndex::attach(&doc);
         drain(&mut ix, &doc);
-        for g in ix.games.values_mut() {
-            g.quiet = Some(Quiet::Records);
+        for k in ix.games.keys().cloned().collect::<Vec<_>>() {
+            ix.hush(&k, Quiet::Records);
         }
+        assert!(ix.awake.is_empty());
         ix.hk.insert(hk.clone(), Hk::Nothing);
         put(&doc, &ck("t1", 1), Any::Bool(false));
         put(&doc, &hk, Any::Bool(false));
         drain(&mut ix, &doc);
         assert_eq!(ix.games[&("t1".to_string(), INC.to_string())].quiet, None, "its record changed");
         assert_eq!(ix.games[&("t2".to_string(), INC.to_string())].quiet, Some(Quiet::Records), "nothing of its own did");
+        assert_eq!(ix.awake.iter().cloned().collect::<Vec<_>>(), vec![("t1".to_string(), INC.to_string())]);
         assert_eq!(ix.hk[&hk], Hk::Unread);
         // (A record added to it, or one deleted, too.)
-        ix.games.get_mut(&("t2".to_string(), INC.to_string())).unwrap().quiet = Some(Quiet::Records);
+        let t2 = ("t2".to_string(), INC.to_string());
+        ix.hush(&t2, Quiet::Mine);
         put(&doc, &ck("t2", 2), Any::Bool(true));
         drain(&mut ix, &doc);
-        assert_eq!(ix.games[&("t2".to_string(), INC.to_string())].quiet, None);
-        ix.games.get_mut(&("t2".to_string(), INC.to_string())).unwrap().quiet = Some(Quiet::Records);
+        assert_eq!(ix.games[&t2].quiet, None);
+        assert!(ix.awake.contains(&t2));
+        ix.hush(&t2, Quiet::Records);
         delete(&doc, &ck("t2", 2));
         drain(&mut ix, &doc);
-        assert_eq!(ix.games[&("t2".to_string(), INC.to_string())].quiet, None);
+        assert_eq!(ix.games[&t2].quiet, None);
+        assert!(ix.awake.contains(&t2));
+        // (And the last key of a game gone: the game is, from every set.)
+        ix.hush(&t2, Quiet::Mine);
+        delete(&doc, &ck("t2", 1));
+        drain(&mut ix, &doc);
+        assert!(!ix.games.contains_key(&t2) && !ix.awake.contains(&t2) && !ix.mine_quiet.contains(&t2));
         // (A delegation key gone is gone.)
         delete(&doc, &hk);
         drain(&mut ix, &doc);
@@ -354,7 +437,7 @@ mod tests {
         }
         let mut ix = FairIndex::attach(&doc);
         drain(&mut ix, &doc);
-        ix.games.get_mut(&("t1".to_string(), INC.to_string())).unwrap().quiet = Some(Quiet::Records);
+        ix.hush(&("t1".to_string(), INC.to_string()), Quiet::Records);
         {
             let comp = doc.get_or_insert_map(COMPUTED_MAP);
             let mut txn = doc.transact_mut();
@@ -397,6 +480,44 @@ mod tests {
         assert!(done);
         assert_eq!(charged, 6 * one);
         assert_eq!(keys_of(&ix, "t1").len(), 10);
+    }
+
+    #[test]
+    fn games_none_of_whose_rounds_are_this_houses_wake_when_its_own_key_changes_and_the_others_do_not() {
+        let doc = Doc::new();
+        for t in ["t1", "t2", "t3"] {
+            put(&doc, &ck(t, 1), Any::Bool(true));
+        }
+        let mut ix = FairIndex::attach(&doc);
+        drain(&mut ix, &doc);
+        let key = |t: &str| (t.to_string(), INC.to_string());
+        assert_eq!(ix.awake.len(), 3, "every game awake at first");
+        ix.mine_is(Some("a".into()));
+        ix.hush(&key("t1"), Quiet::Mine);
+        ix.hush(&key("t2"), Quiet::Records);
+        assert_eq!(ix.awake.iter().cloned().collect::<Vec<_>>(), vec![key("t3")]);
+        ix.mine_is(Some("a".into()));
+        assert_eq!(ix.awake.len(), 1, "the same: nothing wakes");
+        ix.mine_is(None);
+        assert_eq!(ix.awake.iter().cloned().collect::<Vec<_>>(), vec![key("t1"), key("t3")], "its key changed: the game of none of its rounds wakes");
+        assert_eq!(ix.games[&key("t1")].quiet, None);
+        assert_eq!(ix.games[&key("t2")].quiet, Some(Quiet::Records));
+        // (Hushed again under the new value, it sleeps until the next change, and a game it last woke for is not
+        // woken again by it.)
+        ix.hush(&key("t1"), Quiet::Mine);
+        ix.mine_is(None);
+        assert!(!ix.awake.contains(&key("t1")));
+        ix.hush(&key("t3"), Quiet::Records);
+        ix.mine_is(Some("b".into()));
+        assert_eq!(ix.awake.iter().cloned().collect::<Vec<_>>(), vec![key("t1")]);
+        // (One woken by a record of its own is no longer among them: passed by after for its records, a change of
+        // the key does not wake it.)
+        ix.hush(&key("t1"), Quiet::Mine);
+        put(&doc, &ck("t1", 1), Any::Bool(false));
+        drain(&mut ix, &doc);
+        ix.hush(&key("t1"), Quiet::Records);
+        ix.mine_is(Some("c".into()));
+        assert!(ix.awake.is_empty());
     }
 
     #[test]
