@@ -1480,7 +1480,7 @@ fn after_a_start_a_game_it_revealed_at_holds_the_beat_until_it_reads_it_through_
 }
 
 #[test]
-fn a_pass_that_cannot_read_the_rooms_keys_to_their_end_counts_the_games_it_knows_as_when_last_read_through() {
+fn a_pass_that_cannot_get_to_the_changes_of_the_rooms_fair_only_records_counts_the_games_it_knows_as_when_last_read_through() {
     let mut game = Game::new("keys-spent");
     game.house.settle_ms = SETTLE_MS;
     // (A house table beside, its state holding a reveal there: a house table is none of the games.)
@@ -1488,20 +1488,23 @@ fn a_pass_that_cannot_read_the_rooms_keys_to_their_end_counts_the_games_it_knows
     game.house.done.insert((ROOM.into(), T2.into(), INC_R.into()), Done { r: 1, d: None, c: false, kept: Vec::new() });
     game.settle();
     assert!(game.beat().is_some());
-    // More keys in the room than a tick visits: no pass gets to the game's records.
-    // (A beat whose check is put off waits a tick here: the house table reads nothing on a pass after the reads
-    // are spent.)
-    let keys = game.junk_keys(4_000);
+    // More changes to the keys of games' records before each tick than a tick looks at: no pass gets to the game's
+    // records. (A beat whose check is put off waits a tick here: the house table reads nothing on a pass after the
+    // reads are spent.)
+    let keys = game.junk_games(4_000);
     for _ in 0..2 {
         let before = game.beat();
         for _ in 0..2 {
+            game.touch(&keys);
             assert!(game.tick(HEARTBEAT_MS).short && game.house.read_out);
         }
         assert!(game.beat().is_some() && game.beat() != before, "heard, as settled at the game it knows");
     }
     let before = game.beat();
+    game.touch(&keys);
     game.tick(HOUSE_HEARD_MS);
     for _ in 0..3 {
+        game.touch(&keys);
         game.tick(HEARTBEAT_MS);
     }
     assert_eq!(game.beat(), before, "settling there again, and not read");
@@ -1513,18 +1516,19 @@ fn a_pass_that_cannot_read_the_rooms_keys_to_their_end_counts_the_games_it_knows
 }
 
 #[test]
-fn after_a_start_a_pass_that_cannot_read_the_rooms_keys_counts_a_game_it_revealed_at_as_one_it_settles_at() {
+fn after_a_start_a_pass_that_cannot_get_to_the_rooms_fair_only_records_counts_a_game_it_revealed_at_as_one_it_settles_at() {
     let mut game = Game::new("start-keys-spent");
     game.add_house_table();
     game.closed_on_the_join();
     game.seeds(1);
     game.ticks();
     assert_eq!(game.records("h:1:").len(), 1);
-    let keys = game.junk_keys(4_000);
+    let keys = game.junk_games(4_000);
     game.restart(SETTLE_MS);
     let before = game.beat();
     for _ in 0..3 {
-        game.tick(HEARTBEAT_MS);
+        game.touch(&keys);
+        assert!(game.tick(HEARTBEAT_MS).short && game.house.read_out);
         assert_eq!(game.beat(), before, "no beat while a game it committed at is not read through");
     }
     for key in &keys {
@@ -1711,8 +1715,8 @@ fn after_a_start_a_game_whose_rounds_past_its_base_are_not_this_houses_holds_no_
 
 #[test]
 fn a_game_whose_first_read_is_short_of_a_check_counts_as_one_it_serves_and_has_not_settled_at() {
-    // (And so when the tick's second pass cannot read the room's keys to their end: the room holds more of them than
-    // what is left of the tick's reads after the first.)
+    // (And so when the tick's second pass can read nothing: the first spent the tick's reads on the games named after
+    // it.)
     for flooded in [false, true] {
         let mut game = Game::new(&format!("new-short-{flooded}"));
         game.ticks();
@@ -1730,7 +1734,10 @@ fn a_game_whose_first_read_is_short_of_a_check_counts_as_one_it_serves_and_has_n
         let (ctx, ses) = (std::mem::replace(&mut game.ctx, ctx2.clone()), std::mem::replace(&mut game.ses, ses2.clone()));
         game.closed(1, &game.sid(), &"ab".repeat(32));
         (game.ctx, game.ses) = (ctx, ses);
-        let keys = if flooded { game.junk_keys(2_000) } else { Vec::new() };
+        // (Flooded: the end orders of many games no root opened, named after both games, which the first pass reads
+        // after them with what is left of the tick's reads, and which leave the second nothing.)
+        let keys = if flooded { game.junk_games(2_000) } else { Vec::new() };
+        game.house.rooms.get_mut(ROOM).unwrap().turn = 0;
         game.delete_top(&format!("hb:{}", game.house.public()));
         let before = game.beat();
         game.tick_with_passes(HEARTBEAT_MS, 2);
@@ -1809,15 +1816,31 @@ impl Game {
         }
     }
 
-    /// `n` keys of the room's, a kilobyte each, under no name of a game's: their keys.
-    fn junk_keys(&self, n: usize) -> Vec<String> {
+    /// `n` end orders of games no root opened (a kilobyte's key each, named after every game here), whose keys the
+    /// room's index follows: their keys.
+    fn junk_games(&self, n: usize) -> Vec<String> {
+        let keys: Vec<String> = (0..n).map(|i| format!("fin:zz{i:04}{}:p{}", "k".repeat(980), "0".repeat(24))).collect();
+        assert!(keys.iter().all(|k| k.len() <= MAX_KEY_BYTES));
+        self.touch(&keys);
+        keys
+    }
+
+    /// Each of `keys` written again (true): a change the room's index looks at on the next pass.
+    fn touch(&self, keys: &[String]) {
         let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
         let mut txn = self.doc.transact_mut();
-        let keys: Vec<String> = (0..n).map(|i| format!("zz{i:04}{}", "k".repeat(994))).collect();
-        for key in &keys {
+        for key in keys {
             comp.insert(&mut txn, key.as_str(), Any::Bool(true));
         }
-        keys
+    }
+
+    /// Each of `keys` taken out of the room: a change the room's index looks at on the next pass, as one put in is.
+    fn untouch(&self, keys: &[String]) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        for key in keys {
+            comp.remove(&mut txn, key);
+        }
     }
 
     /// The room's keys under `prefix`, in order.
@@ -1836,6 +1859,228 @@ impl Game {
         let Some(Out::YMap(m)) = comp.get(&txn, ses) else { return 0 };
         m.keys(&txn).filter(|k| k.starts_with("o:1:")).count()
     }
+}
+
+#[test]
+fn keys_of_no_game_cost_the_walk_nothing_whatever_their_number() {
+    // 🔒 Some 60,000 keys of the room's, more visits than a tick has reads for, under no name of a game's record: the
+    // walk once listed them all each pass, and no game was reached. Now only the first pass after a start lists them
+    // (charged, so that tick reads no game); every tick after it reaches the game.
+    let mut game = Game::new("index-keys");
+    game.ticks();
+    {
+        let comp = game.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = game.doc.transact_mut();
+        for i in 0..60_000 {
+            comp.insert(&mut txn, format!("zz{i:05}"), Any::Bool(true));
+        }
+    }
+    let visits: usize = (0..60_000).map(|i| format!("zz{i:05}").len() + VISIT_BYTES).sum();
+    assert!(visits > READ_PER_TICK, "more than a tick visits");
+    let (c, _, _) = game.closed_on_the_join();
+    assert!(!game.house.read_out);
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c.clone()]);
+    // After a start: the listing spends the tick, and the next reads the game.
+    game.restart(0);
+    assert!(game.tick(200).short && game.house.read_out, "the first pass lists the room's keys");
+    let (c2, _, _) = game.closed(2, &c, &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    assert!(!game.house.read_out);
+    let reveals = game.records("h:2:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c2]);
+}
+
+#[test]
+fn junk_under_many_delegation_keys_is_read_once_and_the_games_go_on() {
+    // 🔒 Some 600 houses' keys holding junk of a small record's weight, more than a tick reads: the walk once read
+    // them all each pass, and no game was reached. Now each is read once (over the ticks the reads allow), and again
+    // only when it changes.
+    let mut game = Game::new("index-hk");
+    game.ticks();
+    let filler = "j".repeat(8_000);
+    let keys: Vec<String> = (0..600).map(|i| format!("hk:{}", who(&format!("junk{i}")).public)).collect();
+    for key in &keys {
+        game.put_top_any(key, Any::String(Arc::from(filler.as_str())));
+    }
+    let weight: usize = keys.iter().map(|k| k.len() + VISIT_BYTES + filler.len() + 2).sum();
+    assert!(weight > READ_PER_TICK, "more than a tick reads");
+    let mut short = 0;
+    while game.tick(200).short {
+        short += 1;
+        assert!(short < 5, "read within a few ticks");
+    }
+    assert!(short >= 1, "not all in one");
+    let (c, _, _) = game.closed_on_the_join();
+    game.seeds(1);
+    for _ in 0..3 {
+        assert!(!game.tick(200).short);
+    }
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+    // (One changed: that one is read again, and the rest are not.)
+    let left = |game: &mut Game| {
+        game.now += 200;
+        game.house.tick_with(ROOM, &game.doc, game.now, 1_700_000_000_000 + game.now, VERIFY_PER_TICK, 1);
+        READ_PER_TICK - game.house.read_left
+    };
+    let quiet = left(&mut game);
+    assert_eq!(left(&mut game), quiet, "the same, tick after tick");
+    game.put_top_any(&keys[7], Any::String(Arc::from(filler.as_str())));
+    let one = left(&mut game);
+    // (Its key looked at, then its value read: the key and a visit each, and the value's weight.)
+    assert_eq!(one - quiet, 2 * (keys[7].len() + VISIT_BYTES) + filler.len() + 2);
+}
+
+#[test]
+fn the_index_follows_the_rooms_doc_while_it_serves_the_games() {
+    // 🔒 Another doc of the room (the room loaded again): the index follows it, and a game opened there is joined.
+    // Not serving the games: no index, which would only grow.
+    let mut game = Game::new("index-doc");
+    game.ticks();
+    assert_eq!(game.records("o:1:").len(), 1);
+    let doc = Doc::new();
+    {
+        use yrs::updates::decoder::Decode;
+        let update = game.doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+    }
+    game.doc = doc;
+    game.ticks();
+    let (_, ses2) = game.second_game("roulette-3", game.house.public());
+    game.ticks();
+    assert_eq!(game.joins_in(&ses2), 1, "the game opened in the other doc");
+    game.house.serve_fair_only(false);
+    game.tick(200);
+    assert!(game.house.rooms[ROOM].index.is_none());
+    game.house.serve_fair_only(true);
+    game.tick(200);
+    assert!(game.house.rooms[ROOM].index.is_some());
+}
+
+#[test]
+fn games_that_have_nothing_for_this_house_are_read_once_until_their_records_change() {
+    // 🔒 Many end orders of games no root opened: each such game is read once, and passed by after that, so the
+    // game the house serves is reached on every tick; one that comes to have a root is read again.
+    let mut game = Game::new("index-quiet");
+    game.ticks();
+    let keys = game.junk_games(3_000);
+    let mut short = 0;
+    while game.tick(200).short {
+        short += 1;
+        assert!(short < 5, "read within a few ticks");
+    }
+    assert!(short >= 1, "not all in one");
+    let quiet = game.house.rooms[ROOM].index.as_ref().unwrap().games.values().filter(|g| g.quiet == Some(Quiet::Records)).count();
+    assert_eq!(quiet, 3_000);
+    let (c, _, _) = game.closed_on_the_join();
+    game.seeds(1);
+    for _ in 0..3 {
+        assert!(!game.tick(200).short);
+        assert!(READ_PER_TICK - game.house.read_left < 1024 * 1024, "the junk games cost nothing");
+    }
+    assert_eq!(strs(&game.records("h:1:")[0].1, "x"), vec![c]);
+    // A game this house is no house of (its root names another): passed by too, until a delegation of this house
+    // comes under its key; then read again, and joined.
+    let other = House::open(&[9u8; 32], None).unwrap();
+    let (_, ses2) = game.second_game("roulette-3", other.public());
+    game.ticks();
+    let key2 = game.house.rooms[ROOM].index.as_ref().unwrap().games.keys().find(|k| k.0 == "roulette-3").cloned().unwrap();
+    assert!(matches!(game.house.rooms[ROOM].index.as_ref().unwrap().games[&key2].quiet, Some(Quiet::Mine(_))));
+    game.put_top(&format!("hk:{}", game.house.public()), &delegation(&game.owner, game.house.public()));
+    game.ticks();
+    assert_eq!(game.joins_in(&ses2), 1, "read again, and joined");
+    // (And a game whose only record was junk, given its root: read again, and joined.)
+    let t3 = "roulette-4";
+    let inc3 = hb::faironly_inc('p', ROOM, t3, "f1", &game.owner.public, "0123456789abcdef", TS);
+    game.put_top_any(&format!("fin:{t3}:{inc3}"), Any::Bool(true));
+    game.tick(200);
+    let key3 = (t3.to_string(), inc3.clone());
+    assert_eq!(game.house.rooms[ROOM].index.as_ref().unwrap().games[&key3].quiet, Some(Quiet::Records));
+    let (_, ses3) = game.second_game(t3, game.house.public());
+    game.ticks();
+    assert_eq!(game.joins_in(&ses3), 1, "read again, and joined");
+    let _ = keys;
+}
+
+#[test]
+fn a_pass_behind_the_changes_of_the_rooms_fair_only_records_is_short_though_no_game_it_knows_is_this_houses() {
+    // 🔒 Short, so the next tick carries on (and a step-down's last word reads the room in full): a change it has not
+    // got to may be one that gives a game to this house. Here each change is of a key put in and taken out again, more
+    // than a tick has reads for, and the one game it knows has been handed on.
+    let mut game = Game::new("index-behind");
+    game.ticks();
+    game.transfer(&who("buyer"), 0);
+    game.ticks();
+    assert!(!game.tick(200).short, "a game handed on: nothing for this house");
+    let keys = game.junk_games(6_000);
+    game.untouch(&keys);
+    let mut short = 0;
+    while game.tick(200).short {
+        short += 1;
+        assert!(short < 5, "caught up within a few ticks");
+    }
+    assert!(short >= 1, "not all in one");
+    assert_eq!(game.house.rooms[ROOM].index.as_ref().unwrap().games.len(), 1, "and none of the keys kept");
+}
+
+#[test]
+fn a_pass_short_of_the_rooms_delegations_puts_nothing_under_this_houses_key() {
+    // 🔒 Only a pass that read every delegation of the room chooses what goes under `hk:<house>`: one cut short before
+    // it got to the key knows nothing of what is there. Here a stranger's good delegation of this house, which stays,
+    // behind junk under other houses' keys that come first and weigh more than a tick reads.
+    let mut game = Game::new("hk-short");
+    game.handed_to_the_buyer();
+    let key = format!("hk:{}", game.house.public());
+    let strangers = delegation(&who("landlord"), game.house.public());
+    game.put_top(&key, &strangers);
+    for _ in 0..2 {
+        game.tick(REPUT_MS);
+        game.ticks();
+    }
+    assert_eq!(game.hk_hash(), hb::rec_hash(&strangers), "a stranger's stays");
+    let filler = "j".repeat(8_000);
+    let junk: Vec<String> = (0..600).map(|i| format!("hk:-{i:042}")).collect();
+    assert!(junk.iter().all(|k| is_pub(&k[3..]) && *k < key), "other houses' keys, before this house's");
+    for k in &junk {
+        game.put_top_any(k, Any::String(Arc::from(filler.as_str())));
+    }
+    let mut short = 0;
+    while game.tick(REPUT_MS).short {
+        short += 1;
+        assert!(short < 5, "read within a few ticks");
+        assert_eq!(game.hk_hash(), hb::rec_hash(&strangers), "nothing written over it");
+    }
+    assert!(short >= 1, "not all in one");
+    assert_eq!(game.hk_hash(), hb::rec_hash(&strangers));
+}
+
+#[test]
+fn a_game_with_nothing_for_this_house_is_read_again_while_it_holds_a_forged_record() {
+    // 🔒 Passed by only once nothing is left to do there: a forged record of a game handed on goes at the put-back's
+    // turn, though the passes before that turn found the game none of this house's.
+    let mut game = Game::new("forged-quiet");
+    game.ticks();
+    game.transfer(&who("buyer"), 0);
+    game.ticks();
+    game.tick(REPUT_MS);
+    // A transfer of the buyer's, the game's holder now (whose transfers the resolution looks at), its signature broken.
+    let good = game.transfer_of(&game.ctx, &who("buyer"), &who("carol"), 3, "fedcba9876543210fedcba98");
+    game.delete_top(&format!("xf:{T}:{}:{}", game.ctx.inc, hb::xf_id(&good).unwrap()));
+    let bad = with(&good, "g", s(&sign(&who("dave"), &[3u8; 32])));
+    let xf = format!("xf:{T}:{}:{}", game.ctx.inc, hb::xf_id(&bad).unwrap());
+    game.put_top(&xf, &bad);
+    game.tick(200);
+    game.tick(200);
+    assert!(game.top(&xf).is_some(), "not before the put-back's turn");
+    game.tick(REPUT_MS);
+    assert!(game.top(&xf).is_none(), "deleted at it");
 }
 
 #[test]
@@ -2046,10 +2291,11 @@ fn a_game_handed_on_before_it_revealed_there_is_remembered_as_none_of_this_house
     let before = game.beat();
     game.tick(HEARTBEAT_MS);
     assert_eq!(game.beat(), before, "read through as none of this house's");
-    // No pass reads the room's keys to their end now: as last read through, none of its own.
-    game.junk_keys(4_000);
+    // No pass gets to the changes of the room's FAIR ONLY records now: as last read through, none of its own.
+    let keys = game.junk_games(4_000);
     for _ in 0..3 {
-        game.tick(HEARTBEAT_MS);
+        game.touch(&keys);
+        assert!(game.tick(HEARTBEAT_MS).short && game.house.read_out);
     }
     assert_eq!(game.beat(), before);
 }

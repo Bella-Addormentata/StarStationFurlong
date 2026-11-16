@@ -89,13 +89,14 @@
 //! The rules are computedFold's (THE HOUSE) and the bytes house_bytes.rs's.
 //! The node never decides a round: the pages' fold does, from the records.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, Transact, TransactionMut, WriteTxn};
 
 use crate::house_auth as ha;
+use crate::house_index::{FairIndex, Hk, Kind, Quiet};
 use crate::house_bytes::{self as hb, CVal, Ctx, HouseKey};
 
 /// How often the node's loop ticks the house.
@@ -787,6 +788,9 @@ struct RoomMem {
     /// afterwards counts only those whose delegation the doc holds then, so the houses of a plan that comes after
     /// ([`HousePlan::gapped`]) may be more than the ones a page counts. For the run.
     gapped: bool,
+    /// 🔒 The keys of the room's FAIR ONLY records, kept from the doc's changes while this house serves the games
+    /// (house_index.rs): what the walk reads them from.
+    index: Option<FairIndex>,
 }
 
 impl RoomMem {
@@ -1360,6 +1364,15 @@ impl House {
         true
     }
 
+    /// Charge `n` to this tick's reads whatever is left of them: what it pays for is done all the same (the first listing
+    /// of a room's keys, house_index.rs), and once it has spent them every read after it is short ([`charge`] finds
+    /// nothing left).
+    fn admit(&mut self, n: usize) {
+        if self.read_left != usize::MAX {
+            self.read_left = self.read_left.saturating_sub(n);
+        }
+    }
+
     /// The value under a key of `key_len` bytes, read and charged ([`charge`]:
     /// see [`read_costed`], which it is).
     ///
@@ -1444,6 +1457,17 @@ impl House {
             if mem.last_tick.is_some_and(|last| now.saturating_sub(last) >= HOUSE_HEARD_MS) {
                 mem.settle_games_again();
             }
+        }
+        // 🔒 The index of the room's FAIR ONLY records follows the doc while it serves the games (attached with no
+        // transaction open, and again for another doc of the room), and is let go of while it does not: it would only
+        // grow then.
+        if self.serve_games {
+            let mem = self.rooms.entry(room.to_string()).or_default();
+            if !mem.index.as_ref().is_some_and(|ix| ix.follows(doc)) {
+                mem.index = Some(FairIndex::attach(doc));
+            }
+        } else if let Some(mem) = self.rooms.get_mut(room) {
+            mem.index = None;
         }
         let mut out = TickOut::default();
         let mut updates = Vec::new();
@@ -1926,6 +1950,12 @@ impl House {
     /// not its own, and joins nothing more. Under an end order it reveals with no next commitment, steps down and
     /// joins nothing.
     ///
+    /// 🔒 The games come from the room's index of their records (house_index.rs), kept from the doc's changes, so a key
+    /// of any other name costs the walk nothing, and the value under each house's key is read once after it changes. A
+    /// game a pass found to have nothing for this house (over, with no base, under rules this build does not know, or
+    /// with none of its rounds to come this house's) is not read again until a record of it changes, or for the last,
+    /// what stands under this house's own key: many such games cost the walk once each.
+    ///
     /// A game is read as a house table is: a record of it a page may read otherwise holds the game (and goes back as
     /// read when it is whole), a check put off leaves it short for the next pass, and one this tick is through with
     /// is not read again. The games take their turns as the house tables do: after a tick a read was short, the next
@@ -1947,7 +1977,7 @@ impl House {
     /// serves and has not settled at holds the room's beat whether a pass reads it or not; one it has settled at does
     /// not, for a close it first reads later is not one it first read while settling (the block, B2), and a flood
     /// under one game's keys would stop the room's beat. `seen`: the games the doc holds records of, None when the
-    /// pass did not read the room's keys to their end (then every game it knows of).
+    /// pass could not bring the room's index of them up to the doc (then every game it knows of).
     fn games_count(&self, room: &str, seen: Option<&[(String, String)]>) -> GamesOut {
         let tables = self.rooms.get(room).map(|mem| &mem.tables);
         let games: BTreeSet<(String, String)> = match seen {
@@ -1982,15 +2012,24 @@ impl House {
     }
 
     /// The walk of [`House::games`]: what it finds of each game goes into `games_through`, and what the doc lost of
-    /// it into `reput`. The games the doc holds records of, None when the pass did not read the room's keys to their
-    /// end.
+    /// it into `reput`. The games the doc holds records of, None when the pass could not bring the room's index of
+    /// them up to the doc (house_index.rs).
     fn walk_games<T: ReadTxn>(&mut self, room: &str, txn: &T, comp: &MapRef, now: u64, writes: &mut Vec<Write>, reput: &mut Vec<Write>) -> Option<Vec<(String, String)>> {
-        #[derive(Clone, Copy, PartialEq)]
-        enum Kind {
-            Ck,
-            Xf,
-            Fin,
+        // (Out of the room's memory while the walk reads it, and back after. No index, no games: tick_with attaches it.)
+        let Some(mut ix) = self.rooms.get_mut(room).and_then(|mem| mem.index.take()) else {
+            self.short = true;
+            return None;
+        };
+        let seen = self.walk_indexed(room, txn, comp, now, writes, reput, &mut ix);
+        if let Some(mem) = self.rooms.get_mut(room) {
+            mem.index = Some(ix);
         }
+        seen
+    }
+
+    /// [`House::walk_games`], from the room's index `ix`.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_indexed<T: ReadTxn>(&mut self, room: &str, txn: &T, comp: &MapRef, now: u64, writes: &mut Vec<Write>, reput: &mut Vec<Write>, ix: &mut FairIndex) -> Option<Vec<(String, String)>> {
         #[derive(Default)]
         struct Recs {
             cks: Vec<(String, CVal)>,
@@ -2003,35 +2042,21 @@ impl House {
         // (Yjs keeps what came before the records it depends on until they come: the doc holds part of an update, and
         // what it lacks may be in the part to come.)
         let partial = txn.store().pending_update().is_some();
-        // The room's keys, each costing its visit: each game's by game, its records read, and charged, when its turn
-        // comes; and the room's delegations, read once the keys are, which every game reads. (A page takes one only
-        // under its house's key, casinoDoc fedDelegation: anything under another is nothing to a game.)
-        let mut by_game: BTreeMap<(String, String), Vec<(String, Kind)>> = BTreeMap::new();
-        let mut hk_keys: Vec<(String, Out)> = Vec::new();
-        let cut_short = 'scan: {
-            for (key, value) in comp.iter(txn) {
-                if !self.charge(key.len() + VISIT_BYTES) {
-                    break 'scan true;
-                }
-                if let Some(h) = key.strip_prefix("hk:") {
-                    if is_pub(h) {
-                        hk_keys.push((key.to_string(), value));
-                    }
-                    continue;
-                }
-                let parsed = if key.len() > MAX_KEY_BYTES || !hb::utf8(key) { None } else { ha::parse_fair_only_key(key) };
-                let (t, inc, kind) = match parsed {
-                    Some(ha::FairOnlyKey::Ck { t, inc, .. }) => (t, inc, Kind::Ck),
-                    Some(ha::FairOnlyKey::Xf { t, inc, .. }) => (t, inc, Kind::Xf),
-                    Some(ha::FairOnlyKey::Fin { t, inc }) => (t, inc, Kind::Fin),
-                    _ => continue,
-                };
-                by_game.entry((t.to_string(), inc.to_string())).or_default().push((key.to_string(), kind));
+        // 🔒 The room's FAIR ONLY records, from its index (house_index.rs): brought up to what the doc holds, a visit
+        // charged for each key noted since the last pass (and the room's keys listed, the first time: the listing
+        // comes whatever it costs, and may leave this tick nothing for the games); each game's records read, and
+        // charged, when its turn comes; and the room's delegations, read once each after it changed, which every game
+        // reads. (A page takes one only under its house's key, casinoDoc fedDelegation: anything under another is
+        // nothing to a game.) A key of any other name costs the walk nothing.
+        let drained = ix.drain(txn, comp, &mut |n, admitted| {
+            if admitted {
+                self.admit(n);
+                return true;
             }
-            false
-        };
-        // (The room's keys not all read: nothing at its games this pass.)
-        if cut_short {
+            self.charge(n)
+        });
+        // (The keys noted not all looked at: nothing at its games this pass, for one may lack its own record.)
+        if !drained {
             self.short = true;
             return None;
         }
@@ -2042,42 +2067,56 @@ impl House {
         // (What this house's own key holds, when it names this house.)
         let my_hk = format!("hk:{me}");
         let mut mine: Option<CVal> = None;
-        for (key, value) in hk_keys {
-            let theirs = |v: &CVal| str_of(v, "h") == key.strip_prefix("hk:");
-            let v = match self.read_charged(0, Some(value), ha::MAX_SMALL_RECORD_BYTES) {
-                Read::Val(v) => v,
-                // (A page may hold anything there: the house's delegation, maybe.)
-                Read::Unclear(_, hb::Clarity::Unknown) => {
-                    hk_unclear = true;
-                    continue;
-                }
-                // One a page reads as the house does, or as junk: whole as read, a page might count by it or not, so
-                // the games wait and it goes back as read; junk either way is no matter.
-                Read::Unclear(v, _) => {
-                    if ha::as_delegation(&v) && theirs(&v) {
-                        hk_unclear = true;
-                        hk_heals.push(Write::Top { key: key.clone(), value: v });
+        for (key, seen) in ix.hk.iter_mut() {
+            if *seen == Hk::Unread {
+                let theirs = |v: &CVal| str_of(v, "h") == key.strip_prefix("hk:");
+                *seen = match self.read_charged(key.len(), comp.get(txn, key), ha::MAX_SMALL_RECORD_BYTES) {
+                    Read::Val(v) if theirs(&v) => Hk::Theirs(v),
+                    Read::Val(_) => Hk::Nothing,
+                    // (A page may hold anything there: the house's delegation, maybe.)
+                    Read::Unclear(_, hb::Clarity::Unknown) => Hk::Unknown,
+                    // One a page reads as the house does, or as junk: whole as read, a page might count by it or not, so
+                    // the games wait and it goes back as read; junk either way is no matter.
+                    Read::Unclear(v, _) if ha::as_delegation(&v) && theirs(&v) => Hk::Whole(v),
+                    Read::Unclear(..) => Hk::Nothing,
+                    // (The tick's reads spent: so is each game's read, which is then short; the rest are read on the next.)
+                    Read::Spent => {
+                        hk_read = false;
+                        break;
                     }
-                    continue;
+                    Read::Absent | Read::Heavy => Hk::Nothing,
+                };
+            }
+            match seen {
+                Hk::Theirs(v) => {
+                    if *key == my_hk {
+                        mine = Some(v.clone());
+                    }
+                    delegations.push(v.clone());
                 }
-                // (The tick's reads spent: so is each game's read, which is then short.)
-                Read::Spent => {
-                    hk_read = false;
-                    break;
+                Hk::Unknown => hk_unclear = true,
+                Hk::Whole(v) => {
+                    hk_unclear = true;
+                    hk_heals.push(Write::Top { key: key.clone(), value: v.clone() });
                 }
-                Read::Absent | Read::Heavy => continue,
-            };
-            if theirs(&v) {
-                if key == my_hk {
-                    mine = Some(v.clone());
-                }
-                delegations.push(v);
+                Hk::Nothing | Hk::Unread => {}
             }
         }
+        // (What stands under this house's own key, which is the only one of the room's that can name it: a game none of
+        // whose rounds are this house's stays so while it is the same, [`Quiet::Mine`].)
+        let mine_seen: Option<String> = match ix.hk.get(&my_hk) {
+            Some(Hk::Theirs(v)) => hb::rec_hash(v).map(|h| format!("t{h}")),
+            Some(Hk::Whole(v)) => hb::rec_hash(v).map(|h| format!("w{h}")),
+            Some(Hk::Unknown) => Some("?".to_string()),
+            Some(Hk::Unread) => Some("-".to_string()),
+            Some(Hk::Nothing) | None => None,
+        };
         let hk_healed = !hk_heals.is_empty();
         writes.append(&mut hk_heals);
-        let seen: Vec<(String, String)> = by_game.keys().cloned().collect();
-        let mut order: Vec<_> = by_game.into_iter().collect();
+        let seen: Vec<(String, String)> = ix.games.keys().cloned().collect();
+        // (Each game and its records' keys, as the index holds them now.)
+        type GameKeys = ((String, String), Vec<(String, Kind)>);
+        let mut order: Vec<GameKeys> = ix.games.iter().map(|(k, g)| (k.clone(), g.keys.iter().map(|(k, kind)| (k.clone(), *kind)).collect())).collect();
         if !order.is_empty() {
             let turn = self.rooms[room].turn % order.len();
             order.rotate_left(turn);
@@ -2089,12 +2128,25 @@ impl House {
                 self.short |= self.games_through.get(&key).is_some_and(|(_, short)| *short);
                 continue;
             }
-            // Its records (their visits charged above).
+            // 🔒 A game that has nothing for this house, as a pass found it, with nothing changed since that could change
+            // that (house_index.rs): not read again, and counted as it was found.
+            let quiet = ix.games.get(&key).and_then(|g| g.quiet.as_ref()).is_some_and(|q| match q {
+                Quiet::Records => true,
+                Quiet::Mine(at) => *at == mine_seen,
+            });
+            if quiet {
+                let found = (false, false);
+                self.note_read_through(room, &key, found);
+                self.through.insert(key.clone(), (false, false));
+                self.games_through.insert(key.clone(), (Some(found), false));
+                continue;
+            }
+            // Its records, each charged as it is read.
             let mut recs = Recs::default();
             let mut spent = false;
             for (k, kind) in &keys {
                 let cap = if *kind == Kind::Ck { ha::MAX_CHECKPOINT_BYTES } else { ha::MAX_SMALL_RECORD_BYTES };
-                let v = match self.read_charged(0, comp.get(txn, k), cap) {
+                let v = match self.read_charged(k.len(), comp.get(txn, k), cap) {
                     Read::Val(v) => v,
                     // (A page may hold anything there: a record the game counts by, maybe.)
                     Read::Unclear(_, hb::Clarity::Unknown) => {
@@ -2201,11 +2253,19 @@ impl House {
             }
             // (A check put off that could not change the answer.)
             self.deferred = false;
+            // (Whether nothing it found here is left to do, should the game be one that has nothing for this house: no
+            // forged record to delete, now or once the doc holds no part of an update. What the rest of an update
+            // brings is a change of the records, which the index notes.)
+            let tidy = res.invalid.is_empty();
             let Some(base) = res.base.as_ref().filter(|_| !res.newer && res.live) else {
                 // (Over, or under rules this build does not know: its delegation wants no key. A game whose base the
                 // doc has lost is neither, and its put-back is the pages'.)
                 if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)).filter(|_| res.base.is_some()) {
                     table.keyed = false;
+                }
+                // (None of which a delegation changes: it stays so until a record of the game does.)
+                if let Some(game) = ix.games.get_mut(&key).filter(|_| tidy) {
+                    game.quiet = Some(Quiet::Records);
                 }
                 through!(false, false)
             };
@@ -2233,6 +2293,11 @@ impl House {
                     if let Some(table) = self.rooms.get_mut(room).and_then(|mem| mem.tables.get_mut(&key)) {
                         table.held_since.get_or_insert(now);
                         table.keyed = false;
+                    }
+                    // (So until a record of the game changes, or what stands under this house's key: no other delegation
+                    // of the room's names it, and the ones its own records carry are its records.)
+                    if let Some(game) = ix.games.get_mut(&key).filter(|_| tidy) {
+                        game.quiet = Some(Quiet::Mine(mine_seen.clone()));
                     }
                     through!(false, false)
                 }

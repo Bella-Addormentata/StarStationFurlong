@@ -134,6 +134,8 @@ mod house_bytes;
 // 🔒 FAIR ONLY tables (PR 6c, the node's half): who holds a game and which
 // checkpoint it stands at, read as every page reads it.
 mod house_auth;
+// 🔒 The keys of a room's FAIR ONLY records, kept from each update's changes, for the house's walk at the games.
+mod house_index;
 // 🧮 The pages' fold run by the node in QuickJS (PR 6b-1): behind a cargo
 // feature while it runs in shadow only.
 #[cfg(feature = "house-fold")]
