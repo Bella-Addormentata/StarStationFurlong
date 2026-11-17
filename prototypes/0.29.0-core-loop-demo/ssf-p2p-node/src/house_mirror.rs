@@ -114,7 +114,8 @@ use std::time::{Duration, Instant};
 use yrs::types::{DeepObservable, EntryChange, Event, Events, PathSegment};
 use yrs::{Doc, Map, MapRef, Out, ReadTxn, Subscription, TransactionMut};
 
-use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, MAX_TOP_BYTES, READ_PER_TICK, VISIT_BYTES};
+use crate::fold_summary::records_digest;
+use crate::house::{checkpoint_ok, own_record, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, MAX_TOP_BYTES, READ_PER_TICK, VISIT_BYTES};
 use crate::house_bytes::{self as hb, CVal, Ctx};
 
 /// What a drain reads of a room, charged as the house's tick charges its own
@@ -635,6 +636,9 @@ struct Table {
     /// The records of the live session that are, or will be once taken, in
     /// the worker's table: key → weight.
     keys: HashMap<String, usize>,
+    /// 🔒 Of those, the keys under which the session holds its own record (`house::own_record`): what the digest of an
+    /// answer for a FAIR ONLY game is of ([`RoomMirror::records_digest`]).
+    own: BTreeSet<String>,
     /// Records a page may read otherwise.
     unclear: HashSet<String>,
     /// Changes not yet taken: the latest per key, and what each weighs.
@@ -712,6 +716,7 @@ impl Table {
             present: false,
             flooded: false,
             keys: HashMap::new(),
+            own: BTreeSet::new(),
             unclear: HashSet::new(),
             queue: BTreeMap::new(),
             queue_bytes: 0,
@@ -774,6 +779,7 @@ impl Table {
         self.generation += 1;
         self.version += 1;
         self.keys.clear();
+        self.own.clear();
         self.unclear.clear();
         self.queue.clear();
         self.queue_bytes = 0;
@@ -847,11 +853,17 @@ impl Table {
             self.note_signer(key, v);
         }
         match &value {
-            Some(_) => {
+            Some(v) => {
                 self.keys.insert(key.to_string(), size);
+                if own_record(key, v) {
+                    self.own.insert(key.to_string());
+                } else {
+                    self.own.remove(key);
+                }
             }
             None => {
                 self.keys.remove(key);
+                self.own.remove(key);
             }
         }
         self.version += 1;
@@ -1506,6 +1518,13 @@ impl RoomMirror {
             self.resets += 1;
         }
         true
+    }
+
+    /// 🔒 The digest of the records the live session holds as the mirror last read it (`fold_summary::records_digest` of
+    /// the keys under which it holds its own record). None for a table that is not mirrored.
+    pub fn records_digest(&self, t: &str, inc: &str) -> Option<String> {
+        let tb = self.tables.get(&(t.to_string(), inc.to_string()))?;
+        Some(records_digest(tb.own.iter().map(String::as_str)))
     }
 
     /// The mirror has read everything of the table that the doc has changed

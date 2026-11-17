@@ -5,6 +5,7 @@
 
 use super::tests::{obj, padded, s, scratch, seed_of, sign, sorted, strs, who, with, Who};
 use super::*;
+use crate::fold_summary::{records_digest, BaseSummary, FoldSummary};
 use yrs::MapPrelim;
 
 const ROOM: &str = "room-game";
@@ -29,6 +30,11 @@ struct Game {
     /// The checkpoint the live session continues from, and that session's key.
     base: CVal,
     ses: String,
+    /// 🔒 Where the house reads the fold's answers (none unless a test puts one).
+    answers: GameAnswers,
+    /// 🔒 A watch of the room's players' keys, as the fold in shadow keeps one: an answer is made with where it stands.
+    #[cfg(feature = "house-fold")]
+    pins: crate::fold_pins::PlayerPins,
 }
 
 impl Game {
@@ -60,7 +66,23 @@ impl Game {
             txn.get_or_insert_map(CASINO_MAP);
             txn.get_or_insert_map(COMPUTED_MAP);
         }
-        let mut game = Game { doc, owner, house, now: 1_000_000, dir, ctx, base: CVal::Undef, ses: String::new() };
+        let answers = GameAnswers::default();
+        house.read_answers_from(answers.clone());
+        #[cfg(feature = "house-fold")]
+        let pins = crate::fold_pins::PlayerPins::attach(&doc, crate::fold_pins::PIN_WALK_KEYS);
+        let mut game = Game {
+            doc,
+            owner,
+            house,
+            now: 1_000_000,
+            dir,
+            ctx,
+            base: CVal::Undef,
+            ses: String::new(),
+            answers,
+            #[cfg(feature = "house-fold")]
+            pins,
+        };
         let root = game.root(game.house.public(), "f1");
         game.lay(&root);
         game
@@ -3678,4 +3700,1215 @@ fn a_game_whose_records_are_gone_has_no_plan() {
     game.delete_top(&game.ses.clone());
     game.ticks();
     assert!(planned(&game.house).is_empty());
+}
+
+// ── 🔒 The trim (design-final section 8.5 N3, N4, N5; computedSimHouse.ts trimDuty) ─────────────────────────────────
+
+/// A round of the fold's answer, undecided, missing no slip.
+fn round(r: i64, close: &str) -> RoundSummary {
+    RoundSummary {
+        r,
+        close: close.into(),
+        decided: None,
+        counted: vec![],
+        pocket: None,
+        deltas: vec![],
+        house: None,
+        forfeit: None,
+        abandon: None,
+        copies: None,
+        dice: None,
+        missing: Some(vec![]),
+        seven_out: None,
+    }
+}
+
+/// Round r decided by the house reveal of hash `reveal` on close `close`, its outcome pocket 17, its decider and the
+/// reveals it counted under `copies`.
+fn by_house(r: i64, close: &str, reveal: &str, copies: &[&str]) -> RoundSummary {
+    RoundSummary { decided: Some("house".into()), house: Some(reveal.into()), pocket: Some(17), copies: Some(copies.iter().map(|c| c.to_string()).collect()), ..round(r, close) }
+}
+
+/// The last checkpoint of each FAIR ONLY game this house signed, as its rows file has it: its key and canonical bytes.
+fn rows_on_disk(dir: &std::path::Path) -> BTreeMap<(String, String, String), (String, String)> {
+    let rows = parse_rows(&std::fs::read(dir.join(ROWS_FILE)).unwrap()).unwrap();
+    rows.into_iter().map(|(at, row)| (at, (row.key, hb::canon(&row.value).unwrap()))).collect()
+}
+
+/// A value's canonical bytes (a record read back from the doc has its fields in another order).
+fn canon_of(v: Option<CVal>) -> Option<String> {
+    v.as_ref().and_then(hb::canon)
+}
+
+impl Game {
+    /// The fold's answer for the live session as the bundle gives one of a FAIR ONLY game: rounds `rounds`, the open
+    /// round `open` asking for `required`; alice 5 up and bob 5 down; kept 1,000 bytes of 1,000.
+    fn summary(&self, rounds: Vec<RoundSummary>, open: i64, required: Option<String>) -> FoldSummary {
+        FoldSummary {
+            v: 1,
+            rules: None,
+            base: BaseSummary { sid: self.sid(), u: self.base.get("u").and_then(CVal::as_int).unwrap(), l: None, n: vec![], ended: false, h: None },
+            rounds,
+            tip: None,
+            open,
+            parent: String::new(),
+            house_table: false,
+            required,
+            joins: vec![],
+            nets: vec![("alice".into(), "5".into()), ("bob".into(), "-5".into())],
+            held: vec![],
+            carry: serde_json::Value::Null,
+            pending: false,
+            records: 0,
+            bytes: 0,
+            raw_bytes: 1_000,
+            kept: Some(1_000),
+            felt_bytes: Some(0),
+            felts: Some(0),
+            carry_felts: Some(vec![]),
+            open_closes: Some(vec![]),
+        }
+    }
+
+    /// The digest of the records the live session holds now, as the fold's mirror keeps them.
+    fn digest(&self) -> String {
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { return records_digest([]) };
+        let mut keys: Vec<String> = m
+            .iter(&txn)
+            .filter_map(|(k, v)| match v {
+                // (A record a page may read otherwise is none to the mirror: it reads it so.)
+                Out::Any(a) if hb::clarity(&a) == hb::Clarity::Clear && own_record(k, &CVal::from_any(&a)) => Some(k.to_string()),
+                _ => None,
+            })
+            .collect();
+        keys.sort();
+        records_digest(keys.iter().map(String::as_str))
+    }
+
+    /// `f` as the fold in shadow would put it where the house reads it: on the game's base, of the session as the doc
+    /// holds it now, under the houses by round of the house's plan.
+    fn answer(&mut self, f: FoldSummary) {
+        let spans = self.house.fold_plan(ROOM).expect("a plan").games.into_iter().find(|g| g.inc == self.ctx.inc).expect("the game planned").spans;
+        self.answer_with(f, spans, self.digest());
+    }
+
+    fn answer_with(&mut self, summary: FoldSummary, spans: Vec<(String, i64, Option<i64>)>, digest: String) {
+        let answer = GameAnswer {
+            base_key: self.ck_key(&self.base),
+            sid: self.sid(),
+            spans,
+            digest,
+            born: 1,
+            frame: 1,
+            summary,
+            #[cfg(feature = "house-fold")]
+            pins: Some((self.pins.watch(), self.pins.watch().epoch())),
+        };
+        self.answers.lock().unwrap().insert((ROOM.to_string(), T.to_string(), self.ctx.inc.clone()), answer);
+    }
+
+    fn no_answer(&mut self) {
+        self.answers.lock().unwrap().clear();
+    }
+
+    /// Put `v` under `key` in the live session as it is, whatever it is.
+    fn put_in_session(&self, key: &str, v: Any) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { panic!("no session {}", self.ses) };
+        m.insert(&mut txn, key, v);
+    }
+
+    /// Delete `key` from the live session.
+    fn delete_in_session(&self, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { panic!("no session {}", self.ses) };
+        m.remove(&mut txn, key);
+    }
+
+    /// Not trimmed: the base the test laid is still in the doc (a trim deletes every checkpoint of the game but its
+    /// own). (One checkpoint is not enough: a trim leaves one too.)
+    fn untrimmed(&self) -> bool {
+        let base = self.ck_key(&self.base);
+        self.cks().iter().any(|(k, _)| *k == base)
+    }
+
+    /// The game's checkpoints in the doc, by key.
+    fn cks(&self) -> Vec<(String, CVal)> {
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let prefix = format!("ck:{T}:{}:", self.ctx.inc);
+        let mut out: Vec<(String, CVal)> = comp
+            .iter(&txn)
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .filter_map(|(k, v)| match v {
+                Out::Any(a) => Some((k.to_string(), CVal::from_any(&a))),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The doc's session maps of the game.
+    fn sessions(&self) -> Vec<String> {
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let prefix = format!("ses:{T}:{}:", self.ctx.inc);
+        let mut out: Vec<String> = comp.iter(&txn).filter(|(k, v)| k.starts_with(&prefix) && matches!(v, Out::YMap(_))).map(|(k, _)| k.to_string()).collect();
+        out.sort();
+        out
+    }
+
+    /// The game as a page resolves it from the doc: the base's key.
+    fn resolved_base(&self) -> Option<String> {
+        let cks = self.cks();
+        let deleg = self.top(&format!("hk:{}", self.house.public()));
+        let rec = ha::AuthRecords { cks: cks.iter().map(|(k, v)| (k.as_str(), v)).collect(), xfs: vec![], fins: vec![], delegations: deleg.iter().collect() };
+        let res = ha::resolve_game(ROOM, T, &self.ctx.inc, None, &rec, &mut |_, k, bytes, g| bytes().map(|b| hb::verify(k, &b, g)));
+        assert!(!res.pending);
+        res.base.map(|b| b.key)
+    }
+
+    /// Round 1 joined, closed on the join and revealed by the house: (close, its key, the reveal's key, its hash).
+    fn revealed_round_one(&mut self) -> (String, String, String, String) {
+        let (c, _, _) = self.closed_on_the_join();
+        self.seeds(1);
+        self.ticks();
+        let (rk, _) = self.records("h:1:").into_iter().next().expect("the house revealed round 1");
+        let hash = rk.rsplit(':').next().unwrap().to_string();
+        let ck = self.records("c:1:").into_iter().map(|(k, _)| k).find(|k| k.ends_with(&c)).unwrap();
+        (c, ck, rk, hash)
+    }
+
+    /// The answer of round 1 decided by the house's reveal and nothing else, under pressure (kept 100 KiB): the trim's
+    /// every condition met but the time since the round was decided.
+    fn pressed_answer(&mut self, c: &str, ck: &str, rk: &str, hash: &str) -> FoldSummary {
+        let mut f = self.summary(vec![by_house(1, c, hash, &[ck, rk])], 2, Some(self.commit(2)));
+        f.kept = Some(100 * 1024);
+        f.raw_bytes = 100 * 1024;
+        f
+    }
+}
+
+#[test]
+fn the_house_trims_a_game_from_the_folds_answer_signs_it_and_keeps_its_row() {
+    let mut game = Game::opened("trim", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // A felt of the open round, and an earlier base's checkpoint with its session, which the trim deletes too.
+    let felt = game.slip(&who("carol"), 2);
+    let felt_key = format!("s:2:carol:{felt}");
+    // (And a join of the open round, as the fold names it: whatever is under its key goes with it.)
+    let join = "ef".repeat(16);
+    let join_key = format!("o:2:{join}");
+    game.put_in_session(&join_key, to_any(&obj(vec![("r", CVal::Int(2))])));
+    let (old_base, old_ses) = (game.ck_key(&game.base), game.ses.clone());
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.carry_felts = Some(vec![felt_key.clone()]);
+    f.joins = vec![join];
+    game.answer(f);
+    // Not before HOUSE_TRIM_AFTER_MS since its reveal decided the round.
+    game.tick(200);
+    assert!(game.untrimmed(), "too soon");
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1, "the base it trimmed from is gone: {cks:?}");
+    let (key, v) = &cks[0];
+    assert_ne!(*key, old_base);
+    let me = game.house.public().to_string();
+    assert_eq!(str_of(v, "b"), Some(game.sid().as_str()));
+    assert_eq!(v.get("u").and_then(CVal::as_int), Some(1));
+    assert_eq!(str_of(v, "l"), Some(c.as_str()));
+    assert_eq!(str_of(v, "d"), Some(format!("h:{hash}").as_str()));
+    assert_eq!(v.get("o").and_then(CVal::as_int), Some(17));
+    assert_eq!(canon_of(v.get("n").cloned()), hb::canon(&obj(vec![("alice", s("5")), ("bob", s("-5"))])));
+    assert_eq!(str_of(v, "h"), Some(game.commit(2).as_str()));
+    assert_eq!(v.get("dl").and_then(hb::canon), hb::canon(&delegation(&game.owner, &me)));
+    assert_eq!(str_of(v, "k"), Some(me.as_str()));
+    assert!(v.get("s").is_none() && v.get("x").is_none() && v.get("w").is_none() && v.get("e").is_none());
+    for k in ["ok", "j", "rv", "ts"] {
+        assert_eq!(v.get(k), game.base.get(k), "{k} is the base's");
+    }
+    assert!(hb::verify(&me, &hb::sign_bytes("ck", &game.ctx, &with_out(v, "g")).unwrap(), str_of(v, "g").unwrap()));
+    assert_eq!(*key, game.ck_key(v));
+    // The pages count from it, and its session holds what the trim carried: the open round's felt, round 1's decider
+    // and its reveal.
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, v).unwrap());
+    assert_eq!(game.sessions(), vec![next.clone()], "the old session ({old_ses}) is gone");
+    game.ses = next;
+    let held: Vec<String> = game.records("").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(held, sorted(vec![ck.clone(), felt_key, join_key, rk.clone()]));
+    // On disk, and counted.
+    let rows = rows_on_disk(&game.dir);
+    assert_eq!(rows.get(&(ROOM.to_string(), T.to_string(), game.ctx.inc.clone())), Some(&(key.clone(), hb::canon(v).unwrap())));
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    // What it waited for and when its rounds were decided are of the session it closed: gone with it.
+    let mem = &game.house.rooms[ROOM].tables[&(T.to_string(), game.ctx.inc.clone())];
+    assert!(mem.decided_at.is_empty() && mem.waits.is_empty());
+    // And the house plays on from it: once its walk reads it, the plan follows it.
+    game.base = v.clone();
+    game.no_answer();
+    game.ticks();
+    assert_eq!(planned(&game.house)[0].base_key, *key);
+    game.tick(REPUT_MS);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 }, "once, and its checkpoint is there: nothing to put back");
+}
+
+/// `v` without field `k`.
+fn with_out(v: &CVal, k: &str) -> CVal {
+    let CVal::Obj(fields) = v else { panic!("no record") };
+    CVal::Obj(fields.iter().filter(|(f, _)| f != k).cloned().collect())
+}
+
+#[test]
+fn a_craps_trim_carries_the_dice_and_the_carry() {
+    let mut game = Game::opened_as("trim-craps", "landlord", 'q');
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].pocket = None;
+    f.rounds[0].dice = Some([3, 1]);
+    f.carry = serde_json::json!({ "p": 4, "w": {} });
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1);
+    let v = &cks[0].1;
+    assert_eq!(v.get("u").and_then(CVal::as_int), Some(1));
+    assert_eq!(v.get("o"), Some(&CVal::Arr(vec![CVal::Int(3), CVal::Int(1)])));
+    assert_eq!(canon_of(v.get("s").cloned()), hb::canon(&obj(vec![("p", CVal::Int(4)), ("w", obj(vec![]))])));
+    assert_eq!(game.resolved_base().as_deref(), Some(cks[0].0.as_str()));
+}
+
+#[test]
+fn a_round_a_bettors_abandon_decided_is_trimmed_to_with_its_abandon() {
+    let mut game = Game::opened("trim-abandon", "landlord");
+    let (c, a, b) = game.closed_on_the_join();
+    let _ = (a, b);
+    game.abandon(&who("alice"), 1, &c);
+    game.ticks();
+    let z = game.records("z:1:")[0].0.rsplit(':').next().unwrap().to_string();
+    let mut f = game.summary(vec![RoundSummary { decided: Some("void".into()), abandon: Some(z.clone()), ..round(1, &c) }], 2, None);
+    f.kept = Some(100 * 1024);
+    game.answer(f);
+    // The abandon's time runs from when the trim first read it.
+    game.tick(200);
+    assert!(game.untrimmed());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1);
+    assert_eq!(cks[0].1.get("u").and_then(CVal::as_int), Some(1), "trimmed");
+    assert_eq!(str_of(&cks[0].1, "d"), Some(format!("z:{z}").as_str()));
+    assert!(cks[0].1.get("o").is_none() && cks[0].1.get("h").is_none(), "no outcome, no commitment");
+}
+
+#[test]
+fn no_trim_from_an_answer_that_is_not_the_session_the_house_reads() {
+    let mut game = Game::opened("trim-stale", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    let spans = planned(&game.house)[0].spans.clone();
+    // A record the answer did not see.
+    let digest = game.digest();
+    game.slip(&who("carol"), 2);
+    game.answer_with(f.clone(), spans.clone(), digest);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed(), "a felt came after the answer");
+    // Other houses by round, or none of the game's.
+    game.answer_with(f.clone(), vec![], game.digest());
+    game.tick(200);
+    assert!(game.untrimmed(), "other houses");
+    // Another base or session.
+    let mut other = GameAnswer {
+        base_key: "ck:x".into(),
+        sid: game.sid(),
+        spans: spans.clone(),
+        digest: game.digest(),
+        born: 1,
+        frame: 1,
+        summary: f.clone(),
+        #[cfg(feature = "house-fold")]
+        pins: Some((game.pins.watch(), game.pins.watch().epoch())),
+    };
+    game.answers.lock().unwrap().insert((ROOM.to_string(), T.to_string(), game.ctx.inc.clone()), other.clone());
+    game.tick(200);
+    assert!(game.untrimmed(), "another base");
+    other.base_key = game.ck_key(&game.base);
+    other.sid = "abc".into();
+    game.answers.lock().unwrap().insert((ROOM.to_string(), T.to_string(), game.ctx.inc.clone()), other);
+    game.tick(200);
+    assert!(game.untrimmed(), "another session");
+    // One whose fold has signatures left to check.
+    game.answer(FoldSummary { pending: true, ..f.clone() });
+    game.tick(200);
+    assert!(game.untrimmed(), "not finished");
+    // The answer of the session as it is.
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn no_trim_while_a_round_is_in_flight_or_the_round_is_not_one_it_may_trim_to() {
+    let mut game = Game::opened("trim-not", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // A close of the open round.
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.tip = Some(2);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed(), "a round in flight");
+    // Nothing decided past the base.
+    let f = game.summary(vec![round(1, &c)], 1, Some(game.commit(1)));
+    game.answer(FoldSummary { kept: Some(100 * 1024), ..f });
+    game.tick(200);
+    assert!(game.untrimmed(), "nothing decided");
+    // Decided otherwise than by this house's reveal or an abandon.
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0] = RoundSummary { decided: Some("reveals".into()), ..round(1, &c) };
+    game.answer(f);
+    game.tick(200);
+    assert!(game.untrimmed(), "every seed in");
+    // By a reveal that is not the one its state file has.
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].house = Some("ab".repeat(16));
+    game.answer(f);
+    game.tick(200);
+    assert!(game.untrimmed(), "another reveal");
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].close = "cd".repeat(16);
+    game.answer(f);
+    game.tick(200);
+    assert!(game.untrimmed(), "another close");
+    // (Its own round read under another close waits MISSING_WAIT_MS for the record it lost; past it, still not its
+    // reveal's round to trim to, and nothing to cross-check.)
+    game.tick(MISSING_WAIT_MS);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed(), "another close, past the wait");
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn no_trim_to_a_round_before_the_holder_it_serves_held_the_game() {
+    let mut game = Game::opened("trim-from", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // Handed to the buyer from round 2, who delegates this house: round 1 is the seller's, and so is the round a
+    // checkpoint at the hand-over stands at (none past it is the buyer's yet).
+    let buyer = who("buyer");
+    game.transfer(&buyer, 2);
+    game.put_top(&format!("hk:{}", game.house.public()), &delegation(&buyer, game.house.public()));
+    game.ticks();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed(), "round 1 is under the round the buyer holds the game from");
+    assert_eq!(game.house.game_counts(), GameCounts::default(), "and no checkpoint is made to be refused");
+}
+
+/// An abandon-decided round `r` on top of round 1 decided by the house's reveal.
+fn abandoned_after(r: i64) -> RoundSummary {
+    RoundSummary { decided: Some("void".into()), abandon: Some("12".repeat(16)), ..round(r, &"34".repeat(16)) }
+}
+
+#[test]
+fn a_trim_waits_for_pressure() {
+    type Press = Box<dyn Fn(&mut FoldSummary, &mut Game)>;
+    let cases: Vec<(&str, Press, Press)> = vec![
+        (
+            "rounds",
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.rounds.push(abandoned_after(HOUSE_TRIM_ROUNDS - 1))),
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.rounds.push(abandoned_after(HOUSE_TRIM_ROUNDS))),
+        ),
+        ("bytes", Box::new(|f: &mut FoldSummary, _: &mut Game| f.kept = Some(HOUSE_TRIM_BYTES - 1)), Box::new(|f: &mut FoldSummary, _: &mut Game| f.kept = Some(HOUSE_TRIM_BYTES))),
+        (
+            "junk",
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.raw_bytes = 1_000 + HOUSE_SWEEP_BYTES - 1),
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.raw_bytes = 1_000 + HOUSE_SWEEP_BYTES),
+        ),
+        (
+            "seven-out",
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.rounds.push(RoundSummary { seven_out: Some(true), ..abandoned_after(HOUSE_SEVEN_OUT_MIN - 1) })),
+            Box::new(|f: &mut FoldSummary, _: &mut Game| f.rounds.push(RoundSummary { seven_out: Some(true), ..abandoned_after(HOUSE_SEVEN_OUT_MIN) })),
+        ),
+        ("idle", Box::new(|_: &mut FoldSummary, g: &mut Game| g.now += HOUSE_IDLE_MS - 10_000), Box::new(|_: &mut FoldSummary, g: &mut Game| g.now += 1_000)),
+    ];
+    for (name, short, pressed) in cases {
+        let mut game = Game::opened(&format!("trim-press-{name}"), "landlord");
+        let (c, ck, rk, hash) = game.revealed_round_one();
+        let base = game.summary(vec![by_house(1, &c, &hash, &[&ck, &rk])], 2, Some(game.commit(2)));
+        game.answer(base.clone());
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        assert!(game.untrimmed(), "{name}: no pressure");
+        let mut f = base.clone();
+        short(&mut f, &mut game);
+        game.answer(f.clone());
+        game.tick(0);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        assert_eq!(game.house.game_counts().trims, 0, "{name}: short of it");
+        let mut f = base.clone();
+        short(&mut f, &mut game);
+        pressed(&mut f, &mut game);
+        game.answer(f);
+        game.tick(0);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        assert_eq!(game.house.game_counts().trims, 1, "{name}: pressed");
+    }
+}
+
+#[test]
+fn the_rooms_games_heavy_together_press_a_trim_of_one_not_light() {
+    for (other_kept, kept, trims) in [
+        (HOUSE_ROOM_BYTES - HOUSE_ROOM_MIN_BYTES - 1, HOUSE_ROOM_MIN_BYTES, 0),
+        (HOUSE_ROOM_BYTES, HOUSE_ROOM_MIN_BYTES - 1, 0),
+        (HOUSE_ROOM_BYTES - HOUSE_ROOM_MIN_BYTES, HOUSE_ROOM_MIN_BYTES, 1),
+    ] {
+        let mut game = Game::opened(&format!("trim-room-{other_kept}-{kept}"), "landlord");
+        let (c, ck, rk, hash) = game.revealed_round_one();
+        // Another game of the room the house remembers as that heavy; and a house table, which is none of the games'.
+        let tables = &mut game.house.rooms.get_mut(ROOM).unwrap().tables;
+        tables.entry((T2.to_string(), format!("p{}", "0".repeat(24)))).or_default().kept = other_kept;
+        tables.entry((T2.to_string(), INC_R.to_string())).or_default().kept = HOUSE_ROOM_BYTES;
+        let mut f = game.summary(vec![by_house(1, &c, &hash, &[&ck, &rk])], 2, Some(game.commit(2)));
+        f.kept = Some(kept);
+        f.raw_bytes = kept;
+        game.answer(f);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        assert_eq!(game.house.game_counts().trims, trims, "{other_kept} + {kept}");
+    }
+}
+
+#[test]
+fn the_cross_check_refuses_an_answer_that_disagrees_with_what_the_house_knows() {
+    type Fault = Box<dyn FnMut(&mut Vec<(String, CVal)>) + Send>;
+    let set = |k: &'static str, v: CVal| -> Fault { Box::new(move |b: &mut Vec<(String, CVal)>| b.iter_mut().filter(|(f, _)| f == k).for_each(|(_, x)| *x = v.clone())) };
+    let faults: Vec<(&str, Fault)> = vec![
+        ("b", set("b", s("abc"))),
+        ("u", set("u", CVal::Int(2))),
+        ("l", set("l", s(&"ab".repeat(16)))),
+        ("d", set("d", s(&format!("h:{}", "ab".repeat(16))))),
+        ("h", set("h", s(&"cd".repeat(32)))),
+        ("h gone", Box::new(|b: &mut Vec<(String, CVal)>| b.retain(|(f, _)| f != "h"))),
+        ("nets", Box::new(|b: &mut Vec<(String, CVal)>| {
+            let n: Vec<(String, CVal)> = (0..=ha::MAX_TABLE_PIDS).map(|i| (format!("p{i}"), s("0"))).collect();
+            b.iter_mut().filter(|(f, _)| f == "n").for_each(|(_, x)| *x = CVal::Obj(n.clone()));
+        })),
+        ("not a page's", set("ts", s("then"))),
+    ];
+    for (name, fault) in faults {
+        let mut game = Game::opened(&format!("trim-cross-{}", name.replace(' ', "-")), "landlord");
+        let (c, ck, rk, hash) = game.revealed_round_one();
+        game.house.fault_trim = Some(fault);
+        let f = game.pressed_answer(&c, &ck, &rk, &hash);
+        game.answer(f);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        assert!(game.untrimmed(), "{name}: not signed");
+        assert_eq!(game.house.game_counts(), GameCounts { trims: 0, cross_check_mismatches: 1, row_put_backs: 0 }, "{name}");
+        assert!(!game.dir.join(ROWS_FILE).exists(), "{name}: no row");
+    }
+}
+
+#[test]
+fn the_cross_check_holds_the_commitment_to_what_its_reveal_carried_and_none_after_a_step_down() {
+    let mut game = Game::opened("trim-commit", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // The fold says round 2 asks for no commitment, where its reveal carried one.
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.required = None;
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().cross_check_mismatches, 1);
+    // Stepped down since: the commitment is lifted, and a trim that names it is refused.
+    game.house.begin_step_down();
+    game.no_answer();
+    game.ticks();
+    assert!(game.house.last_of(&game.ctx).unwrap().r > 1, "stepped down");
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().cross_check_mismatches, 2);
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.required = None;
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1, "none named");
+}
+
+#[test]
+fn a_missing_frozen_slip_holds_the_trim_for_the_wait_and_a_tick_without_an_answer_starts_it_over() {
+    let mut game = Game::opened("trim-wait", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].missing = Some(vec!["bob".into()]);
+    game.answer(f.clone());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(MISSING_WAIT_MS - HOUSE_TRIM_AFTER_MS - 1);
+    assert!(game.untrimmed(), "waiting");
+    // A tick with no answer forgets it.
+    game.no_answer();
+    game.tick(1);
+    game.answer(f.clone());
+    game.tick(MISSING_WAIT_MS - 1);
+    assert!(game.untrimmed(), "waiting afresh");
+    // Another slip missing waits on its own.
+    f.rounds[0].missing = Some(vec!["alice".into(), "bob".into()]);
+    game.answer(f.clone());
+    game.tick(1);
+    assert!(game.untrimmed(), "alice's waits from now");
+    game.tick(MISSING_WAIT_MS - 1);
+    assert!(game.untrimmed());
+    game.tick(1);
+    assert_eq!(game.house.game_counts().trims, 1, "nobody put them back");
+}
+
+#[test]
+fn its_own_round_read_otherwise_holds_a_trim_to_an_abandon_for_the_wait() {
+    let mut game = Game::opened("trim-own-round", "landlord");
+    let (c, _, _, _) = game.revealed_round_one();
+    // Round 1 read as an abandon decided it on another close: the slip its reveal counted is gone.
+    let other = "ef".repeat(16);
+    let z = "12".repeat(16);
+    let mut f = game.summary(vec![RoundSummary { decided: Some("void".into()), abandon: Some(z), ..round(1, &other) }], 2, None);
+    f.kept = Some(100 * 1024);
+    let _ = c;
+    game.answer(f.clone());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(MISSING_WAIT_MS - 1);
+    assert!(game.untrimmed(), "waiting for its round");
+    // (And an abandon's time runs from when the trim first reads the round decided by it, once nothing is waited for.)
+    game.tick(1);
+    assert!(game.untrimmed());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn nothing_of_its_own_into_the_session_it_would_close_the_same_pass() {
+    let mut game = Game::opened("trim-own-write", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    // Round 2 closed: the pass that reveals it writes into the session; the answer is of the session before.
+    let (c2, _, _) = game.closed(2, &c, &game.commit(2));
+    game.seeds(2);
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.records("h:2:").len(), 1, "revealed round 2");
+    let _ = c2;
+    assert_eq!(game.house.game_counts().trims, 0);
+}
+
+#[test]
+fn no_trim_from_a_doc_that_holds_part_of_an_update() {
+    let mut game = Game::opened("trim-partial", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let (first, second) = game.updates_out_of_order();
+    game.apply_update(&second);
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed());
+    game.apply_update(&first);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn a_trim_it_cannot_note_on_disk_is_not_written() {
+    let mut game = Game::opened("trim-disk", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    std::fs::create_dir_all(game.dir.join(ROWS_FILE)).unwrap();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed());
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    std::fs::remove_dir_all(game.dir.join(ROWS_FILE)).unwrap();
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn its_last_checkpoint_goes_back_while_none_stands_above_it_and_after_a_start() {
+    let mut game = Game::opened("trim-reput", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    let (key, v) = game.cks().into_iter().next().unwrap();
+    game.no_answer();
+    // Gone from the doc: back at the put-back's turn.
+    game.delete_top(&key);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    // Junk under its key: the same. (The session it opens is there: as it is.)
+    let live = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    game.ses = live.clone();
+    game.put_in_session("left-as-it-is", Any::Number(1.0));
+    let held = game.records_in(&live);
+    game.put_top(&key, &s("junk"));
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+    assert_eq!(game.records_in(&live), held, "its session as it was");
+    // Every record of the game gone, the session's too: it goes back all the same, once the doc holds no part of an
+    // update.
+    for (k, _) in game.cks() {
+        game.delete_top(&k);
+    }
+    for k in game.sessions() {
+        game.delete_top(&k);
+    }
+    let (first, second) = game.updates_out_of_order();
+    game.apply_update(&second);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert!(game.top(&key).is_none(), "not from a doc that holds part of an update");
+    game.apply_update(&first);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "a game the doc holds nothing of");
+    // (With the session it opens, which holds nothing its trim carried: the session it closed is gone with them.)
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    assert_eq!(game.sessions(), vec![next.clone()]);
+    game.ses = next;
+    assert!(game.records("").iter().all(|(k, _)| *k != ck && *k != rk), "{:?}", game.records(""));
+    // After a start, from its rows file.
+    let dir = game.dir.clone();
+    let mut again = House::open(&NODE, Some(dir.join(STATE_FILE))).unwrap();
+    again.settle_ms = 0;
+    again.serve_fair_only(true);
+    game.delete_top(&key);
+    game.tick_of(&mut again);
+    game.now += REPUT_MS;
+    game.tick_of(&mut again);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "after a start");
+    assert_eq!(again.game_counts().row_put_backs, 1);
+}
+
+impl Game {
+    /// The doc as it is now: as the node's saved room would hold it, had it stopped now.
+    fn saved(&self) -> Vec<u8> {
+        self.doc.transact().encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// The node stopped and started again with its state file and rows, on the doc as `saved` held it: what it wrote
+    /// since is lost, as no page had it.
+    fn stopped_before_it_saved(&mut self, saved: &[u8]) {
+        use yrs::updates::decoder::Decode;
+        let doc = Doc::new();
+        doc.transact_mut().apply_update(yrs::Update::decode_v1(saved).unwrap()).unwrap();
+        self.doc = doc;
+        self.restart(0);
+        self.no_answer();
+    }
+
+    /// Session `ses`'s records: their keys and canonical bytes.
+    fn records_in(&mut self, ses: &str) -> Vec<(String, Option<String>)> {
+        let live = std::mem::replace(&mut self.ses, ses.to_string());
+        let out = self.records("").into_iter().map(|(k, v)| (k, hb::canon(&v))).collect();
+        self.ses = live;
+        out
+    }
+}
+
+/// A trim of round 1 that carried the open round's felts of carol and dave and a join of it, with round 1's decider and
+/// reveal: the game; the checkpoint's key and value; the session it closed, and the one it opened; and the doc just
+/// before it.
+fn trimmed_with_copies(name: &str) -> (Game, String, CVal, String, String, Vec<u8>) {
+    let mut game = Game::opened(name, "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let carol = format!("s:2:carol:{}", game.slip(&who("carol"), 2));
+    let dave = format!("s:2:dave:{}", game.slip(&who("dave"), 2));
+    let join = "ef".repeat(16);
+    game.put_in_session(&format!("o:2:{join}"), to_any(&obj(vec![("r", CVal::Int(2))])));
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.carry_felts = Some(vec![carol, dave]);
+    f.joins = vec![join];
+    game.answer(f);
+    game.tick(200);
+    let closed = game.ses.clone();
+    let saved = game.saved();
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+    let (key, v) = game.cks().into_iter().next().unwrap();
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    assert_eq!(game.records_in(&next).len(), 5, "the felts, the join, the decider and its reveal");
+    (game, key, v, closed, next, saved)
+}
+
+#[test]
+fn a_checkpoint_put_back_after_the_doc_lost_its_trim_whole_opens_its_session_with_what_the_trim_carried() {
+    let (mut game, key, v, closed, next, saved) = trimmed_with_copies("trim-lost-whole");
+    let carried = game.records_in(&next);
+    // The node stopped before it saved the room, and no page had the trim: the doc as it was before, the row on disk.
+    game.stopped_before_it_saved(&saved);
+    assert!(game.top(&key).is_none() && !game.sessions().contains(&next));
+    // (Meanwhile dave's felt left the session it closed: it is not one to put back.)
+    let dave = carried.iter().map(|(k, _)| k.clone()).find(|k| k.starts_with("s:2:dave:")).unwrap();
+    game.ses = closed.clone();
+    game.delete_in_session(&dave);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "its checkpoint back");
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    // The session it opens, with what the trim carried out of the one it closed, as the trim wrote it.
+    let back = game.records_in(&next);
+    assert_eq!(back, carried.into_iter().filter(|(k, _)| *k != dave).collect::<Vec<_>>());
+    // Once, and the pages count from it.
+    game.tick(REPUT_MS);
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn a_checkpoint_a_page_put_back_alone_after_the_doc_lost_its_trim_gets_its_session_with_what_the_trim_carried() {
+    let (mut game, key, v, _closed, next, saved) = trimmed_with_copies("trim-lost-ck-only");
+    let carried = game.records_in(&next);
+    game.stopped_before_it_saved(&saved);
+    // A page that counted from the checkpoint puts it back, and only it: the session it opens is the house's to open.
+    game.put_top(&key, &v);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(game.records_in(&next), carried, "the session, with what the trim carried");
+    assert_eq!(game.house.game_counts().row_put_backs, 0, "the checkpoint was the page's to put back");
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+}
+
+#[test]
+fn a_lost_session_of_its_rows_checkpoint_goes_back_with_this_houses_records_in_it() {
+    let (mut game, key, _v, _closed, next, _saved) = trimmed_with_copies("trim-lost-next");
+    // The house plays on in the session the trim opened: it reveals round 2 there.
+    game.no_answer();
+    game.ses = next.clone();
+    game.closed(2, &game.sid(), &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    let own: Vec<String> = game.records("h:2:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(own.len(), 1, "its reveal of round 2");
+    // The map gone (the session it closed went with the trim: nothing carried to put back), it goes back in one write
+    // with its reveal in it, as any lost map does.
+    game.delete_top(&next);
+    // (What the put-back writes at the top of the doc, by key.)
+    let written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = written.clone();
+    let _sub = yrs::Observable::observe(&game.doc.get_or_insert_map(COMPUTED_MAP), move |txn, e: &yrs::types::map::MapEvent| seen.lock().unwrap().extend(e.keys(txn).keys().map(|k| k.to_string())));
+    game.tick(REPUT_MS);
+    assert!(game.has_session(), "the map goes back");
+    let back: Vec<String> = game.records("").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(back, own, "with its reveal in it, and nothing the trim carried");
+    assert_eq!(*written.lock().unwrap(), vec![next.clone()], "and its checkpoint, which the doc holds, is not written again ({key})");
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+}
+
+#[test]
+fn no_checkpoint_goes_back_from_its_row_while_the_doc_holds_part_of_an_update() {
+    let (mut game, key, v, _closed, next, saved) = trimmed_with_copies("trim-lost-partial");
+    let carried = game.records_in(&next);
+    game.stopped_before_it_saved(&saved);
+    let (first, second) = game.updates_out_of_order();
+    game.apply_update(&second);
+    assert!(game.doc.transact().store().pending_update().is_some(), "the doc holds part of an update");
+    for _ in 0..3 {
+        game.tick(REPUT_MS);
+    }
+    assert!(game.top(&key).is_none(), "it, and the session it opens, may be in the part to come");
+    assert!(!game.sessions().contains(&next));
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+    game.apply_update(&first);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+    assert_eq!(game.records_in(&next), carried, "and its session with it");
+}
+
+#[test]
+fn a_checkpoint_above_its_last_one_takes_its_row_away() {
+    let mut game = Game::opened("trim-above", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    let (key, v) = game.cks().into_iter().next().unwrap();
+    game.no_answer();
+    game.base = v;
+    game.ses = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &game.base).unwrap());
+    assert_eq!(rows_on_disk(&game.dir).len(), 1);
+    // A later trim, as another of the game's houses would sign one: its row is no longer one to put back.
+    game.trim(2, &"ab".repeat(16), &"cd".repeat(16), None);
+    game.ticks();
+    assert!(rows_on_disk(&game.dir).is_empty());
+    game.delete_top(&key);
+    game.tick(REPUT_MS);
+    assert!(game.top(&key).is_none());
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+}
+
+#[test]
+fn the_rows_file_reads_back_what_it_wrote_and_no_row_whose_key_is_not_its_checkpoints() {
+    let game = Game::opened("trim-rows", "landlord");
+    let ck = game.base.clone();
+    let key = game.ck_key(&ck);
+    let path = game.dir.join(ROWS_FILE);
+    let at = (ROOM.to_string(), T.to_string(), game.ctx.inc.clone());
+    // With what its trim carried, each record as it was.
+    let copies = vec![("s:2:carol:ab".to_string(), obj(vec![("r", CVal::Int(2)), ("p", s("carol"))])), ("o:2:cd".to_string(), obj(vec![("r", CVal::Int(2))]))];
+    let canons = |copies: &[(String, CVal)]| copies.iter().map(|(k, v)| (k.clone(), hb::canon(v))).collect::<Vec<_>>();
+    let mut rows = BTreeMap::new();
+    rows.insert(at.clone(), Row { key: key.clone(), value: ck.clone(), copies: copies.clone() });
+    write_rows(&path, &rows).unwrap();
+    let back = parse_rows(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(back.keys().collect::<Vec<_>>(), vec![&at]);
+    assert_eq!((back[&at].key.as_str(), hb::canon(&back[&at].value)), (key.as_str(), hb::canon(&ck)));
+    assert_eq!(canons(&back[&at].copies), canons(&copies));
+    // (A file of v 1, from before a row kept what its trim carried: it carried nothing.)
+    let old = serde_json::json!({ "v": 1, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck)]] });
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let back = parse_rows(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!((back[&at].key.as_str(), back[&at].copies.len()), (key.as_str(), 0));
+    let wrong = serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, "ck:x", hb::canon(&ck), []]] });
+    std::fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(rows_on_disk(&game.dir).is_empty());
+    for bad in [
+        serde_json::json!({ "v": 3, "rows": [] }),
+        serde_json::json!({ "v": 1 }),
+        serde_json::json!({ "v": 1, "rows": [[ROOM]] }),
+        serde_json::json!({ "v": 1, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck), []]] }),
+        serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck)]] }),
+        serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck), [["o:2:cd"]]]] }),
+    ] {
+        assert!(parse_rows(&serde_json::to_vec(&bad).unwrap()).is_none(), "{bad}");
+    }
+    // Unreadable: the house starts all the same, with no row.
+    std::fs::write(&path, b"{").unwrap();
+    let house = House::open(&NODE, Some(game.dir.join(STATE_FILE))).unwrap();
+    assert!(house.rows.is_empty());
+}
+
+#[test]
+fn the_trim_write_lays_its_checkpoint_deletes_the_rest_and_opens_its_session() {
+    let doc = Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut txn, "ck:t:p:old", Any::String("old".into()));
+        comp.insert(&mut txn, "ck:t:p:new", Any::String("there".into()));
+        comp.insert(&mut txn, "ses:t:p:aaa", MapPrelim::default());
+        comp.insert(&mut txn, "other", Any::String("stays".into()));
+    }
+    let w = Write::Trim {
+        key: "ck:t:p:new".into(),
+        value: s("new"),
+        gone: vec!["ck:t:p:old".into(), "ck:t:p:new".into(), "ses:t:p:aaa".into(), "ses:t:p:none".into()],
+        ses: "ses:t:p:bbb".into(),
+        copies: vec![("s:2:carol:x".into(), s("felt"))],
+    };
+    apply(&mut doc.transact_mut(), &[w]);
+    let txn = doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let mut keys: Vec<String> = comp.keys(&txn).map(str::to_string).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["ck:t:p:new", "other", "ses:t:p:bbb"]);
+    assert_eq!(top_value_within(&comp, &txn, "ck:t:p:new", usize::MAX), Some(s("there")), "what is there stays");
+    let Some(Out::YMap(m)) = comp.get(&txn, "ses:t:p:bbb") else { panic!("no session") };
+    assert_eq!(m.len(&txn), 1);
+}
+
+impl Game {
+    /// 🔒 The bundled fold's own answer for the live session, every signature checked, under the houses by round of the
+    /// house's plan: what the fold in shadow puts where the house reads it.
+    #[cfg(feature = "house-fold")]
+    fn folded(&self) -> FoldSummary {
+        use crate::house_fold::{strict_check, FairHouses, FoldEngine};
+        let plan = planned(&self.house).into_iter().find(|g| g.inc == self.ctx.inc).expect("the game planned");
+        let mut pins: Vec<(String, String)> = ["owner", "alice", "bob", "carol", "mallory", "buyer", "landlord"].iter().map(|p| (p.to_string(), who(p).public.clone())).collect();
+        pins.sort();
+        let mut e = FoldEngine::new(strict_check()).expect("the engine starts");
+        e.open_fair_only(&self.ctx, &FairHouses { rv: plan.rv, spans: plan.spans }, Some(&self.base), &pins).unwrap();
+        e.reset(&self.ctx, &self.records("")).unwrap();
+        e.result(&self.ctx).unwrap()
+    }
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn the_house_trims_a_game_from_the_bundled_folds_own_answer_and_the_fold_plays_on_from_its_checkpoint() {
+    for letter in ['p', 'q'] {
+        let mut game = Game::opened_as(&format!("trim-folded-{letter}"), "landlord", letter);
+        let (_, _, _, hash) = game.revealed_round_one();
+        let f = game.folded();
+        assert!(!f.pending, "{letter}: every signature checked");
+        let decided: Vec<_> = f.rounds.iter().map(|r| (r.r, r.decided.clone(), r.house.clone())).collect();
+        assert_eq!(decided, vec![(1, Some("house".to_string()), Some(hash.clone()))], "{letter}: round 1 is the house's reveal's");
+        // A game this small is pressed only once nothing new has come for HOUSE_IDLE_MS. Each tick has the fold's answer
+        // for the session as it is then, as the shadow's pass after each tick puts it.
+        // (Folded again only when the session has changed: the same records give the same answer.)
+        let (start, mut last) = (game.now, (game.digest(), f));
+        while game.cks().iter().all(|(_, v)| v.get("u").and_then(CVal::as_int) == Some(0)) {
+            assert!(game.now - start < 2 * HOUSE_IDLE_MS, "{letter}: never trimmed ({:?})", game.house.game_counts());
+            if game.digest() != last.0 {
+                last = (game.digest(), game.folded());
+            }
+            game.answer(last.1.clone());
+            game.tick(1_000);
+        }
+        assert!(game.now - start >= HOUSE_IDLE_MS - 2_000, "{letter}: not before it was idle ({} ms)", game.now - start);
+        let before = last.1;
+        assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 }, "{letter}");
+        let cks = game.cks();
+        assert_eq!(cks.len(), 1, "{letter}");
+        let (key, v) = cks[0].clone();
+        assert_eq!(v.get("u").and_then(CVal::as_int), Some(1), "{letter}");
+        assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()), "{letter}: the pages count from it");
+        // The fold opened on it with its session reads the game as it was: the same nets, the same open round asking
+        // for the same commitment, the same carry, and nothing left to check.
+        game.base = v.clone();
+        game.ses = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+        let after = game.folded();
+        assert!(!after.pending, "{letter}");
+        assert_eq!(after.base.u, 1, "{letter}");
+        assert!(after.rounds.iter().all(|r| r.r > 1), "{letter}: no round at or before its base");
+        assert_eq!((&after.nets, after.open, &after.required, &after.carry), (&before.nets, before.open, &before.required, &before.carry), "{letter}");
+    }
+}
+
+#[test]
+fn a_record_a_page_may_read_otherwise_is_in_neither_digest_and_holds_no_trim_back() {
+    let mut game = Game::opened("trim-unclear", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // A felt of round 2 under its own key whose signature fails (none the house puts back as every page reads it), with
+    // a `__proto__` field that is no object: a page reads that felt, or junk.
+    let felt = game.slip(&who("carol"), 2);
+    let key = format!("s:2:carol:{felt}");
+    let carol = game.records(&key)[0].1.clone();
+    game.delete_in_session(&key);
+    let bob_g = game.records("s:1:bob:")[0].1.get("g").cloned().unwrap();
+    let v = with(&carol, "g", bob_g);
+    let key = format!("s:2:carol:{}", hb::rec_hash(&v).unwrap());
+    game.put_in_session(&key, padded(&v, Any::Null));
+    let txn = game.doc.transact();
+    let Some(Out::YMap(m)) = txn.get_map(COMPUTED_MAP).unwrap().get(&txn, &game.ses) else { panic!() };
+    let Some(Out::Any(raw)) = m.get(&txn, &key) else { panic!("gone") };
+    assert_eq!(hb::clarity(&raw), hb::Clarity::Proto);
+    drop(txn);
+    // The fold's mirror reads no record there, and neither does the house's read: the same records.
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn a_new_record_starts_the_idle_time_over() {
+    let mut game = Game::opened("trim-idle", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.summary(vec![by_house(1, &c, &hash, &[&ck, &rk])], 2, Some(game.commit(2)));
+    game.answer(f.clone());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed(), "not idle yet");
+    // Most of the idle time on, a felt comes: idle from when the trim reads it.
+    game.now += HOUSE_IDLE_MS - 10_000;
+    game.slip(&who("carol"), 2);
+    game.answer(f.clone());
+    game.tick(0);
+    game.now += 20_000;
+    game.tick(0);
+    assert!(game.untrimmed(), "idle 20 s since the felt");
+    game.now += HOUSE_IDLE_MS - 20_000;
+    game.tick(0);
+    assert_eq!(game.house.game_counts().trims, 1, "idle since");
+}
+
+#[test]
+fn a_trim_at_the_round_of_a_hand_over_is_the_new_holders_and_carries_the_transfer() {
+    let mut game = Game::opened("trim-at-xf", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    // Handed to the buyer at round 1, who delegates this house: a checkpoint at round 1 is the buyer's to make.
+    let buyer = who("buyer");
+    let xf = game.transfer(&buyer, 1);
+    let me = game.house.public().to_string();
+    game.put_top(&format!("hk:{me}"), &delegation(&buyer, &me));
+    game.ticks();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1);
+    let (key, v) = &cks[0];
+    assert_eq!(v.get("u").and_then(CVal::as_int), Some(1));
+    assert_eq!(v.get("dl").and_then(hb::canon), hb::canon(&delegation(&buyer, &me)), "by the delegation it serves the buyer by");
+    assert_eq!(v.get("x").map(|x| x.as_arr().unwrap().iter().filter_map(hb::canon).collect::<Vec<_>>()), Some(vec![hb::canon(&xf).unwrap()]), "the chain's transfer");
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn no_trim_to_the_round_its_base_stands_at() {
+    let mut game = Game::opened("trim-at-base", "landlord");
+    let (c, _, _, hash) = game.revealed_round_one();
+    // Its base at round 1 already (its own trim, laid), and a felt of round 2 in the session that follows it.
+    game.trim(1, &c, &hash, Some(&game.commit(2)));
+    game.slip(&who("carol"), 2);
+    game.ticks();
+    // An answer that says round 1 was decided by an abandon: no round past the base to trim to.
+    let mut f = game.summary(vec![RoundSummary { decided: Some("void".into()), abandon: Some("12".repeat(16)), ..round(1, &c) }], 2, Some(game.commit(2)));
+    f.kept = Some(100 * 1024);
+    game.answer(f);
+    game.tick(200);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert!(game.untrimmed());
+    assert_eq!(game.house.game_counts(), GameCounts::default(), "and no checkpoint is made to be refused");
+}
+
+#[test]
+fn a_second_trim_deletes_every_session_a_checkpoint_it_read_opens() {
+    let mut game = Game::opened("trim-twice", "landlord");
+    let (c, _, _, hash) = game.revealed_round_one();
+    // Its trim to round 1 laid beside the opening and its session, both still in the doc.
+    let (root_ses, root_key) = (game.ses.clone(), game.ck_key(&game.base));
+    game.trim(1, &c, &hash, Some(&game.commit(2)));
+    assert_eq!(game.sessions().len(), 2);
+    // Round 2 on it, revealed.
+    let (c2, _, _) = game.closed(2, &game.sid(), &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    let (rk2, _) = game.records("h:2:").into_iter().next().expect("the house revealed round 2");
+    let hash2 = rk2.rsplit(':').next().unwrap().to_string();
+    let ck2 = game.records("c:2:").into_iter().map(|(k, _)| k).find(|k| k.ends_with(&c2)).unwrap();
+    let mut f = game.summary(vec![by_house(2, &c2, &hash2, &[&ck2, &rk2])], 3, Some(game.commit(3)));
+    f.kept = Some(100 * 1024);
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1, "the opening ({root_key}) and its first trim gone");
+    assert_eq!(cks[0].1.get("u").and_then(CVal::as_int), Some(2));
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &cks[0].1).unwrap());
+    assert_eq!(game.sessions(), vec![next], "the opening's session ({root_ses}) is gone too");
+}
+
+// ── #468 round 1 ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_made_before_a_players_key_came_is_not_trimmed_from_and_one_made_after_is() {
+    let mut game = Game::opened("trim-pins", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    // A player's key comes after the fold was given the keys: a felt of theirs may count that the answer left out.
+    {
+        let mut txn = game.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "dave", to_any(&obj(vec![("keyB64", s(&who("dave").public))])));
+    }
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed(), "the answer was made before the key came");
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    // An answer made with it.
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_with_no_watch_of_the_players_keys_is_not_trimmed_from() {
+    let mut game = Game::opened("trim-pins-none", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    let at = (ROOM.to_string(), T.to_string(), game.ctx.inc.clone());
+    game.answers.lock().unwrap().get_mut(&at).unwrap().pins = None;
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed(), "nothing says the keys are the room's");
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_whose_watch_of_the_players_keys_was_let_go_is_not_trimmed_from() {
+    let mut game = Game::opened("trim-pins-gone", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    // The watch the answer was made by is let go (the shadow stopped following the room): it no longer sees a key come.
+    game.pins = crate::fold_pins::PlayerPins::attach(&game.doc, crate::fold_pins::PIN_WALK_KEYS);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed());
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn a_session_past_the_keys_the_house_reads_is_not_trimmed_from() {
+    for (extra, trims) in [(0usize, 1u64), (1, 0)] {
+        let mut game = Game::opened(&format!("trim-keys-{extra}"), "landlord");
+        let (c, ck, rk, hash) = game.revealed_round_one();
+        let f = game.pressed_answer(&c, &ck, &rk, &hash);
+        game.answer(f);
+        // Keys of nothing up to the keys the house reads of a session (and one more): the answer's records are the same.
+        let held = game.records("").len();
+        {
+            let comp = game.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = game.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &game.ses) else { panic!("no session") };
+            for i in 0..MAX_SESSION_KEYS - held + extra {
+                m.insert(&mut txn, format!("n{i}"), Any::Number(0.0));
+            }
+        }
+        assert_eq!(game.records("").len(), MAX_SESSION_KEYS + extra);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        game.tick(200);
+        assert_eq!(game.house.game_counts().trims, trims, "{extra} past the keys it reads");
+    }
+}
+
+#[test]
+fn a_tick_that_checks_no_answer_forgets_what_the_trim_waited_for_whatever_kept_it_from_one() {
+    let mut game = Game::opened("trim-wait-held", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].missing = Some(vec!["bob".into()]);
+    game.answer(f.clone());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(MISSING_WAIT_MS - HOUSE_TRIM_AFTER_MS - 1);
+    assert!(game.untrimmed(), "waiting");
+    // A tick the game is held in (a record under its keys no reader can tell), its answer as it was: no answer checked.
+    let unreadable = game.unreadable();
+    game.tick(1);
+    game.delete_top(&unreadable);
+    // The slip could have come back and gone again meanwhile: the wait begins again.
+    game.tick(1);
+    game.tick(200);
+    assert!(game.untrimmed(), "waiting afresh");
+    game.tick(MISSING_WAIT_MS - 400);
+    assert!(game.untrimmed(), "waiting afresh still");
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1, "nobody put it back");
+}
+
+#[test]
+fn a_file_is_put_in_place_in_its_directory_or_the_one_it_runs_in() {
+    assert_eq!(dir_of(std::path::Path::new("house-checkpoints.json")), std::path::Path::new("."));
+    assert_eq!(dir_of(std::path::Path::new("/a/b/house-checkpoints.json")), std::path::Path::new("/a/b"));
+    let dir = scratch("put-in-place");
+    let (tmp, path) = (dir.join("rows.json.tmp"), dir.join("rows.json"));
+    std::fs::write(&tmp, b"new").unwrap();
+    std::fs::write(&path, b"old").unwrap();
+    put_in_place(&tmp, &path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert!(!tmp.exists());
 }

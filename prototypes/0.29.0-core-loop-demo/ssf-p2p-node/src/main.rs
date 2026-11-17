@@ -134,6 +134,7 @@ mod treasury_codec;
 // computed-table fold computes, and the owner's node's house job.
 mod house;
 mod house_bytes;
+mod fold_summary;
 // 🔒 FAIR ONLY tables (PR 6c, the node's half): who holds a game and which
 // checkpoint it stands at, read as every page reads it.
 mod house_auth;
@@ -533,6 +534,14 @@ pub struct HouseFoldReport {
     pub games_over: u64,
     #[serde(default)]
     pub game_answers: u64,
+    /// 🔒 The house's trims of FAIR ONLY games written, the trims its cross-check refused to sign, and its checkpoints
+    /// put back (house.rs `GameCounts`).
+    #[serde(default)]
+    pub trims: u64,
+    #[serde(default)]
+    pub cross_check_mismatches: u64,
+    #[serde(default)]
+    pub row_put_backs: u64,
     /// Why the fold is off (`crashes`: the worker failed too often; `env`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off: Option<String>,
@@ -2647,7 +2656,15 @@ async fn node_main() -> Result<()> {
         fingerprint.house_fold = Some(HouseFoldReport { off: Some("env".to_string()), ..HouseFoldReport::default() });
         None
     } else {
-        Some(Mutex::new(fold_shadow::FoldShadow::live(fold_supervisor::ChildLaunch::new(), std::time::Instant::now())))
+        // 🔒 (Its answers for the FAIR ONLY games go where the house's trims read them: a map of their own, so the
+        // house's tick never waits on a pass of the shadow.)
+        let answers = fold_summary::GameAnswers::default();
+        let mut shadow = fold_shadow::FoldShadow::live(fold_supervisor::ChildLaunch::new(), std::time::Instant::now());
+        shadow.share_answers(answers.clone());
+        if let Some(h) = house.as_mut() {
+            h.read_answers_from(answers);
+        }
+        Some(Mutex::new(shadow))
     };
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
@@ -5495,7 +5512,12 @@ fn fold_shadow_pass(hub: &SharedHub) {
     // or a doc, and a request posted by the time it began would be called unanswered the sooner.)
     let report = fold_shadow::tick_shadow_with(shadow, served_docs(&hub.rooms), &std::time::Instant::now, |room_id| house::lock(house).fold_plan(room_id));
     match report {
-        Some(report) => hub.fingerprint.lock().unwrap().house_fold = Some(report),
+        Some(mut report) => {
+            // 🔒 (And what the house's trims did with the answers: the shadow's lock is let go.)
+            let c = house::lock(house).game_counts();
+            (report.trims, report.cross_check_mismatches, report.row_put_backs) = (c.trims, c.cross_check_mismatches, c.row_put_backs);
+            hub.fingerprint.lock().unwrap().house_fold = Some(report)
+        }
         None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),
     }
 }
