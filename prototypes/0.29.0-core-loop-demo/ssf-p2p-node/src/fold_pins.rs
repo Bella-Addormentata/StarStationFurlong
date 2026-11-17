@@ -346,6 +346,14 @@ pub struct PlayerPins {
     cache: Option<(u64, Vec<(String, String)>)>,
 }
 
+/// 🔒 Its observers go with it: whoever holds a watch of it is told that what it said holds no longer (an answer of the
+/// fold made with these pins is not believed after, fold_summary.rs `GameAnswer::pins`).
+impl Drop for PlayerPins {
+    fn drop(&mut self) {
+        lock(&self.shared).epoch += 1;
+    }
+}
+
 impl PlayerPins {
     /// Watch `doc`'s `players` map, and read what it holds up to `walk_limit`
     /// entries. Call it with no transaction open on `doc`.

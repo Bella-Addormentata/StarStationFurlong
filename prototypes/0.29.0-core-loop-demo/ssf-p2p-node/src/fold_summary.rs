@@ -102,6 +102,11 @@ pub struct GameAnswer {
     pub born: u64,
     pub frame: u64,
     pub summary: FoldSummary,
+    /// The watch of the room's players' keys and where it stood when the fold was given them (fold_pins.rs
+    /// `PinWatch::epoch`): a key that came since may make a felt count that this answer left out, and a trim carries
+    /// only the felts an answer names. The house goes by the answer only while the watch stands there still (None: never).
+    #[cfg(feature = "house-fold")]
+    pub pins: Option<(crate::fold_pins::PinWatch, u64)>,
 }
 
 /// 🔒 The digest of a session's records, by their keys, given in order (sorted, no repeats): a record of a FAIR ONLY game's

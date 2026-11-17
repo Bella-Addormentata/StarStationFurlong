@@ -1090,6 +1090,9 @@ pub struct House {
     /// 🔒 Where the fold in shadow puts its answers for the FAIR ONLY games ([`House::read_answers_from`]): what a trim goes
     /// by. None: no fold, and no trim.
     answers: Option<GameAnswers>,
+    /// 🔒 The FAIR ONLY games whose trim checked an answer this tick ([`waits_on`]): the others forget what they waited
+    /// for as the tick ends, whatever kept them from it.
+    waits_noted: HashSet<(String, String)>,
     /// 🔒 `(room, t, inc)` → the last checkpoint it signed for a FAIR ONLY game, its key and value ([`ROWS_FILE`]).
     rows: BTreeMap<(String, String, String), (String, CVal)>,
     rows_path: Option<PathBuf>,
@@ -1310,6 +1313,7 @@ impl House {
             serve_games: false,
             games_through: HashMap::new(),
             answers: None,
+            waits_noted: HashSet::new(),
             rows,
             rows_path,
             counts: GameCounts::default(),
@@ -1631,6 +1635,7 @@ impl House {
         self.held_now.clear();
         self.wanted.clear();
         self.games_through.clear();
+        self.waits_noted.clear();
         // 🔒 Not ticked here for HOUSE_HEARD_MS (the node was cut off, or asleep): the pages took the house as away, and
         // it settles at each FAIR ONLY game again, reading before it reveals (design-final section 8.5, N1).
         if let Some(mem) = self.rooms.get_mut(room) {
@@ -1683,7 +1688,16 @@ impl House {
         self.games_through.clear();
         if let Some(mem) = self.rooms.get_mut(room) {
             mem.last_tick = Some(now);
+            // 🔒 A game whose trim checked no answer this tick forgets what it waited for (the game held, its session
+            // gone, the read short, no answer that is the game: whatever it was, a record it waited for could have come
+            // back and gone again unseen, and a new loss waits afresh).
+            for (key, table) in mem.tables.iter_mut() {
+                if !self.waits_noted.contains(key) {
+                    table.waits.clear();
+                }
+            }
         }
+        self.waits_noted.clear();
         // (The plan the last pass made is complete when the tick got to read the room to its end,
         // and left no table of it waiting on a value a page may read otherwise, which would leave
         // out of the plan's houses one the table names: the live house's decisions are as they were.
@@ -3576,15 +3590,24 @@ impl House {
     }
 
     /// 🔒 The fold's latest answer for game `(t, inc)` of `room`, if it is of the game as the house reads it now: on the
-    /// base the walk chose, of the session that follows it, under the houses by round of this pass's plan, and folded from
-    /// the records the session holds now (the digest of their keys, [`own_record`]: the answer can be of a moment before
-    /// the house's read, the fold running beside the tick). (The digest is worked out only for an answer that is the rest
-    /// of that.)
+    /// base the walk chose, of the session that follows it, under the houses by round of this pass's plan, with the
+    /// players' keys the room holds now (the watch of them stands where it stood when the fold was given them), and folded
+    /// from the records the session holds now (the digest of their keys, [`own_record`]: the answer can be of a moment
+    /// before the house's read, the fold running beside the tick). Not of a session past [`MAX_SESSION_KEYS`]: the read
+    /// stops there, and a record past it is in neither the house's digest nor its sight (the fold's mirror holds such a
+    /// session: no honest one is). (The digest is worked out only for an answer that is the rest of that.)
     fn answer_for(&self, room: &str, read: &TableRead, g: &TrimOf) -> Option<GameAnswer> {
+        if read.keys > MAX_SESSION_KEYS {
+            return None;
+        }
         let answers = self.answers.as_ref()?.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = answers.get(&(room.to_string(), read.ctx.t.clone(), read.ctx.inc.clone()))?;
         let sid = read.ses_key.rsplit(':').next().unwrap_or("");
         if a.base_key != g.base.key || a.sid != sid || a.spans != g.spans || a.summary.pending {
+            return None;
+        }
+        #[cfg(feature = "house-fold")]
+        if !a.pins.as_ref().is_some_and(|(watch, at)| watch.epoch() == *at) {
             return None;
         }
         let mut keys: Vec<&str> = read.records.iter().map(String::as_str).collect();
@@ -3637,6 +3660,7 @@ impl House {
         // (Noted at every answer checked, a close of the open round in or not: a wait that began for one loss must not
         // stand in for the next.)
         let waits = waits_on(mem, done.as_ref(), base_u, &read.ses_key, &f.rounds, now);
+        self.waits_noted.insert(key.clone());
         if f.tip.is_some() {
             return Trimmed::Done;
         }
@@ -3809,8 +3833,8 @@ fn trim_body(b: &CVal, f: &crate::fold_summary::FoldSummary, d: &RoundSummary, c
 ///   such reading: a new reading is a new loss.
 /// - **a frozen slip missing** from a decided round: one wait for each slip, by its close and its bettor.
 ///
-/// A thing no longer so is forgotten, so the same loss again waits afresh; and a tick that could check no answer forgets
-/// them all ([`House::trim_duty`]). The pages that showed the round put the record back in their turns (their witness
+/// A thing no longer so is forgotten, so the same loss again waits afresh; and a tick that checked no answer of the game
+/// forgets them all, whatever kept it from one ([`House::tick`]: a record could have come back and gone again unseen). The pages that showed the round put the record back in their turns (their witness
 /// copies), within seconds; if nobody has by then, nobody is left who can, and the round is as the fold reads it.
 fn waits_on(mem: &mut TableMem, done: Option<&Done>, base_u: i64, ses_key: &str, rounds: &[RoundSummary], now: u64) -> bool {
     let mut gone: BTreeSet<String> = BTreeSet::new();
@@ -4113,7 +4137,35 @@ fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), 
         f.write_all(&body)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    put_in_place(&tmp, path)
+}
+
+/// Put the file `tmp` (written and synced) in place of `path`, lastingly: the rename is a change of the directory, which
+/// is synced too, or a crash after it could lose it and the house come back without what it said it had written. On
+/// Unix the directory is opened and synced (`.` for a path with no directory part); a file system that cannot sync one
+/// says so (`InvalidInput`, `Unsupported`), and the rename is as lasting as it makes it. Elsewhere the rename is all
+/// there is (Windows opens no directory as a file).
+fn put_in_place(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    #[cfg(unix)]
+    {
+        let dir = dir_of(path);
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            if !matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported) {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The directory a file `path` is in: `.` for a path with no directory part.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dir_of(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    }
 }
 
 /// 🔒 The rows file ([`ROWS_FILE`]): `{"v": 1, "rows": [[room, t, inc, key, canon], …]}`, the last checkpoint the house
@@ -4135,7 +4187,7 @@ fn parse_rows(bytes: &[u8]) -> Option<BTreeMap<(String, String, String), (String
     Some(out)
 }
 
-/// 🔒 Write the rows file whole, synced, then put in place (as [`write_state`]).
+/// 🔒 Write the rows file whole, synced, then put in place (as [`write_state`], [`put_in_place`]).
 fn write_rows(path: &std::path::Path, rows: &BTreeMap<(String, String, String), (String, CVal)>) -> std::io::Result<()> {
     let rows: Vec<_> = rows.iter().map(|((room, t, inc), (key, value))| serde_json::json!([room, t, inc, key, hb::canon(value)])).collect();
     let body = serde_json::to_vec(&serde_json::json!({ "v": 1, "rows": rows }))?;
@@ -4146,7 +4198,7 @@ fn write_rows(path: &std::path::Path, rows: &BTreeMap<(String, String, String), 
         f.write_all(&body)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    put_in_place(&tmp, path)
 }
 
 #[cfg(test)]

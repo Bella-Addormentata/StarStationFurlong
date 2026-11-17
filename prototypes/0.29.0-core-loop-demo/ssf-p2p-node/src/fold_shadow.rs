@@ -681,9 +681,9 @@ impl RoomShadow {
     }
 
     /// 🔒 Keep, for each FAIR ONLY game the view follows, the answer in hand if it is the game as the mirror last read it
-    /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it: [`Feed::covers`]), the doc
-    /// has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the plan's, and the fold is
-    /// finished. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
+    /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it, and the view's pins:
+    /// [`Feed::covers`]), the doc has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the
+    /// plan's, and the fold is finished. With the watch of the pins and its epoch as the view read them. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
     /// its answer let go of.
     fn keep_answers<L: Launch>(&mut self, view: &FoldView, inputs: &Inputs, sup: &Supervisor<L>) {
         let games: BTreeSet<TableKey> = view.games.iter().map(|g| (g.t.clone(), g.inc.clone())).collect();
@@ -705,7 +705,9 @@ impl RoomShadow {
                 Some(a) if a.born == st.born && a.frame == fold.frame => a.digest.clone(),
                 _ => self.mirror.records_digest(&k.0, &k.1).unwrap_or_default(),
             };
-            let answer = GameAnswer { base_key: g.base_key.clone(), sid: g.sid.clone(), spans: g.spans.clone(), digest, born: st.born, frame: fold.frame, summary: fold.summary.clone() };
+            // (The fold covers the view's pins: made with them, which the watch says where it stood on when they were read.)
+            let pins = view.watch.clone().map(|w| (w, view.pins_epoch));
+            let answer = GameAnswer { base_key: g.base_key.clone(), sid: g.sid.clone(), spans: g.spans.clone(), digest, born: st.born, frame: fold.frame, summary: fold.summary.clone(), pins };
             if self.answers.get(&k) != Some(&answer) {
                 self.answers.insert(k, answer);
             }

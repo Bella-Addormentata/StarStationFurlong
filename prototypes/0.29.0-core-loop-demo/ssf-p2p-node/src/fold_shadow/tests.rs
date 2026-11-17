@@ -4002,3 +4002,37 @@ fn the_answers_the_house_reads_go_when_the_fold_goes_off() {
     assert!(shared.lock().unwrap().is_empty(), "no answer of a fold that is off");
     let _ = plan;
 }
+
+#[test]
+fn a_games_answer_carries_the_watch_of_the_players_keys_where_the_view_read_them() {
+    let (mut b, _plan) = game_bench();
+    // The view's pins read by a watch of the room's players, as the node's own view is.
+    let pins = crate::fold_pins::PlayerPins::attach(&b.doc, crate::fold_pins::PIN_WALK_KEYS);
+    let watch = pins.watch();
+    {
+        let view = b.view.as_mut().unwrap();
+        view.watch = Some(watch.clone());
+        view.pins_epoch = watch.epoch();
+    }
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    let first = b.game_answer().unwrap();
+    assert_eq!(first.pins, Some((watch.clone(), watch.epoch())), "made with the pins where the watch stood");
+    // A player's key comes: the watch moves past the answer (which the house then goes by no more), and the answer the
+    // next view makes stands where it reads the pins.
+    {
+        let players = b.doc.get_or_insert_map("players");
+        let mut txn = b.doc.transact_mut();
+        players.insert(&mut txn, "zed", to_any(&obj(vec![("keyB64", s("zed-key"))])));
+    }
+    let moved = watch.epoch();
+    assert!(first.pins.as_ref().is_some_and(|(_, at)| *at < moved));
+    // (While the view still reads the pins as before, the answers made with them say so: not where the watch is now.)
+    b.ticks(20);
+    assert!(b.game_answer().is_some_and(|a| a.pins.as_ref().is_some_and(|(_, at)| *at < moved)), "made with the view's pins, at the view's epoch");
+    b.view.as_mut().unwrap().pins_epoch = moved;
+    b.until("the answer at the new epoch", |b| b.game_answer().is_some_and(|a| a.pins.as_ref().is_some_and(|(_, at)| *at == moved)));
+    // A view with no watch: the answer carries none, and the house goes by none such.
+    b.view.as_mut().unwrap().watch = None;
+    b.until("an answer with no watch", |b| b.game_answer().is_some_and(|a| a.pins.is_none()));
+    drop(pins);
+}

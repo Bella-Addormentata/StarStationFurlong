@@ -32,6 +32,9 @@ struct Game {
     ses: String,
     /// 🔒 Where the house reads the fold's answers (none unless a test puts one).
     answers: GameAnswers,
+    /// 🔒 A watch of the room's players' keys, as the fold in shadow keeps one: an answer is made with where it stands.
+    #[cfg(feature = "house-fold")]
+    pins: crate::fold_pins::PlayerPins,
 }
 
 impl Game {
@@ -65,7 +68,21 @@ impl Game {
         }
         let answers = GameAnswers::default();
         house.read_answers_from(answers.clone());
-        let mut game = Game { doc, owner, house, now: 1_000_000, dir, ctx, base: CVal::Undef, ses: String::new(), answers };
+        #[cfg(feature = "house-fold")]
+        let pins = crate::fold_pins::PlayerPins::attach(&doc, crate::fold_pins::PIN_WALK_KEYS);
+        let mut game = Game {
+            doc,
+            owner,
+            house,
+            now: 1_000_000,
+            dir,
+            ctx,
+            base: CVal::Undef,
+            ses: String::new(),
+            answers,
+            #[cfg(feature = "house-fold")]
+            pins,
+        };
         let root = game.root(game.house.public(), "f1");
         game.lay(&root);
         game
@@ -3778,7 +3795,17 @@ impl Game {
     }
 
     fn answer_with(&mut self, summary: FoldSummary, spans: Vec<(String, i64, Option<i64>)>, digest: String) {
-        let answer = GameAnswer { base_key: self.ck_key(&self.base), sid: self.sid(), spans, digest, born: 1, frame: 1, summary };
+        let answer = GameAnswer {
+            base_key: self.ck_key(&self.base),
+            sid: self.sid(),
+            spans,
+            digest,
+            born: 1,
+            frame: 1,
+            summary,
+            #[cfg(feature = "house-fold")]
+            pins: Some((self.pins.watch(), self.pins.watch().epoch())),
+        };
         self.answers.lock().unwrap().insert((ROOM.to_string(), T.to_string(), self.ctx.inc.clone()), answer);
     }
 
@@ -3995,7 +4022,17 @@ fn no_trim_from_an_answer_that_is_not_the_session_the_house_reads() {
     game.tick(200);
     assert!(game.untrimmed(), "other houses");
     // Another base or session.
-    let mut other = GameAnswer { base_key: "ck:x".into(), sid: game.sid(), spans: spans.clone(), digest: game.digest(), born: 1, frame: 1, summary: f.clone() };
+    let mut other = GameAnswer {
+        base_key: "ck:x".into(),
+        sid: game.sid(),
+        spans: spans.clone(),
+        digest: game.digest(),
+        born: 1,
+        frame: 1,
+        summary: f.clone(),
+        #[cfg(feature = "house-fold")]
+        pins: Some((game.pins.watch(), game.pins.watch().epoch())),
+    };
     game.answers.lock().unwrap().insert((ROOM.to_string(), T.to_string(), game.ctx.inc.clone()), other.clone());
     game.tick(200);
     assert!(game.untrimmed(), "another base");
@@ -4582,4 +4619,124 @@ fn a_second_trim_deletes_every_session_a_checkpoint_it_read_opens() {
     assert_eq!(cks[0].1.get("u").and_then(CVal::as_int), Some(2));
     let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &cks[0].1).unwrap());
     assert_eq!(game.sessions(), vec![next], "the opening's session ({root_ses}) is gone too");
+}
+
+// ── #468 round 1 ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_made_before_a_players_key_came_is_not_trimmed_from_and_one_made_after_is() {
+    let mut game = Game::opened("trim-pins", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    // A player's key comes after the fold was given the keys: a felt of theirs may count that the answer left out.
+    {
+        let mut txn = game.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "dave", to_any(&obj(vec![("keyB64", s(&who("dave").public))])));
+    }
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed(), "the answer was made before the key came");
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    // An answer made with it.
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_with_no_watch_of_the_players_keys_is_not_trimmed_from() {
+    let mut game = Game::opened("trim-pins-none", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    let at = (ROOM.to_string(), T.to_string(), game.ctx.inc.clone());
+    game.answers.lock().unwrap().get_mut(&at).unwrap().pins = None;
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed(), "nothing says the keys are the room's");
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn an_answer_whose_watch_of_the_players_keys_was_let_go_is_not_trimmed_from() {
+    let mut game = Game::opened("trim-pins-gone", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let f = game.pressed_answer(&c, &ck, &rk, &hash);
+    game.answer(f.clone());
+    // The watch the answer was made by is let go (the shadow stopped following the room): it no longer sees a key come.
+    game.pins = crate::fold_pins::PlayerPins::attach(&game.doc, crate::fold_pins::PIN_WALK_KEYS);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(200);
+    assert!(game.untrimmed());
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1);
+}
+
+#[test]
+fn a_session_past_the_keys_the_house_reads_is_not_trimmed_from() {
+    for (extra, trims) in [(0usize, 1u64), (1, 0)] {
+        let mut game = Game::opened(&format!("trim-keys-{extra}"), "landlord");
+        let (c, ck, rk, hash) = game.revealed_round_one();
+        let f = game.pressed_answer(&c, &ck, &rk, &hash);
+        game.answer(f);
+        // Keys of nothing up to the keys the house reads of a session (and one more): the answer's records are the same.
+        let held = game.records("").len();
+        {
+            let comp = game.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = game.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &game.ses) else { panic!("no session") };
+            for i in 0..MAX_SESSION_KEYS - held + extra {
+                m.insert(&mut txn, format!("n{i}"), Any::Number(0.0));
+            }
+        }
+        assert_eq!(game.records("").len(), MAX_SESSION_KEYS + extra);
+        game.tick(HOUSE_TRIM_AFTER_MS);
+        game.tick(200);
+        assert_eq!(game.house.game_counts().trims, trims, "{extra} past the keys it reads");
+    }
+}
+
+#[test]
+fn a_tick_that_checks_no_answer_forgets_what_the_trim_waited_for_whatever_kept_it_from_one() {
+    let mut game = Game::opened("trim-wait-held", "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.rounds[0].missing = Some(vec!["bob".into()]);
+    game.answer(f.clone());
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.tick(MISSING_WAIT_MS - HOUSE_TRIM_AFTER_MS - 1);
+    assert!(game.untrimmed(), "waiting");
+    // A tick the game is held in (a record under its keys no reader can tell), its answer as it was: no answer checked.
+    let unreadable = game.unreadable();
+    game.tick(1);
+    game.delete_top(&unreadable);
+    // The slip could have come back and gone again meanwhile: the wait begins again.
+    game.tick(1);
+    game.tick(200);
+    assert!(game.untrimmed(), "waiting afresh");
+    game.tick(MISSING_WAIT_MS - 400);
+    assert!(game.untrimmed(), "waiting afresh still");
+    game.tick(200);
+    assert_eq!(game.house.game_counts().trims, 1, "nobody put it back");
+}
+
+#[test]
+fn a_file_is_put_in_place_in_its_directory_or_the_one_it_runs_in() {
+    assert_eq!(dir_of(std::path::Path::new("house-checkpoints.json")), std::path::Path::new("."));
+    assert_eq!(dir_of(std::path::Path::new("/a/b/house-checkpoints.json")), std::path::Path::new("/a/b"));
+    let dir = scratch("put-in-place");
+    let (tmp, path) = (dir.join("rows.json.tmp"), dir.join("rows.json"));
+    std::fs::write(&tmp, b"new").unwrap();
+    std::fs::write(&path, b"old").unwrap();
+    put_in_place(&tmp, &path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert!(!tmp.exists());
 }
