@@ -169,6 +169,11 @@ pub const HOUSE_SEVEN_OUT_MIN: i64 = 8;
 pub const HOUSE_IDLE_MS: u64 = 60_000;
 /// …and junk (design-final section 8.9 SWEEP_BYTES): what the session weighs past what the fold kept.
 pub const HOUSE_SWEEP_BYTES: i64 = 48 * 1024;
+/// 🔒 The sweep (design-final section 8.5 N3s, 8.9 SWEEP_KEYS, SWEEP_MIN_MS; computedSimHouse.ts): a session with no round
+/// decided since its base is cleared of junk by the base's content signed again, one sweep on (`w`), when the junk weighs
+/// [`HOUSE_SWEEP_BYTES`] or is this many keys (a key of nothing weighs little), and at most this often.
+pub const HOUSE_SWEEP_KEYS: i64 = 2_048;
+pub const HOUSE_SWEEP_MIN_MS: u64 = 10_000;
 /// Signatures a tick of a room checks that it hasn't before (about 15 ms of
 /// strict ed25519): past it, what waits on them waits a tick.
 pub const VERIFY_PER_TICK: usize = 256;
@@ -832,6 +837,11 @@ struct TableMem {
     last_new_key: Option<u64>,
     /// 🔒 The session's kept bytes as the fold last said (the room's pressure, [`HOUSE_ROOM_BYTES`]).
     kept: i64,
+    /// 🔒 When it last swept the game ([`HOUSE_SWEEP_MIN_MS`]).
+    last_sweep: Option<u64>,
+    /// 🔒 The copies of round u its last trim or sweep carried into the session of the checkpoint it signed: that
+    /// checkpoint's key, and theirs ([`House::sweep_duty`]). For the run.
+    carried: Option<(String, Vec<String>)>,
 }
 
 #[derive(Default)]
@@ -996,12 +1006,13 @@ struct Kept {
 
 type VerdictId = (&'static str, [String; 3], String);
 
-/// 🔒 What the house did at FAIR ONLY games, for the fingerprint: trims written, trims its cross-check refused to sign
-/// (the fold's answer disagreed with what the house knows of the round, or the checkpoint would not read as the game's
-/// base), and its checkpoints put back.
+/// 🔒 What the house did at FAIR ONLY games, for the fingerprint: trims written, sweeps written, trims and sweeps its
+/// cross-check refused to sign (the fold's answer disagreed with what the house knows of the round, a sweep did not hold
+/// what its base holds, or the checkpoint would not read as the game's base), and its checkpoints put back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GameCounts {
     pub trims: u64,
+    pub sweeps: u64,
     pub cross_check_mismatches: u64,
     pub row_put_backs: u64,
 }
@@ -3689,11 +3700,15 @@ impl House {
         // stand in for the next.)
         let waits = waits_on(mem, done.as_ref(), base_u, &read.ses_key, &f.rounds, now);
         self.waits_noted.insert(key.clone());
-        if f.tip.is_some() {
+        if f.tip.is_some() || waits {
             return Trimmed::Done;
         }
-        let Some(d) = f.rounds.iter().rev().find(|v| v.decided.is_some()) else { return Trimmed::Done };
-        if waits || d.r <= base_u || d.r < g.from {
+        let Some(d) = f.rounds.iter().rev().find(|v| v.decided.is_some()).filter(|d| d.r > base_u) else {
+            // 🔒 (No sweep of a base under the round its holder holds the game from: S1.)
+            return if base_u >= g.from { self.sweep_duty(room, txn, comp, read, g, f, now, writes) } else { Trimmed::Done };
+        };
+        // 🔒 (Nor a trim under it: the rounds a seller's house decided, with none past them yet.)
+        if d.r < g.from {
             return Trimmed::Done;
         }
         let mut own: Option<Kept> = None;
@@ -3758,22 +3773,11 @@ impl House {
             self.counts.cross_check_mismatches += 1;
             return Trimmed::Done;
         };
-        // What it carries into the session it opens (the L7 copies): the open round's felts whose seed is not out, the
-        // houses' joins of it, and round D's decider with the reveals it counted.
+        // What it carries into the session it opens: round D's decider with the reveals it counted, beside the open
+        // round's felts and joins.
+        let carried = d.copies.clone().unwrap_or_default();
         let Some(Out::YMap(ses)) = comp.get(txn, &read.ses_key) else { return Trimmed::Done };
-        let wanted = f.carry_felts.iter().flatten().cloned().chain(f.joins.iter().map(|j| format!("o:{}:{j}", f.open))).chain(d.copies.iter().flatten().cloned());
-        let mut copies: Vec<(String, CVal)> = Vec::new();
-        for k in wanted {
-            if copies.iter().any(|(c, _)| *c == k) {
-                continue;
-            }
-            match self.read_charged(k.len(), ses.get(txn, &k), MAX_RECORD_BYTES) {
-                Read::Val(v) => copies.push((k, v)),
-                // (The tick's reads spent: the next pass.)
-                Read::Spent => return Trimmed::Wait,
-                _ => {}
-            }
-        }
+        let Some(copies) = self.copies_of(txn, &ses, f, &carried) else { return Trimmed::Wait };
         let Some(next) = hb::next_sid3(ctx, &value) else { return Trimmed::Done };
         // On disk first: a checkpoint it signed and lost is one it cannot put back.
         let row = (room.to_string(), ctx.t.clone(), ctx.inc.clone());
@@ -3792,9 +3796,152 @@ impl House {
         if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
             mem.decided_at.clear();
             mem.waits.clear();
+            mem.carried = Some((ck_key.clone(), carried));
         }
         writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: format!("ses:{}:{}:{next}", ctx.t, ctx.inc), copies });
         Trimmed::Done
+    }
+
+    /// 🔒 The sweep of FAIR ONLY game `read` (design-final section 8.5 N3s; computedSimHouse.ts `sweepDuty`), from the
+    /// fold's answer `f` ([`House::trim_duty`] has checked it): no round decided since the base, no close of the open
+    /// round, and junk piled up in the session ([`HOUSE_SWEEP_BYTES`] of what the fold does not use, or
+    /// [`HOUSE_SWEEP_KEYS`] keys of it). The base's content signed again by this house with one sweep more, closing the
+    /// junked session: a checkpoint of the same round that outranks the base (S3) and opens a session of its own, into
+    /// which go what a trim would carry: the open round's felts and joins, and the copies of round u the swept session
+    /// held. Cross-checked as a trim is, on disk first as a trim is; at most one per [`HOUSE_SWEEP_MIN_MS`]. A trim sweeps
+    /// too, so this is only for a session with nothing decided in it.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_duty<T: ReadTxn>(&mut self, room: &str, txn: &T, comp: &MapRef, read: &TableRead, g: &TrimOf, f: &crate::fold_summary::FoldSummary, now: u64, writes: &mut Vec<Write>) -> Trimmed {
+        let ctx = &read.ctx;
+        let key = (ctx.t.clone(), ctx.inc.clone());
+        let b = &g.base.ck;
+        let Some(mem) = self.rooms.get(room).and_then(|m| m.tables.get(&key)) else { return Trimmed::Done };
+        if mem.last_sweep.is_some_and(|at| now.saturating_sub(at) < HOUSE_SWEEP_MIN_MS) {
+            return Trimmed::Done;
+        }
+        let (Some(kept), CVal::Obj(fields)) = (f.kept, b) else { return Trimmed::Done };
+        // Round u's decider, and the reveals its trim copied with it (a house that restarted since carries the decider
+        // alone: the rest is for show). Each is what its key says, or is junk as any other key is: junk a peer wrote over
+        // one would else ride every sweep and press the next, and would not be counted among the keys this sweep clears.
+        // What is carried is no junk by its weight either (the fold keeps none of round u, so `raw_bytes - kept` holds
+        // it): a sweep would clear none of it, and a round whose records weigh HOUSE_SWEEP_BYTES would be swept every
+        // HOUSE_SWEEP_MIN_MS for nothing.
+        let wanted: Vec<String> = match &mem.carried {
+            Some((at, keys)) if *at == g.base.key => keys.clone(),
+            _ => str_of(b, "d").and_then(|d| Some(format!("{}:{}:{}", d.get(..1)?, read.base_u, d.get(2..)?))).into_iter().collect(),
+        };
+        let Some(Out::YMap(ses)) = comp.get(txn, &read.ses_key) else { return Trimmed::Done };
+        let Some((carried, carried_bytes)) = self.carried_in(txn, &ses, wanted) else { return Trimmed::Wait };
+        let junk_keys = read.keys as i64 - f.felts.unwrap_or(0) - f.joins.len() as i64 - carried.len() as i64;
+        if f.raw_bytes - kept - carried_bytes < HOUSE_SWEEP_BYTES && junk_keys < HOUSE_SWEEP_KEYS {
+            return Trimmed::Done;
+        }
+        // The base's content, but its signature, and what is this sweep's: the session it closes, one sweep on, this
+        // house's under the delegation it serves the game by now, with the chain's transfers.
+        let sid = read.ses_key.rsplit(':').next().unwrap_or("");
+        let w = b.get("w").and_then(CVal::as_int).unwrap_or(0) + 1;
+        let held = |k: &str| !matches!(k, "g" | "e" | "f" | "x" | "b" | "w" | "dl" | "k");
+        let content: Vec<(String, CVal)> = fields.iter().filter(|(k, _)| held(k)).cloned().collect();
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut body = content.clone();
+        body.push(("b".to_string(), CVal::Str(sid.to_string())));
+        body.push(("w".to_string(), CVal::Int(w)));
+        body.push(("dl".to_string(), g.dl.clone()));
+        if !g.x.is_empty() {
+            body.push(("x".to_string(), CVal::Arr(g.x.clone())));
+        }
+        body.push(("k".to_string(), CVal::Str(self.key.public.clone())));
+        #[cfg(test)]
+        if let Some(fault) = self.fault_trim.as_mut() {
+            fault(&mut body);
+        }
+        // The cross-check: the session it closes, one sweep on, this house's under its delegation, and for the rest the
+        // base's content, field for field.
+        let field = |k: &str| body.iter().find(|(f, v)| f == k && *v != CVal::Undef).map(|(_, v)| v);
+        let same = |a: Option<&CVal>, b: &CVal| a.and_then(hb::canon).is_some_and(|a| hb::canon(b) == Some(a));
+        let rest = CVal::Obj(body.iter().filter(|(k, _)| held(k)).cloned().collect());
+        let agrees = field("b").and_then(CVal::as_str) == Some(sid)
+            && field("w").and_then(CVal::as_int) == Some(w)
+            && field("k").and_then(CVal::as_str) == Some(self.key.public.as_str())
+            && same(field("dl"), g.dl)
+            && same(Some(&rest), &CVal::Obj(content))
+            && same(Some(field("x").unwrap_or(&CVal::Arr(vec![]))), &CVal::Arr(g.x.clone()));
+        let sealed = if agrees {
+            match self.seal_as_base(room, ctx, g, body) {
+                None => return Trimmed::Wait,
+                Some(sealed) => sealed,
+            }
+        } else {
+            None
+        };
+        let Some((ck_key, value)) = sealed else {
+            self.counts.cross_check_mismatches += 1;
+            return Trimmed::Done;
+        };
+        let Some(copies) = self.copies_of(txn, &ses, f, &carried) else { return Trimmed::Wait };
+        let Some(next) = hb::next_sid3(ctx, &value) else { return Trimmed::Done };
+        // On disk first, as a trim's.
+        let row = (room.to_string(), ctx.t.clone(), ctx.inc.clone());
+        let was = self.rows.insert(row.clone(), Row { key: ck_key.clone(), value: value.clone(), copies: copies.clone() });
+        if let Some(path) = &self.rows_path {
+            if let Err(e) = write_rows(path, &self.rows) {
+                eprintln!("🏠 house: cannot write {}: {e} — not sweeping {}", path.display(), ctx.t);
+                match was {
+                    Some(w) => self.rows.insert(row, w),
+                    None => self.rows.remove(&row),
+                };
+                return Trimmed::Done;
+            }
+        }
+        self.counts.sweeps += 1;
+        if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
+            mem.last_sweep = Some(now);
+            mem.decided_at.clear();
+            mem.waits.clear();
+            mem.carried = Some((ck_key.clone(), carried));
+        }
+        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: format!("ses:{}:{}:{next}", ctx.t, ctx.inc), copies });
+        Trimmed::Done
+    }
+
+    /// 🔒 Of round u's records `wanted`, those session `ses` holds as their keys say (each its value's hash), and what
+    /// they weigh together as the fold weighs a key: the key and its value's canonical form, in UTF-16 code units. None:
+    /// the tick's reads ran out on one (the next pass), never those read before it.
+    fn carried_in<T: ReadTxn>(&mut self, txn: &T, ses: &MapRef, wanted: Vec<String>) -> Option<(Vec<String>, i64)> {
+        let mut carried: Vec<String> = Vec::new();
+        let mut bytes: i64 = 0;
+        for k in wanted {
+            match self.read_charged(k.len(), ses.get(txn, &k), MAX_RECORD_BYTES) {
+                Read::Val(v) => {
+                    let Some(c) = hb::canon(&v).filter(|c| hb::hash_of_canon(c) == k.rsplit(':').next().unwrap_or("")) else { continue };
+                    bytes += (k.encode_utf16().count() + c.encode_utf16().count()) as i64;
+                    carried.push(k);
+                }
+                // (The tick's reads spent: the next pass.)
+                Read::Spent => return None,
+                _ => {}
+            }
+        }
+        Some((carried, bytes))
+    }
+
+    /// 🔒 What a trim or a sweep carries into the session it opens (the L7 copies; computedSimHouse.ts `copiesOf`): the
+    /// open round's felts whose seed is not out, the houses' joins of it, and round u's decider with the reveals it
+    /// counted (`carried`), each once, as the session holds it. None: the tick's reads are spent (the next pass).
+    fn copies_of<T: ReadTxn>(&mut self, txn: &T, ses: &MapRef, f: &crate::fold_summary::FoldSummary, carried: &[String]) -> Option<Vec<(String, CVal)>> {
+        let wanted = f.carry_felts.iter().flatten().cloned().chain(f.joins.iter().map(|j| format!("o:{}:{j}", f.open))).chain(carried.iter().cloned());
+        let mut copies: Vec<(String, CVal)> = Vec::new();
+        for k in wanted {
+            if copies.iter().any(|(c, _)| *c == k) {
+                continue;
+            }
+            match self.read_charged(k.len(), ses.get(txn, &k), MAX_RECORD_BYTES) {
+                Read::Val(v) => copies.push((k, v)),
+                Read::Spent => return None,
+                _ => {}
+            }
+        }
+        Some(copies)
     }
 
     /// 🔒 A checkpoint body signed, if it reads as a page reads one and is the best of the game with it in (else no page

@@ -534,10 +534,12 @@ pub struct HouseFoldReport {
     pub games_over: u64,
     #[serde(default)]
     pub game_answers: u64,
-    /// 🔒 The house's trims of FAIR ONLY games written, the trims its cross-check refused to sign, and its checkpoints
-    /// put back (house.rs `GameCounts`).
+    /// 🔒 The house's trims and sweeps of FAIR ONLY games written, the ones its cross-check refused to sign, and its
+    /// checkpoints put back (house.rs `GameCounts`).
     #[serde(default)]
     pub trims: u64,
+    #[serde(default)]
+    pub sweeps: u64,
     #[serde(default)]
     pub cross_check_mismatches: u64,
     #[serde(default)]
@@ -5515,7 +5517,7 @@ fn fold_shadow_pass(hub: &SharedHub) {
         Some(mut report) => {
             // 🔒 (And what the house's trims did with the answers: the shadow's lock is let go.)
             let c = house::lock(house).game_counts();
-            (report.trims, report.cross_check_mismatches, report.row_put_backs) = (c.trims, c.cross_check_mismatches, c.row_put_backs);
+            (report.trims, report.sweeps, report.cross_check_mismatches, report.row_put_backs) = (c.trims, c.sweeps, c.cross_check_mismatches, c.row_put_backs);
             hub.fingerprint.lock().unwrap().house_fold = Some(report)
         }
         None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),

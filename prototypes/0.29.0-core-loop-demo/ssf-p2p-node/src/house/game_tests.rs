@@ -3945,7 +3945,7 @@ fn the_house_trims_a_game_from_the_folds_answer_signs_it_and_keeps_its_row() {
     // On disk, and counted.
     let rows = rows_on_disk(&game.dir);
     assert_eq!(rows.get(&(ROOM.to_string(), T.to_string(), game.ctx.inc.clone())), Some(&(key.clone(), hb::canon(v).unwrap())));
-    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 });
     // What it waited for and when its rounds were decided are of the session it closed: gone with it.
     let mem = &game.house.rooms[ROOM].tables[&(T.to_string(), game.ctx.inc.clone())];
     assert!(mem.decided_at.is_empty() && mem.waits.is_empty());
@@ -3955,7 +3955,7 @@ fn the_house_trims_a_game_from_the_folds_answer_signs_it_and_keeps_its_row() {
     game.ticks();
     assert_eq!(planned(&game.house)[0].base_key, *key);
     game.tick(REPUT_MS);
-    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 }, "once, and its checkpoint is there: nothing to put back");
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 }, "once, and its checkpoint is there: nothing to put back");
 }
 
 /// `v` without field `k`.
@@ -4209,7 +4209,7 @@ fn the_cross_check_refuses_an_answer_that_disagrees_with_what_the_house_knows() 
         game.answer(f);
         game.tick(HOUSE_TRIM_AFTER_MS);
         assert!(game.untrimmed(), "{name}: not signed");
-        assert_eq!(game.house.game_counts(), GameCounts { trims: 0, cross_check_mismatches: 1, row_put_backs: 0 }, "{name}");
+        assert_eq!(game.house.game_counts(), GameCounts { trims: 0, sweeps: 0, cross_check_mismatches: 1, row_put_backs: 0 }, "{name}");
         assert!(!game.dir.join(ROWS_FILE).exists(), "{name}: no row");
     }
 }
@@ -4660,7 +4660,7 @@ fn the_house_trims_a_game_from_the_bundled_folds_own_answer_and_the_fold_plays_o
         }
         assert!(game.now - start >= HOUSE_IDLE_MS - 2_000, "{letter}: not before it was idle ({} ms)", game.now - start);
         let before = last.1;
-        assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 }, "{letter}");
+        assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 }, "{letter}");
         let cks = game.cks();
         assert_eq!(cks.len(), 1, "{letter}");
         let (key, v) = cks[0].clone();
@@ -4738,7 +4738,7 @@ fn a_trim_at_the_round_of_a_hand_over_is_the_new_holders_and_carries_the_transfe
     let f = game.pressed_answer(&c, &ck, &rk, &hash);
     game.answer(f);
     game.tick(HOUSE_TRIM_AFTER_MS);
-    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 });
     let cks = game.cks();
     assert_eq!(cks.len(), 1);
     let (key, v) = &cks[0];
@@ -4764,6 +4764,13 @@ fn no_trim_to_the_round_its_base_stands_at() {
     game.tick(HOUSE_TRIM_AFTER_MS);
     assert!(game.untrimmed());
     assert_eq!(game.house.game_counts(), GameCounts::default(), "and no checkpoint is made to be refused");
+    // (Nothing decided past it: junk there is swept.)
+    game.junk(HOUSE_SWEEP_BYTES);
+    let mut f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    f.rounds = vec![RoundSummary { decided: Some("void".into()), abandon: Some("12".repeat(16)), ..round(1, &c) }];
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 0, sweeps: 1, cross_check_mismatches: 0, row_put_backs: 0 });
 }
 
 #[test]
@@ -4911,4 +4918,683 @@ fn a_file_is_put_in_place_in_its_directory_or_the_one_it_runs_in() {
     put_in_place(&tmp, &path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"new");
     assert!(!tmp.exists());
+}
+
+// ── The sweep (design-final section 8.5 N3s; computedSimHouseGame.test.ts "the sweep") ──────────────────────────────
+
+impl Game {
+    /// 🔒 Each key of the live session weighed as the fold weighs it (computedFold `weigh`): the key and its value's
+    /// canonical form, in UTF-16 code units.
+    fn weights(&self) -> BTreeMap<String, i64> {
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { return BTreeMap::new() };
+        m.iter(&txn)
+            .map(|(k, v)| {
+                let c = match v {
+                    Out::Any(a) => hb::canon(&CVal::from_any(&a)).map_or(64, |c| c.encode_utf16().count()),
+                    _ => 64,
+                };
+                (k.to_string(), (k.encode_utf16().count() + c) as i64)
+            })
+            .collect()
+    }
+
+    /// What `keys` of the live session weigh together.
+    fn weight_of(&self, keys: &[String]) -> i64 {
+        let w = self.weights();
+        keys.iter().map(|k| w[k]).sum()
+    }
+
+    /// Junk in the live session under keys of no record (`junk-…`, a kilobyte of `x` each): at least `bytes` of it.
+    fn junk(&self, bytes: i64) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { panic!("no session {}", self.ses) };
+        let mut i = m.keys(&txn).filter(|k| k.starts_with("junk-")).count();
+        let mut added = 0;
+        while added < bytes {
+            let key = format!("junk-{i}");
+            added += (key.len() + 1_002) as i64;
+            m.insert(&mut txn, key, Any::String("x".repeat(1_000).into()));
+            i += 1;
+        }
+    }
+
+    /// `n` keys of nothing (0) in the live session, `tag` before each one's number.
+    fn nothings(&self, n: usize, tag: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &self.ses) else { panic!("no session {}", self.ses) };
+        for i in 0..n {
+            m.insert(&mut txn, format!("{tag}{i}"), Any::Number(0.0));
+        }
+    }
+
+    /// The fold's answer of the live session with no round decided past the base, the open round `open` asking for
+    /// `required`, as the fold weighs the session now: it keeps the open round's felts `felts` and the houses' joins
+    /// `joins` (their keys), and nothing else.
+    fn unswept(&self, open: i64, required: Option<String>, felts: &[String], joins: &[String]) -> FoldSummary {
+        let mut f = self.summary(vec![], open, required);
+        f.raw_bytes = self.weights().values().sum();
+        f.kept = Some(self.weight_of(&felts.iter().chain(joins).cloned().collect::<Vec<_>>()));
+        f.felts = Some(felts.len() as i64);
+        f.carry_felts = Some(sorted(felts.to_vec()));
+        f.joins = joins.iter().map(|k| k.rsplit(':').next().unwrap().to_string()).collect();
+        f
+    }
+
+    /// The live session's keys.
+    fn session_keys(&self) -> Vec<String> {
+        self.weights().into_keys().collect()
+    }
+
+    /// The game's one checkpoint in the doc, laid as its base with the session it opens.
+    fn follow(&mut self) -> (String, CVal) {
+        let cks = self.cks();
+        assert_eq!(cks.len(), 1, "one checkpoint: {cks:?}");
+        let (key, v) = cks[0].clone();
+        self.base = v.clone();
+        self.ses = format!("ses:{T}:{}:{}", self.ctx.inc, hb::next_sid3(&self.ctx, &v).unwrap());
+        (key, v)
+    }
+}
+
+/// A game with nothing decided: the house's join of round 1 in, and alice's felt of round 1: (the felt's key, the
+/// join's key).
+fn fresh(name: &str) -> (Game, String, String) {
+    let mut game = Game::opened(name, "landlord");
+    game.tick(0);
+    let joins = game.records("o:1:");
+    assert_eq!(joins.len(), 1, "the house joined round 1");
+    let felt = game.slip(&who("alice"), 1);
+    (game, format!("s:1:alice:{felt}"), joins[0].0.clone())
+}
+
+/// Round 1 played, revealed by the house and trimmed to by it, carrying its reveal and the two seeds it counted, and
+/// nothing decided since: the trim's key, round 1's close, and what the trim carried (its reveal, alice's seed, bob's).
+fn trimmed(name: &str) -> (Game, String, String, Vec<String>) {
+    let mut game = Game::opened(name, "landlord");
+    let (c, _, rk, hash) = game.revealed_round_one();
+    let (xa, xb) = (game.records("x:1:alice:")[0].0.clone(), game.records("x:1:bob:")[0].0.clone());
+    let mut f = game.summary(vec![by_house(1, &c, &hash, &[&rk, &xa, &xb])], 2, Some(game.commit(2)));
+    f.kept = Some(100 * 1024);
+    f.raw_bytes = 100 * 1024;
+    game.answer(f);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+    let (key, v) = game.follow();
+    assert_eq!(v.get("u").and_then(CVal::as_int), Some(1));
+    game.no_answer();
+    game.ticks();
+    let carried = sorted(vec![rk, xa, xb]);
+    assert_eq!(game.session_keys(), carried, "the trim carried round 1's decider and seeds, and nothing joins round 2");
+    (game, key, c, carried)
+}
+
+#[test]
+fn the_sweeps_numbers_are_the_pages_twins() {
+    assert_eq!((HOUSE_SWEEP_BYTES, HOUSE_SWEEP_KEYS, HOUSE_SWEEP_MIN_MS), (48 * 1024, 2_048, 10_000));
+}
+
+#[test]
+fn junk_in_a_session_with_nothing_decided_is_swept_by_the_bases_content_signed_again_one_sweep_on() {
+    let (mut game, felt, join) = fresh("sweep-fresh");
+    let (root_key, root) = (game.ck_key(&game.base), game.base.clone());
+    let old_ses = game.ses.clone();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    assert!(f.raw_bytes - f.kept.unwrap() >= HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 0, sweeps: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    let cks = game.cks();
+    assert_eq!(cks.len(), 1, "the root ({root_key}) is gone: {cks:?}");
+    let (key, v) = &cks[0];
+    let me = game.house.public().to_string();
+    // The root's content, the session it closes, one sweep on, this house's under its delegation.
+    for k in ["v", "ok", "j", "rv", "ts", "u", "l", "n"] {
+        assert_eq!(canon_of(v.get(k).cloned()), canon_of(root.get(k).cloned()), "{k} is the root's");
+    }
+    assert_eq!(str_of(v, "b"), Some(old_ses.rsplit(':').next().unwrap()));
+    assert_eq!(v.get("w").and_then(CVal::as_int), Some(1));
+    assert_eq!(v.get("dl").and_then(hb::canon), hb::canon(&delegation(&game.owner, &me)));
+    assert_eq!(str_of(v, "k"), Some(me.as_str()));
+    let CVal::Obj(fields) = v else { panic!("no record") };
+    assert_eq!(sorted(fields.iter().map(|(k, _)| k.clone()).collect()), ["b", "dl", "g", "j", "k", "l", "n", "ok", "rv", "ts", "u", "v", "w"].map(String::from).to_vec());
+    assert!(hb::verify(&me, &hb::sign_bytes("ck", &game.ctx, &with_out(v, "g")).unwrap(), str_of(v, "g").unwrap()));
+    // The pages count from it; its session, not the junked one, holds the open felt and the join, and no junk.
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, v).unwrap());
+    assert_ne!(next, old_ses);
+    assert_eq!(game.sessions(), vec![next.clone()]);
+    game.follow();
+    assert_eq!(game.session_keys(), sorted(vec![felt.clone(), join.clone()]));
+    let rows = rows_on_disk(&game.dir);
+    assert_eq!(rows.get(&(ROOM.to_string(), T.to_string(), game.ctx.inc.clone())), Some(&(key.clone(), hb::canon(v).unwrap())));
+    // Round 1 plays on from it, on the join it carried: no second join, and the house reveals the close made on it.
+    game.no_answer();
+    game.ticks();
+    assert_eq!(game.records("o:1:").into_iter().map(|(k, _)| k).collect::<Vec<_>>(), vec![join]);
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1, "the house revealed round 1");
+    assert_eq!(canon_of(reveals[0].1.get("x").cloned()), hb::canon(&CVal::Arr(vec![s(&c)])));
+    assert_eq!(game.house.game_counts().sweeps, 1);
+}
+
+#[test]
+fn a_sweep_the_doc_lost_whole_goes_back_with_what_it_carried_and_none_of_the_junk() {
+    let (mut game, felt, join) = fresh("sweep-lost-whole");
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    game.answer(f);
+    let saved = game.saved();
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    let (key, v) = game.cks().into_iter().next().unwrap();
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    // The node stopped before it saved the room, and no page had the sweep.
+    game.stopped_before_it_saved(&saved);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "its checkpoint back");
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    assert_eq!(game.records_in(&next).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), sorted(vec![felt, join]), "the felt and the join, and no junk");
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn after_a_trim_a_sweep_signs_the_checkpoint_again_and_carries_round_us_decider_and_seeds_on() {
+    let (mut game, key, _, carried) = trimmed("sweep-trimmed");
+    let trim = game.base.clone();
+    let trim_ses = game.sid();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    let (swept, v) = game.follow();
+    assert_ne!(swept, key);
+    // The checkpoint's content (its nets, its outcome, the commitment it carried), on the session it closes, one sweep on.
+    let CVal::Obj(fields) = &trim else { panic!("no record") };
+    for (k, was) in fields.iter().filter(|(k, _)| !matches!(k.as_str(), "g" | "b")) {
+        assert_eq!(canon_of(v.get(k).cloned()), hb::canon(was), "{k} is the trim's");
+    }
+    assert_eq!(str_of(&v, "b"), Some(trim_ses.as_str()));
+    assert_eq!(v.get("w").and_then(CVal::as_int), Some(1));
+    let CVal::Obj(swept_fields) = &v else { panic!("no record") };
+    assert_eq!(sorted(swept_fields.iter().map(|(k, _)| k.clone()).collect()), sorted(fields.iter().map(|(k, _)| k.clone()).chain(["w".to_string()]).collect()));
+    assert_eq!(game.resolved_base().as_deref(), Some(swept.as_str()));
+    assert_eq!(game.session_keys(), carried);
+    // …and a second sweep carries them on again, two sweeps on.
+    game.ticks();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(HOUSE_SWEEP_MIN_MS);
+    assert_eq!(game.house.game_counts().sweeps, 2);
+    let (_, v) = game.follow();
+    assert_eq!((v.get("u").and_then(CVal::as_int), v.get("w").and_then(CVal::as_int)), (Some(1), Some(2)));
+    assert_eq!(str_of(&v, "h"), Some(game.commit(2).as_str()));
+    assert_eq!(game.session_keys(), carried);
+    // Round 2 plays on it: the house reveals the close made on the commitment it carried.
+    game.no_answer();
+    game.ticks();
+    let (c2, _, _) = game.closed(2, &game.sid(), &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    let reveals = game.records("h:2:");
+    assert_eq!(reveals.len(), 1, "the house revealed round 2");
+    assert_eq!(canon_of(reveals[0].1.get("x").cloned()), hb::canon(&CVal::Arr(vec![s(&c2)])));
+}
+
+#[test]
+fn junk_a_peer_wrote_over_a_carried_seed_is_not_carried() {
+    let (mut game, _, _, carried) = trimmed("sweep-overwritten");
+    let seed = carried.iter().find(|k| k.starts_with("x:1:bob:")).unwrap().clone();
+    game.put_in_session(&seed, Any::String("x".repeat(HOUSE_SWEEP_BYTES as usize).into()));
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    game.follow();
+    assert_eq!(game.session_keys(), carried.into_iter().filter(|k| *k != seed).collect::<Vec<_>>());
+    // (And nothing junk is left to press another.)
+    game.ticks();
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(HOUSE_SWEEP_MIN_MS + 2_400);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+}
+
+#[test]
+fn what_is_carried_is_no_junk_by_its_weight() {
+    let (mut game, _, _, carried) = trimmed("sweep-carried-weight");
+    let weight = game.weight_of(&carried);
+    assert!(weight > 500, "round 1's decider and seeds weigh {weight}");
+    // Junk a byte short of HOUSE_SWEEP_BYTES besides round 1's records (a key of 4 and a string's quotes): the session
+    // past what the fold keeps weighs more.
+    game.put_in_session("fill", Any::String("x".repeat(HOUSE_SWEEP_BYTES as usize - 1 - 6).into()));
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    assert_eq!(f.raw_bytes - f.kept.unwrap(), HOUSE_SWEEP_BYTES - 1 + weight);
+    game.answer(f);
+    game.tick(HOUSE_SWEEP_MIN_MS + 2_400);
+    assert_eq!(game.house.game_counts().sweeps, 0);
+    // A byte more is swept.
+    game.put_in_session("fill", Any::String("x".repeat(HOUSE_SWEEP_BYTES as usize - 6).into()));
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    assert_eq!(f.raw_bytes - f.kept.unwrap(), HOUSE_SWEEP_BYTES + weight);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+}
+
+#[test]
+fn a_carried_seed_written_over_is_one_junk_key_more() {
+    let (mut game, _, _, carried) = trimmed("sweep-carried-keys");
+    let seed = carried.iter().find(|k| k.starts_with("x:1:bob:")).unwrap().clone();
+    game.put_in_session(&seed, Any::Number(0.0));
+    game.nothings(HOUSE_SWEEP_KEYS as usize - 2, "a");
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    assert!(f.raw_bytes - f.kept.unwrap() < HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    game.tick(200);
+    game.tick(2_400);
+    assert_eq!(game.house.game_counts().sweeps, 0, "one junk key short");
+    game.nothings(1, "b");
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    game.follow();
+    assert_eq!(game.session_keys(), carried.into_iter().filter(|k| *k != seed).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_house_that_restarted_since_the_trim_carries_the_decider_on_and_not_what_else_lies_under_round_u() {
+    let (mut game, _, _, carried) = trimmed("sweep-restarted");
+    game.restart(SETTLE_MS);
+    game.house.read_answers_from(game.answers.clone());
+    game.junk(HOUSE_SWEEP_BYTES);
+    let start = game.now;
+    while game.house.game_counts().sweeps == 0 {
+        assert!(game.now - start < SETTLE_MS + 5_000, "never swept");
+        game.tick(200);
+        if game.house.fold_plan(ROOM).is_some_and(|p| !p.games.is_empty()) {
+            let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+            game.answer(f);
+        }
+    }
+    game.follow();
+    let decider: Vec<String> = carried.into_iter().filter(|k| k.starts_with("h:1:")).collect();
+    assert_eq!(decider.len(), 1);
+    assert_eq!(game.session_keys(), decider);
+}
+
+#[test]
+fn at_most_one_sweep_per_house_sweep_min_ms() {
+    let (mut game, felt, join) = fresh("sweep-often");
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    let at = game.now;
+    game.follow();
+    game.ticks();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    game.answer(f);
+    while game.now - at < HOUSE_SWEEP_MIN_MS - 200 {
+        game.tick(200);
+    }
+    assert_eq!(game.house.game_counts().sweeps, 1, "junk again at once waits");
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 2);
+    let (key, v) = game.follow();
+    assert_eq!((v.get("u").and_then(CVal::as_int), v.get("w").and_then(CVal::as_int)), (Some(0), Some(2)));
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn junk_just_short_of_house_sweep_bytes_is_left_however_long_and_an_idle_session_with_nothing_decided_is_not_swept() {
+    let (mut game, felt, join) = fresh("sweep-short");
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    game.put_in_session("fill", Any::String("x".repeat((HOUSE_SWEEP_BYTES - (f.raw_bytes - f.kept.unwrap()) - 3_000) as usize).into()));
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    assert!(f.raw_bytes - f.kept.unwrap() < HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    let start = game.now;
+    while game.now - start < HOUSE_IDLE_MS + 5_000 {
+        game.tick(1_000);
+    }
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    game.junk(4_000);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt], &[join]);
+    assert!(f.raw_bytes - f.kept.unwrap() >= HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+}
+
+#[test]
+fn keys_of_nothing_are_swept_at_house_sweep_keys_though_they_weigh_little() {
+    let (mut game, felt, join) = fresh("sweep-keys");
+    game.nothings(HOUSE_SWEEP_KEYS as usize - 1, "a");
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    assert!(f.raw_bytes - f.kept.unwrap() < HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    game.tick(200);
+    game.tick(2_400);
+    assert_eq!(game.house.game_counts().sweeps, 0, "one short");
+    game.nothings(1, "b");
+    let f = game.unswept(1, Some(game.commit(1)), &[felt.clone()], &[join.clone()]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    game.follow();
+    assert_eq!(game.session_keys(), sorted(vec![felt, join]));
+}
+
+#[test]
+fn no_sweep_while_a_close_of_the_open_round_is_in_and_once_it_is_decided_the_trim_sweeps() {
+    let mut game = Game::opened("sweep-close", "landlord");
+    let (c, _, _) = game.closed_on_the_join();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let mut f = game.unswept(1, Some(game.commit(1)), &[], &[]);
+    f.rounds = vec![round(1, &c)];
+    f.tip = Some(1);
+    game.answer(f);
+    game.tick(200);
+    game.tick(2_800);
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    game.seeds(1);
+    game.ticks();
+    let (rk, _) = game.records("h:1:").into_iter().next().expect("the house revealed round 1");
+    let hash = rk.rsplit(':').next().unwrap().to_string();
+    let mut f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    f.rounds = vec![by_house(1, &c, &hash, &[&rk])];
+    game.answer(f);
+    game.tick(200);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 });
+    let (_, v) = game.follow();
+    assert_eq!((v.get("u").and_then(CVal::as_int), str_of(&v, "l")), (Some(1), Some(c.as_str())));
+    assert!(v.get("w").is_none());
+}
+
+#[test]
+fn a_frozen_slip_its_reveal_counted_deleted_holds_the_sweep_for_the_wait_and_back_the_round_is_trimmed_to() {
+    let mut game = Game::opened("sweep-deleted-slip", "landlord");
+    let (c, _, rk, hash) = game.revealed_round_one();
+    let root = game.ck_key(&game.base);
+    let alice = game.records("s:1:alice:")[0].clone();
+    game.delete_in_session(&alice.0);
+    game.junk(HOUSE_SWEEP_BYTES);
+    // (Off the chain: no round decided, no close in.)
+    let f = game.unswept(1, Some(game.commit(1)), &[], &[]);
+    game.answer(f);
+    let start = game.now;
+    while game.now - start < 28_000 {
+        game.tick(1_000);
+    }
+    assert_eq!(game.house.game_counts(), GameCounts::default(), "a sweep would void the round for good");
+    assert_eq!(game.cks().into_iter().map(|(k, _)| k).collect::<Vec<_>>(), vec![root]);
+    // A witness puts it back: the round is decided again, and the junk presses its trim.
+    game.put_in_session(&alice.0, to_any(&alice.1));
+    let mut f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    f.rounds = vec![by_house(1, &c, &hash, &[&rk])];
+    game.answer(f);
+    game.tick(200);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 1, sweeps: 0, cross_check_mismatches: 0, row_put_backs: 0 });
+    let (_, v) = game.follow();
+    assert_eq!((v.get("u").and_then(CVal::as_int), str_of(&v, "l"), str_of(&v, "d")), (Some(1), Some(c.as_str()), Some(format!("h:{hash}").as_str())));
+}
+
+#[test]
+fn a_frozen_slip_nobody_puts_back_for_the_wait_leaves_the_junked_session_to_be_swept() {
+    let mut game = Game::opened("sweep-deleted-for-good", "landlord");
+    game.revealed_round_one();
+    let alice = game.records("s:1:alice:")[0].0.clone();
+    game.delete_in_session(&alice);
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[], &[]);
+    game.answer(f);
+    let start = game.now;
+    while game.now - start < 29_000 {
+        game.tick(1_000);
+    }
+    assert_eq!(game.house.game_counts().sweeps, 0);
+    while game.now - start < 32_000 {
+        game.tick(1_000);
+    }
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    let (_, v) = game.follow();
+    assert_eq!((v.get("u").and_then(CVal::as_int), v.get("w").and_then(CVal::as_int)), (Some(0), Some(1)));
+}
+
+#[test]
+fn no_sweep_of_a_base_under_the_round_the_holder_it_serves_holds_the_game_from() {
+    let (mut game, felt, join) = fresh("sweep-from");
+    // Handed to the buyer from round 1, who delegates this house: the root is the seller's.
+    let buyer = who("buyer");
+    game.transfer(&buyer, 1);
+    game.put_top(&format!("hk:{}", game.house.public()), &delegation(&buyer, game.house.public()));
+    game.ticks();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt], &[join]);
+    game.answer(f);
+    game.tick(200);
+    game.tick(2_400);
+    assert!(game.untrimmed());
+    assert_eq!(game.house.game_counts(), GameCounts::default(), "and no checkpoint is made to be refused");
+}
+
+#[test]
+fn a_sweep_it_cannot_note_on_disk_is_not_written() {
+    let (mut game, felt, join) = fresh("sweep-disk");
+    std::fs::create_dir_all(game.dir.join(ROWS_FILE)).unwrap();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt], &[join]);
+    game.answer(f);
+    game.tick(200);
+    assert!(game.untrimmed());
+    assert_eq!(game.house.game_counts(), GameCounts::default());
+    // (Nor is the time it did not sweep counted against the next.)
+    std::fs::remove_dir_all(game.dir.join(ROWS_FILE)).unwrap();
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+}
+
+#[test]
+fn the_cross_check_refuses_a_sweep_that_does_not_hold_what_its_base_holds() {
+    type Fault = Box<dyn FnMut(&mut Vec<(String, CVal)>) + Send>;
+    let set = |k: &'static str, v: CVal| -> Fault {
+        Box::new(move |b: &mut Vec<(String, CVal)>| {
+            b.retain(|(f, _)| f != k);
+            b.push((k.to_string(), v.clone()));
+        })
+    };
+    let me = Game::opened("sweep-cross-key", "landlord").house.public().to_string();
+    let faults: Vec<(&str, Fault)> = vec![
+        ("b", set("b", s(&"f".repeat(24)))),
+        ("w", set("w", CVal::Int(2))),
+        ("w gone", Box::new(|b: &mut Vec<(String, CVal)>| b.retain(|(f, _)| f != "w"))),
+        ("n", set("n", obj(vec![("alice", s("1000"))]))),
+        ("o", set("o", CVal::Int(5))),
+        ("h", set("h", s(&"e".repeat(64)))),
+        ("u", set("u", CVal::Int(2))),
+        ("k", set("k", s(&who("buyer").public))),
+        ("dl", set("dl", delegation(&who("buyer"), &me))),
+        ("x", set("x", CVal::Arr(vec![s("xf")]))),
+        ("e", set("e", CVal::Int(1))),
+    ];
+    for (name, fault) in faults {
+        let (mut game, key, _, _) = trimmed(&format!("sweep-cross-{}", name.replace(' ', "-")));
+        game.house.fault_trim = Some(fault);
+        game.junk(HOUSE_SWEEP_BYTES);
+        let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+        game.answer(f);
+        game.tick(200);
+        game.tick(2_400);
+        let counts = game.house.game_counts();
+        assert_eq!(counts.sweeps, 0, "{name}");
+        assert!(counts.cross_check_mismatches >= 1, "{name}");
+        assert_eq!(game.cks().into_iter().map(|(k, _)| k).collect::<Vec<_>>(), vec![key.clone()], "{name}");
+        assert_eq!(rows_on_disk(&game.dir).values().map(|(k, _)| k.clone()).collect::<Vec<_>>(), vec![key.clone()], "{name}: the trim's row");
+        game.house.fault_trim = None;
+        game.tick(200);
+        assert_eq!(game.house.game_counts().sweeps, 1, "{name}: then swept");
+    }
+}
+
+#[test]
+fn a_sweep_at_the_round_of_a_hand_over_is_the_new_holders_and_carries_the_transfer() {
+    let (mut game, felt, join) = fresh("sweep-at-xf");
+    let buyer = who("buyer");
+    let xf = game.transfer(&buyer, 0);
+    let me = game.house.public().to_string();
+    game.put_top(&format!("hk:{me}"), &delegation(&buyer, &me));
+    game.ticks();
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(1, Some(game.commit(1)), &[felt], &[join]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts(), GameCounts { trims: 0, sweeps: 1, cross_check_mismatches: 0, row_put_backs: 0 });
+    let (key, v) = game.follow();
+    assert_eq!(v.get("dl").and_then(hb::canon), hb::canon(&delegation(&buyer, &me)), "by the delegation it serves the buyer by");
+    assert_eq!(v.get("x").map(|x| x.as_arr().unwrap().iter().filter_map(hb::canon).collect::<Vec<_>>()), Some(vec![hb::canon(&xf).unwrap()]), "the chain's transfer");
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn the_house_sweeps_a_game_from_the_bundled_folds_own_answer_and_the_fold_reads_the_game_as_before() {
+    for letter in ['p', 'q'] {
+        let mut game = Game::opened_as(&format!("sweep-folded-{letter}"), "landlord", letter);
+        game.tick(0);
+        game.slip(&who("alice"), 1);
+        game.ticks();
+        let clean = game.folded();
+        assert!(!clean.pending, "{letter}");
+        assert_eq!((clean.felts, clean.joins.len()), (Some(1), 1), "{letter}: alice's felt and the house's join");
+        game.junk(HOUSE_SWEEP_BYTES);
+        let f = game.folded();
+        assert_eq!(f.raw_bytes - f.kept.unwrap(), clean.raw_bytes - clean.kept.unwrap() + game.weight_of(&game.session_keys().into_iter().filter(|k| k.starts_with("junk-")).collect::<Vec<_>>()), "{letter}: the junk weighs as the fold weighs it");
+        game.answer(f);
+        game.tick(200);
+        assert_eq!(game.house.game_counts(), GameCounts { trims: 0, sweeps: 1, cross_check_mismatches: 0, row_put_backs: 0 }, "{letter}");
+        let (key, _) = game.follow();
+        assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()), "{letter}");
+        game.ticks();
+        let after = game.folded();
+        assert!(!after.pending, "{letter}");
+        assert_eq!(after.raw_bytes - after.kept.unwrap(), 0, "{letter}: no junk left");
+        assert_eq!((&after.nets, after.open, &after.required, &after.carry, &after.joins, after.felts), (&clean.nets, clean.open, &clean.required, &clean.carry, &clean.joins, clean.felts), "{letter}");
+    }
+}
+
+#[cfg(feature = "house-fold")]
+#[test]
+fn what_a_sweep_carries_weighs_as_the_bundled_fold_weighs_it() {
+    let (mut game, _, _, carried) = trimmed("sweep-folded-carried");
+    let clean = game.folded();
+    assert!(!clean.pending);
+    let weight = game.weight_of(&carried);
+    assert_eq!(clean.raw_bytes - clean.kept.unwrap(), weight, "the fold keeps none of round 1's records, and weighs them as the house does");
+    game.put_in_session("fill", Any::String("x".repeat(HOUSE_SWEEP_BYTES as usize - 100 - 6).into()));
+    let f = game.folded();
+    assert!(f.raw_bytes - f.kept.unwrap() >= HOUSE_SWEEP_BYTES);
+    game.answer(f);
+    game.tick(HOUSE_SWEEP_MIN_MS);
+    assert_eq!(game.house.game_counts().sweeps, 0);
+    game.put_in_session("more", Any::String("x".repeat(200).into()));
+    let f = game.folded();
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    game.follow();
+    assert_eq!(game.session_keys(), carried);
+}
+
+#[test]
+fn what_a_trim_or_a_sweep_carries_is_none_where_the_ticks_reads_run_out_on_it_never_less() {
+    // 🔒 Each record a trim or a sweep carries is read at its cost. Where the tick's reads run out on one, it carries
+    // none this pass (it waits for the next), never those read before it: a checkpoint signed with less would leave a
+    // felt or a join behind in the session it closes.
+    let mut game = Game::opened("copies-spent", "landlord");
+    let (carol, dave, join) = (format!("s:2:carol:{}", "ab".repeat(16)), format!("s:2:dave:{}", "cd".repeat(16)), "ef".repeat(16));
+    let joined = format!("o:2:{join}");
+    for k in [&carol, &dave, &joined] {
+        game.put_in_session(k, to_any(&obj(vec![("r", CVal::Int(2))])));
+    }
+    let mut f = game.summary(vec![], 2, None);
+    f.carry_felts = Some(vec![carol.clone(), dave.clone()]);
+    f.joins = vec![join];
+    let txn = game.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(ses)) = comp.get(&txn, &game.ses) else { panic!("the session") };
+    let keys = |c: Vec<(String, CVal)>| c.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+    // The reads last: all three, each once.
+    game.house.read_left = usize::MAX;
+    let all = game.house.copies_of(&txn, &ses, &f, std::slice::from_ref(&carol));
+    assert_eq!(all.map(keys), Some(vec![carol.clone(), dave.clone(), joined]));
+    // (What carol's felt costs a tick's reads.)
+    let mut first = f.clone();
+    first.carry_felts = Some(vec![carol.clone()]);
+    first.joins = vec![];
+    (game.house.read_left, game.house.read_out) = (1 << 20, false);
+    assert_eq!(game.house.copies_of(&txn, &ses, &first, &[]).map(keys), Some(vec![carol.clone()]));
+    let cost = (1 << 20) - game.house.read_left;
+    // Reads for carol's felt and not dave's: none.
+    (game.house.read_left, game.house.read_out) = (cost, false);
+    assert_eq!(game.house.copies_of(&txn, &ses, &f, &[]), None, "the next pass");
+    assert!(game.house.read_out);
+}
+
+#[test]
+fn what_a_sweep_carries_of_round_u_is_none_where_the_ticks_reads_run_out_on_it_never_less() {
+    // 🔒 The same of round u's records, which a sweep reads before it signs: where the tick's reads run out on one, the
+    // sweep waits for the next pass. With less, it would sign without the decider and count the record left as junk.
+    let (mut game, _, _, carried) = trimmed("sweep-carried-spent");
+    let weight = game.weight_of(&carried);
+    let txn = game.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(ses)) = comp.get(&txn, &game.ses) else { panic!("the session") };
+    // The reads last: each record, and what they weigh as the fold weighs them.
+    game.house.read_left = usize::MAX;
+    assert_eq!(game.house.carried_in(&txn, &ses, carried.clone()), Some((carried.clone(), weight)));
+    // (What the first costs a tick's reads.)
+    (game.house.read_left, game.house.read_out) = (1 << 20, false);
+    assert_eq!(game.house.carried_in(&txn, &ses, carried[..1].to_vec()).map(|(c, _)| c), Some(carried[..1].to_vec()));
+    let cost = (1 << 20) - game.house.read_left;
+    // Reads for the first and not the rest: none.
+    (game.house.read_left, game.house.read_out) = (cost, false);
+    assert_eq!(game.house.carried_in(&txn, &ses, carried.clone()), None, "the next pass");
+    assert!(game.house.read_out);
+}
+
+#[test]
+fn a_sweep_carries_what_the_last_trim_noted_only_on_the_base_it_noted_it_for() {
+    // 🔒 What the last trim or sweep carried is noted with the checkpoint it signed. Under any other base (one another
+    // house signed since, or one put back), a sweep goes by that base: the decider it names, alone.
+    let (mut game, key, _, carried) = trimmed("sweep-other-base");
+    let at = (T.to_string(), game.ctx.inc.clone());
+    let mem = game.house.rooms.get_mut(ROOM).unwrap().tables.get_mut(&at).unwrap();
+    let noted = mem.carried.clone().map(|(k, keys)| (k, sorted(keys)));
+    assert_eq!(noted, Some((key.clone(), carried.clone())), "noted with the trim's checkpoint");
+    mem.carried = Some((format!("{key}0"), carried.clone()));
+    game.junk(HOUSE_SWEEP_BYTES);
+    let f = game.unswept(2, Some(game.commit(2)), &[], &[]);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().sweeps, 1);
+    game.follow();
+    let decider: Vec<String> = carried.into_iter().filter(|k| k.starts_with("h:1:")).collect();
+    assert_eq!(decider.len(), 1);
+    assert_eq!(game.session_keys(), decider);
 }
