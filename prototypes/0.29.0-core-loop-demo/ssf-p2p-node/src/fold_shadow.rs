@@ -1350,6 +1350,7 @@ impl<L: Launch> FoldShadow<L> {
             // (The house's, which the node's pass puts in: main.rs `fold_shadow_pass`.)
             trims: 0,
             sweeps: 0,
+            ends: 0,
             cross_check_mismatches: 0,
             row_put_backs: 0,
             off: self.sup.off().map(str::to_string),

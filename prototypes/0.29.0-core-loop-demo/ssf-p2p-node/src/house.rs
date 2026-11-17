@@ -753,10 +753,11 @@ pub enum Write {
     /// 🔒 A top-level key deleted: a FAIR ONLY game's forged record (its own signature fails under the key it claims,
     /// design-final section 8.4 P7, as the pages delete them).
     Delete { key: String },
-    /// 🔒 A FAIR ONLY game's trim (design-final section 8.5 N3), in one transaction: its checkpoint `key` (where nothing is
-    /// under the key yet), every key in `gone` deleted but that one (the game's other checkpoints and its sessions), and
-    /// the session the checkpoint opens, `ses`, made anew with `copies` in it.
-    Trim { key: String, value: CVal, gone: Vec<String>, ses: String, copies: Vec<(String, CVal)> },
+    /// 🔒 A FAIR ONLY game's trim (design-final section 8.5 N3), sweep (N3s) or end (N6), in one transaction: its
+    /// checkpoint `key` (where nothing is under the key yet), every key in `gone` deleted but that one (the game's other
+    /// checkpoints and its sessions), and the session the checkpoint opens, `ses`, made anew with `copies` in it. An end
+    /// opens none.
+    Trim { key: String, value: CVal, gone: Vec<String>, ses: Option<String>, copies: Vec<(String, CVal)> },
     /// 🔒 A FAIR ONLY game's last checkpoint this house signed, put back from its row (design-final section 8.5 N5): with
     /// `ck`, the checkpoint under `key`; and with `ses` (the session it opens, the session it closed, and what its trim
     /// carried), that session made, where the doc holds no map under its key, with each record its trim carried that the
@@ -1006,13 +1007,14 @@ struct Kept {
 
 type VerdictId = (&'static str, [String; 3], String);
 
-/// 🔒 What the house did at FAIR ONLY games, for the fingerprint: trims written, sweeps written, trims and sweeps its
-/// cross-check refused to sign (the fold's answer disagreed with what the house knows of the round, a sweep did not hold
-/// what its base holds, or the checkpoint would not read as the game's base), and its checkpoints put back.
+/// 🔒 What the house did at FAIR ONLY games, for the fingerprint: trims written, sweeps written, ends written, the ones
+/// its cross-check refused to sign (the fold's answer disagreed with what the house knows of the round, a sweep did not
+/// hold what its base holds, or the checkpoint would not read as the game's base), and its checkpoints put back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GameCounts {
     pub trims: u64,
     pub sweeps: u64,
+    pub ends: u64,
     pub cross_check_mismatches: u64,
     pub row_put_backs: u64,
 }
@@ -2725,10 +2727,11 @@ impl House {
                 short!(Some(current));
             }
             self.table_duties(room, &read, res.fin.is_some(), now, writes, Some(&view));
-            // 🔒 The trim (design-final section 8.5 N3), at a game it serves now, while no end order stands. Not from a doc
-            // that holds part of an update: a close, or a frozen slip a page is putting back, may be in the part to come,
-            // and a trim deletes the session it would land in. What it waits for it waits for afresh after.
-            if let (true, None, ha::HouseBy::Yes { value: dl, .. }) = (current, res.fin.as_ref(), &by_now) {
+            // 🔒 The trim (design-final section 8.5 N3) at a game it serves now, or its end (N6) once an end order stands.
+            // Not from a doc that holds part of an update: a close, or a frozen slip a page is putting back, may be in the
+            // part to come, and a trim or an end deletes the session it would land in. What it waits for it waits for
+            // afresh after.
+            if let (true, ha::HouseBy::Yes { value: dl, .. }) = (current, &by_now) {
                 if partial {
                     if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
                         mem.waits.clear();
@@ -2742,7 +2745,18 @@ impl House {
                     gone.dedup();
                     let x: Vec<CVal> = res.chain.iter().skip(1).filter_map(|h| h.step.as_ref().map(|s| s.xf.clone())).collect();
                     let g = TrimOf { base, dl, x, from: res.chain[last].from, spans: &spans, gone };
-                    if self.trim_duty(room, txn, comp, &read, &g, now, writes) == Trimmed::Wait {
+                    let queued = writes.len();
+                    let duty = match res.fin.as_ref() {
+                        None => self.trim_duty(room, txn, comp, &read, &g, now, writes),
+                        Some(fin) => self.end_duty(room, &read, &g, fin, now, writes),
+                    };
+                    // 🔒 (Its row's checkpoint, gone from the doc, goes back at the put-back's turn, written after this: a
+                    // trim, a sweep or an end it queued over it supersedes it, and its put-back would lay it and its session
+                    // again beside the new one. Nobody tidies an ended game after.)
+                    if writes[queued..].iter().any(|w| matches!(w, Write::Trim { .. })) {
+                        reput.retain(|w| !matches!(w, Write::Restore { key, .. } if *key == base.key));
+                    }
+                    if duty == Trimmed::Wait {
                         short!(Some(current));
                     }
                 }
@@ -3798,7 +3812,122 @@ impl House {
             mem.waits.clear();
             mem.carried = Some((ck_key.clone(), carried));
         }
-        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: format!("ses:{}:{}:{next}", ctx.t, ctx.inc), copies });
+        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: Some(format!("ses:{}:{}:{next}", ctx.t, ctx.inc)), copies });
+        Trimmed::Done
+    }
+
+    /// 🔒 The end of FAIR ONLY game `read`, whose end order `fin` stands (design-final section 8.5 N6; computedSimHouse.ts
+    /// `endDuty`; its other half, reveals with no next commitment, the step-down and no join, is the table duties'). With
+    /// no round in flight (no tip, no close of the open round in: what the holder's page waits for too), an ended
+    /// checkpoint embedding the order, with the fold's nets and no carry, commitment or sweep count: at the last decided
+    /// round D past the base, under a trim's conditions but its pressure (D decided by this house's own reveal or a
+    /// bettor's abandon, every decided round's frozen slips in or missing for [`MISSING_WAIT_MS`], [`HOUSE_TRIM_AFTER_MS`]
+    /// since D was decided), else at the base's round with the base's `l`, `d` and `o`, at once. Never under the round the
+    /// holder it serves by holds the game from (S1). Cross-checked as a trim is, on disk first as a trim is. Then
+    /// [`Write::Trim`] with no next session: the game's sessions and lower checkpoints go, the holder's own end at a lower
+    /// round among them (the B4 race).
+    fn end_duty(&mut self, room: &str, read: &TableRead, g: &TrimOf, fin: &CVal, now: u64, writes: &mut Vec<Write>) -> Trimmed {
+        let ctx = &read.ctx;
+        let key = (ctx.t.clone(), ctx.inc.clone());
+        let base_u = read.base_u;
+        // (Nothing of its own into the session it would close, this pass: the doc does not hold it yet.)
+        if writes.iter().any(|w| matches!(w, Write::Session { ses, .. } if *ses == read.ses_key)) {
+            return Trimmed::Done;
+        }
+        // A tick that has no answer of the session as it reads it forgets what it waited for, as a trim's.
+        let Some(answer) = self.answer_for(room, read, g) else {
+            if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
+                mem.waits.clear();
+            }
+            return Trimmed::Done;
+        };
+        let f = &answer.summary;
+        let done = self.last_of(ctx).cloned();
+        let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) else { return Trimmed::Done };
+        mem.kept = f.kept.unwrap_or(0);
+        // (Noted at every answer checked, a round in flight or not, as a trim's.)
+        let waits = waits_on(mem, done.as_ref(), base_u, &read.ses_key, &f.rounds, now);
+        self.waits_noted.insert(key.clone());
+        // (A round in flight: its tip, or a close of the open round in. An answer that does not say counts as one.)
+        if f.tip.is_some() || f.open_closes.as_ref().is_none_or(|c| !c.is_empty()) || waits {
+            return Trimmed::Done;
+        }
+        let past = f.rounds.iter().rev().find(|v| v.decided.is_some()).filter(|d| d.r > base_u);
+        // 🔒 (No end under the round its delegator holds the game from, S1: the end waits for a decided round at or past
+        // it, as the holder's page waits.)
+        if past.map_or(base_u, |d| d.r) < g.from {
+            return Trimmed::Done;
+        }
+        let mut own: Option<Kept> = None;
+        if let Some(d) = past {
+            if let Some(hash) = &d.house {
+                let Some(done) = done.as_ref().filter(|done| done.d.as_ref() == Some(&(d.r, d.close.clone()))) else { return Trimmed::Done };
+                let key = format!("h:{}:{hash}", d.r);
+                own = done.kept.iter().find(|k| k.ses == read.ses_key && k.key == key).cloned();
+                if own.is_none() {
+                    return Trimmed::Done;
+                }
+            } else if d.abandon.is_none() {
+                return Trimmed::Done;
+            }
+            let at = *mem.decided_at.entry(d.close.clone()).or_insert(now);
+            if now.saturating_sub(at) < HOUSE_TRIM_AFTER_MS {
+                return Trimmed::Done;
+            }
+        }
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut body = end_body(&g.base.ck, f, past, craps_inc(&ctx.inc), g, fin, &self.key.public);
+        #[cfg(test)]
+        if let Some(fault) = self.fault_trim.as_mut() {
+            fault(&mut body);
+        }
+        // The cross-check, before it signs: the session it closes, the round it ends at, no more players than a game
+        // holds, nothing that hands the game on (a carry, a commitment, a sweep count), and the round as its own reveal
+        // decided it.
+        let field = |k: &str| body.iter().find(|(f, v)| f == k && *v != CVal::Undef).map(|(_, v)| v);
+        let sid = read.ses_key.rsplit(':').next().unwrap_or("");
+        let nets = match field("n") {
+            Some(CVal::Obj(n)) => n.len(),
+            _ => usize::MAX,
+        };
+        let mut agrees = field("b").and_then(CVal::as_str) == Some(sid)
+            && field("u").and_then(CVal::as_int) == Some(past.map_or(base_u, |d| d.r))
+            && nets <= ha::MAX_TABLE_PIDS
+            && ["s", "h", "w"].iter().all(|k| field(k).is_none());
+        if let (Some(own), Some(done)) = (&own, &done) {
+            let own_hash = hb::rec_hash(&own.rec).map(|h| format!("h:{h}"));
+            agrees &= field("l").and_then(CVal::as_str) == done.d.as_ref().map(|(_, x)| x.as_str()) && field("d").and_then(CVal::as_str) == own_hash.as_deref();
+        }
+        let sealed = if agrees {
+            match self.seal_as_base(room, ctx, g, body) {
+                None => return Trimmed::Wait,
+                Some(sealed) => sealed,
+            }
+        } else {
+            None
+        };
+        let Some((ck_key, value)) = sealed else {
+            self.counts.cross_check_mismatches += 1;
+            return Trimmed::Done;
+        };
+        // On disk first, as a trim's.
+        let row = (room.to_string(), ctx.t.clone(), ctx.inc.clone());
+        let was = self.rows.insert(row.clone(), Row { key: ck_key.clone(), value: value.clone(), copies: vec![] });
+        if let Some(path) = &self.rows_path {
+            if let Err(e) = write_rows(path, &self.rows) {
+                eprintln!("🏠 house: cannot write {}: {e} — not ending {}", path.display(), ctx.t);
+                match was {
+                    Some(w) => self.rows.insert(row, w),
+                    None => self.rows.remove(&row),
+                };
+                return Trimmed::Done;
+            }
+        }
+        self.counts.ends += 1;
+        if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
+            mem.carried = None;
+        }
+        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: None, copies: vec![] });
         Trimmed::Done
     }
 
@@ -3900,7 +4029,7 @@ impl House {
             mem.waits.clear();
             mem.carried = Some((ck_key.clone(), carried));
         }
-        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: format!("ses:{}:{}:{next}", ctx.t, ctx.inc), copies });
+        writes.push(Write::Trim { key: ck_key, value, gone: g.gone.clone(), ses: Some(format!("ses:{}:{}:{next}", ctx.t, ctx.inc)), copies });
         Trimmed::Done
     }
 
@@ -3990,6 +4119,44 @@ fn trim_body(b: &CVal, f: &crate::fold_summary::FoldSummary, d: &RoundSummary, c
     if let Some(h) = &f.required {
         body.push(("h".to_string(), CVal::Str(h.clone())));
     }
+    body.push(("dl".to_string(), g.dl.clone()));
+    if !g.x.is_empty() {
+        body.push(("x".to_string(), CVal::Arr(g.x.clone())));
+    }
+    body.push(("k".to_string(), CVal::Str(me.to_string())));
+    body
+}
+
+/// 🔒 The body of a FAIR ONLY game's end (computedSimHouse.ts `endDuty`), from its base `b`, the fold's answer `f` and
+/// the order `fin`: the name's inputs from the base; the session it closes; at the last decided round D past the base,
+/// D's round, close, how it was decided and its outcome as a trim's, else the base's; the nets; `e: 1`, the order, the
+/// delegation this house serves the game by, the chain's transfers, and this house's key. No carry, commitment or sweep
+/// count: nothing goes on. Unsigned.
+fn end_body(b: &CVal, f: &crate::fold_summary::FoldSummary, past: Option<&RoundSummary>, craps: bool, g: &TrimOf, fin: &CVal, me: &str) -> Vec<(String, CVal)> {
+    let from_base = |k: &str| (k.to_string(), b.get(k).cloned().unwrap_or(CVal::Undef));
+    let mut body = vec![("v".to_string(), CVal::Int(1)), from_base("ok"), from_base("j"), from_base("rv"), from_base("ts")];
+    body.push(("b".to_string(), CVal::Str(f.base.sid.clone())));
+    match past {
+        Some(d) => {
+            body.push(("u".to_string(), CVal::Int(d.r)));
+            body.push(("l".to_string(), CVal::Str(d.close.clone())));
+            let how = match (&d.house, &d.abandon) {
+                (Some(h), _) => CVal::Str(format!("h:{h}")),
+                (None, Some(z)) => CVal::Str(format!("z:{z}")),
+                (None, None) => CVal::Undef,
+            };
+            body.push(("d".to_string(), how));
+            // (A round a house reveal voided, counting nobody, has no outcome.)
+            if d.decided.as_deref() == Some("house") {
+                let o = if craps { d.dice.map(|[a, b]| CVal::Arr(vec![CVal::Int(a), CVal::Int(b)])) } else { d.pocket.map(CVal::Int) };
+                body.push(("o".to_string(), o.unwrap_or(CVal::Undef)));
+            }
+        }
+        None => body.extend(["u", "l", "d", "o"].map(from_base)),
+    }
+    body.push(("n".to_string(), CVal::Obj(f.nets.iter().map(|(pid, net)| (pid.clone(), CVal::Str(net.clone()))).collect())));
+    body.push(("e".to_string(), CVal::Int(1)));
+    body.push(("f".to_string(), fin.clone()));
     body.push(("dl".to_string(), g.dl.clone()));
     if !g.x.is_empty() {
         body.push(("x".to_string(), CVal::Arr(g.x.clone())));
@@ -4232,9 +4399,11 @@ fn apply(txn: &mut TransactionMut, writes: &[Write]) -> Option<Vec<u8>> {
                 for k in gone.iter().filter(|k| *k != key) {
                     comp.remove(txn, k);
                 }
-                let next = comp.insert(txn, ses.as_str(), yrs::MapPrelim::default());
-                for (k, v) in copies {
-                    next.insert(txn, k.as_str(), to_any(v));
+                if let Some(ses) = ses {
+                    let next = comp.insert(txn, ses.as_str(), yrs::MapPrelim::default());
+                    for (k, v) in copies {
+                        next.insert(txn, k.as_str(), to_any(v));
+                    }
                 }
             }
             Write::Restore { key, value, ck, ses } => {
@@ -4363,7 +4532,8 @@ fn dir_of(path: &std::path::Path) -> &std::path::Path {
 /// 🔒 The write that puts `row` back ([`Write::Restore`]): its checkpoint (with `ck`), and the session it opens with what
 /// its trim carried.
 fn restore_of(ctx: &Ctx, row: &Row, ck: bool) -> Write {
-    let ses = hb::next_sid3(ctx, &row.value).zip(str_of(&row.value, "b"));
+    // (An end opens none.)
+    let ses = hb::next_sid3(ctx, &row.value).zip(str_of(&row.value, "b")).filter(|_| row.value.get("e").is_none());
     let ses = ses.map(|(next, closed)| (format!("ses:{}:{}:{next}", ctx.t, ctx.inc), format!("ses:{}:{}:{closed}", ctx.t, ctx.inc), row.copies.clone()));
     Write::Restore { key: row.key.clone(), value: row.value.clone(), ck, ses }
 }
