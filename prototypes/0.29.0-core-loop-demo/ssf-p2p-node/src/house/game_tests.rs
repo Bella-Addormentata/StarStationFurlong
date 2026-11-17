@@ -504,6 +504,58 @@ fn a_last_word_it_cannot_note_on_disk_is_said_at_the_tick_that_can() {
 }
 
 #[test]
+fn a_last_word_at_a_game_held_is_said_once_the_hold_is_over() {
+    // 🔒 A game it holds state of, held at its last word (a record under its keys no reader can tell): nothing there
+    // that tick, and its last word stays due; the record gone, the commitment is lifted.
+    let mut game = Game::new("off-held");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    let junk = game.unreadable();
+    game.house.serve_fair_only(false);
+    for _ in 0..3 {
+        assert!(!game.tick(200).short);
+    }
+    assert!(game.records("h:").is_empty(), "held");
+    game.delete_top(&junk);
+    game.ticks();
+    let downs = game.records("h:1:");
+    assert_eq!(downs.len(), 1);
+    assert!(strs(&downs[0].1, "x").is_empty());
+    game.house.games_looked.clear();
+    for _ in 0..3 {
+        assert_eq!(game.tick(1_000).wrote, 0);
+    }
+    assert!(game.house.games_looked.is_empty(), "said: no game read: {:?}", game.house.games_looked);
+}
+
+#[test]
+fn a_game_it_holds_no_state_of_held_does_not_keep_its_last_word_due() {
+    // 🔒 Nothing of its own can wait there: a hold of another house's game, for as long as it lasts, keeps the house
+    // reading none of the games once its last word is said.
+    let mut game = Game::new("off-held-other");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    let other = House::open(&[9u8; 32], None).unwrap();
+    let (ctx2, _) = game.second_game("roulette-3", other.public());
+    let junk = format!("xf:{}:{}:{}", ctx2.t, ctx2.inc, "cd".repeat(16));
+    let mut pad: HashMap<String, Any> = HashMap::new();
+    for i in 0..1_200 {
+        pad.insert(format!("pad{i:04}"), Any::Undefined);
+    }
+    game.put_top_any(&junk, Any::Map(Arc::new(pad)));
+    game.ticks();
+    assert!(game.house.rooms[ROOM].tables.get(&(ctx2.t.clone(), ctx2.inc.clone())).is_some(), "the other game read");
+    game.house.serve_fair_only(false);
+    game.ticks();
+    assert_eq!(game.records("h:1:").len(), 1, "its last word");
+    game.house.games_looked.clear();
+    for _ in 0..3 {
+        assert_eq!(game.tick(1_000).wrote, 0);
+    }
+    assert!(game.house.games_looked.is_empty(), "said: no game read: {:?}", game.house.games_looked);
+}
+
+#[test]
 fn told_to_stop_past_a_closes_grace_short_of_its_seeds_it_still_reveals_nothing() {
     // 🔒 Serving, it would reveal the round at the end of the grace with the seeds it saw (the missing ones forfeit).
     // Stepping down it reveals only a round whose seeds are all in, as at the node's stop.

@@ -898,8 +898,9 @@ struct RoomMem {
     /// and steps down at each as the node's stop does ([`House::begin_step_down`]): it reveals a close whose seeds are
     /// all in with no next commitment, lifts the commitment nobody closed on, and joins nothing; it trims, sweeps and
     /// ends nothing, puts nothing back, and adds no beat for them. Told to serve them again before then, it serves on
-    /// with no settling: it read them all along. Let go once a tick reads the room through (not short) and notes on disk
-    /// all it decided there ([`House::mark_done`]): the house reads the games no more after. Without it the house would go quiet with its commitment outstanding, and while the
+    /// with no settling: it read them all along. Let go once a tick reads the room through (not short), notes on disk
+    /// all it decided there ([`House::mark_done`]) and held none of the games it holds state of ([`House::held`]): the
+    /// house reads the games no more after. Without it the house would go quiet with its commitment outstanding, and while the
     /// room's beat goes on for a house table beside, a page would close a round on it that nobody reveals.
     games_last_word: bool,
 }
@@ -1751,6 +1752,9 @@ impl House {
             }
         }
         self.through.clear();
+        // 🔒 (A FAIR ONLY game it holds state of, held this tick: nothing there, a step-down among it. Its last word at
+        // the games waits for the hold to be over, [`RoomMem::games_last_word`].)
+        let games_held = self.held_now.iter().any(|(t, inc)| ha::is_fair_only_inc(inc) && self.done.contains_key(&(room.to_string(), t.clone(), inc.clone())));
         self.held_now.clear();
         self.games_through.clear();
         if let Some(mem) = self.rooms.get_mut(room) {
@@ -1802,9 +1806,10 @@ impl House {
             }
         }
         // 🔒 Its last word at the games, once told to stop serving them ([`RoomMem::games_last_word`]): said, where the
-        // tick read the room through and noted all it decided. It reads them no more, and lets their index go. (Short, or
-        // a reveal or step-down it could not note on disk and so did not write: the next tick says it.)
-        if !self.serve_games && !out.short && !self.unnoted {
+        // tick read the room through and noted all it decided. It reads them no more, and lets their index go. (Short, a
+        // reveal or step-down it could not note on disk and so did not write, or a game it holds state of held: a later
+        // tick says it.)
+        if !self.serve_games && !out.short && !self.unnoted && !games_held {
             if let Some(mem) = self.rooms.get_mut(room).filter(|mem| mem.games_last_word) {
                 mem.games_last_word = false;
                 mem.index = None;
