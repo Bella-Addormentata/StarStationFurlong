@@ -57,7 +57,8 @@ describe('fairOnlyRow, off', () => {
     const armed = { ...IDLE, armed: fairOnlyArm(true, BASE) };
     expect(fairOnlyRow(with_(OFF), armed)).toEqual({ value: 'OFF', colour: LANE_UNKNOWN_COLOUR, note: FAIR_ONLY_OFF_NOTE, warning: FAIR_ONLY_ON_WARNING, error: null, button: CONFIRM_ON });
     expect(FAIR_ONLY_ON_WARNING).toMatch(/^Turn FAIR ONLY tables on\? /);
-    expect(FAIR_ONLY_ON_WARNING).toContain('the page that holds it ends it once no round is in flight');
+    expect(FAIR_ONLY_ON_WARNING).toContain("its house steps down there and serves that game no more: end it from the table's ⚙ card");
+    expect(FAIR_ONLY_ON_WARNING).toContain('Turned off here, this page ends the games it holds itself.');
     expect(FAIR_ONLY_ON_WARNING).toMatch(/Tap CONFIRM\.$/);
     // An off armed (from before the node turned off) shows no CONFIRM for an on.
     expect(fairOnlyRow(with_(OFF), { ...IDLE, armed: fairOnlyArm(false, BASE) })).toMatchObject({ button: TURN_ON, warning: null });
@@ -103,7 +104,9 @@ describe('fairOnlyRow, on', () => {
     const armed = { ...IDLE, armed: fairOnlyArm(false, BASE) };
     expect(fairOnlyRow(with_(ON), armed)).toEqual({ value: 'ON', colour: LANE_ON_COLOUR, note: FAIR_ONLY_ON_NOTE, warning: FAIR_ONLY_OFF_WARNING, error: null, button: CONFIRM_OFF });
     expect(FAIR_ONLY_OFF_WARNING).toMatch(/^Turn FAIR ONLY tables off\? /);
-    expect(FAIR_ONLY_OFF_WARNING).toContain('take the house as away');
+    // (What the off does, as it does it: the node's house steps down at each game, and this page ends the ones it holds.)
+    expect(FAIR_ONLY_OFF_WARNING).toContain('reveals a round whose seeds are in and starts no new one');
+    expect(FAIR_ONLY_OFF_WARNING).toContain('this page ends each game it holds once no round is in flight');
     // An on armed shows no CONFIRM for an off.
     expect(fairOnlyRow(with_(ON), { ...IDLE, armed: fairOnlyArm(true, BASE) })).toMatchObject({ button: TURN_OFF, warning: null });
   });
@@ -118,7 +121,9 @@ describe('fairOnlyRow, on', () => {
         value: 'STOPPED', colour: LANE_OFF_COLOUR, note: fairOnlyStoppedNote(unable), warning: FAIR_ONLY_OFF_WARNING, error: null, button: CONFIRM_OFF,
       });
       expect(fairOnlyStoppedNote(unable)).toContain(fairOnlyUnableWords(unable));
-      expect(fairOnlyStoppedNote(unable)).toContain('Your tables do not offer SET FAIR ONLY meanwhile.');
+      // (Nothing serves them, so this page ends the ones it holds: computedTable fairOffDuty.)
+      expect(fairOnlyStoppedNote(unable)).toMatch(/this page ends each FAIR ONLY game it holds once no round is in flight\.$/);
+      expect(fairOnlyStoppedNote(unable)).toContain('Your tables do not offer SET FAIR ONLY meanwhile, ');
     }
   });
 
@@ -204,26 +209,32 @@ describe('parseFairOnly', () => {
 const answer = (status: number, body: unknown): Response =>
   new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
+/** A turn on armed on node `node-a`. */
+const ARM_ON = { on: true, node: 'node-a' } as const;
+
 describe('turnFairOnly', () => {
-  it("POSTs a simple request to the node's own origin, refusing redirects", async () => {
+  it("POSTs a simple request to the node's own origin, naming the node it was armed on, refusing redirects", async () => {
     const fetchImpl = vi.fn(async () => answer(200, { ok: true, fair_only: { on: true, chosen: true } }));
-    await expect(turnFairOnly('http://127.0.0.1:8081', true, fetchImpl as unknown as typeof fetch)).resolves.toEqual({ ok: true });
+    await expect(turnFairOnly('http://127.0.0.1:8081', ARM_ON, fetchImpl as unknown as typeof fetch)).resolves.toEqual({ ok: true });
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe('http://127.0.0.1:8081/api/house/fair-only?on=1');
+    expect(url).toBe('http://127.0.0.1:8081/api/house/fair-only?on=1&node=node-a');
     expect(init).toMatchObject({ method: 'POST', redirect: 'error' });
     expect(init.body).toBeUndefined();
     expect(init.headers).toBeUndefined();
-    await turnFairOnly('http://127.0.0.1:8080', false, fetchImpl as unknown as typeof fetch);
-    expect((fetchImpl.mock.calls[1] as unknown as [string])[0]).toBe('http://127.0.0.1:8080/api/house/fair-only?on=0');
+    // An off names it too, and a node id is sent as a query value.
+    await turnFairOnly('http://127.0.0.1:8080', { on: false, node: 'a b&c' }, fetchImpl as unknown as typeof fetch);
+    expect((fetchImpl.mock.calls[1] as unknown as [string])[0]).toBe('http://127.0.0.1:8080/api/house/fair-only?on=0&node=a%20b%26c');
     expect(FAIR_ONLY_TIMEOUT_MS).toBe(15_000);
   });
 
   it("brings back the node's own refusal, or words what the page saw", async () => {
-    const said = async (res: Response) => turnFairOnly('http://127.0.0.1:8080', true, (async () => res) as unknown as typeof fetch);
+    const said = async (res: Response) => turnFairOnly('http://127.0.0.1:8080', ARM_ON, (async () => res) as unknown as typeof fetch);
     // The node's words, as fair_only_switch.rs says them.
     const fold = 'FAIR ONLY tables were not turned on: the fold of the tables is turned off by SSF_HOUSE_FOLD in this node\'s environment, so its house cannot serve FAIR ONLY games; start the node without it';
     expect(await said(answer(409, { ok: false, error: `  ${fold}  `, fair_only: { on: false, chosen: false, unable: 'fold-env' } }))).toEqual({ ok: false, error: fold });
     const pageOnly = "only this computer's own Star Station page can turn FAIR ONLY tables on or off";
+    const otherNode = 'FAIR ONLY tables were not turned: the turn was confirmed for another node than the one that answers now. Look at the Network settings again';
+    expect(await said(answer(409, { ok: false, error: otherNode }))).toEqual({ ok: false, error: otherNode });
     expect(await said(answer(403, { ok: false, error: pageOnly }))).toEqual({ ok: false, error: pageOnly });
     expect(await said(answer(403, { ok: false }))).toEqual({ ok: false, error: 'your node answered 403' });
     expect(await said(answer(500, 'not json'))).toEqual({ ok: false, error: 'your node answered 500' });
@@ -234,17 +245,17 @@ describe('turnFairOnly', () => {
 
   it('never throws: no origin, an unreachable node, or no answer in time', async () => {
     const never = vi.fn();
-    expect(await turnFairOnly('', true, never as unknown as typeof fetch)).toEqual({ ok: false, error: 'your node is not answering' });
+    expect(await turnFairOnly('', ARM_ON, never as unknown as typeof fetch)).toEqual({ ok: false, error: 'your node is not answering' });
     expect(never).not.toHaveBeenCalled();
     const unreachable = async () => { throw new TypeError('Failed to fetch'); };
-    expect(await turnFairOnly('http://127.0.0.1:8080', true, unreachable as unknown as typeof fetch)).toEqual({ ok: false, error: 'your node could not be reached' });
+    expect(await turnFairOnly('http://127.0.0.1:8080', ARM_ON, unreachable as unknown as typeof fetch)).toEqual({ ok: false, error: 'your node could not be reached' });
     const hangs = (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     });
-    expect(await turnFairOnly('http://127.0.0.1:8080', true, hangs as unknown as typeof fetch, 20)).toEqual({
+    expect(await turnFairOnly('http://127.0.0.1:8080', ARM_ON, hangs as unknown as typeof fetch, 20)).toEqual({
       ok: false, error: 'your node did not answer in time; it may still be turning FAIR ONLY tables on, so look again in a moment',
     });
-    expect(await turnFairOnly('http://127.0.0.1:8080', false, hangs as unknown as typeof fetch, 20)).toEqual({
+    expect(await turnFairOnly('http://127.0.0.1:8080', { on: false, node: 'node-a' }, hangs as unknown as typeof fetch, 20)).toEqual({
       ok: false, error: 'your node did not answer in time; it may still be turning FAIR ONLY tables off, so look again in a moment',
     });
     const trickles = async (_url: string, init?: RequestInit) => ({
@@ -254,7 +265,7 @@ describe('turnFairOnly', () => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       }),
     }) as unknown as Response;
-    expect(((await turnFairOnly('http://127.0.0.1:8080', true, trickles as unknown as typeof fetch, 20)) as { error: string }).error).toContain('did not answer in time');
+    expect(((await turnFairOnly('http://127.0.0.1:8080', ARM_ON, trickles as unknown as typeof fetch, 20)) as { error: string }).error).toContain('did not answer in time');
   });
 });
 
@@ -295,6 +306,8 @@ describe('main.ts and index.html wire the FAIR ONLY switch', () => {
     expect(refresh.slice(gone)).toContain('if (!fairOnlyStands(fairOnlyArmed, fingerprint)) fairOnlyArmed = null;');
     // The tables read the fold from the same fingerprint, so SET FAIR ONLY follows a turn.
     expect(refresh.slice(gone)).toContain('setLocalHouseFold(fingerprint.house_fold ?? null);');
+    // …and whether its house serves none (switch off, or something in the way), so this page ends the games it holds there (computedTable fairOffDuty).
+    expect(refresh.slice(gone)).toContain('setLocalFairOnlyStopped(fingerprint.fair_only !== undefined && (!fingerprint.fair_only.on || fingerprint.fair_only.unable !== undefined));');
   });
 
   it('arms each turn first, takes a fresh tap for CONFIRM, no held key, and no tap while a turn is in flight', () => {
@@ -317,7 +330,8 @@ describe('main.ts and index.html wire the FAIR ONLY switch', () => {
     expect(turn).toContain('if (fairOnlyTurning) return;');
     expect(turn).toContain('if (!armedFor || armedFor.on !== on || !fairOnlyStands(armedFor, localNodeLive ? localFingerprint : null)) {');
     expect(turn.indexOf('fairOnlyError = FAIR_ONLY_NOT_CONFIRMED;')).toBeLessThan(turn.indexOf('await turnFairOnly('));
-    expect(turn).toContain('await turnFairOnly(localNodeOrigin, on);');
+    // (The turn and the node it was armed for go out with it: the node takes it only if it is that node.)
+    expect(turn).toContain('await turnFairOnly(localNodeOrigin, armedFor);');
     expect(turn).toContain('fairOnlyError = turned.ok ? null : turned.error;');
     expect(turn.indexOf('await refreshLocalFingerprint();')).toBeGreaterThan(turn.indexOf('await turnFairOnly('));
     const opened = main.indexOf('if (id === "setnet") {');

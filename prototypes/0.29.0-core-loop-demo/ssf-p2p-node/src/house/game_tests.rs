@@ -418,6 +418,199 @@ fn a_game_is_not_served_until_the_house_is_told_to() {
 }
 
 #[test]
+fn told_to_stop_it_steps_down_its_commitment_at_a_game_and_reads_the_game_no_more() {
+    let mut game = Game::new("off-down");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    game.house.serve_fair_only(false);
+    assert!(!game.house.serves_fair_only());
+    // Its last word: the commitment nobody closed on is lifted, as at the node's stop, and nothing is joined.
+    assert!(game.tick(200).wrote > 0);
+    let downs = game.records("h:1:");
+    assert_eq!(downs.len(), 1);
+    assert!(strs(&downs[0].1, "x").is_empty(), "a step-down");
+    assert!(downs[0].1.get("c").is_none());
+    // Then it reads the game no more: a close of the next round, seeds and all, is nobody's to reveal.
+    let (_, _, _) = game.closed(2, &game.sid(), &game.commit(2));
+    game.seeds(2);
+    for _ in 0..5 {
+        assert_eq!(game.tick(1_000).wrote, 0);
+    }
+    assert_eq!(game.records("o:").len(), 1, "no join after it");
+    assert_eq!(game.records("h:").len(), 1);
+}
+
+#[test]
+fn told_to_stop_it_reveals_a_close_whose_seeds_are_in_without_a_next_commitment() {
+    let mut game = Game::new("off-reveal");
+    let (c, a, b) = game.closed_on_the_join();
+    game.seeds(1);
+    game.house.serve_fair_only(false);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+    assert_eq!(strs(&reveals[0].1, "n"), sorted(vec![a, b]));
+    assert!(reveals[0].1.get("c").is_none(), "no commitment for a round it will not serve");
+    for _ in 0..5 {
+        game.tick(1_000);
+    }
+    assert!(game.records("o:2:").is_empty() && game.records("h:2:").is_empty());
+}
+
+#[test]
+fn told_to_stop_with_a_close_short_of_its_seeds_it_leaves_the_round_to_its_bettors() {
+    let mut game = Game::new("off-short");
+    game.closed_on_the_join();
+    game.house.serve_fair_only(false);
+    game.ticks();
+    // (No reveal short of the seeds, as at the node's stop, and no step-down of a commitment a close names: the
+    // bettors' abandon voids the round, at no cost to a stake.)
+    assert!(game.records("h:").is_empty());
+    // Its last word said, it reads the game no more: the seeds that come after are not revealed for.
+    game.seeds(1);
+    for _ in 0..5 {
+        game.tick(1_000);
+    }
+    assert!(game.records("h:").is_empty());
+}
+
+#[test]
+fn told_to_stop_past_a_closes_grace_short_of_its_seeds_it_still_reveals_nothing() {
+    // 🔒 Serving, it would reveal the round at the end of the grace with the seeds it saw (the missing ones forfeit).
+    // Stepping down it reveals only a round whose seeds are all in, as at the node's stop.
+    let mut game = Game::new("off-past-grace");
+    game.closed_on_the_join();
+    game.ticks();
+    assert!(game.records("h:").is_empty(), "within the grace");
+    game.house.serve_fair_only(false);
+    game.tick(REVEAL_GRACE_MS);
+    game.ticks();
+    assert!(game.records("h:").is_empty());
+}
+
+#[test]
+fn its_last_word_puts_back_no_session_map() {
+    // 🔒 Serving, it puts a game's session map back; stepping down it writes its step-down and goes.
+    let mut game = Game::new("off-no-map");
+    game.ticks();
+    assert_eq!(game.records("o:1:").len(), 1);
+    let ses = game.ses.clone();
+    game.delete_top(&ses);
+    game.house.serve_fair_only(false);
+    for _ in 0..3 {
+        game.tick(REPUT_MS);
+    }
+    assert!(!game.has_session());
+}
+
+#[test]
+fn its_last_word_at_a_room_of_games_alone_is_no_beat() {
+    let mut game = Game::new("off-no-beat");
+    game.ticks();
+    let beat = game.beat();
+    assert!(beat.is_some());
+    game.house.serve_fair_only(false);
+    game.tick(HEARTBEAT_MS);
+    assert_eq!(game.records("h:1:").len(), 1, "its last word");
+    assert_eq!(game.beat(), beat, "and no beat with it");
+}
+
+#[test]
+fn its_last_word_while_it_settles_at_a_game_holds_no_beat_of_the_house_table_beside() {
+    // 🔒 Serving, the room's beat waits until it has settled at every game it serves. Stepping down there, it holds
+    // the house table's beat back no more.
+    let mut game = Game::new("off-settling-beat");
+    game.add_house_table();
+    game.house.settle_ms = SETTLE_MS;
+    game.ticks();
+    assert_eq!(game.beat(), None, "settling");
+    game.house.serve_fair_only(false);
+    // (Its last word, said in one tick: it had joined nothing while it settled, and steps down nothing.)
+    assert!(!game.tick(200).short);
+    assert!(game.beat().is_some(), "the house table's beat in that tick");
+    assert!(game.records("o:").is_empty() && game.records("h:").is_empty());
+}
+
+#[test]
+fn its_last_word_ends_no_game() {
+    // 🔒 It steps down and goes, and signs no checkpoint (a trim's would carry its next commitment on): the end is the
+    // holder's page's, once the table has been quiet (computedTable.ts fairEndDuty).
+    let mut game = Game::opened("off-no-end", "landlord");
+    let (c, _, _, hash) = game.last_round();
+    let f = game.ending(&c, &hash);
+    game.answer(f);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().ends, 0, "too soon");
+    game.house.serve_fair_only(false);
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    game.ticks();
+    assert_eq!(game.house.game_counts().ends, 0);
+    assert!(game.untrimmed());
+}
+
+#[test]
+fn a_flood_at_a_house_table_leaves_the_games_their_reads_for_its_last_word() {
+    let mut game = Game::new("off-flood-house-table");
+    game.add_house_table();
+    game.junk_in(&format!("ses:{T2}:{INC_R}:g"), 100, 60_000);
+    game.ticks();
+    assert_eq!(game.records("o:1:").len(), 1, "joined beside the flood");
+    game.house.serve_fair_only(false);
+    game.ticks();
+    let downs = game.records("h:1:");
+    assert_eq!(downs.len(), 1, "its last word beside the flood");
+    assert!(strs(&downs[0].1, "x").is_empty());
+}
+
+#[test]
+fn its_last_word_said_turned_on_and_off_again_before_a_tick_it_reads_the_game_no_more() {
+    // 🔒 It stepped down at the game and has served nothing there since: it has nothing more to say there, and no
+    // game to read for it.
+    let mut game = Game::new("off-on-off");
+    game.tick(0);
+    game.house.serve_fair_only(false);
+    assert!(game.tick(200).wrote > 0);
+    assert_eq!(game.records("h:1:").len(), 1);
+    game.house.serve_fair_only(true);
+    game.house.serve_fair_only(false);
+    game.house.games_looked.clear();
+    for _ in 0..3 {
+        assert_eq!(game.tick(1_000).wrote, 0);
+    }
+    assert!(game.house.games_looked.is_empty(), "no game read: {:?}", game.house.games_looked);
+}
+
+#[test]
+fn a_last_word_at_the_games_cut_short_is_said_at_the_next_tick() {
+    let mut game = Game::new("off-cut");
+    game.closed_on_the_join();
+    game.seeds(1);
+    game.house.serve_fair_only(false);
+    // (One pass: the close's and the slips' checks are asked for with the doc let go, and the tick is short.)
+    assert!(game.tick_with_passes(200, 1).short);
+    assert!(game.records("h:").is_empty());
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert!(reveals[0].1.get("c").is_none());
+}
+
+#[test]
+fn turned_off_and_on_again_before_a_tick_it_serves_on_with_no_step_down() {
+    let mut game = Game::new("off-on");
+    let (c, _, _) = game.closed_on_the_join();
+    game.house.serve_fair_only(false);
+    game.house.serve_fair_only(true);
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+    assert_eq!(str_of(&reveals[0].1, "c"), Some(game.commit(2).as_str()), "it carries the next commitment on");
+}
+
+#[test]
 fn joins_and_reveals_at_a_game_whoever_holds_the_deed() {
     // The deed is another's, who delegated nothing, and the room holds no `hk:` key: the root's own delegation
     // makes this house the game's.
@@ -2614,10 +2807,12 @@ fn turned_off_after_it_served_it_leaves_a_game_alone_put_backs_too() {
             let Some(Out::YMap(m)) = comp.get(&txn, &game.ses) else { panic!() };
             m.remove(&mut txn, &joins[0].0);
         }
+        // (Its last word there puts nothing back, and steps down only what the doc shows of it: with the join gone, nothing.)
         for _ in 0..3 {
             game.tick(REPUT_MS);
         }
         assert!(game.records("o:1:").is_empty(), "its join stays gone (a house table beside: {beside})");
+        assert!(game.records("h:").is_empty());
         if beside {
             assert_eq!(game.at_house_table("o:1:"), 1, "the house table is served as before");
         }
@@ -2931,15 +3126,24 @@ fn an_end_order_at_a_game_far_past_its_first_round_looks_for_its_commitment_from
 
 #[test]
 fn a_house_that_serves_the_games_again_settles_at_them_again() {
-    // 🔒 Settled at the game and joined at round 1, the house stops serving the games while the room still ticks
-    // (no gap), and a close comes meanwhile: served again, it settles at the game again, so it first reads that close
-    // while settling and never reveals it. One that comes once it has settled again it reveals.
+    // 🔒 Settled at the game and joined at round 1, the house stops serving the games while the room still ticks (no
+    // gap). Its join gone from the doc by then, its last word there steps nothing down (as the doc shows it, it has no
+    // commitment out), and it reads the game no more. The join comes back and a close of round 1 comes meanwhile:
+    // served again, it settles at the game again, so it first reads that close while settling and never reveals it.
+    // One that comes once it has settled again it reveals.
     for later in [false, true] {
         let mut game = Game::new(&format!("served-on-again-{later}"));
         game.house.settle_ms = SETTLE_MS;
         game.settle();
-        assert_eq!(game.records("o:1:").len(), 1);
+        let joins = game.records("o:1:");
+        assert_eq!(joins.len(), 1);
+        game.delete_in_session(&joins[0].0);
         game.house.serve_fair_only(false);
+        for _ in 0..30 {
+            game.tick(1_000);
+        }
+        assert!(game.records("h:").is_empty() && game.records("o:").is_empty(), "its last word: nothing to step down");
+        game.put_in_session(&joins[0].0, to_any(&joins[0].1));
         if !later {
             game.closed(1, &game.sid(), &game.commit(1));
             game.seeds(1);
@@ -2957,6 +3161,41 @@ fn a_house_that_serves_the_games_again_settles_at_them_again() {
         }
         assert_eq!(game.records("h:1:").len(), usize::from(later), "the close came once it had settled again: {later}");
     }
+}
+
+#[test]
+fn told_to_stop_it_never_joins_a_game_again_once_it_stepped_down_there() {
+    // 🔒 Its last word lifted its commitment for the open round, whose seed is then open: served again, it never joins
+    // that round again (its commitment for a round is the one seed, now open), so the game is for its holder's page to
+    // end (computedTable.ts fairOffDuty) or for another house to join.
+    let mut game = Game::new("off-never-again");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    game.house.serve_fair_only(false);
+    game.tick(200);
+    assert_eq!(game.records("h:1:").len(), 1);
+    game.house.serve_fair_only(true);
+    for _ in 0..10 {
+        game.tick(1_000);
+    }
+    assert_eq!(game.records("o:").len(), 1);
+}
+
+#[test]
+fn turned_off_and_on_again_before_its_last_word_it_does_not_settle_again() {
+    // 🔒 Told to stop and to serve again before a tick: it read the game all along, so a close it first reads after is
+    // no close first read while settling, and it reveals it.
+    let mut game = Game::new("off-on-settled");
+    game.house.settle_ms = SETTLE_MS;
+    game.settle();
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.house.serve_fair_only(false);
+    game.house.serve_fair_only(true);
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
 }
 
 // ── Put-backs at a game (design-final section 8.5 N5) ────────────────────────

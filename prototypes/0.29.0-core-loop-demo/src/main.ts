@@ -271,7 +271,7 @@ import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
-import { leaveComputedTables, setLocalHouse, setLocalHouseFold } from "./computedTable";
+import { leaveComputedTables, setLocalFairOnlyStopped, setLocalHouse, setLocalHouseFold } from "./computedTable";
 import { listenToRoom, noteRoomHeard } from "./roomHearing";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -1678,7 +1678,7 @@ async function turnFairOnlySwitch(on: boolean): Promise<void> {
   fairOnlyTurning = on ? "on" : "off";
   fairOnlyError = null;
   renderFairOnlyRow();
-  const turned = await turnFairOnly(localNodeOrigin, on);
+  const turned = await turnFairOnly(localNodeOrigin, armedFor);
   fairOnlyTurning = null;
   fairOnlyError = turned.ok ? null : turned.error;
   await refreshLocalFingerprint();
@@ -10559,6 +10559,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // 🔒 …and what its fold serves: a table moves to a FAIR ONLY game only where
   // the owner's own node says it runs them (computedTable switchFairOnlyOn).
   setLocalHouseFold(fingerprint.house_fold ?? null);
+  // 🔒 …and whether its house serves no FAIR ONLY game (its switch off, or
+  // something in the way): then this page ends the games its key holds there
+  // (computedTable fairOffDuty), the house having stepped down at them.
+  setLocalFairOnlyStopped(fingerprint.fair_only !== undefined && (!fingerprint.fair_only.on || fingerprint.fair_only.unable !== undefined));
   setLocalHolderNode(fingerprint.iroh_node_id ?? null); // 🤝 a holder's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);

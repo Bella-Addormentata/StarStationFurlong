@@ -35,11 +35,21 @@
 //! why ([`FairOnlyView::unable`]), and its `houseFold` names no `p` or `q`,
 //! so no page offers a new game.
 //!
-//! Turned off, the house stops serving the games from its next tick: it
-//! answers no turn of theirs from then on. Their pages take the house as
-//! away, and the page that holds a game ends it once no round is in flight
-//! (as when the owner's node stops); turned on again, the house settles at
-//! each game again before it answers, as after a gap.
+//! Turned off, the house says its last word at the games from its next tick
+//! (house.rs `games_last_word`), as at the node's stop: it reveals a close
+//! whose seeds are in with no next commitment, lifts the commitment nobody
+//! closed on, and then serves them no more. So no page closes a round on a
+//! commitment nobody will reveal, though the room's beat goes on for a house
+//! table beside. The page that holds a game, seeing its own node's switch off
+//! in the fingerprint, writes the game's end order, and the end once the
+//! table is quiet (computedTable.ts `fairOffDuty`, `fairEndDuty`). Turned on
+//! again, the house settles at each game again before it answers, as after a
+//! gap (not where its last word is still to come: it read them all along).
+//! The fold stopping for good takes the house off the games the same way.
+//!
+//! A turn names the node it was confirmed for, an off too, and only that node
+//! takes it ([`fair_only_gate`]): a node that took another's port since the
+//! page armed CONFIRM refuses it.
 //!
 //! Every decision rests on a pure function or on a [`FairOnlySwitch`], and a
 //! test makes a switch of its own over a file of its own with the
@@ -285,17 +295,42 @@ pub fn advertise(fold: &mut HouseFoldReport, serving: bool) {
 /// The route's path.
 pub const FAIR_ONLY_ROUTE: &str = "/api/house/fair-only";
 
-/// The route's query: `on=1` or `on=0`, once, and no other key.
-pub fn fair_only_asked(target: &str) -> Option<bool> {
+/// What the page asks of the route: the turn, and the node its player
+/// confirmed it for, by its iroh node id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FairOnlyAsk<'a> {
+    pub on: bool,
+    pub node: &'a str,
+}
+
+/// The route's query: `on=1` or `on=0`, and `node=<iroh node id>`, the node
+/// the CONFIRM was armed on. Each key once, in any order, and no other key.
+/// Both turns name the node, an off too: an off ends the games the page holds
+/// at that node's house (computedTable.ts `fairOffDuty`).
+pub fn fair_only_asked(target: &str) -> Option<FairOnlyAsk<'_>> {
     let (path, query) = target.split_once('?')?;
     if path != FAIR_ONLY_ROUTE {
         return None;
     }
-    match query {
-        "on=1" => Some(true),
-        "on=0" => Some(false),
-        _ => None,
+    let (mut on, mut node) = (None, None);
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        let taken = match key {
+            "on" => on
+                .replace(match value {
+                    "1" => true,
+                    "0" => false,
+                    _ => return None,
+                })
+                .is_some(),
+            "node" if !value.is_empty() => node.replace(value).is_some(),
+            _ => return None,
+        };
+        if taken {
+            return None;
+        }
     }
+    Some(FairOnlyAsk { on: on?, node: node? })
 }
 
 /// The route's refusal for a request from anything but this computer's own
@@ -303,7 +338,12 @@ pub fn fair_only_asked(target: &str) -> Option<bool> {
 pub const PAGE_ONLY_WORDS: &str = "only this computer's own Star Station page can turn FAIR ONLY tables on or off";
 
 /// The route's refusal for a query it does not know.
-pub const BAD_ASK_WORDS: &str = "ask with on=1 or on=0";
+pub const BAD_ASK_WORDS: &str = "ask with on=1 or on=0, and the node= the turn was confirmed for";
+
+/// The route's refusal of a turn confirmed for another node than this one
+/// (another took its port since the page armed it).
+pub const OTHER_NODE_WORDS: &str =
+    "FAIR ONLY tables were not turned: the turn was confirmed for another node than the one that answers now. Look at the Network settings again";
 
 /// An on's refusal where the node's environment holds the switch off.
 pub const HELD_OFF_WORDS: &str = "FAIR ONLY tables are switched off on this node by SSF_FAIR_ONLY in its environment; the switch here cannot turn them on";
@@ -318,14 +358,17 @@ pub const TURN_FAILED_WORDS: &str = "the node's turn of the FAIR ONLY switch fai
 /// The route's gate and query: `Ok(on)` for a turn to make, or the refusal's
 /// status and body. `local` is chia_wallet_switch::local_page, the wallet
 /// switch's gate: an allowed loopback or desktop-app Origin, never a web
-/// origin or none, sent to a loopback Host on the API's own port.
-pub fn fair_only_gate(local: bool, target: &str) -> Result<bool, (&'static str, serde_json::Value)> {
+/// origin or none, sent to a loopback Host on the API's own port. A turn is
+/// taken only by the node it was confirmed for (`node_id`, this node's iroh
+/// node id), as the beacon's on is (chia_beacon_switch.rs `beacon_gate`).
+pub fn fair_only_gate(local: bool, target: &str, node_id: &str) -> Result<bool, (&'static str, serde_json::Value)> {
     let refused = |status: &'static str, error: &str| Err((status, serde_json::json!({ "ok": false, "error": error })));
     if !local {
         return refused("403 Forbidden", PAGE_ONLY_WORDS);
     }
     match fair_only_asked(target) {
-        Some(on) => Ok(on),
+        Some(ask) if ask.node != node_id => refused("409 Conflict", OTHER_NODE_WORDS),
+        Some(ask) => Ok(ask.on),
         None => refused("400 Bad Request", BAD_ASK_WORDS),
     }
 }
@@ -334,7 +377,7 @@ pub fn fair_only_gate(local: bool, target: &str) -> Result<bool, (&'static str, 
 const WHAT_IT_DOES: &str = "This node's house serves the FAIR ONLY games at its owner's tables while it runs: it answers their turns, and trims, sweeps and ends them by the fold of the tables";
 
 /// What a turn to off does to the games served, for the node's lines.
-const WHAT_OFF_DOES: &str = "This node's house serves no FAIR ONLY game from now on: their pages take it as away, and the page that holds each ends it once no round is in flight";
+const WHAT_OFF_DOES: &str = "This node's house steps down at each FAIR ONLY game it serves at its next tick (it reveals a round whose seeds are in and lifts its next commitment), and the page that holds each game ends it once no round is in flight. The house serves none from then on";
 
 /// The startup line for the switch as it read (`saved`) under the
 /// environment's word (`env`), with what is in the way (`unable`) while it is
@@ -563,7 +606,8 @@ mod tests {
         // And off again, the same.
         let off = switch.turn(false, 8, None);
         assert_eq!(off.body, serde_json::json!({ "ok": true, "fair_only": { "on": false, "chosen": true } }));
-        assert!(off.line.as_deref().unwrap().contains("their pages take it as away"));
+        assert!(off.line.as_deref().unwrap().contains("steps down at each FAIR ONLY game it serves at its next tick"));
+        assert!(off.line.as_deref().unwrap().contains("the page that holds each game ends it once no round is in flight"));
         assert!(!switch.wanted() && !FairOnlySwitch::read(path.clone(), EnvSwitch::Unset).wanted());
         assert!(FairOnlySwitch::read(path.clone(), EnvSwitch::Unset).start_line(None).unwrap().starts_with("🔒 FAIR ONLY tables: off."));
         assert_eq!(serde_json::from_slice::<FairOnlyFile>(&std::fs::read(&path).unwrap()).unwrap(), FairOnlyFile { on: false, at: 8 });
@@ -749,13 +793,35 @@ mod tests {
     }
 
     #[test]
-    fn the_route_takes_on_and_off_from_this_computers_page_only() {
-        assert_eq!(fair_only_gate(true, "/api/house/fair-only?on=1"), Ok(true));
-        assert_eq!(fair_only_gate(true, "/api/house/fair-only?on=0"), Ok(false));
-        let (status, body) = fair_only_gate(false, "/api/house/fair-only?on=1").unwrap_err();
+    fn the_route_takes_on_and_off_from_this_computers_page_only_for_the_node_it_was_confirmed_for() {
+        const ME: &str = "node-a";
+        assert_eq!(fair_only_gate(true, "/api/house/fair-only?on=1&node=node-a", ME), Ok(true));
+        assert_eq!(fair_only_gate(true, "/api/house/fair-only?on=0&node=node-a", ME), Ok(false));
+        assert_eq!(fair_only_gate(true, "/api/house/fair-only?node=node-a&on=0", ME), Ok(false), "in any order");
+        let (status, body) = fair_only_gate(false, "/api/house/fair-only?on=1&node=node-a", ME).unwrap_err();
         assert_eq!((status, body), ("403 Forbidden", serde_json::json!({ "ok": false, "error": PAGE_ONLY_WORDS })));
-        for bad in ["/api/house/fair-only", "/api/house/fair-only?", "/api/house/fair-only?on=2", "/api/house/fair-only?on=1&on=0", "/api/house/fair-only?on=1&x=1", "/api/house/fair-onlyx?on=1", "/api/chia/beacon?on=1", "/api/house/fair-only?ON=1"] {
-            assert_eq!(fair_only_gate(true, bad), Err(("400 Bad Request", serde_json::json!({ "ok": false, "error": BAD_ASK_WORDS }))), "{bad}");
+        // Confirmed for another node: neither turn is taken.
+        for on in ["1", "0"] {
+            let asked = format!("/api/house/fair-only?on={on}&node=node-b");
+            assert_eq!(fair_only_gate(true, &asked, ME), Err(("409 Conflict", serde_json::json!({ "ok": false, "error": OTHER_NODE_WORDS }))), "{asked}");
+        }
+        for bad in [
+            "/api/house/fair-only",
+            "/api/house/fair-only?",
+            "/api/house/fair-only?on=1",
+            "/api/house/fair-only?on=0",
+            "/api/house/fair-only?node=node-a",
+            "/api/house/fair-only?on=1&node=",
+            "/api/house/fair-only?on=2&node=node-a",
+            "/api/house/fair-only?on=1&on=0&node=node-a",
+            "/api/house/fair-only?on=1&node=node-a&node=node-a",
+            "/api/house/fair-only?on=1&node=node-a&x=1",
+            "/api/house/fair-only?on=1&node",
+            "/api/house/fair-onlyx?on=1&node=node-a",
+            "/api/chia/beacon?on=1&node=node-a",
+            "/api/house/fair-only?ON=1&node=node-a",
+        ] {
+            assert_eq!(fair_only_gate(true, bad, ME), Err(("400 Bad Request", serde_json::json!({ "ok": false, "error": BAD_ASK_WORDS }))), "{bad}");
         }
     }
 

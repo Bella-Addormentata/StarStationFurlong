@@ -1821,7 +1821,7 @@ describe('leaving the room', () => {
     const leave = body.indexOf('leaveComputedTables();');
     expect(leave).toBeGreaterThan(-1);
     expect(leave).toBeLessThan(body.indexOf('sync.flush()'));
-    expect(main).toMatch(/import \{ leaveComputedTables, setLocalHouse, setLocalHouseFold \} from "\.\/computedTable";/);
+    expect(main).toMatch(/import \{ leaveComputedTables, setLocalFairOnlyStopped, setLocalHouse, setLocalHouseFold \} from "\.\/computedTable";/);
   });
 });
 

@@ -934,6 +934,12 @@ pub struct HubState {
     /// 🔒 Whether the house serves them now, as [`sync_fair_only`] last told
     /// it: what the fingerprint says, with no wait on the house's lock.
     pub fair_only_serving: std::sync::atomic::AtomicBool,
+    /// 🔒 Whether the fold in shadow said at its last pass that it is off for
+    /// good (its report's `off`): set by the pass before it tells the house
+    /// ([`fold_shadow_pass`]), and read under the house's lock when the house
+    /// is told ([`sync_fair_only`]), so a turn that waited on the lock reads
+    /// the fold as the pass before it left it.
+    pub fold_down: std::sync::atomic::AtomicBool,
     /// 🧮 The node's fold of the casino tables it is a house of, held against
     /// the pages' checkpoints in shadow (fold_shadow.rs): None without a house,
     /// or turned off (`SSF_HOUSE_FOLD=0`). Ticked by the house's loop only;
@@ -2753,6 +2759,7 @@ async fn node_main() -> Result<()> {
         house: house.map(Mutex::new),
         fair_only: fair_only_switch::FairOnlySwitch::read(std::path::PathBuf::from(fair_only_switch::FAIR_ONLY_FILE), fair_only_switch::env_switch()),
         fair_only_serving: std::sync::atomic::AtomicBool::new(false),
+        fold_down: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "house-fold")]
         fold_shadow,
         #[cfg(feature = "chia-read")]
@@ -2764,13 +2771,13 @@ async fn node_main() -> Result<()> {
     // 🔒 The FAIR ONLY switch, as it read at the start: the house serves the
     // games from its first tick when it is on and nothing is in the way.
     {
-        let unable = fair_only_unable(&hub, false);
+        let unable = fair_only_unable(&hub);
         match hub.fair_only.start_line(unable) {
             Some(line) if unable.is_some() && hub.fair_only.wanted() => eprintln!("{line}"),
             Some(line) => println!("{line}"),
             None => {}
         }
-        sync_fair_only(&hub, unable);
+        sync_fair_only(&hub);
     }
     // 📖 The wallet lease asks the same switch before a saved bundle of a
     // listing's or a knock's goes to the peers again (chia_publish.rs
@@ -5543,26 +5550,28 @@ mod house_fold_switch_tests {
 
 /// 🔒 What is in the way of the house serving FAIR ONLY games now
 /// (fair_only_switch.rs `Unable`), with whether the fold in shadow said at its
-/// last pass that it is off for good (`fold_down`).
-fn fair_only_unable(hub: &HubState, fold_down: bool) -> Option<fair_only_switch::Unable> {
+/// last pass that it is off for good ([`HubState::fold_down`]).
+fn fair_only_unable(hub: &HubState) -> Option<fair_only_switch::Unable> {
     #[cfg(feature = "house-fold")]
     let fold = hub.fold_shadow.is_some();
     #[cfg(not(feature = "house-fold"))]
     let fold = false;
+    let fold_down = hub.fold_down.load(std::sync::atomic::Ordering::Acquire);
     fair_only_switch::unable_of(cfg!(feature = "house-fold"), hub.house.is_some(), fold, fold_down)
 }
 
 /// 🔒 Tell the house whether to serve FAIR ONLY games: the switch on and
-/// nothing in the way (`unable`). The switch is read under the house's lock,
-/// so a turn and a pass of the fold that race leave the house as the later
-/// of them read it, and the fingerprint's mirror with it.
-fn sync_fair_only(hub: &HubState, unable: Option<fair_only_switch::Unable>) {
+/// nothing in the way. Both are read under the house's lock, so a turn and a
+/// pass of the fold that race leave the house as the later of them read them
+/// (a turn that waited on the lock cannot serve the games again on a fold the
+/// pass before it found down), and the fingerprint's mirror with it.
+fn sync_fair_only(hub: &HubState) {
     let Some(house) = hub.house.as_ref() else {
         hub.fair_only_serving.store(false, std::sync::atomic::Ordering::Release);
         return;
     };
     let mut house = house::lock(house);
-    let serve = fair_only_switch::serving(hub.fair_only.wanted(), unable);
+    let serve = fair_only_switch::serving(hub.fair_only.wanted(), fair_only_unable(hub));
     if house.serves_fair_only() != serve {
         house.serve_fair_only(serve);
     }
@@ -5574,8 +5583,7 @@ fn sync_fair_only(hub: &HubState, unable: Option<fair_only_switch::Unable>) {
 /// line, and the house is told. Blocking: it syncs a file and waits for the
 /// house's lock (the route runs it on the blocking pool).
 fn turn_fair_only(hub: &HubState, on: bool) -> (&'static str, serde_json::Value) {
-    let down = hub.fingerprint.lock().unwrap().house_fold.as_ref().is_some_and(|f| f.off.is_some());
-    let unable = fair_only_unable(hub, down);
+    let unable = fair_only_unable(hub);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let turned = hub.fair_only.turn(on, now, unable);
     match &turned.line {
@@ -5583,7 +5591,7 @@ fn turn_fair_only(hub: &HubState, on: bool) -> (&'static str, serde_json::Value)
         Some(line) => println!("{line}"),
         None => {}
     }
-    sync_fair_only(hub, unable);
+    sync_fair_only(hub);
     (turned.status, turned.body)
 }
 
@@ -5605,9 +5613,9 @@ fn fold_shadow_pass(hub: &SharedHub) {
             let c = house::lock(house).game_counts();
             (report.trims, report.sweeps, report.ends, report.cross_check_mismatches, report.row_put_backs) = (c.trims, c.sweeps, c.ends, c.cross_check_mismatches, c.row_put_backs);
             // 🔒 (A fold that stopped for good takes the house off the FAIR ONLY games: it would trim none of them again.)
-            let down = report.off.is_some();
+            hub.fold_down.store(report.off.is_some(), std::sync::atomic::Ordering::Release);
             hub.fingerprint.lock().unwrap().house_fold = Some(report);
-            sync_fair_only(hub, fair_only_unable(hub, down));
+            sync_fair_only(hub);
         }
         None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),
     }
@@ -8166,8 +8174,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     // letters with it: `p` and `q` exactly while the house
                     // serves the games, so a page offers SET FAIR ONLY only
                     // then (no wait on the house's lock: its mirror).
-                    let down = fp.house_fold.as_ref().is_some_and(|f| f.off.is_some());
-                    fp.fair_only = Some(hub_clone.fair_only.view(fair_only_unable(&hub_clone, down)));
+                    fp.fair_only = Some(hub_clone.fair_only.view(fair_only_unable(&hub_clone)));
                     let serving = hub_clone.fair_only_serving.load(std::sync::atomic::Ordering::Acquire);
                     if let Some(fold) = fp.house_fold.as_mut() {
                         fair_only_switch::advertise(fold, serving);
@@ -8359,13 +8366,15 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
             } else if req.starts_with("POST /api/house/fair-only?") || req.starts_with("POST /api/house/fair-only ") {
                 // 🔒 The SpacePhone's FAIR ONLY switch (fair_only_switch.rs):
                 // `on=1` lets this node's house serve the FAIR ONLY games at
-                // its owner's tables from its next tick, `on=0` stops it, and
-                // either is remembered. Behind the wallet switch's gate: only
+                // its owner's tables from its next tick, `on=0` has it step
+                // down there and stop, and either is remembered. Behind the wallet switch's gate: only
                 // this machine's own game page may ask.
                 let target = req.split_whitespace().nth(1).unwrap_or("");
                 let host_header = header_value(&req, "host");
                 let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
-                let (status, body) = match fair_only_switch::fair_only_gate(local, target) {
+                // Either turn names the node it was confirmed for, and is taken only by that node.
+                let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
+                let (status, body) = match fair_only_switch::fair_only_gate(local, target, &node_id) {
                     // (Off the async workers: the turn syncs a file and waits for the house's lock, which its tick holds.)
                     Ok(on) => {
                         let hub = hub_clone.clone();

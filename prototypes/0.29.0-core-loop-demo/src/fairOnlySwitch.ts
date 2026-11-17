@@ -13,9 +13,12 @@
 //
 // The node keeps a turn in one file (`fair_only.json`), for every Chia
 // network: the house is the node's. A turn holds from the house's next
-// tick. Turned off, the house serves no FAIR ONLY game from then on: each
-// game's pages take the house as away, and the page that holds a game ends
-// it once no round is in flight, so the row warns before an off too. The
+// tick. Turned off, the house steps down at each FAIR ONLY game it served
+// (it reveals a round whose seeds are in and lifts its next commitment) and
+// serves none after, and this page, holding a game there, ends it once no
+// round is in flight (computedTable.ts `fairOffDuty`), so the row warns
+// before an off too. A turn names the node CONFIRM was armed on, and only
+// that node takes it. The
 // node's environment decides first: `SSF_FAIR_ONLY=1` holds the switch on
 // and any other value holds it off. And the node says when its house cannot
 // serve the games whatever the switch says (`unable`): then no on is
@@ -122,16 +125,16 @@ export function fairOnlyUnableWords(unable: FairOnlyUnable): string {
 
 /** On, but nothing serves the games. */
 export const fairOnlyStoppedNote = (unable: FairOnlyUnable): string =>
-  `FAIR ONLY tables are on, but nothing serves them now. ${fairOnlyUnableWords(unable)} Your tables do not offer SET FAIR ONLY meanwhile.`;
+  `FAIR ONLY tables are on, but nothing serves them now. ${fairOnlyUnableWords(unable)} Your tables do not offer SET FAIR ONLY meanwhile, and this page ends each FAIR ONLY game it holds once no round is in flight.`;
 
 /** Off, and they could not be turned on now. */
 export const fairOnlyCannotNote = (unable: FairOnlyUnable): string => `FAIR ONLY tables are off. ${fairOnlyUnableWords(unable)}`;
 
 /** What a turn to on does, before CONFIRM. */
-export const FAIR_ONLY_ON_WARNING = `Turn FAIR ONLY tables on? Then ${WHAT_IT_DOES}, and your tables offer SET FAIR ONLY. This is the first test of FAIR ONLY tables. If your node stops, or you turn them off, while a game is on, nobody serves it: the page that holds it ends it once no round is in flight. Tap CONFIRM.`;
+export const FAIR_ONLY_ON_WARNING = `Turn FAIR ONLY tables on? Then ${WHAT_IT_DOES}, and your tables offer SET FAIR ONLY. This is the first test of FAIR ONLY tables. If your node stops while a game is on, its house steps down there and serves that game no more: end it from the table's ⚙ card. Turned off here, this page ends the games it holds itself. Tap CONFIRM.`;
 
 /** What a turn to off does, before CONFIRM. */
-export const FAIR_ONLY_OFF_WARNING = "Turn FAIR ONLY tables off? Your node's house stops serving them at once: the pages at each FAIR ONLY game take the house as away, and the page that holds it ends it once no round is in flight. Your tables stop offering SET FAIR ONLY. Tap CONFIRM.";
+export const FAIR_ONLY_OFF_WARNING = "Turn FAIR ONLY tables off? Your node's house stops serving them: at each FAIR ONLY game it reveals a round whose seeds are in and starts no new one, and this page ends each game it holds once no round is in flight (a bet riding a craps point goes back to its player). Your tables stop offering SET FAIR ONLY. Tap CONFIRM.";
 
 /** The turn an act sends: `true` to turn on, `false` to turn off, or none
  *  (`arm-on` and `arm-off` only show CONFIRM). */
@@ -186,22 +189,25 @@ export function fairOnlyRow(fp: LocalFingerprint | null | undefined, ui: FairOnl
   return off(note, { act: 'arm-on', label: 'TURN ON', danger: false, busy: false });
 }
 
-/** Ask the node at `origin` to turn FAIR ONLY tables on or off. Never
+/** Ask the node at `origin` to make the turn CONFIRM was armed for
+ *  (`armed`): on or off, for the node whose warning was read, which takes it
+ *  only if it is that node (another may have taken its port since). Never
  *  throws: a refusal comes back in the node's words, anything else in the
  *  page's. */
 export async function turnFairOnly(
   origin: string,
-  on: boolean,
+  armed: FairOnlyArmed,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = FAIR_ONLY_TIMEOUT_MS,
 ): Promise<TurnResult> {
   if (!origin) return { ok: false, error: 'your node is not answering' };
+  const { on, node } = armed;
   const ctl = new AbortController();
   const deadline = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     // No redirect: the answer must be the node's own (the fingerprint probe's
     // rule). No body and no custom header: a simple request, no preflight.
-    const res = await fetchImpl(`${origin}/api/house/fair-only?on=${on ? 1 : 0}`, { method: 'POST', signal: ctl.signal, redirect: 'error' });
+    const res = await fetchImpl(`${origin}/api/house/fair-only?on=${on ? 1 : 0}&node=${encodeURIComponent(node)}`, { method: 'POST', signal: ctl.signal, redirect: 'error' });
     if (res.status === 404) {
       return { ok: false, error: 'your node is older than the FAIR ONLY switch: update Star Station' };
     }
