@@ -76,7 +76,9 @@
 //! address that is not the writer's: a holder opens only toward public
 //! addresses at ports the game could have bound ([`v6_admitted`]), and the
 //! book's caps bound how often, as for any opening. Off with `SSF_NO_DHT=1`
-//! (the whole DHT) or `SSF_DHT_KNOCK=0`.
+//! (the whole DHT) or `SSF_DHT_KNOCK=0`; `SSF_DHT_KNOCK=ipv4` or `=ipv6`
+//! leaves one way only, on both sides (a test of one way on computers that
+//! have both).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -264,6 +266,42 @@ pub(crate) fn knock_point(room_key: &[u8; 32], holder: &PublicKey, bucket: u64) 
 /// anything else leaves it on, as the DHT itself is on unless told otherwise.
 pub(crate) fn knock_off(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("0")
+}
+
+/// The ways a knock goes while it is on: the IPv4 announce at the knock
+/// point, the IPv6 note beside it, or both (the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KnockWays {
+    Both,
+    /// `SSF_DHT_KNOCK=ipv4`: the announce alone.
+    Ipv4,
+    /// `SSF_DHT_KNOCK=ipv6`: the note alone.
+    Ipv6,
+}
+
+impl KnockWays {
+    /// Does the knock go by IPv4: announced by a knocker, looked up by a holder?
+    pub(crate) fn ipv4(self) -> bool {
+        self != KnockWays::Ipv6
+    }
+
+    /// Does it go by IPv6: a note left by a knocker, read by a holder?
+    pub(crate) fn ipv6(self) -> bool {
+        self != KnockWays::Ipv4
+    }
+}
+
+/// The ways `SSF_DHT_KNOCK` names: `ipv4` or `ipv6` (any case) for one of
+/// them, unset or anything else for both. A computer with both kinds of
+/// address could not show that one way links by itself otherwise: on two
+/// computers that have both, the IPv4 knock may link them first. Set it on
+/// both sides; each side does only its part of the way named.
+pub(crate) fn knock_ways(raw: Option<&str>) -> KnockWays {
+    match raw.map(|raw| raw.trim().to_ascii_lowercase()).as_deref() {
+        Some("ipv4") => KnockWays::Ipv4,
+        Some("ipv6") => KnockWays::Ipv6,
+        _ => KnockWays::Both,
+    }
 }
 
 /// May the holder open toward `addr`, as far as the address itself goes: a
@@ -659,19 +697,21 @@ pub struct KnockDht {
     /// Where opening dials toward us came in from, to dial back
     /// ([`CameIn`]).
     came_in: Mutex<CameIn>,
+    /// The ways knocks go (`SSF_DHT_KNOCK`).
+    ways: KnockWays,
 }
 
 impl KnockDht {
     /// Knock on `dht`, the node's own DHT client (main.rs `own_dht`), whose
     /// join goes on in the background.
-    pub(crate) fn on(dht: Dht) -> Self {
-        Self { dht, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0), came_in: Mutex::new(CameIn::default()) }
+    pub(crate) fn on(dht: Dht, ways: KnockWays) -> Self {
+        Self { dht, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0), came_in: Mutex::new(CameIn::default()), ways }
     }
 
     /// Join the DHT with `builder` on a client of the test's own.
     #[cfg(test)]
     pub(crate) fn start(builder: &DhtBuilder) -> std::io::Result<Self> {
-        Ok(Self::on(builder.build()?))
+        Ok(Self::on(builder.build()?, KnockWays::Both))
     }
 
     /// Is a knock of ours out now?
@@ -1060,7 +1100,7 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
         rounds.tick().await;
         let rooms = rooms_to_poll(&hub);
         let unix_secs = crate::chia_resolve::unix_now();
-        let points = round_points(&rooms, &me, unix_secs);
+        let points = if knock.ways.ipv4() { round_points(&rooms, &me, unix_secs) } else { Vec::new() };
         // The IPv6 notes are read only by a holder that has a public IPv6
         // address of its own: without one, no opening could leave toward them.
         let live: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
@@ -1071,7 +1111,11 @@ pub(crate) async fn run_holder(hub: SharedHub, endpoint: IrohEndpoint) {
                 IpAddr::V4(_) => None,
             })
             .collect();
-        let notes = if own6.iter().any(|ip| crate::ipv6_is_public(*ip)) { round_notes(&rooms, &me, unix_secs) } else { Vec::new() };
+        let notes = if knock.ways.ipv6() && own6.iter().any(|ip| crate::ipv6_is_public(*ip)) {
+            round_notes(&rooms, &me, unix_secs)
+        } else {
+            Vec::new()
+        };
         // All of a round's lookups side by side, the notes beside the points:
         // one slow point holds no other room up, and the round is over within
         // LOOKUP_TIMEOUT, with whatever each lookup had found by then.
@@ -1327,22 +1371,40 @@ async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU
         let port = knock_port(&live, &hub.reach.self_advertised.lock().unwrap(), bound, crate::ipv4_is_public);
         // And the IPv6 note beside the knock, on a computer with a public IPv6
         // address: the knock's peer list carries IPv4 only.
-        let mine6 = own_public_v6(&live, crate::ipv6_is_public);
+        let mine6 = if knock.ways.ipv6() { own_public_v6(&live, crate::ipv6_is_public) } else { Vec::new() };
+        // With the announce off (`SSF_DHT_KNOCK=ipv6`) the note is the knock,
+        // and is counted as out from the moment it begins, as an announce is.
+        let note_is_knock = !knock.ways.ipv4();
         let v6_note = async {
             if mine6.is_empty() {
                 return None;
             }
+            if note_is_knock {
+                count_knock_out(&knock.knocks_out, &state);
+            }
             let began = Instant::now();
             let left = tokio::time::timeout(V6_NOTE_WAIT, knock.leave_v6_note(&room_key, &target, bucket, &mine6, LOOKUP_TIMEOUT)).await;
+            if note_is_knock && !out_before && matches!(left, Ok(Err(_))) {
+                uncount_knock_out(&knock.knocks_out, &state);
+            }
             Some((left, began.elapsed()))
         };
         let began = Instant::now();
         let announce = async {
+            if !knock.ways.ipv4() {
+                return None;
+            }
             let how = announced(&knock.knocks_out, &state, out_before, ANNOUNCE_TIMEOUT, knock.announce(point, port)).await;
-            (how, began.elapsed())
+            Some((how, began.elapsed()))
         };
-        let ((how, took), v6) = tokio::join!(announce, v6_note);
+        let (announced_how, v6) = tokio::join!(announce, v6_note);
+        if note_is_knock && matches!(v6, Some((Ok(Ok(_)) | Err(_), _))) {
+            out_before = true;
+        }
         match v6 {
+            None if note_is_knock => {
+                eprintln!("🚪 DHT knock: only the IPv6 note is on (SSF_DHT_KNOCK=ipv6) and this computer has no public IPv6 address; no knock on {shown}… goes out");
+            }
             None => {}
             Some((Ok(Ok(entries)), took)) => println!(
                 "🚪 DHT knock: left a note for {shown}… with this computer's {} IPv6 address(es) ({:.1} s, {entries} in the note); it opens toward them too",
@@ -1355,6 +1417,7 @@ async fn knock_rounds(hub: SharedHub, endpoint: IrohEndpoint, state: Arc<AtomicU
                 V6_NOTE_WAIT.as_secs()
             ),
         }
+        let Some((how, took)) = announced_how else { continue };
         match how {
             Announced::Stored => {
                 out_before = true;
@@ -1581,6 +1644,22 @@ mod tests {
         }
         // The first hour of the clock has none before it.
         assert_eq!(poll_buckets(5), vec![0]);
+    }
+
+    #[test]
+    fn the_knock_goes_both_ways_unless_one_is_named() {
+        assert_eq!(knock_ways(None), KnockWays::Both);
+        assert_eq!(knock_ways(Some("1")), KnockWays::Both);
+        assert_eq!(knock_ways(Some("")), KnockWays::Both);
+        assert_eq!(knock_ways(Some("ipv6")), KnockWays::Ipv6);
+        assert_eq!(knock_ways(Some(" IPv6 ")), KnockWays::Ipv6);
+        assert_eq!(knock_ways(Some("ipv4")), KnockWays::Ipv4);
+        assert_eq!(knock_ways(Some("v6")), KnockWays::Both);
+        assert!(KnockWays::Both.ipv4() && KnockWays::Both.ipv6());
+        assert!(!KnockWays::Ipv6.ipv4() && KnockWays::Ipv6.ipv6());
+        assert!(KnockWays::Ipv4.ipv4() && !KnockWays::Ipv4.ipv6());
+        // A named way is not the knock off.
+        assert!(!knock_off(Some("ipv6")) && !knock_off(Some("ipv4")));
     }
 
     #[test]
