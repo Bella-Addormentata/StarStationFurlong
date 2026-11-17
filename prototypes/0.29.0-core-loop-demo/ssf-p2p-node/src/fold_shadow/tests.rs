@@ -448,7 +448,7 @@ impl Bench {
         let bench = Bench {
             shadow: FoldShadow::new(launch, now),
             doc: Doc::new(),
-            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] }),
+            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] }),
             case,
             now,
             log,
@@ -697,7 +697,7 @@ fn a_room_that_is_no_longer_followed_has_its_tables_forgotten_and_goes() {
     assert_eq!(b.forgets(), 1, "the worker was told");
     assert_eq!(b.shadow.counts().cold, before.cold, "what the room did stays counted");
     // It is followed afresh when there is something again.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
     b.until("followed again", |b| b.caught_up());
     assert_eq!(b.shadow.counts().cold, before.cold + 1);
 }
@@ -809,7 +809,7 @@ fn a_room_followed_again_before_it_was_let_go_of_is_kept() {
     b.view = None;
     b.ticks(3);
     // The house finds the room and its table again while the worker still has to be told.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] });
     b.shadow.sup.unclog(QUEUE_BYTES);
     for _ in 0..6 {
         b.tick();
@@ -1025,7 +1025,7 @@ fn the_tables_a_worker_can_hold_are_shared_between_the_rooms_in_room_order() {
                 comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
             }
         }
-        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
+        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
         docs.push((room.to_string(), doc, Some(view)));
     }
     for _ in 0..200 {
@@ -1323,7 +1323,7 @@ fn every_table_to_go_is_let_go_of_in_every_room_before_a_new_one_is_asked_for() 
         }
     };
     let names = |p: &str, from: usize, to: usize| -> Vec<String> { (from..to).map(|i| format!("{p}{i}")).collect() };
-    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
+    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
     // Room a has 7 tables and room b 7: the worker is full.
     let (a1, b1) = (names("a", 0, 7), names("b", 0, 7));
     make(&docs[0].1, "room-a", &names("a", 0, 10));
@@ -1390,7 +1390,7 @@ fn a_forget_the_worker_could_not_take_holds_back_the_new_tables_of_every_room() 
     };
     make(&docs[0].1, "room-a", &[long.clone()]);
     make(&docs[1].1, "room-b", &["b0".to_string(), "b1".to_string()]);
-    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
+    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![] };
     for _ in 0..300 {
         b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[&long]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0"])))]);
         thread::sleep(Duration::from_millis(2));
@@ -2650,6 +2650,34 @@ fn a_delegation_replaced_in_a_room_with_a_plan_and_no_table_yet_is_seen() {
     assert_eq!(b.confirmed_count(), 0);
 }
 
+/// 🔒 What a FAIR ONLY game's answer needs of a view ([`FoldView::pins_settled`]) is the watch's own word on the pins,
+/// whatever the plan: a plan that read the room in part, or was made under another holder, leaves it as it is, and a key
+/// replaced takes it away.
+#[test]
+fn a_views_pins_settled_is_the_watchs_whatever_the_plan() {
+    let b = Bench::new("house craps 3");
+    let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    let plan = |owner: &str, complete: bool| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete, gapped: false, games: vec![] };
+    let mut shadow = b.shadow;
+    let view = shadow.view_of(&room, &doc, plan(OWNER, true), PIN_WALK_KEYS);
+    assert!(view.settled && view.pins_settled);
+    for (owner, complete) in [(OWNER, false), ("someone else", true)] {
+        let view = shadow.view_of(&room, &doc, plan(owner, complete), PIN_WALK_KEYS);
+        assert!(!view.settled && view.pins_settled, "{owner} {complete}");
+    }
+    let players = doc.get_or_insert_map("players");
+    {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("A"))])));
+    }
+    {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("B"))])));
+    }
+    let view = shadow.view_of(&room, &doc, plan(OWNER, true), PIN_WALK_KEYS);
+    assert!(!view.settled && !view.pins_settled, "a key replaced");
+}
+
 /// A view is settled only while the doc names the deed holder the plan was made under.
 #[test]
 fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_under() {
@@ -3700,7 +3728,7 @@ fn game_bench_with(hold: impl FnOnce(&Case) -> Vec<String>) -> (Bench, GamePlan)
             }
         }
     }
-    let view = FoldView { tables: vec![], houses: vec![], pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![plan.clone()] };
+    let view = FoldView { tables: vec![], houses: vec![], pins: case.pins.clone(), settled: true, pins_settled: true, pins_epoch: 0, watch: None, gapped: false, games: vec![plan.clone()] };
     let bench = Bench { shadow: FoldShadow::new(launch, now), doc, view: Some(view), case, now, log, refuse, listed: true };
     (bench, plan)
 }
@@ -4035,4 +4063,24 @@ fn a_games_answer_carries_the_watch_of_the_players_keys_where_the_view_read_them
     b.view.as_mut().unwrap().watch = None;
     b.until("an answer with no watch", |b| b.game_answer().is_some_and(|a| a.pins.is_none()));
     drop(pins);
+}
+
+#[test]
+fn no_game_has_an_answer_while_the_pins_are_not_the_whole_story() {
+    let (mut b, _plan) = game_bench();
+    b.until("the game's answer", |b| b.game_answer().is_some());
+    // A key replaced, a player left unpinned, the players not read to the end: a felt the pages count may be one the
+    // fold was not told of, and the answer it gave is let go of.
+    b.view.as_mut().unwrap().pins_settled = false;
+    b.ticks(1);
+    assert!(b.game_answer().is_none(), "the answer let go of");
+    b.ticks(20);
+    assert!(b.game_answer().is_none(), "and none made while they are not");
+    // (The rest of the view is no part of it: a plan that read the room in part still gives a game's answer.)
+    {
+        let view = b.view.as_mut().unwrap();
+        view.pins_settled = true;
+        view.settled = false;
+    }
+    b.until("an answer once they are", |b| b.game_answer().is_some());
 }

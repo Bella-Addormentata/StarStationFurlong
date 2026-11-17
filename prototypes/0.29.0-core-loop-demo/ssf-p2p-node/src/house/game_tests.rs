@@ -3732,7 +3732,7 @@ fn by_house(r: i64, close: &str, reveal: &str, copies: &[&str]) -> RoundSummary 
 /// The last checkpoint of each FAIR ONLY game this house signed, as its rows file has it: its key and canonical bytes.
 fn rows_on_disk(dir: &std::path::Path) -> BTreeMap<(String, String, String), (String, String)> {
     let rows = parse_rows(&std::fs::read(dir.join(ROWS_FILE)).unwrap()).unwrap();
-    rows.into_iter().map(|(at, (k, v))| (at, (k, hb::canon(&v).unwrap()))).collect()
+    rows.into_iter().map(|(at, row)| (at, (row.key, hb::canon(&row.value).unwrap()))).collect()
 }
 
 /// A value's canonical bytes (a record read back from the doc has its fields in another order).
@@ -4348,20 +4348,37 @@ fn its_last_checkpoint_goes_back_while_none_stands_above_it_and_after_a_start() 
     game.tick(REPUT_MS);
     assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
     assert_eq!(game.house.game_counts().row_put_backs, 1);
-    // Junk under its key: the same.
+    // Junk under its key: the same. (The session it opens is there: as it is.)
+    let live = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    game.ses = live.clone();
+    game.put_in_session("left-as-it-is", Any::Number(1.0));
+    let held = game.records_in(&live);
     game.put_top(&key, &s("junk"));
     game.tick(REPUT_MS);
     assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
-    // Every record of the game gone, the session's too: it goes back all the same.
+    assert_eq!(game.records_in(&live), held, "its session as it was");
+    // Every record of the game gone, the session's too: it goes back all the same, once the doc holds no part of an
+    // update.
     for (k, _) in game.cks() {
         game.delete_top(&k);
     }
     for k in game.sessions() {
         game.delete_top(&k);
     }
+    let (first, second) = game.updates_out_of_order();
+    game.apply_update(&second);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert!(game.top(&key).is_none(), "not from a doc that holds part of an update");
+    game.apply_update(&first);
     game.tick(REPUT_MS);
     game.tick(REPUT_MS);
     assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "a game the doc holds nothing of");
+    // (With the session it opens, which holds nothing its trim carried: the session it closed is gone with them.)
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    assert_eq!(game.sessions(), vec![next.clone()]);
+    game.ses = next;
+    assert!(game.records("").iter().all(|(k, _)| *k != ck && *k != rk), "{:?}", game.records(""));
     // After a start, from its rows file.
     let dir = game.dir.clone();
     let mut again = House::open(&NODE, Some(dir.join(STATE_FILE))).unwrap();
@@ -4373,6 +4390,102 @@ fn its_last_checkpoint_goes_back_while_none_stands_above_it_and_after_a_start() 
     game.tick_of(&mut again);
     assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "after a start");
     assert_eq!(again.game_counts().row_put_backs, 1);
+}
+
+impl Game {
+    /// The doc as it is now: as the node's saved room would hold it, had it stopped now.
+    fn saved(&self) -> Vec<u8> {
+        self.doc.transact().encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// The node stopped and started again with its state file and rows, on the doc as `saved` held it: what it wrote
+    /// since is lost, as no page had it.
+    fn stopped_before_it_saved(&mut self, saved: &[u8]) {
+        use yrs::updates::decoder::Decode;
+        let doc = Doc::new();
+        doc.transact_mut().apply_update(yrs::Update::decode_v1(saved).unwrap()).unwrap();
+        self.doc = doc;
+        self.restart(0);
+        self.no_answer();
+    }
+
+    /// Session `ses`'s records: their keys and canonical bytes.
+    fn records_in(&mut self, ses: &str) -> Vec<(String, Option<String>)> {
+        let live = std::mem::replace(&mut self.ses, ses.to_string());
+        let out = self.records("").into_iter().map(|(k, v)| (k, hb::canon(&v))).collect();
+        self.ses = live;
+        out
+    }
+}
+
+/// A trim of round 1 that carried the open round's felts of carol and dave and a join of it, with round 1's decider and
+/// reveal: the game; the checkpoint's key and value; the session it closed, and the one it opened; and the doc just
+/// before it.
+fn trimmed_with_copies(name: &str) -> (Game, String, CVal, String, String, Vec<u8>) {
+    let mut game = Game::opened(name, "landlord");
+    let (c, ck, rk, hash) = game.revealed_round_one();
+    let carol = format!("s:2:carol:{}", game.slip(&who("carol"), 2));
+    let dave = format!("s:2:dave:{}", game.slip(&who("dave"), 2));
+    let join = "ef".repeat(16);
+    game.put_in_session(&format!("o:2:{join}"), to_any(&obj(vec![("r", CVal::Int(2))])));
+    let mut f = game.pressed_answer(&c, &ck, &rk, &hash);
+    f.carry_felts = Some(vec![carol, dave]);
+    f.joins = vec![join];
+    game.answer(f);
+    game.tick(200);
+    let closed = game.ses.clone();
+    let saved = game.saved();
+    game.tick(HOUSE_TRIM_AFTER_MS);
+    assert_eq!(game.house.game_counts().trims, 1);
+    let (key, v) = game.cks().into_iter().next().unwrap();
+    let next = format!("ses:{T}:{}:{}", game.ctx.inc, hb::next_sid3(&game.ctx, &v).unwrap());
+    assert_eq!(game.records_in(&next).len(), 5, "the felts, the join, the decider and its reveal");
+    (game, key, v, closed, next, saved)
+}
+
+#[test]
+fn a_checkpoint_put_back_after_the_doc_lost_its_trim_whole_opens_its_session_with_what_the_trim_carried() {
+    let (mut game, key, v, closed, next, saved) = trimmed_with_copies("trim-lost-whole");
+    let carried = game.records_in(&next);
+    // The node stopped before it saved the room, and no page had the trim: the doc as it was before, the row on disk.
+    game.stopped_before_it_saved(&saved);
+    assert!(game.top(&key).is_none() && !game.sessions().contains(&next));
+    // (Meanwhile dave's felt left the session it closed: it is not one to put back.)
+    let dave = carried.iter().map(|(k, _)| k.clone()).find(|k| k.starts_with("s:2:dave:")).unwrap();
+    game.ses = closed.clone();
+    game.delete_in_session(&dave);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v), "its checkpoint back");
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    // The session it opens, with what the trim carried out of the one it closed, as the trim wrote it.
+    let back = game.records_in(&next);
+    assert_eq!(back, carried.into_iter().filter(|(k, _)| *k != dave).collect::<Vec<_>>());
+    // Once, and the pages count from it.
+    game.tick(REPUT_MS);
+    assert_eq!(game.house.game_counts().row_put_backs, 1);
+    assert_eq!(game.resolved_base().as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn no_checkpoint_goes_back_from_its_row_while_the_doc_holds_part_of_an_update() {
+    let (mut game, key, v, _closed, next, saved) = trimmed_with_copies("trim-lost-partial");
+    let carried = game.records_in(&next);
+    game.stopped_before_it_saved(&saved);
+    let (first, second) = game.updates_out_of_order();
+    game.apply_update(&second);
+    assert!(game.doc.transact().store().pending_update().is_some(), "the doc holds part of an update");
+    for _ in 0..3 {
+        game.tick(REPUT_MS);
+    }
+    assert!(game.top(&key).is_none(), "it, and the session it opens, may be in the part to come");
+    assert!(!game.sessions().contains(&next));
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+    game.apply_update(&first);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+    assert_eq!(game.records_in(&next), carried, "and its session with it");
 }
 
 #[test]
@@ -4403,14 +4516,33 @@ fn the_rows_file_reads_back_what_it_wrote_and_no_row_whose_key_is_not_its_checkp
     let ck = game.base.clone();
     let key = game.ck_key(&ck);
     let path = game.dir.join(ROWS_FILE);
+    let at = (ROOM.to_string(), T.to_string(), game.ctx.inc.clone());
+    // With what its trim carried, each record as it was.
+    let copies = vec![("s:2:carol:ab".to_string(), obj(vec![("r", CVal::Int(2)), ("p", s("carol"))])), ("o:2:cd".to_string(), obj(vec![("r", CVal::Int(2))]))];
+    let canons = |copies: &[(String, CVal)]| copies.iter().map(|(k, v)| (k.clone(), hb::canon(v))).collect::<Vec<_>>();
     let mut rows = BTreeMap::new();
-    rows.insert((ROOM.to_string(), T.to_string(), game.ctx.inc.clone()), (key.clone(), ck.clone()));
+    rows.insert(at.clone(), Row { key: key.clone(), value: ck.clone(), copies: copies.clone() });
     write_rows(&path, &rows).unwrap();
-    assert_eq!(parse_rows(&std::fs::read(&path).unwrap()).unwrap().into_iter().map(|(at, (k, v))| (at, (k, hb::canon(&v)))).collect::<Vec<_>>(), vec![((ROOM.to_string(), T.to_string(), game.ctx.inc.clone()), (key.clone(), hb::canon(&ck)))]);
-    let wrong = serde_json::json!({ "v": 1, "rows": [[ROOM, T, game.ctx.inc, "ck:x", hb::canon(&ck)]] });
+    let back = parse_rows(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(back.keys().collect::<Vec<_>>(), vec![&at]);
+    assert_eq!((back[&at].key.as_str(), hb::canon(&back[&at].value)), (key.as_str(), hb::canon(&ck)));
+    assert_eq!(canons(&back[&at].copies), canons(&copies));
+    // (A file of v 1, from before a row kept what its trim carried: it carried nothing.)
+    let old = serde_json::json!({ "v": 1, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck)]] });
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let back = parse_rows(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!((back[&at].key.as_str(), back[&at].copies.len()), (key.as_str(), 0));
+    let wrong = serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, "ck:x", hb::canon(&ck), []]] });
     std::fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
     assert!(rows_on_disk(&game.dir).is_empty());
-    for bad in [serde_json::json!({ "v": 2, "rows": [] }), serde_json::json!({ "v": 1 }), serde_json::json!({ "v": 1, "rows": [[ROOM]] })] {
+    for bad in [
+        serde_json::json!({ "v": 3, "rows": [] }),
+        serde_json::json!({ "v": 1 }),
+        serde_json::json!({ "v": 1, "rows": [[ROOM]] }),
+        serde_json::json!({ "v": 1, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck), []]] }),
+        serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck)]] }),
+        serde_json::json!({ "v": 2, "rows": [[ROOM, T, game.ctx.inc, key, hb::canon(&ck), [["o:2:cd"]]]] }),
+    ] {
         assert!(parse_rows(&serde_json::to_vec(&bad).unwrap()).is_none(), "{bad}");
     }
     // Unreadable: the house starts all the same, with no row.

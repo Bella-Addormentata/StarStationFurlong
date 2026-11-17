@@ -343,6 +343,10 @@ pub struct FoldView {
     /// asks it of every tick the session is followed in, not only the one a
     /// trim comes in.
     pub settled: bool,
+    /// 🔒 The pins alone are the whole story (fold_pins.rs [`PlayerPins::view`]: no key replaced, none left unpinned,
+    /// the players read to the end), whatever the plan: what a FAIR ONLY game's answer needs, for a player whose key the
+    /// fold was not given has felts the pages count and the fold does not, and a trim from it would leave them behind.
+    pub pins_settled: bool,
     /// The epoch of the pins as this view saw them, and a way to ask where they are now
     /// (None: they never move, as in a view made by hand).
     pub pins_epoch: u64,
@@ -684,10 +688,14 @@ impl RoomShadow {
     /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it, and the view's pins:
     /// [`Feed::covers`]), the doc has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the
     /// plan's, and the fold is finished. With the watch of the pins and its epoch as the view read them. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
-    /// its answer let go of.
+    /// its answer let go of, and no game has one while the pins are not the whole story ([`FoldView::pins_settled`]):
+    /// they move the epoch when they stop being so, which takes back an answer made before.
     fn keep_answers<L: Launch>(&mut self, view: &FoldView, inputs: &Inputs, sup: &Supervisor<L>) {
         let games: BTreeSet<TableKey> = view.games.iter().map(|g| (g.t.clone(), g.inc.clone())).collect();
-        self.answers.retain(|k, _| games.contains(k));
+        self.answers.retain(|k, _| games.contains(k) && view.pins_settled);
+        if !view.pins_settled {
+            return;
+        }
         for g in &view.games {
             let k = (g.t.clone(), g.inc.clone());
             if !self.feed.covers(&k.0, &k.1, &self.mirror, sup, inputs) || !self.mirror.current(&k.0, &k.1) {
@@ -1148,7 +1156,7 @@ impl<L: Launch> FoldShadow<L> {
         // (And the key the watch has pinned for that holder is the key the pass pinned: the houses are the ones that
         // key delegated.)
         let held = deed.as_deref() == Some(plan.owner.as_str()) && pins.iter().any(|(pid, key)| *pid == plan.owner && *key == plan.owner_key);
-        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch), gapped: plan.gapped, games: plan.games }
+        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_settled, pins_epoch, watch: Some(watch), gapped: plan.gapped, games: plan.games }
     }
 
     /// One tick, with every room the node serves: its doc, and what to follow there (None:
