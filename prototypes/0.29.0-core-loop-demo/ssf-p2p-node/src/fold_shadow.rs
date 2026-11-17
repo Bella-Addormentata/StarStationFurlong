@@ -1349,6 +1349,7 @@ impl<L: Launch> FoldShadow<L> {
             game_answers: self.rooms.values().map(|rs| rs.answers.len() as u64).sum(),
             // (The house's, which the node's pass puts in: main.rs `fold_shadow_pass`.)
             trims: 0,
+            sweeps: 0,
             cross_check_mismatches: 0,
             row_put_backs: 0,
             off: self.sup.off().map(str::to_string),
