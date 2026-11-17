@@ -26,6 +26,15 @@
 //!   address a connection that came in from it still stands to, nor toward
 //!   one a link in any room has a direct path to, whichever side dialed it
 //!   ([`linked_addrs`]; [`OpeningBook::begin`] has the other limits).
+//! - **The dial back**: the holder's own router may give its game socket a
+//!   different outside port for every destination (GitHub's machines do), so
+//!   the knocker's dial to the holder's port never meets it. The opening dial
+//!   arrives FROM that mapping, though: while a knock is out, the knocker
+//!   keeps where an opening came in from ([`CameIn`]), and its dial to that IP
+//!   goes there too, on the pair of addresses both routers already let
+//!   through. It lands wherever the opening got in at all (2026-11-16: a
+//!   GitHub machine held, a home computer whose router had opened a port
+//!   knocked, and they linked 33 s after the invite was opened).
 //!
 //! What it does not do: it does not find a holder's address (the dial does
 //! that, from the pass and the DHT's address record), and it reads and writes
@@ -33,7 +42,10 @@
 //! game's socket an outside port the node does not know: a different one for
 //! every destination, or one fixed other port the router never told it. The
 //! knock names the outside port as far as it is known ([`knock_port`]), and
-//! the holder's router lets in only what comes from the port it sent to.
+//! the holder's router lets in only what comes from the port it sent to. Nor,
+//! for the same reason, where the holder's router is the one with a port for
+//! every destination and the knocker's lets in only what it asked for: its
+//! opening never gets in, so there is nothing to dial back to.
 //!
 //! Who can see what: a knocker's address and port are stored by the DHT nodes
 //! nearest the knock point, and handed to anyone who asks at that point. The
@@ -92,6 +104,17 @@ pub(crate) const MAX_ROOMS: usize = 4;
 /// keep it for only thirty seconds, so the hold sends again well inside that.
 pub(crate) const OPENING_PERIOD: Duration = Duration::from_secs(15);
 pub(crate) const OPENING_WINDOW: Duration = Duration::from_secs(180);
+
+/// How long the knocker keeps the address an opening dial came in from
+/// ([`CameIn`]). Openings come every [`OPENING_PERIOD`], and each one keeps
+/// the routers' entries for that pair of addresses fresh; one heard longer ago
+/// than this is not dialed back.
+pub(crate) const DIAL_BACK_FOR: Duration = Duration::from_secs(60);
+
+/// The most addresses [`CameIn`] keeps. Each one is an opening that came in
+/// while a knock of ours was out, so a handful is plenty; the bound keeps a
+/// stream of stray inbound dials from growing it.
+pub(crate) const CAME_IN_MAX: usize = 16;
 
 /// An opening dial is let go after this long: its packets left at once, and
 /// nothing more is wanted of it.
@@ -369,6 +392,57 @@ impl OpeningBook {
     }
 }
 
+/// The knocker's side of an opening that came in: where the holder's opening
+/// dials came from, and when. The holder's router may give its game socket a
+/// different outside port for every destination (GitHub's machines do,
+/// 2026-11-16): the port the knocker dials then never meets the holder's
+/// mapping, but the opening dial arrives FROM it. A dial of the knocker's own
+/// to that very address goes out on the pair of addresses the opening came in
+/// on, which both routers already let through, so it lands, where the
+/// knocker's router let the opening in at all (a port it forwards or had
+/// opened for it, or one that lets in anyone once the computer has sent out).
+/// Pure: the clock is handed in.
+#[derive(Default)]
+pub(crate) struct CameIn {
+    /// The addresses openings came in from, and when the last one from each
+    /// did. Several per IP: two holders behind one public address each open
+    /// from a port of their own, and neither may push the other's out.
+    from: HashMap<SocketAddrV4, Instant>,
+}
+
+impl CameIn {
+    /// An opening dial came in from `addr` at `now`. At most [`CAME_IN_MAX`]
+    /// addresses are kept, the ones heard from last.
+    pub(crate) fn note(&mut self, addr: SocketAddrV4, now: Instant) {
+        self.from.retain(|_, at| now.duration_since(*at) < DIAL_BACK_FOR);
+        self.from.insert(addr, now);
+        while self.from.len() > CAME_IN_MAX {
+            let oldest = self.from.iter().min_by_key(|(addr, at)| (**at, **addr)).map(|(addr, _)| *addr);
+            match oldest {
+                Some(addr) => self.from.remove(&addr),
+                None => break,
+            };
+        }
+    }
+
+    /// The addresses to dial back for a dial whose hints name `ips`: those an
+    /// opening came in from within [`DIAL_BACK_FOR`], from one of those IPs,
+    /// that the dial does not hold already (`known`). An opening from an IP
+    /// the dial does not name is not followed: the dial would only go where
+    /// nobody it means is.
+    pub(crate) fn dial_back(&mut self, ips: &HashSet<Ipv4Addr>, known: &HashSet<SocketAddr>, now: Instant) -> Vec<SocketAddrV4> {
+        self.from.retain(|_, at| now.duration_since(*at) < DIAL_BACK_FOR);
+        let mut back: Vec<SocketAddrV4> = self
+            .from
+            .keys()
+            .filter(|addr| ips.contains(addr.ip()) && !known.contains(&SocketAddr::V4(**addr)))
+            .copied()
+            .collect();
+        back.sort();
+        back
+    }
+}
+
 /// The node's own client on the Mainline DHT for knocks, with the holder's
 /// book. The address lookup keeps the client it publishes and resolves with
 /// to itself, so this is a second one, on a socket of its own, which the
@@ -381,13 +455,16 @@ pub struct KnockDht {
     /// handshake that fails on the way in is most likely the opening dial we
     /// asked for (main.rs `run_iroh_listener`).
     knocks_out: AtomicUsize,
+    /// Where opening dials toward us came in from, to dial back
+    /// ([`CameIn`]).
+    came_in: Mutex<CameIn>,
 }
 
 impl KnockDht {
     /// Knock on `dht`, the node's own DHT client (main.rs `own_dht`), whose
     /// join goes on in the background.
     pub(crate) fn on(dht: Dht) -> Self {
-        Self { dht, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0) }
+        Self { dht, book: Mutex::new(OpeningBook::default()), knocks_out: AtomicUsize::new(0), came_in: Mutex::new(CameIn::default()) }
     }
 
     /// Join the DHT with `builder` on a client of the test's own.
@@ -415,6 +492,29 @@ impl KnockDht {
         if let SocketAddr::V4(v4) = addr {
             self.book.lock().unwrap().note_landed(v4, Instant::now());
         }
+    }
+
+    /// An inbound dial that ended before it linked came from `addr` while a
+    /// knock of ours was out: most likely the opening we asked for (main.rs
+    /// `run_iroh_listener`). Kept to dial back ([`CameIn`]).
+    pub(crate) fn note_opening_from(&self, addr: SocketAddr) {
+        if let SocketAddr::V4(v4) = addr {
+            self.came_in.lock().unwrap().note(v4, Instant::now());
+        }
+    }
+
+    /// Where a dial whose hints are `hints` should also go: the addresses an
+    /// opening came in from lately, from the IPs it dials ([`CameIn::dial_back`]).
+    pub(crate) fn dial_back(&self, hints: &[SocketAddr]) -> Vec<SocketAddrV4> {
+        let ips: HashSet<Ipv4Addr> = hints
+            .iter()
+            .filter_map(|addr| match addr {
+                SocketAddr::V4(v4) => Some(*v4.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        let known: HashSet<SocketAddr> = hints.iter().copied().collect();
+        self.came_in.lock().unwrap().dial_back(&ips, &known, Instant::now())
     }
 
     /// A connection accepted from `addr` stands for as long as the guard this
@@ -867,6 +967,74 @@ mod tests {
     /// An IPv6 address of the documentation range.
     fn sock6(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), port)
+    }
+
+    /// GitHub's machine held the room and the owner's computer knocked
+    /// (2026-11-16): the openings came in from the holder's IP on a port its
+    /// router picked for this destination, never the one the knocker dialed.
+    /// The knocker dials that address back.
+    #[test]
+    fn an_opening_from_the_ip_we_dial_is_dialed_back_on_its_own_port() {
+        let now = Instant::now();
+        let mut came = CameIn::default();
+        let holder = v4(203, 0, 113, 7, 44452);
+        let mapped = v4(203, 0, 113, 7, 61022);
+        came.note(mapped, now);
+        let ips: HashSet<Ipv4Addr> = [*holder.ip()].into();
+        let known: HashSet<SocketAddr> = [SocketAddr::V4(holder)].into();
+        assert_eq!(came.dial_back(&ips, &known, now + Duration::from_secs(5)), vec![mapped]);
+        // Another holder behind the same public address opens from a port of
+        // its own: both are dialed back, neither pushes the other out.
+        let other = v4(203, 0, 113, 7, 61040);
+        came.note(other, now + Duration::from_secs(15));
+        assert_eq!(came.dial_back(&ips, &known, now + Duration::from_secs(16)), vec![mapped, other]);
+    }
+
+    #[test]
+    fn the_book_of_openings_keeps_the_last_few_only() {
+        let now = Instant::now();
+        let mut came = CameIn::default();
+        let count = CAME_IN_MAX as u16 + 4;
+        for i in 0..count {
+            came.note(v4(203, 0, 113, 7, 40000 + i), now + Duration::from_millis(u64::from(i)));
+        }
+        let ips: HashSet<Ipv4Addr> = [Ipv4Addr::new(203, 0, 113, 7)].into();
+        let back = came.dial_back(&ips, &HashSet::new(), now + Duration::from_secs(1));
+        assert_eq!(back.len(), CAME_IN_MAX);
+        // The oldest went first.
+        assert_eq!(back.first().map(|a| a.port()), Some(40000 + 4));
+        assert_eq!(back.last().map(|a| a.port()), Some(40000 + count - 1));
+    }
+
+    #[test]
+    fn an_opening_is_not_followed_elsewhere_twice_or_too_late() {
+        let now = Instant::now();
+        let mut came = CameIn::default();
+        let holder = v4(203, 0, 113, 7, 44452);
+        came.note(v4(198, 51, 100, 9, 50000), now);
+        let ips: HashSet<Ipv4Addr> = [*holder.ip()].into();
+        let mut known: HashSet<SocketAddr> = [SocketAddr::V4(holder)].into();
+        // From an IP the dial does not name: not followed.
+        assert!(came.dial_back(&ips, &known, now).is_empty());
+        // The very address the dial holds already: nothing to add.
+        came.note(holder, now);
+        assert!(came.dial_back(&ips, &known, now).is_empty());
+        // Heard too long ago: dropped.
+        let mapped = v4(203, 0, 113, 7, 61022);
+        came.note(mapped, now);
+        known.remove(&SocketAddr::V4(holder));
+        assert!(came.dial_back(&ips, &known, now + DIAL_BACK_FOR).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_knocker_dials_back_only_ipv4_hints_of_its_own_dial() {
+        let mut builder = DhtBuilder::default();
+        builder.no_bootstrap();
+        let knock = KnockDht::start(&builder).expect("a DHT client that joins nothing");
+        knock.note_opening_from(sock(203, 0, 113, 7, 61022));
+        knock.note_opening_from(sock6(61023));
+        assert_eq!(knock.dial_back(&[sock(203, 0, 113, 7, 44452), sock6(44452)]), vec![v4(203, 0, 113, 7, 61022)]);
+        assert!(knock.dial_back(&[sock(198, 51, 100, 9, 44452)]).is_empty());
     }
 
     #[test]
