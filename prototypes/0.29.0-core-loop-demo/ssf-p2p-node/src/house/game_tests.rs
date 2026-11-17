@@ -4468,6 +4468,46 @@ fn a_checkpoint_put_back_after_the_doc_lost_its_trim_whole_opens_its_session_wit
 }
 
 #[test]
+fn a_checkpoint_a_page_put_back_alone_after_the_doc_lost_its_trim_gets_its_session_with_what_the_trim_carried() {
+    let (mut game, key, v, _closed, next, saved) = trimmed_with_copies("trim-lost-ck-only");
+    let carried = game.records_in(&next);
+    game.stopped_before_it_saved(&saved);
+    // A page that counted from the checkpoint puts it back, and only it: the session it opens is the house's to open.
+    game.put_top(&key, &v);
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(game.records_in(&next), carried, "the session, with what the trim carried");
+    assert_eq!(game.house.game_counts().row_put_backs, 0, "the checkpoint was the page's to put back");
+    assert_eq!(canon_of(game.top(&key)), hb::canon(&v));
+}
+
+#[test]
+fn a_lost_session_of_its_rows_checkpoint_goes_back_with_this_houses_records_in_it() {
+    let (mut game, key, _v, _closed, next, _saved) = trimmed_with_copies("trim-lost-next");
+    // The house plays on in the session the trim opened: it reveals round 2 there.
+    game.no_answer();
+    game.ses = next.clone();
+    game.closed(2, &game.sid(), &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    let own: Vec<String> = game.records("h:2:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(own.len(), 1, "its reveal of round 2");
+    // The map gone (the session it closed went with the trim: nothing carried to put back), it goes back in one write
+    // with its reveal in it, as any lost map does.
+    game.delete_top(&next);
+    // (What the put-back writes at the top of the doc, by key.)
+    let written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = written.clone();
+    let _sub = yrs::Observable::observe(&game.doc.get_or_insert_map(COMPUTED_MAP), move |txn, e: &yrs::types::map::MapEvent| seen.lock().unwrap().extend(e.keys(txn).keys().map(|k| k.to_string())));
+    game.tick(REPUT_MS);
+    assert!(game.has_session(), "the map goes back");
+    let back: Vec<String> = game.records("").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(back, own, "with its reveal in it, and nothing the trim carried");
+    assert_eq!(*written.lock().unwrap(), vec![next.clone()], "and its checkpoint, which the doc holds, is not written again ({key})");
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+}
+
+#[test]
 fn no_checkpoint_goes_back_from_its_row_while_the_doc_holds_part_of_an_update() {
     let (mut game, key, v, _closed, next, saved) = trimmed_with_copies("trim-lost-partial");
     let carried = game.records_in(&next);

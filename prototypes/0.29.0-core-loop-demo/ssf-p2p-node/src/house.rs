@@ -752,12 +752,14 @@ pub enum Write {
     /// under the key yet), every key in `gone` deleted but that one (the game's other checkpoints and its sessions), and
     /// the session the checkpoint opens, `ses`, made anew with `copies` in it.
     Trim { key: String, value: CVal, gone: Vec<String>, ses: String, copies: Vec<(String, CVal)> },
-    /// 🔒 A FAIR ONLY game's last checkpoint this house signed, put back from its row (design-final section 8.5 N5): the
-    /// checkpoint under `key`; and with `ses` (the session it opens, the session it closed, and what its trim carried),
-    /// that session made, where the doc holds no map under its key, with each record its trim carried that the closed
-    /// session holds still. So the doc lost the trim whole (the node stopped before it saved it, and no page had it),
-    /// and what the trim carried out of the closed session would else be left behind in it.
-    Restore { key: String, value: CVal, ses: Option<(String, String, Vec<(String, CVal)>)> },
+    /// 🔒 A FAIR ONLY game's last checkpoint this house signed, put back from its row (design-final section 8.5 N5): with
+    /// `ck`, the checkpoint under `key`; and with `ses` (the session it opens, the session it closed, and what its trim
+    /// carried), that session made, where the doc holds no map under its key, with each record its trim carried that the
+    /// closed session holds still. The closed session is there only where the trim's deletes never landed: the doc lost
+    /// the trim (the node stopped before it saved it, and no page had it, or a page put back only its checkpoint), and
+    /// what the trim carried out of the closed session would else be left behind in it. Without `ck`: only the session,
+    /// of a checkpoint the doc holds.
+    Restore { key: String, value: CVal, ck: bool, ses: Option<(String, String, Vec<(String, CVal)>)> },
 }
 
 /// 🔒 A row of [`ROWS_FILE`]: the last checkpoint this house signed for a FAIR ONLY game, its key and value, and what
@@ -1860,9 +1862,18 @@ impl House {
                 }
             }
             // 🔒 (A game's session map the walk puts back is there for its own records, which go into it in the same
-            // write: a close put back into it by a page is read by the house beside its join, not before.)
-            let (maps, game_reput): (Vec<Write>, Vec<Write>) = std::mem::take(&mut fo.reput).into_iter().partition(|w| matches!(w, Write::NewSession { .. }));
-            let new_maps: HashSet<String> = maps.iter().filter_map(|w| if let Write::NewSession { ses } = w { Some(ses.clone()) } else { None }).collect();
+            // write: a close put back into it by a page is read by the house beside its join, not before. One its row
+            // puts back with its checkpoint too.)
+            let (maps, game_reput): (Vec<Write>, Vec<Write>) = std::mem::take(&mut fo.reput).into_iter().partition(|w| matches!(w, Write::NewSession { .. } | Write::Restore { .. }));
+            let new_maps: HashSet<String> = maps
+                .iter()
+                .filter_map(|w| match w {
+                    Write::NewSession { ses } | Write::Restore { ses: Some((ses, _, _)), .. } => Some(ses.clone()),
+                    _ => None,
+                })
+                .collect();
+            // 🔒 (A checkpoint it signed, from its row.)
+            self.counts.row_put_backs += maps.iter().filter(|w| matches!(w, Write::Restore { ck: true, .. })).count() as u64;
             writes.extend(maps);
             let mut restored: Vec<(String, String)> = Vec::new();
             for (tkey, table) in &mem.tables {
@@ -1921,10 +1932,6 @@ impl House {
                     _ => false,
                 };
                 if !skip {
-                    // 🔒 (A checkpoint it signed, from its row.)
-                    if matches!(&w, Write::Restore { .. }) {
-                        self.counts.row_put_backs += 1;
-                    }
                     writes.push(w);
                 }
             }
@@ -2536,7 +2543,7 @@ impl House {
                 match res.base.as_ref() {
                     Some(b) if b.key == row.key => {
                         if !row_held && !partial {
-                            reput.push(restore_of(&Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() }, row));
+                            reput.push(restore_of(&Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() }, row, true));
                         }
                     }
                     Some(b) if uw_of(&b.ck) > uw_of(&row.value) => self.drop_row(room, &t, &inc),
@@ -2644,10 +2651,12 @@ impl House {
             if !matches!(comp.get(txn, &ses_key), Some(Out::YMap(_))) {
                 // (Its reveals from before a start among them, [`House::own_from_before`].)
                 self.hold_began(room, &key, now);
-                // (Not where its checkpoint goes back with it in the same write: that one carries what goes into it.)
+                // (Not where its checkpoint goes back with it in the same write: that one carries what goes into it. And
+                // of its row's checkpoint, the doc holding it, as its row would put it back: with what its trim carried.)
                 let restored = reput.iter().any(|w| matches!(w, Write::Restore { ses: Some((next, _, _)), .. } if *next == ses_key));
                 if !partial && !restored {
-                    reput.push(Write::NewSession { ses: ses_key });
+                    let of_row = row.as_ref().filter(|row| row.key == base.key).map(|row| restore_of(&ctx, row, false));
+                    reput.push(of_row.filter(|w| matches!(w, Write::Restore { ses: Some(_), .. })).unwrap_or(Write::NewSession { ses: ses_key }));
                 }
                 through!(current, false);
             }
@@ -2745,7 +2754,7 @@ impl House {
             let rec = ha::AuthRecords { cks: vec![(row.key.as_str(), &row.value)], xfs: vec![], fins: vec![], delegations: mine.iter().collect() };
             let res = ha::resolve_game(room, &t, &inc, None, &rec, &mut |id, k, bytes, g| self.verified_auth(room, id, k, bytes, g));
             if !partial && !res.pending && res.base.is_some_and(|b| b.key == row.key) {
-                reput.push(restore_of(&Ctx { room: room.to_string(), t, inc }, &row));
+                reput.push(restore_of(&Ctx { room: room.to_string(), t, inc }, &row, true));
             }
         }
         // 🔒 This house's key holds one value (`hk:<house>`), and each game it serves by a delegation that game's base
@@ -4081,8 +4090,10 @@ fn apply(txn: &mut TransactionMut, writes: &[Write]) -> Option<Vec<u8>> {
                     next.insert(txn, k.as_str(), to_any(v));
                 }
             }
-            Write::Restore { key, value, ses } => {
-                comp.insert(txn, key.as_str(), to_any(value));
+            Write::Restore { key, value, ck, ses } => {
+                if *ck {
+                    comp.insert(txn, key.as_str(), to_any(value));
+                }
                 if let Some((next, closed, copies)) = ses {
                     if !matches!(comp.get(txn, next), Some(Out::YMap(_))) {
                         let held: Vec<&(String, CVal)> = match comp.get(txn, closed) {
@@ -4202,12 +4213,12 @@ fn dir_of(path: &std::path::Path) -> &std::path::Path {
     }
 }
 
-/// 🔒 The write that puts `row` back ([`Write::Restore`]): its checkpoint, and the session it opens with what its trim
-/// carried.
-fn restore_of(ctx: &Ctx, row: &Row) -> Write {
+/// 🔒 The write that puts `row` back ([`Write::Restore`]): its checkpoint (with `ck`), and the session it opens with what
+/// its trim carried.
+fn restore_of(ctx: &Ctx, row: &Row, ck: bool) -> Write {
     let ses = hb::next_sid3(ctx, &row.value).zip(str_of(&row.value, "b"));
     let ses = ses.map(|(next, closed)| (format!("ses:{}:{}:{next}", ctx.t, ctx.inc), format!("ses:{}:{}:{closed}", ctx.t, ctx.inc), row.copies.clone()));
-    Write::Restore { key: row.key.clone(), value: row.value.clone(), ses }
+    Write::Restore { key: row.key.clone(), value: row.value.clone(), ck, ses }
 }
 
 /// 🔒 The rows file ([`ROWS_FILE`]): `{"v": 2, "rows": [[room, t, inc, key, canon, [[k, canon], …]], …]}`, the last
