@@ -3532,7 +3532,12 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
                 // on opens its router with a dial that cannot finish
                 // (dht_knock.rs `opening_dial`): it ends here, as it must.
                 #[cfg(feature = "chia-read")]
-                if hub.dht_knock.as_ref().is_some_and(|knock| knock.knock_out()) {
+                if let Some(knock) = hub.dht_knock.as_ref().filter(|knock| knock.knock_out()) {
+                    // Where it came from is where the holder's router lets a
+                    // dial of ours back in: our own dial goes there too.
+                    if let iroh::endpoint::IncomingAddr::Ip(from) = &inbound_path.0 {
+                        knock.note_opening_from(*from);
+                    }
                     println!("🚪 DHT knock: an inbound dial ended before it linked, as an opening dial does (a knock of ours is out); still listening");
                     continue;
                 }
@@ -4050,6 +4055,8 @@ async fn dial_peer_inner(
     #[cfg(feature = "chia-read")]
     let knocking = dht_knock::knock_while_dialing(&hub, &iroh_ep, &room_id, target_pub_key);
     let mut delay = std::time::Duration::from_millis(DIAL_BACKOFF_START_MS);
+    #[cfg(feature = "chia-read")]
+    let mut dialed_back: std::collections::HashSet<std::net::SocketAddrV4> = std::collections::HashSet::new();
     for attempt in 1..=MAX_DIAL_ATTEMPTS {
         let still_needs = {
             let rooms = hub.rooms.lock().unwrap();
@@ -4069,10 +4076,37 @@ async fn dial_peer_inner(
                 Err(e) => eprintln!("⚠️ Ignoring invalid relay hint '{}': {:?}", relay_url_str, e),
             }
         }
+        let mut hinted: Vec<SocketAddr> = Vec::new();
         for direct_addr_str in &direct_hints {
             match direct_addr_str.parse::<SocketAddr>() {
-                Ok(socket_addr) => addr = addr.with_ip_addr(socket_addr),
+                Ok(socket_addr) => {
+                    hinted.push(socket_addr);
+                    addr = addr.with_ip_addr(socket_addr);
+                }
                 Err(e) => eprintln!("⚠️ Ignoring invalid direct hint '{}': {:?}", direct_addr_str, e),
+            }
+        }
+        #[cfg(not(feature = "chia-read"))]
+        let _ = &hinted;
+        // 🚪 The computer we knocked on opened toward us from an address its
+        // router picked for us alone: dial it there too (dht_knock.rs
+        // `CameIn`).
+        #[cfg(feature = "chia-read")]
+        if let Some(knock) = hub.dht_knock.as_ref() {
+            // The IPs this dial goes to: its hints, and what the endpoint has
+            // learned for the target by itself (the DHT's address record, for
+            // a dial that came with a node id alone).
+            if let Some(info) = iroh_ep.remote_info(target_pub_key).await {
+                hinted.extend(info.addrs().filter_map(|known| match known.addr() {
+                    iroh::TransportAddr::Ip(ip) => Some(*ip),
+                    _ => None,
+                }));
+            }
+            for back in knock.dial_back(&hinted) {
+                if dialed_back.insert(back) {
+                    println!("🚪 DHT knock: the computer we knocked on opened toward us from {back}; dialing it back there");
+                }
+                addr = addr.with_ip_addr(SocketAddr::V4(back));
             }
         }
 
