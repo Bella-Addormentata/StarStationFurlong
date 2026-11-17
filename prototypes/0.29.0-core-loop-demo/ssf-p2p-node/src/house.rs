@@ -893,6 +893,16 @@ struct RoomMem {
     /// put off, a record a page may read otherwise, the tick's reads spent), and gone once a pass finds the game is not
     /// this house's, or has no base or no session to follow, or the doc holds no record of it.
     game_plans: BTreeMap<GameKey, GamePlan>,
+    /// 🔒 The house was told to stop serving the FAIR ONLY games ([`House::serve_fair_only`]) while it followed the
+    /// room's: its last word there is still to come. The next tick reads the games once more as it would serving them,
+    /// and steps down at each as the node's stop does ([`House::begin_step_down`]): it reveals a close whose seeds are
+    /// all in with no next commitment, lifts the commitment nobody closed on, and joins nothing; it trims, sweeps and
+    /// ends nothing, puts nothing back, and adds no beat for them. Told to serve them again before then, it serves on
+    /// with no settling: it read them all along. Let go once a tick reads the room through (not short), notes on disk
+    /// all it decided there ([`House::mark_done`]) and held none of the games it holds state of ([`House::held`]): the
+    /// house reads the games no more after. Without it the house would go quiet with its commitment outstanding, and while the
+    /// room's beat goes on for a house table beside, a page would close a round on it that nobody reveals.
+    games_last_word: bool,
 }
 
 impl RoomMem {
@@ -1090,6 +1100,9 @@ pub struct House {
     /// (a table's, the room's own).
     wanted: HashMap<VerdictId, (String, Option<Vec<u8>>, String)>,
     short: bool,
+    /// 🔒 Whether this tick decided a reveal or a step-down it could not note in its state ([`House::mark_done`]),
+    /// and so did not write: its last word at the games ([`RoomMem::games_last_word`]) is not said at such a tick.
+    unnoted: bool,
     /// The verdicts given this tick (the newest of `verdict_order`): none of
     /// them goes to make room while it runs, so a pass never asks again.
     fresh: usize,
@@ -1333,6 +1346,7 @@ impl House {
             last_pass: false,
             wanted: HashMap::new(),
             short: false,
+            unnoted: false,
             fresh: 0,
             through: HashMap::new(),
             looks: Looks::default(),
@@ -1374,20 +1388,41 @@ impl House {
 
     /// 🔒 Serve the FAIR ONLY games (letters `p`/`q`) this house is delegated a house of: join, reveal and step down
     /// there (design-final section 8.5, N1). Off unless told: the node says so once it also signs their checkpoints.
+    /// Told to stop, it says its last word at each room's games it followed ([`RoomMem::games_last_word`]): it steps
+    /// down there at the room's next tick, and serves them no more.
     pub fn serve_fair_only(&mut self, on: bool) {
         // 🔒 (On again after a spell off: it settles at each game again, as after a gap, for it read none of them.)
+        // (Not where its last word there is still to come: it has read the games all along.)
         if on && !self.serve_games {
             for mem in self.rooms.values_mut() {
-                mem.settle_games_again();
+                if !mem.games_last_word {
+                    mem.settle_games_again();
+                }
+                mem.games_last_word = false;
             }
         }
-        // (Off: no game is followed for it, and a pass that finds them again plans them afresh.)
+        // (Off: no game is followed for it, and a pass that finds them again plans them afresh.) 🔒 And where it followed
+        // the games, its last word is due there ([`RoomMem::games_last_word`]).
         if !on {
             for mem in self.rooms.values_mut() {
                 mem.game_plans.clear();
+                if self.serve_games && mem.index.is_some() {
+                    mem.games_last_word = true;
+                }
             }
         }
         self.serve_games = on;
+    }
+
+    /// 🔒 Whether it serves FAIR ONLY games now ([`House::serve_fair_only`]).
+    pub fn serves_fair_only(&self) -> bool {
+        self.serve_games
+    }
+
+    /// 🔒 Whether a tick in `room` reads its FAIR ONLY games: while the house serves them, and for its last word there
+    /// after it was told to stop ([`RoomMem::games_last_word`]).
+    fn games_now(&self, room: &str) -> bool {
+        self.serve_games || self.rooms.get(room).is_some_and(|mem| mem.games_last_word)
     }
 
     pub fn stepping_down(&self) -> bool {
@@ -1613,6 +1648,7 @@ impl House {
         if let Some(path) = &self.state_path {
             if let Err(e) = write_state(path, &self.done) {
                 eprintln!("🏠 house: cannot write {}: {e} — not revealing round {r} of {}", path.display(), ctx.t);
+                self.unnoted = true;
                 match was {
                     Some(w) => self.done.insert(key, w),
                     None => self.done.remove(&key),
@@ -1667,6 +1703,7 @@ impl House {
         self.wanted.clear();
         self.games_through.clear();
         self.waits_noted.clear();
+        self.unnoted = false;
         // 🔒 Not ticked here for HOUSE_HEARD_MS (the node was cut off, or asleep): the pages took the house as away, and
         // it settles at each FAIR ONLY game again, reading before it reveals (design-final section 8.5, N1).
         if let Some(mem) = self.rooms.get_mut(room) {
@@ -1677,7 +1714,7 @@ impl House {
         // 🔒 The index of the room's FAIR ONLY records follows the doc while it serves the games (attached with no
         // transaction open, and again for another doc of the room), and is let go of while it does not: it would only
         // grow then.
-        if self.serve_games {
+        if self.games_now(room) {
             let mem = self.rooms.entry(room.to_string()).or_default();
             if !mem.index.as_ref().is_some_and(|ix| ix.follows(doc)) {
                 mem.index = Some(FairIndex::attach(doc));
@@ -1715,6 +1752,9 @@ impl House {
             }
         }
         self.through.clear();
+        // 🔒 (A FAIR ONLY game it holds state of, held this tick: nothing there, a step-down among it. Its last word at
+        // the games waits for the hold to be over, [`RoomMem::games_last_word`].)
+        let games_held = self.held_now.iter().any(|(t, inc)| ha::is_fair_only_inc(inc) && self.done.contains_key(&(room.to_string(), t.clone(), inc.clone())));
         self.held_now.clear();
         self.games_through.clear();
         if let Some(mem) = self.rooms.get_mut(room) {
@@ -1765,6 +1805,17 @@ impl House {
                 }
             }
         }
+        // 🔒 Its last word at the games, once told to stop serving them ([`RoomMem::games_last_word`]): said, where the
+        // tick read the room through and noted all it decided. It reads them no more, and lets their index go. (Short, a
+        // reveal or step-down it could not note on disk and so did not write, or a game it holds state of held: a later
+        // tick says it.)
+        if !self.serve_games && !out.short && !self.unnoted && !games_held {
+            if let Some(mem) = self.rooms.get_mut(room).filter(|mem| mem.games_last_word) {
+                mem.games_last_word = false;
+                mem.index = None;
+                mem.game_plans.clear();
+            }
+        }
         out.update = match updates.len() {
             0 => None,
             1 => updates.pop(),
@@ -1785,36 +1836,44 @@ impl House {
         let prev = self.rooms.get_mut(room).and_then(|mem| mem.fold.take());
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
+        // 🔒 (Whether this pass reads the games: serving them, or its last word there, [`RoomMem::games_last_word`].)
+        let games_now = self.games_now(room);
 
         // 🔒 While it serves the games, half of what the tick may still read is theirs: a flood at a house table, or
         // among the casino's keys, leaves them their reads (as a flood at one game leaves the others their turns).
-        let games_share = if self.serve_games && self.read_left != usize::MAX { self.read_left / 2 } else { 0 };
+        let games_share = if games_now && self.read_left != usize::MAX { self.read_left / 2 } else { 0 };
         self.read_left -= games_share;
         // The room's house tables (`r`/`d`), while the deed holder delegates this house. (🔒 A pass that cannot read
         // them still reads the games, which are whoever holds the deed's.)
         let rd = match self.house_tables(room, txn, &comp, now, prev, &mut writes) {
-            Tables::Stop | Tables::None if !self.serve_games => return writes,
+            Tables::Stop | Tables::None if !games_now => return writes,
             Tables::Stop | Tables::None => None,
             Tables::Some(rd) => Some(rd),
         };
         // 🔒 The FAIR ONLY games it is a house of, whoever holds the deed. (The house tables' reads spent are theirs.)
-        let mut fo = if self.serve_games {
+        let mut fo = if games_now {
             let tables_out = std::mem::replace(&mut self.read_out, false);
             self.read_left += games_share;
             self.rooms.entry(room.to_string()).or_default();
-            let fo = self.games(room, txn, &comp, now, &mut writes);
+            let mut fo = self.games(room, txn, &comp, now, &mut writes);
             self.read_out |= tables_out;
+            // 🔒 (Its last word at the games puts nothing back: it writes its reveals and step-downs, and goes.)
+            if !self.serve_games {
+                fo.reput.clear();
+            }
             fo
         } else {
             GamesOut::default()
         };
-        let fair_tables = rd.as_ref().map_or(0, |rd| rd.fair) + fo.settled;
+        // 🔒 (Its last word at the games is no beat for them: it steps down there.)
+        let games_beat = if self.serve_games { fo.settled } else { 0 };
+        let fair_tables = rd.as_ref().map_or(0, |rd| rd.fair) + games_beat;
 
         // The heartbeat, while a table runs Fair. 🔒 And not while it settles at a game it serves: the beat is the
         // room's, so a page at that game would hear it and close at once, and a close first read while settling is
         // never revealed for. (The other tables go without a beat for SETTLE_MS at most, well inside HOUSE_HEARD_MS.)
         let beat_due = self.rooms[room].last_beat.is_none_or(|at| now.saturating_sub(at) >= HEARTBEAT_MS);
-        if fair_tables > 0 && fo.settled == fo.serving && !self.stepping_down && beat_due {
+        if fair_tables > 0 && (fo.settled == fo.serving || !self.serve_games) && !self.stepping_down && beat_due {
             let beat_key = format!("hb:{pub_key}");
             // It counts on from the doc's beat only as it signed it: a peer's
             // copy with a higher count would push its own past what the
@@ -2731,7 +2790,8 @@ impl House {
             // Not from a doc that holds part of an update: a close, or a frozen slip a page is putting back, may be in the
             // part to come, and a trim or an end deletes the session it would land in. What it waits for it waits for
             // afresh after.
-            if let (true, ha::HouseBy::Yes { value: dl, .. }) = (current, &by_now) {
+            // 🔒 (Nor in its last word at the games, once told to stop serving them: it steps down there and goes.)
+            if let (true, true, ha::HouseBy::Yes { value: dl, .. }) = (self.serve_games, current, &by_now) {
                 if partial {
                     if let Some(mem) = self.rooms.get_mut(room).and_then(|m| m.tables.get_mut(&key)) {
                         mem.waits.clear();
@@ -3374,10 +3434,12 @@ impl House {
 
     /// One table's join, reveal and step-down.
     /// 🔒 At a FAIR ONLY game (`game`): only at the rounds this house decides, `friendly` meaning an end order stands
-    /// (it reveals with no next commitment, steps down and joins nothing).
+    /// (it reveals with no next commitment, steps down and joins nothing). Its last word at a game it was told to stop
+    /// serving ([`RoomMem::games_last_word`]) is a step-down, as at the node's stop.
     fn table_duties(&mut self, room: &str, read: &TableRead, friendly: bool, now: u64, writes: &mut Vec<Write>, game: Option<&GameView>) {
         let ctx = &read.ctx;
         let fo = game.is_some();
+        let stepping = self.stepping_down || (fo && !self.serve_games);
         let mine = |r: i64| game.is_none_or(|g| g.mine.contains(&r));
         let done = read.own_reveals().map(|h| h.r).fold(self.done_of(ctx), i64::max);
         let carried = |r: i64, me: &House| {
@@ -3467,7 +3529,7 @@ impl House {
             let due = all_in || now >= t0 + grace;
             // Stopping: reveal only a round whose seeds are all in (a void
             // costs nobody their stake; a reveal short of seeds would).
-            if self.stepping_down && !all_in {
+            if stepping && !all_in {
                 break;
             }
             if !due {
@@ -3482,7 +3544,7 @@ impl House {
             n.truncate(MAX_HOUSE_COUNTED);
             let x = vec![best.hash.clone()];
             // 🔒 (No commitment for a round that is not its own: the game has changed hands at this one.)
-            let next = (!friendly && !self.stepping_down && mine(r + 1)).then(|| self.commit(ctx, r + 1));
+            let next = (!friendly && !stepping && mine(r + 1)).then(|| self.commit(ctx, r + 1));
             let carries = next.is_some();
             let mut body = vec![
                 ("r".to_string(), CVal::Int(r)),
@@ -3509,7 +3571,7 @@ impl House {
         }
         let done = revealed_now.map_or(done, |r| r.max(done));
 
-        if friendly || self.stepping_down {
+        if friendly || stepping {
             // Step down: the outstanding commitment (the lowest round past
             // the last revealed that has one), unless a close names it (then
             // its reveal, above, carries none on).

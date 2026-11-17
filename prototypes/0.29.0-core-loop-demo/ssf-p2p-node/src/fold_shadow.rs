@@ -1330,6 +1330,8 @@ impl<L: Launch> FoldShadow<L> {
         HouseFoldReport {
             rules: ["r", "d"].iter().filter_map(|l| rules_id(l).map(|r| (l.to_string(), r.to_string()))).collect(),
             letters: "rd".to_string(),
+            // (And `pq` with the rules versions, while the house serves FAIR ONLY games: main.rs puts them in, fair_only_switch.rs `advertise`.)
+            rv: Vec::new(),
             attest: false,
             shadow_agreed: self.tally.agree,
             shadow_mismatches: self.tally.mismatch,

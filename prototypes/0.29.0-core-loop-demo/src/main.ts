@@ -271,7 +271,7 @@ import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
-import { leaveComputedTables, setLocalHouse, setLocalHouseFold } from "./computedTable";
+import { leaveComputedTables, setLocalFairOnlyStopped, setLocalHouse, setLocalHouseFold } from "./computedTable";
 import { listenToRoom, noteRoomHeard } from "./roomHearing";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -303,6 +303,7 @@ import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
 import { BEACON_BUTTON_ID, beaconRow, beaconStands, beaconTarget, beaconTurnOf, turnBeacon, type BeaconTarget } from "./beaconSwitch";
+import { FAIR_ONLY_BUTTON_ID, fairOnlyArm, fairOnlyArmOf, fairOnlyRow, fairOnlyStands, fairOnlyTurnOf, FAIR_ONLY_NOT_CONFIRMED, turnFairOnly, type FairOnlyArmed } from "./fairOnlySwitch";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
@@ -1463,6 +1464,77 @@ function renderBeaconRow(): void {
   }
 }
 
+/** 🔒 The FAIR ONLY row's switch (fairOnlySwitch.ts), the beacon's rules: a
+ *  turn armed and waiting for CONFIRM (for the node whose warning was read,
+ *  and no other: a fingerprint that names another disarms it), a turn in
+ *  flight, and the last turn's failure. Opening the Network view disarms it
+ *  and clears the failure; the node's own memory of the switch rides on its
+ *  fingerprint. */
+let fairOnlyArmed: FairOnlyArmed | null = null;
+let fairOnlyTurning: "on" | "off" | null = null;
+let fairOnlyError: string | null = null;
+/** When the switch last changed what it does (a tap within BANK_SETTLE_MS of
+ *  that is no decision). */
+let fairOnlyChangedAt = 0;
+/** What the switch did at the last render. */
+let fairOnlyShownAct: string | null = null;
+
+/** 🔒 Drop an armed CONFIRM: the warning it stands under is no longer being
+ *  read. */
+function disarmFairOnly(): void {
+  if (fairOnlyArmed === null) return;
+  fairOnlyArmed = null;
+  renderFairOnlyRow();
+}
+
+/** 🔒 The FAIR ONLY row of the Network rows and the note, switch, warning and
+ *  error under it, from the node that answered the last probe (none while it
+ *  does not). Written with textContent, hidden and attributes only, never
+ *  innerHTML, so focus stays on the one button from TURN ON to CONFIRM to
+ *  TURNING ON. */
+function renderFairOnlyRow(): void {
+  const fp = localNodeLive ? localFingerprint : null;
+  const row = fairOnlyRow(fp, { armed: fairOnlyArmed, turning: fairOnlyTurning, error: fairOnlyError });
+  setNetworkRow("network-fair-only", row.value, row.colour);
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("fair-only-note", row.note);
+  line("fair-only-warning", row.warning);
+  line("fair-only-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== fairOnlyShownAct) {
+    fairOnlyShownAct = b?.act ?? null;
+    fairOnlyChangedAt = performance.now();
+  }
+  const btn = document.getElementById(FAIR_ONLY_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went hands focus to its view, not to the page behind
+    // the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
 /** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
  *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
  *  the address override, the two room switches and the override's text box.
@@ -1586,6 +1658,32 @@ async function turnBeaconSwitch(on: boolean): Promise<void> {
   await refreshLocalFingerprint();
   beaconChangedAt = performance.now();
   renderBeaconRow();
+}
+
+/** 🔒 Ask the node to turn FAIR ONLY tables on or off, then read its
+ *  fingerprint again so the row, the switch and the tables' SET FAIR ONLY
+ *  show what the node now holds, not what the page hoped. The turn goes out
+ *  only for the node CONFIRM was armed on, and only for the turn it was
+ *  armed for. */
+async function turnFairOnlySwitch(on: boolean): Promise<void> {
+  if (fairOnlyTurning) return;
+  const armedFor = fairOnlyArmed;
+  fairOnlyArmed = null;
+  if (!armedFor || armedFor.on !== on || !fairOnlyStands(armedFor, localNodeLive ? localFingerprint : null)) {
+    fairOnlyError = FAIR_ONLY_NOT_CONFIRMED;
+    fairOnlyChangedAt = performance.now();
+    renderFairOnlyRow();
+    return;
+  }
+  fairOnlyTurning = on ? "on" : "off";
+  fairOnlyError = null;
+  renderFairOnlyRow();
+  const turned = await turnFairOnly(localNodeOrigin, armedFor);
+  fairOnlyTurning = null;
+  fairOnlyError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  fairOnlyChangedAt = performance.now();
+  renderFairOnlyRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -9615,6 +9713,10 @@ function setupSpacePhoneOverlay() {
       beaconArmed = null;
       if (!beaconTurning) beaconError = null;
       renderBeaconRow();
+      // 🔒 And for FAIR ONLY tables.
+      fairOnlyArmed = null;
+      if (!fairOnlyTurning) fairOnlyError = null;
+      renderFairOnlyRow();
       // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
       // and every other control without a pointer (Tab is the app's phone
       // toggle, not a tab stop).
@@ -9916,8 +10018,9 @@ function setupSpacePhoneOverlay() {
         const focused = document.activeElement;
         if (focused instanceof HTMLElement && container.contains(focused)) focused.blur();
         // 🔦 And a beacon CONFIRM armed in the Network view is dropped: its
-        // warning went offscreen with the phone.
+        // warning went offscreen with the phone. 🔒 A FAIR ONLY one too.
         disarmBeacon();
+        disarmFairOnly();
         // Hand focus back to whatever opened the phone from outside it. The
         // phone is only moved offscreen, never display:none, so a control
         // left focused inside it keeps answering the arrow keys against
@@ -10191,6 +10294,7 @@ function setupSpacePhoneOverlay() {
         const focused = document.activeElement;
         if (container && focused instanceof HTMLElement && container.contains(focused)) focused.blur();
         disarmBeacon();
+        disarmFairOnly();
         container?.classList.remove("active");
         void enterRoomFromPass(seed);
       }
@@ -10395,6 +10499,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       chiaLaneArmed = false;
       listMeArmed = null;
       beaconArmed = null;
+      fairOnlyArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // 🛰️ The title's steps say so too (firstRunSteps.ts): a node that stopped
@@ -10412,6 +10517,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     renderChiaLaneRow();
     renderListMeRow();
     renderBeaconRow();
+    renderFairOnlyRow();
     return localFingerprint;
   }
   // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
@@ -10427,6 +10533,8 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
   // 🔦 The same for a beacon armed on another node or network.
   if (!beaconStands(beaconArmed, fingerprint)) beaconArmed = null;
+  // 🔒 And for a FAIR ONLY turn armed on another node.
+  if (!fairOnlyStands(fairOnlyArmed, fingerprint)) fairOnlyArmed = null;
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🛰️ The title's steps read the node, the Phone Book and the wallet from
@@ -10451,12 +10559,17 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // 🔒 …and what its fold serves: a table moves to a FAIR ONLY game only where
   // the owner's own node says it runs them (computedTable switchFairOnlyOn).
   setLocalHouseFold(fingerprint.house_fold ?? null);
+  // 🔒 …and whether its house serves no FAIR ONLY game (its switch off, or
+  // something in the way): then this page ends the games its key holds there
+  // (computedTable fairOffDuty), the house having stepped down at them.
+  setLocalFairOnlyStopped(fingerprint.fair_only !== undefined && (!fingerprint.fair_only.on || fingerprint.fair_only.unable !== undefined));
   setLocalHolderNode(fingerprint.iroh_node_id ?? null); // 🤝 a holder's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
   renderChiaLaneRow();
   renderListMeRow();
   renderBeaconRow();
+  renderFairOnlyRow();
   refileHolderNode(); // 🤝 this computer's node, or its routes, may have changed
   return fingerprint;
 }
@@ -10987,6 +11100,36 @@ function setupNetworkDetailsPanel() {
     });
     // A held Enter or Space repeats its keydown, and each one taps the button.
     beaconBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
+    });
+  }
+  // 🔒 The FAIR ONLY switch (fairOnlySwitch.ts), the beacon's rules: TURN ON
+  // and TURN OFF each arm CONFIRM, and CONFIRM takes a fresh tap.
+  const fairOnlyBtn = document.getElementById(FAIR_ONLY_BUTTON_ID) as HTMLButtonElement | null;
+  if (fairOnlyBtn) {
+    fairOnlyBtn.addEventListener("click", (e) => {
+      if (fairOnlyBtn.getAttribute("aria-disabled") === "true") return;
+      // Nothing is armed or turned from a phone that is put away (the
+      // beacon's rule): an armed CONFIRM is dropped with the tap.
+      if (!networkViewOnScreen()) {
+        disarmFairOnly();
+        return;
+      }
+      const act = fairOnlyBtn.dataset.act;
+      const arm = fairOnlyArmOf(act);
+      if (arm === null && !freshTap((e as MouseEvent).detail, performance.now(), fairOnlyChangedAt)) return;
+      if (arm !== null) {
+        fairOnlyArmed = fairOnlyArm(arm, localNodeLive ? localFingerprint : null);
+        fairOnlyError = null;
+        fairOnlyChangedAt = performance.now();
+        renderFairOnlyRow();
+        return;
+      }
+      const on = fairOnlyTurnOf(act);
+      if (on !== null) void turnFairOnlySwitch(on);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    fairOnlyBtn.addEventListener("keydown", (e) => {
       if (laneKeyRepeat(e)) e.preventDefault();
     });
   }

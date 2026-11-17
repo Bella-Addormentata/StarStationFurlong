@@ -115,6 +115,65 @@ export interface LocalFingerprint {
    *  fold, with its house off, or older. Kept only in the node's shape
    *  (`parseHouseFold`). */
   house_fold?: HouseFold;
+  /** 🔒 The FAIR ONLY switch, the owner's choice to let this node's house
+   *  serve the FAIR ONLY games at their tables (the node's
+   *  fair_only_switch.rs `FairOnlyView`): whether it is on, whether the
+   *  player turned it, whether `SSF_FAIR_ONLY` in the node's environment
+   *  holds it, and why the house cannot serve the games now, if it cannot
+   *  (fairOnlySwitch.ts). Sent by every node that has the switch
+   *  (`POST /api/house/fair-only`); absent from older nodes. Kept only in the
+   *  node's shape (`parseFairOnly`). */
+  fair_only?: FairOnlySwitchView;
+}
+
+/** 🔒 Why the node's house cannot serve FAIR ONLY games now, whatever its
+ *  switch says (the node's fair_only_switch.rs `Unable`): a build without
+ *  the fold of the tables (`build`), its house off (`house`), the fold turned
+ *  off in its environment (`fold-env`), or stopped after its worker failed
+ *  too often (`fold-down`). `other` is a reason this page does not know yet,
+ *  from a newer node: still something in the way. */
+export type FairOnlyUnable = 'build' | 'house' | 'fold-env' | 'fold-down' | 'other';
+
+/** 🔒 What the node's FAIR ONLY switch says. The house serves the games
+ *  exactly when `on` and no `unable`. */
+export interface FairOnlySwitchView {
+  /** The switch is on: by the player's word here, as it starts where the
+   *  player never turned it, or held on by `SSF_FAIR_ONLY=1` in the node's
+   *  environment. */
+  on: boolean;
+  /** The player turned the switch (`false`: nobody did, so it is on as it
+   *  starts, or its file cannot be read). */
+  chosen: boolean;
+  /** `SSF_FAIR_ONLY` in the node's environment decides, and the switch
+   *  cannot change it: with `on` it holds them on, without it off. */
+  held?: true;
+  /** The switch's file is there but cannot be read, so it counts as off. */
+  damaged?: true;
+  /** Why the house cannot serve the games now. */
+  unable?: FairOnlyUnable;
+}
+
+const FAIR_ONLY_UNABLE: ReadonlySet<string> = new Set<FairOnlyUnable>(['build', 'house', 'fold-env', 'fold-down']);
+
+/** The node's `fair_only` in its own shape, or undefined when `on` or
+ *  `chosen` is not a boolean (or it is not an object at all): a switch this
+ *  page cannot read is no switch, and the page then offers none. `held` and
+ *  `damaged` are kept only as true. A switch that cannot be read never reads
+ *  as on here unless the node's environment holds it on. An `unable` that is
+ *  there is kept whatever it says: one this page does not know is `other`,
+ *  so something the node says is in the way is never read as nothing.
+ *  Nothing else is copied. */
+export function parseFairOnly(v: unknown): FairOnlySwitchView | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.on !== 'boolean' || typeof r.chosen !== 'boolean') return undefined;
+  const held = r.held === true;
+  const damaged = r.damaged === true;
+  const view: FairOnlySwitchView = { on: r.on && (held || !damaged), chosen: r.chosen };
+  if (held) view.held = true;
+  if (damaged) view.damaged = true;
+  if (r.unable !== undefined && r.unable !== null) view.unable = typeof r.unable === 'string' && FAIR_ONLY_UNABLE.has(r.unable) ? (r.unable as FairOnlyUnable) : 'other';
+  return view;
 }
 
 /** 🧮 The node's fold, as a page reads its report: the incarnation letters it
@@ -557,5 +616,7 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;
   const fold = parseHouseFold(r.house_fold);
   if (fold) fp.house_fold = fold;
+  const fairOnly = parseFairOnly(r.fair_only);
+  if (fairOnly) fp.fair_only = fairOnly;
   return fp;
 }

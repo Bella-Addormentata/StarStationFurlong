@@ -19,7 +19,7 @@ import { asClose, nextSid3 } from './computedFold';
 import type { CloseRec, FoldCtx } from './computedFold';
 import { houseSign } from './computedHouse';
 import {
-  Beating, clockOf, CRAPS_REF, CRAPS_TABLE, keysIn, loadPage, openRoom, PAGE_ROOM, PAGE_TABLE as TABLE, putIn,
+  Beating, clockOf, CRAPS_REF, CRAPS_TABLE, frame, keysIn, loadPage, openRoom, PAGE_ROOM, PAGE_TABLE as TABLE, putIn,
   run as runBare, sync, updatesOf,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
@@ -297,6 +297,128 @@ async function endingRoom(watching = false): Promise<{ pages: Page[]; inc: strin
   expect(endOf(a, inc)).toBeUndefined();
   return { pages, inc, kit, ctx, at: seedsAt, close, closeHash: hashIn(keysIn(a, 'c', 1)[0]) };
 }
+
+describe("the holder's own node serves FAIR ONLY games no more (fairOffDuty)", () => {
+  /** The keys of `fin:` writes page p's doc sees from now on, counted. */
+  const finWrites = (p: Page, inc: string): { n: number } => {
+    const seen = { n: 0 };
+    top(p).observe((e) => { if (e.keysChanged.has(`fin:${TABLE}:${inc}`)) seen.n++; });
+    return seen;
+  };
+
+  it('its page writes the end order of the game its node served, and the end once the table has been quiet FAIR_END_WAIT_MS', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a] = pages;
+    // (Nothing while its node says nothing of an off.)
+    let T = run(pages, at, at + 10 * STEP);
+    expect(finOf(a, inc)).toBeUndefined();
+    a.table.setLocalFairOnlyStopped(true);
+    T = run(pages, T, T + 2 * STEP, { until: () => finOf(a, inc) !== undefined });
+    expect(finOf(a, inc)).toMatchObject({ v: 1, k: a.pub });
+    // The order alone (the end is fairEndDuty's), and no choice of owner-run play: the table goes back to the room's default.
+    expect(endOf(a, inc)).toBeUndefined();
+    expect(a.casino.ownerRunChosen(TABLE)).toBe(false);
+    sync(T, ...pages);
+    for (const p of pages) expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true, fin: { k: a.pub } });
+    // Written once: a look while it stands writes nothing more.
+    const writes = finWrites(a, inc);
+    const ended = run(pages, T + STEP, T + a.table.FAIR_END_WAIT_MS + 5 * STEP, { until: () => endOf(a, inc) !== undefined });
+    expect(endOf(a, inc)).toMatchObject({ e: 1, k: a.pub, f: finOf(a, inc) });
+    expect(ended - T).toBeGreaterThanOrEqual(a.table.FAIR_END_WAIT_MS);
+    expect(writes.n).toBe(0);
+    sync(ended, ...pages);
+    for (const p of pages) expect(p.casino.computedResolutionOf(TABLE, inc)?.live).toBe(false);
+  });
+
+  it('a round in flight: the order alone, its bettors void or the house decides the round, and the end follows', async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    house(a, kit.houseJoin(H, 1));
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], at)).toBe('ok');
+    clockOf(b, at);
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    sync(at, ...pages);
+    const closedAt = run(pages, at + STEP, at + 30_000, { until: () => keysIn(a, 'c', 1).length > 0 });
+    const [close] = closesOf(a, 1);
+    a.table.setLocalFairOnlyStopped(true);
+    const T = run(pages, closedAt + STEP, closedAt + 3 * STEP, { until: () => finOf(a, inc) !== undefined });
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+    expect(endOf(a, inc)).toBeUndefined();
+    // (The node's last word: the round whose seeds are in revealed, with no next commitment.)
+    const seedsAt = run(pages, T + STEP, T + 12_000, { until: () => pages.every((p) => keysIn(p, 'x', 1).length === 2) });
+    house(b, kit.houseReveal(H, 1, [hashIn(keysIn(a, 'c', 1)[0])], frozenOf(close)));
+    sync(seedsAt, ...pages);
+    run(pages, seedsAt + STEP, seedsAt + a.table.FAIR_END_WAIT_MS + 5 * STEP, { until: () => endOf(a, inc) !== undefined });
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, k: a.pub });
+    for (const p of pages) expect(keysIn(p, 'c', 2)).toEqual([]);
+  });
+
+  it('nothing from a page that holds no game, nor with its node on again, nor from a page with no house of its node', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    // B holds nothing: its node's off is nothing to the game.
+    b.table.setLocalHouse(H.pub);
+    b.table.setLocalFairOnlyStopped(true);
+    let T = run(pages, at, at + 10 * STEP);
+    expect(finOf(a, inc)).toBeUndefined();
+    // A's node on again before a look: nothing.
+    a.table.setLocalFairOnlyStopped(true);
+    a.table.setLocalFairOnlyStopped(false);
+    T = run(pages, T, T + 10 * STEP);
+    expect(finOf(a, inc)).toBeUndefined();
+    // A's node says no house key: nothing to tell its games by.
+    a.table.setLocalHouse(null);
+    a.table.setLocalFairOnlyStopped(true);
+    T = run(pages, T, T + 10 * STEP);
+    expect(finOf(a, inc)).toBeUndefined();
+    a.table.setLocalHouse(H.pub);
+    run(pages, T, T + 3 * STEP, { until: () => finOf(a, inc) !== undefined });
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+  });
+
+  it('a game of another house of its node than the one it answers with now: not until its page has made that one a house of the game', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a] = pages;
+    const other = testHouse('owner-other-node');
+    a.table.setLocalHouse(other.pub);
+    a.table.setLocalFairOnlyStopped(true);
+    // (Its page delegates its node's house in the room, at its house duty's next look: until then the game is H's alone.)
+    const delegated = run(pages, at, at + 30_000, { until: () => top(a).has(`hk:${other.pub}`) });
+    expect(finOf(a, inc)).toBeUndefined();
+    run(pages, delegated + STEP, delegated + 3 * STEP, { until: () => finOf(a, inc) !== undefined });
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+  });
+
+  it("not on a page asleep: its order waits for a frame", async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a] = pages;
+    a.table.setLocalFairOnlyStopped(true);
+    // (Its frames stopped: the tick that comes is a sleeping page's.)
+    clockOf(a, at + 60_000);
+    a.table.tickComputedTables([TABLE], at + 60_000);
+    expect(finOf(a, inc)).toBeUndefined();
+    // (Its frames again: it waits out its wake, and then the order goes.)
+    const woke = run(pages, at + 60_000, at + 120_000, { until: () => finOf(a, inc) !== undefined });
+    expect(woke).toBeGreaterThan(at + 60_000 + STEP);
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+  });
+
+  it('looks at most every TICK_MS', async () => {
+    const { pages, at, inc } = await gameRoom(['A', 'B']);
+    const [a] = pages;
+    // (A look that finds no game of its house: its node answers with another one.)
+    a.table.setLocalHouse(testHouse('owner-other-node').pub);
+    a.table.setLocalFairOnlyStopped(true);
+    frame(at + STEP, a);
+    expect(finOf(a, inc)).toBeUndefined();
+    a.table.setLocalHouse(H.pub);
+    frame(at + STEP + 100, a); // 100 ms on: no look
+    expect(finOf(a, inc)).toBeUndefined();
+    frame(at + STEP + a.table.TICK_MS, a);
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+  });
+});
 
 describe("the end order standing, the round decided: the holder's wait", () => {
   it("the house's end comes first: the holder's page writes none, the switch stays naming the game, and the table plays none", async () => {
