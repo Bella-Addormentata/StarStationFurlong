@@ -406,10 +406,13 @@ impl Drop for Game {
 fn a_game_is_not_served_until_the_house_is_told_to() {
     let mut game = Game::new("off");
     game.house.serve_fair_only(false);
+    // (What main.rs's sync asks before it tells the house: fair_only_switch.rs.)
+    assert!(!game.house.serves_fair_only());
     assert_eq!(game.tick(0).wrote, 0);
     assert_eq!(game.tick(1_000).wrote, 0);
     assert!(game.records("o:").is_empty() && game.beat().is_none());
     game.house.serve_fair_only(true);
+    assert!(game.house.serves_fair_only());
     game.tick(1_000);
     assert_eq!(game.records("o:1:").len(), 1);
 }

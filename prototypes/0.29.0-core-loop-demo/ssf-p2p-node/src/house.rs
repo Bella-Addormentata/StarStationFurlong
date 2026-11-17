@@ -1390,6 +1390,11 @@ impl House {
         self.serve_games = on;
     }
 
+    /// 🔒 Whether it serves FAIR ONLY games now ([`House::serve_fair_only`]).
+    pub fn serves_fair_only(&self) -> bool {
+        self.serve_games
+    }
+
     pub fn stepping_down(&self) -> bool {
         self.stepping_down
     }

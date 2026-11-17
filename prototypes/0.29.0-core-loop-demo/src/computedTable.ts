@@ -5155,9 +5155,11 @@ export function setLocalHouseFold(fold: HouseFold | null): void {
 
 /** Whether this page's node says it runs FAIR ONLY games of this build's
  *  rules (design §8.1): its fold names both letters, `p` and `q`, and this
- *  build's rules version, and is not off. No node of today's says so (they fold
- *  `r` and `d`, in shadow), so nothing is offered until the node's half of PR
- *  6c is out. */
+ *  build's rules version, and is not off. A node says so only while its house
+ *  serves FAIR ONLY games: its switch on (as it starts, until its owner turns
+ *  it off in the SpacePhone's Network settings, fairOnlySwitch.ts) and nothing
+ *  in the way (the node's fair_only_switch.rs `advertise`); otherwise it folds
+ *  `r` and `d` alone, in shadow, and nothing is offered. */
 function nodeRunsFairOnly(): boolean {
   const f = localFold;
   return f !== null && f.off !== true && f.letters.includes('p') && f.letters.includes('q') && f.rv.includes(FAIR_ONLY_RV);
