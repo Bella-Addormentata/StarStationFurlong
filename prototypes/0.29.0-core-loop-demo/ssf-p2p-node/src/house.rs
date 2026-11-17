@@ -2745,10 +2745,17 @@ impl House {
                     gone.dedup();
                     let x: Vec<CVal> = res.chain.iter().skip(1).filter_map(|h| h.step.as_ref().map(|s| s.xf.clone())).collect();
                     let g = TrimOf { base, dl, x, from: res.chain[last].from, spans: &spans, gone };
+                    let queued = writes.len();
                     let duty = match res.fin.as_ref() {
                         None => self.trim_duty(room, txn, comp, &read, &g, now, writes),
                         Some(fin) => self.end_duty(room, &read, &g, fin, now, writes),
                     };
+                    // 🔒 (Its row's checkpoint, gone from the doc, goes back at the put-back's turn, written after this: a
+                    // trim, a sweep or an end it queued over it supersedes it, and its put-back would lay it and its session
+                    // again beside the new one. Nobody tidies an ended game after.)
+                    if writes[queued..].iter().any(|w| matches!(w, Write::Trim { .. })) {
+                        reput.retain(|w| !matches!(w, Write::Restore { key, .. } if *key == base.key));
+                    }
                     if duty == Trimmed::Wait {
                         short!(Some(current));
                     }

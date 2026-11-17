@@ -5979,6 +5979,38 @@ fn its_end_deleted_from_the_doc_goes_back_from_its_row_with_no_session() {
 }
 
 #[test]
+fn an_end_over_its_rows_checkpoint_the_doc_lost_is_not_followed_by_that_checkpoints_put_back() {
+    // An end it could not note on disk, its trim's checkpoint gone from the doc meanwhile and that checkpoint's session
+    // there: the end (its check already done) and the row's put-back fall due in the same pass. The end supersedes the
+    // row, and nobody tidies an ended game: the put-back must not lay the trim's checkpoint and session again beside it.
+    let (mut game, key, _, _) = trimmed("end-over-lost-row");
+    game.fin(&who("owner"));
+    game.ticks();
+    assert_eq!(game.records("h:2:").len(), 1, "its step-down");
+    let rows = game.dir.join(ROWS_FILE);
+    std::fs::remove_file(&rows).unwrap();
+    std::fs::create_dir_all(&rows).unwrap();
+    game.answer(game.summary(vec![], 2, None));
+    game.tick(200);
+    game.tick(200);
+    assert_eq!(game.house.game_counts().ends, 0, "not noted, not written");
+    assert_eq!(game.cks().iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), vec![key.clone()]);
+    game.delete_top(&key);
+    std::fs::remove_dir_all(&rows).unwrap();
+    game.tick(REPUT_MS);
+    assert_eq!(game.house.game_counts().ends, 1);
+    let (end, v) = game.the_end();
+    assert_eq!(v.get("u").and_then(CVal::as_int), Some(1), "at the trim's round");
+    assert!(game.sessions().is_empty(), "nor the trim's session: {:?}", game.sessions());
+    assert_eq!(game.house.game_counts().row_put_backs, 0);
+    assert_eq!(game.resolved_base().as_deref(), Some(end.as_str()));
+    game.tick(REPUT_MS);
+    game.tick(REPUT_MS);
+    assert_eq!(game.the_end().0, end);
+    assert!(game.sessions().is_empty());
+}
+
+#[test]
 fn an_end_it_cannot_note_on_disk_is_not_written() {
     let mut game = Game::opened("end-disk", "landlord");
     let (c, _, _, hash) = game.last_round();
