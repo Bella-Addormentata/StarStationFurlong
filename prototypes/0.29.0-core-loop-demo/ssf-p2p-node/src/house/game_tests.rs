@@ -476,6 +476,34 @@ fn told_to_stop_with_a_close_short_of_its_seeds_it_leaves_the_round_to_its_betto
 }
 
 #[test]
+fn a_last_word_it_cannot_note_on_disk_is_said_at_the_tick_that_can() {
+    // 🔒 A step-down not noted in its state is not written: its last word stays due, and the commitment is lifted once
+    // the state can be written again.
+    let mut game = Game::new("off-disk");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    let state = game.dir.join(STATE_FILE);
+    std::fs::remove_file(&state).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    game.house.serve_fair_only(false);
+    for _ in 0..3 {
+        assert!(!game.tick(200).short);
+    }
+    assert!(game.records("h:").is_empty());
+    std::fs::remove_dir_all(&state).unwrap();
+    game.tick(200);
+    let downs = game.records("h:1:");
+    assert_eq!(downs.len(), 1);
+    assert!(strs(&downs[0].1, "x").is_empty());
+    // Said: it reads the game no more.
+    game.house.games_looked.clear();
+    for _ in 0..3 {
+        assert_eq!(game.tick(1_000).wrote, 0);
+    }
+    assert!(game.house.games_looked.is_empty(), "no game read: {:?}", game.house.games_looked);
+}
+
+#[test]
 fn told_to_stop_past_a_closes_grace_short_of_its_seeds_it_still_reveals_nothing() {
     // 🔒 Serving, it would reveal the round at the end of the grace with the seeds it saw (the missing ones forfeit).
     // Stepping down it reveals only a round whose seeds are all in, as at the node's stop.

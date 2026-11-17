@@ -639,6 +639,27 @@ describe('the buyer ends the game it took with a round in flight', () => {
   });
 });
 
+describe("the buyer's own node serves FAIR ONLY games no more (computedTable fairOffDuty)", () => {
+  it("its page writes the end order of the game it took though the base is under its range, its node's house being a house of the rounds past it", async () => {
+    const { pages, at, inc, kit } = await gameRoom(['A', 'B']);
+    const [a, b] = pages;
+    const T = houseRound(pages, kit, 1, at).at;
+    expect(redeem(b, offerAt(a, b, T), T)).toEqual({ ok: true });
+    sync(T, ...pages);
+    // (The buyer's node's house, delegated by the buyer's page at its house duty's look: a house of rounds 2 on.)
+    const H2 = testHouse('buyer-node');
+    b.table.setLocalHouse(H2.pub);
+    const delegated = run(pages, T + STEP, T + 30_000, { until: () => top(b).has(`hk:${H2.pub}`) });
+    expect(res(b, inc)).toMatchObject({ live: true, holder: b.pub, base: { ck: { u: 0 } } });
+    expect(res(b, inc).chain.map((h) => [h.k, h.from])).toEqual([[a.pub, 0], [b.pub, 1]]);
+    expect(res(b, inc).houseAt(H2.pub, 1)).toBe(false);
+    expect(res(b, inc).houseAt(H2.pub, 2)).toBe(true);
+    b.table.setLocalFairOnlyStopped(true);
+    run(pages, delegated + STEP, delegated + 10 * STEP, { until: () => top(b).has(`fin:${TABLE}:${inc}`) });
+    expect(top(b).get(`fin:${TABLE}:${inc}`)).toMatchObject({ v: 1, k: b.pub });
+  });
+});
+
 describe('a flood of offers nobody signed', () => {
   it('costs the buyer\'s page a bounded number of checks a look, each forgery checked once: the good offer behind five forged ones moves the game on the third look', async () => {
     const { pages, at, inc } = await gameRoom(['A', 'B']);

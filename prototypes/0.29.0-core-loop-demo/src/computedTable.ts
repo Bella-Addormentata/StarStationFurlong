@@ -6435,8 +6435,10 @@ function fairOffDuty(pub: string, now: number): void {
     if (holder !== pub || switchGate(t, now) !== null) continue;
     const resolved = computedResolutionOf(t, inc);
     if (!resolved || resolved.pending || !resolved.base || resolved.fin !== null) continue;
-    // (The round after the base: a house of the game's holder for it is one of the rounds to come.)
-    if (resolved.houseAt(house, resolved.base.ck.u + 1) !== true) continue;
+    // (A round of its holder's, the first past the one it took the game at: after a hand-over the base, and the
+    // round after it, can still be the seller's, and so their house's. Every round past it is the holder's alike.)
+    const from = resolved.chain[resolved.chain.length - 1].from;
+    if (resolved.houseAt(house, from + 1) !== true) continue;
     const fin = sealFin({ room: casinoRoomId(), t, inc }, pub, signIdentity).value;
     transactCasino(() => writeFairOnlyEnd(t, inc, fin, null));
   }

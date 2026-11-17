@@ -898,8 +898,8 @@ struct RoomMem {
     /// and steps down at each as the node's stop does ([`House::begin_step_down`]): it reveals a close whose seeds are
     /// all in with no next commitment, lifts the commitment nobody closed on, and joins nothing; it trims, sweeps and
     /// ends nothing, puts nothing back, and adds no beat for them. Told to serve them again before then, it serves on
-    /// with no settling: it read them all along. Let go once a tick reads the room through (not short): the house reads
-    /// the games no more after. Without it the house would go quiet with its commitment outstanding, and while the
+    /// with no settling: it read them all along. Let go once a tick reads the room through (not short) and notes on disk
+    /// all it decided there ([`House::mark_done`]): the house reads the games no more after. Without it the house would go quiet with its commitment outstanding, and while the
     /// room's beat goes on for a house table beside, a page would close a round on it that nobody reveals.
     games_last_word: bool,
 }
@@ -1099,6 +1099,9 @@ pub struct House {
     /// (a table's, the room's own).
     wanted: HashMap<VerdictId, (String, Option<Vec<u8>>, String)>,
     short: bool,
+    /// 🔒 Whether this tick decided a reveal or a step-down it could not note in its state ([`House::mark_done`]),
+    /// and so did not write: its last word at the games ([`RoomMem::games_last_word`]) is not said at such a tick.
+    unnoted: bool,
     /// The verdicts given this tick (the newest of `verdict_order`): none of
     /// them goes to make room while it runs, so a pass never asks again.
     fresh: usize,
@@ -1342,6 +1345,7 @@ impl House {
             last_pass: false,
             wanted: HashMap::new(),
             short: false,
+            unnoted: false,
             fresh: 0,
             through: HashMap::new(),
             looks: Looks::default(),
@@ -1643,6 +1647,7 @@ impl House {
         if let Some(path) = &self.state_path {
             if let Err(e) = write_state(path, &self.done) {
                 eprintln!("🏠 house: cannot write {}: {e} — not revealing round {r} of {}", path.display(), ctx.t);
+                self.unnoted = true;
                 match was {
                     Some(w) => self.done.insert(key, w),
                     None => self.done.remove(&key),
@@ -1697,6 +1702,7 @@ impl House {
         self.wanted.clear();
         self.games_through.clear();
         self.waits_noted.clear();
+        self.unnoted = false;
         // 🔒 Not ticked here for HOUSE_HEARD_MS (the node was cut off, or asleep): the pages took the house as away, and
         // it settles at each FAIR ONLY game again, reading before it reveals (design-final section 8.5, N1).
         if let Some(mem) = self.rooms.get_mut(room) {
@@ -1796,8 +1802,9 @@ impl House {
             }
         }
         // 🔒 Its last word at the games, once told to stop serving them ([`RoomMem::games_last_word`]): said, where the
-        // tick read the room through. It reads them no more, and lets their index go. (Short: the next tick says it.)
-        if !self.serve_games && !out.short {
+        // tick read the room through and noted all it decided. It reads them no more, and lets their index go. (Short, or
+        // a reveal or step-down it could not note on disk and so did not write: the next tick says it.)
+        if !self.serve_games && !out.short && !self.unnoted {
             if let Some(mem) = self.rooms.get_mut(room).filter(|mem| mem.games_last_word) {
                 mem.games_last_word = false;
                 mem.index = None;
