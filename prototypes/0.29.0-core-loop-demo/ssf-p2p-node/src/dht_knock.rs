@@ -441,15 +441,19 @@ fn v6_entry_stands(entry: &V6Entry, now: u64) -> bool {
 /// `now`. An entry is matched by address AND port: two games on one computer
 /// share its addresses on ports of their own, and neither may drop the
 /// other's. An entry of ours at a port we left is not ours to drop either; it
-/// runs out by itself. The newest [`V6_NOTE_MAX`] are kept.
+/// runs out by itself. Ours always stay: the others get the room that is left
+/// of [`V6_NOTE_MAX`], those that stand longest first. An other's entry may
+/// stand longer than ours (a clock ahead of ours), and ranking ours among them
+/// could leave a note we wrote without a single address of ours in it.
 pub(crate) fn merge_v6_note(old: &[V6Entry], mine: &[SocketAddrV6], now: u64) -> Vec<V6Entry> {
+    let mine = &mine[..mine.len().min(V6_NOTE_MAX)];
     let mut entries: Vec<V6Entry> =
         old.iter().filter(|entry| v6_entry_stands(entry, now) && !mine.contains(&entry.addr)).copied().collect();
+    entries.sort_by_key(|entry| entry.until);
+    let over = entries.len().saturating_sub(V6_NOTE_MAX - mine.len());
+    entries.drain(..over);
     let until = now + V6_NOTE_LIFE.as_secs();
     entries.extend(mine.iter().map(|addr| V6Entry { addr: *addr, until }));
-    entries.sort_by_key(|entry| entry.until);
-    let over = entries.len().saturating_sub(V6_NOTE_MAX);
-    entries.drain(..over);
     entries
 }
 
@@ -2242,6 +2246,14 @@ mod tests {
         assert_eq!(note.len(), V6_NOTE_MAX);
         assert!(note.iter().any(|entry| entry.addr == mine[0]) && note.iter().any(|entry| entry.addr == mine[1]));
         assert!(!note.iter().any(|entry| entry.addr == pub6(10, 44442) || entry.addr == pub6(11, 44442)), "the two oldest made room");
+        // A full note of others that stand longer than ours (their clocks
+        // ahead of ours) still makes room for ours: the others that end
+        // soonest go.
+        let ahead: Vec<V6Entry> = (10..18).map(|i| V6Entry { addr: pub6(i, 44442), until: now + 900 + u64::from(i) }).collect();
+        let note = merge_v6_note(&ahead, &mine, now);
+        assert_eq!(note.len(), V6_NOTE_MAX);
+        assert_eq!(&note[V6_NOTE_MAX - 2..], &[V6Entry { addr: mine[0], until: now + life }, V6Entry { addr: mine[1], until: now + life }]);
+        assert!(!note.iter().any(|entry| entry.addr == pub6(10, 44442) || entry.addr == pub6(11, 44442)), "the two that end soonest made room");
     }
 
     #[test]
