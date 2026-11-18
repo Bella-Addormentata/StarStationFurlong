@@ -301,7 +301,7 @@ mod tests {
         let src = main_rs();
         let spawn = ["tokio::spawn(public_v4::", "advertise(dht.clone(), iroh_endpoint.clone(), reach.clone(), port))"].concat();
         assert!(src.contains(&spawn), "the auto entries spawn public_v4::advertise on the node's DHT client");
-        let knock = ["dht_knock::KnockDht::", "on(dht.clone())"].concat();
+        let knock = ["dht_knock::KnockDht::", "on(dht.clone(), ways)"].concat();
         assert!(src.contains(&knock), "the knock runs on the same client");
         let build = ["let own_dht: Option<n0_mainline::Dht> = if !dht_", "on {"].concat();
         assert!(src.contains(&build), "the node's DHT client is built whenever the DHT is on");

@@ -2251,8 +2251,13 @@ async fn node_main() -> Result<()> {
             None
         }
         Some(dht) => {
-            println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)");
-            Some(dht_knock::KnockDht::on(dht.clone()))
+            let ways = dht_knock::knock_ways(std::env::var("SSF_DHT_KNOCK").ok().as_deref());
+            match ways {
+                dht_knock::KnockWays::Both => println!("🚪 DHT knock ON: a dial nobody answers knocks through the DHT, and this computer opens toward whoever knocks on it (SSF_DHT_KNOCK=0 turns it off)"),
+                dht_knock::KnockWays::Ipv4 => println!("🚪 DHT knock ON, IPv4 only (SSF_DHT_KNOCK=ipv4): no IPv6 note is left or read"),
+                dht_knock::KnockWays::Ipv6 => println!("🚪 DHT knock ON, IPv6 only (SSF_DHT_KNOCK=ipv6): only the IPv6 note is left and read, no IPv4 knock is announced or looked up"),
+            }
+            Some(dht_knock::KnockDht::on(dht.clone(), ways))
         }
     };
 
