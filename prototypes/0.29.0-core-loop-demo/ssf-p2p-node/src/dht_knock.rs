@@ -853,7 +853,7 @@ impl KnockDht {
             let versions = opened_versions(&key, &read.items);
             let now = crate::chia_resolve::unix_now();
             if let Some(entries) = written {
-                if note_settled(&versions, mine) {
+                if note_settled(&versions, mine, now) {
                     return Ok(note_entries(&versions, now).len());
                 }
                 // A read that saw nothing in time says nothing either way.
@@ -919,11 +919,14 @@ pub(crate) fn note_entries(versions: &[(i64, Vec<V6Entry>)], now: u64) -> Vec<V6
 
 /// Is the note as a knocker wants to leave it: one newest version (two that
 /// share a version number but differ are two knockers' writes that crossed),
-/// holding all of `mine`?
-pub(crate) fn note_settled(versions: &[(i64, Vec<V6Entry>)], mine: &[SocketAddrV6]) -> bool {
+/// holding all of `mine` in entries that stand at `now`? An entry of ours
+/// whose time is up is no entry: the newest version may be an old one from an
+/// earlier knock this hour, read back because our write landed nowhere.
+pub(crate) fn note_settled(versions: &[(i64, Vec<V6Entry>)], mine: &[SocketAddrV6], now: u64) -> bool {
     let Some(top) = versions.iter().map(|(seq, _)| *seq).max() else { return false };
     let newest: Vec<&Vec<V6Entry>> = versions.iter().filter(|(seq, _)| *seq == top).map(|(_, entries)| entries).collect();
-    newest.windows(2).all(|pair| pair[0] == pair[1]) && mine.iter().all(|addr| newest[0].iter().any(|entry| entry.addr == *addr))
+    newest.windows(2).all(|pair| pair[0] == pair[1])
+        && mine.iter().all(|addr| newest[0].iter().any(|entry| entry.addr == *addr && v6_entry_stands(entry, now)))
 }
 
 /// The version number of a write after a read whose newest version was `cas`:
@@ -2379,11 +2382,11 @@ mod tests {
         // Two versions under one number: two writes crossed. Not settled for
         // either writer, and the holder opens toward both.
         let crossed = vec![(5, vec![at(a, 100)]), (5, vec![at(b, 100)])];
-        assert!(!note_settled(&crossed, &[a]) && !note_settled(&crossed, &[b]));
+        assert!(!note_settled(&crossed, &[a], 50) && !note_settled(&crossed, &[b], 50));
         assert_eq!(note_entries(&crossed, 50), vec![at(a, 100), at(b, 100)]);
         // One newest version with ours in it: settled, whatever older ones say.
         let merged = vec![(6, vec![at(b, 100), at(a, 200)]), (5, vec![at(a, 100)])];
-        assert!(note_settled(&merged, &[a]) && note_settled(&merged, &[b]));
+        assert!(note_settled(&merged, &[a], 50) && note_settled(&merged, &[b], 50));
         // One address in two versions is one entry, the one that stands longest.
         assert_eq!(note_entries(&merged, 50), vec![at(b, 100), at(a, 200)]);
         // But only among those that stand: one too far ahead (an old version
@@ -2394,9 +2397,15 @@ mod tests {
         assert_eq!(note_entries(&ahead, now), vec![at(a, now + 600)]);
         assert_eq!(v6_openings(&note_entries(&ahead, now), now, &HashSet::new(), |_| true), vec![a]);
         // Ours dropped by a newer write: not settled.
-        assert!(!note_settled(&[(7, vec![at(b, 100)]), (6, vec![at(a, 100), at(b, 100)])], &[a]));
+        assert!(!note_settled(&[(7, vec![at(b, 100)]), (6, vec![at(a, 100), at(b, 100)])], &[a], 50));
+        // Ours in the newest version, but its time is up (an old version from
+        // an earlier knock, read back because our write landed nowhere), or
+        // too far ahead to stand: not settled.
+        assert!(!note_settled(&[(6, vec![at(a, now - 1), at(b, now + 600)])], &[a], now));
+        assert!(!note_settled(&[(6, vec![at(a, now + 1800)])], &[a], now));
+        assert!(note_settled(&[(6, vec![at(a, now + 600)])], &[a], now));
         // No version at all: nothing is settled.
-        assert!(!note_settled(&[], &[a]));
+        assert!(!note_settled(&[], &[a], now));
         // A version number is above the one read, and above the clock.
         assert_eq!(note_seq(Some(i64::MAX - 1)), i64::MAX);
         let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
