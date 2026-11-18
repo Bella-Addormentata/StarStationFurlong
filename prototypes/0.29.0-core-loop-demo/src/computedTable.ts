@@ -2966,6 +2966,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   fairTidyDuty(getIdentityPub(), now);
   fairCompactDuty(getIdentityPub(), now);
   fairEndDuty(getIdentityPub(), now);
+  fairOffDuty(getIdentityPub(), now);
   adoptDuty(now);
   houseDuty(now);
 }
@@ -5153,11 +5154,34 @@ export function setLocalHouseFold(fold: HouseFold | null): void {
   localFold = fold;
 }
 
+/** 🔒 Whether this page's own node says its house serves no FAIR ONLY game
+ *  (main.ts setLocalFairOnlyStopped). */
+let localFairOnlyStopped = false;
+/** When fairOffDuty last looked (at most every TICK_MS). */
+let offLookedAt: number | null = null;
+
+/** 🔒 Whether this page's own node says its house serves no FAIR ONLY game
+ *  (its fingerprint's `fair_only`, nodeFingerprint parseFairOnly): its switch
+ *  off, by its owner's word in the SpacePhone's Network settings or by its
+ *  environment, or something in the way (`unable`: a build without the fold,
+ *  the fold turned off or stopped for good). main.ts, on every fingerprint
+ *  read; false for a node that says nothing of the switch (older than it).
+ *  Its house has then said its last word at the games it served (a step-down
+ *  there, at the turn or as the fold stopped, or at the node's stop before a
+ *  start that found it so), and a house that stepped down at a game's round
+ *  never joins it again: this page ends the ones its key holds there
+ *  (fairOffDuty). */
+export function setLocalFairOnlyStopped(stopped: boolean): void {
+  localFairOnlyStopped = stopped;
+}
+
 /** Whether this page's node says it runs FAIR ONLY games of this build's
  *  rules (design §8.1): its fold names both letters, `p` and `q`, and this
- *  build's rules version, and is not off. No node of today's says so (they fold
- *  `r` and `d`, in shadow), so nothing is offered until the node's half of PR
- *  6c is out. */
+ *  build's rules version, and is not off. A node says so only while its house
+ *  serves FAIR ONLY games: its switch on (as it starts, until its owner turns
+ *  it off in the SpacePhone's Network settings, fairOnlySwitch.ts) and nothing
+ *  in the way (the node's fair_only_switch.rs `advertise`); otherwise it folds
+ *  `r` and `d` alone, in shadow, and nothing is offered. */
 function nodeRunsFairOnly(): boolean {
   const f = localFold;
   return f !== null && f.off !== true && f.letters.includes('p') && f.letters.includes('q') && f.rv.includes(FAIR_ONLY_RV);
@@ -6380,6 +6404,44 @@ function fairEndDuty(pub: string, now: number): void {
   // an update, its records still being checked, no end order read), what was
   // gone may have come back and gone again unseen, so its waits begin again.
   for (const [key, st] of fairTables) if (st.gone.size > 0 && !looked.has(key)) st.gone.clear();
+}
+
+/**
+ * 🔒 The end order of each live FAIR ONLY game this page's key holds whose
+ * house is this page's own node's, once that node says its house serves no
+ * FAIR ONLY game (setLocalFairOnlyStopped; the switch's CONFIRM in the
+ * SpacePhone's Network settings warns of it, and its STOPPED note says so).
+ * The node's house has said its last word at the games (ssf-p2p-node house.rs
+ * `games_last_word`: the round whose seeds were in revealed, the commitment
+ * nobody closed on lifted) and serves them no more, so a game left on would
+ * only stand: no round can be played at it, and its felts would hold until
+ * someone ended it. With the order standing the
+ * pages close no more, and this page writes the end once the table has been
+ * quiet FAIR_END_WAIT_MS (fairEndDuty), a round still in flight voided first
+ * by its bettors' abandon. The order alone, as a press mid-round writes it
+ * (switchFairOnlyOff): the end is fairEndDuty's. Nor the house's choice of
+ * owner-run play: the table goes back to what the room runs by default.
+ * Asked again at each look while the node says off, for a game whose order
+ * could not be written (a page asleep or not whole, records still being
+ * checked) or whose order the doc has lost. A game whose house this page
+ * cannot tell yet (its delegation's check put off) waits for a later look.
+ */
+function fairOffDuty(pub: string, now: number): void {
+  if (!localFairOnlyStopped || localHouse === null) return;
+  if (offLookedAt !== null && now >= offLookedAt && now - offLookedAt < TICK_MS) return;
+  offLookedAt = now;
+  const house = localHouse;
+  for (const { t, inc, holder } of computedFairOnlyGames()) {
+    if (holder !== pub || switchGate(t, now) !== null) continue;
+    const resolved = computedResolutionOf(t, inc);
+    if (!resolved || resolved.pending || !resolved.base || resolved.fin !== null) continue;
+    // (A round of its holder's, the first past the one it took the game at: after a hand-over the base, and the
+    // round after it, can still be the seller's, and so their house's. Every round past it is the holder's alike.)
+    const from = resolved.chain[resolved.chain.length - 1].from;
+    if (resolved.houseAt(house, from + 1) !== true) continue;
+    const fin = sealFin({ room: casinoRoomId(), t, inc }, pub, signIdentity).value;
+    transactCasino(() => writeFairOnlyEnd(t, inc, fin, null));
+  }
 }
 
 /** What the ⚙ card shows of the switch: the row at all (`show`: the house,

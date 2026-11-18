@@ -178,6 +178,22 @@
           <div id="beacon-warning" hidden></div>
           <div id="beacon-error" role="status" hidden></div>
         </div>
+        <!-- 🔒 FAIR ONLY tables (fairOnlySwitch.ts): whether this computer's
+             node's house serves the FAIR ONLY games at the owner's tables, and
+             the one button that turns that on or off, each after CONFIRM. Off
+             until the player turns it on here. main.ts writes these with
+             textContent, hidden and data-* only, so focus stays on the button
+             from TURN ON to CONFIRM to TURNING ON. -->
+        <div class="network-row" id="fair-only-row">
+          <span class="label">Fair Only</span>
+          <span class="value" id="network-fair-only">--</span>
+        </div>
+        <div class="chia-lane-detail" id="fair-only-detail">
+          <div id="fair-only-note" hidden></div>
+          <button type="button" id="fair-only-switch" hidden aria-describedby="fair-only-note fair-only-warning"></button>
+          <div id="fair-only-warning" hidden></div>
+          <div id="fair-only-error" role="status" hidden></div>
+        </div>
         <div class="network-row">
           <span class="label">Bridge</span>
           <span class="value" id="network-bridge-status">--</span>

@@ -66,7 +66,7 @@ use crate::fold_supervisor::{Event, Launch, Supervisor};
 use crate::house::{checkpoint_ok, GamePlan, HousePlan};
 use crate::house_auth as ha;
 use crate::house_bytes::{self as hb, CVal};
-use crate::house_fold::{rules_id, FairHouses, FoldSummary, HouseSpan, FOLD_TABLES};
+use crate::house_fold::{rules_id, FairHouses, FoldSummary, FOLD_TABLES};
 use crate::house_mirror::{Hold, Limits, RoomMirror};
 use crate::HouseFoldReport;
 
@@ -343,6 +343,10 @@ pub struct FoldView {
     /// asks it of every tick the session is followed in, not only the one a
     /// trim comes in.
     pub settled: bool,
+    /// 🔒 The pins alone are the whole story (fold_pins.rs [`PlayerPins::view`]: no key replaced, none left unpinned,
+    /// the players read to the end), whatever the plan: what a FAIR ONLY game's answer needs, for a player whose key the
+    /// fold was not given has felts the pages count and the fold does not, and a trim from it would leave them behind.
+    pub pins_settled: bool,
     /// The epoch of the pins as this view saw them, and a way to ask where they are now
     /// (None: they never move, as in a view made by hand).
     pub pins_epoch: u64,
@@ -354,22 +358,7 @@ pub struct FoldView {
     pub games: Vec<GamePlan>,
 }
 
-/// 🔒 The latest answer of the fold for a FAIR ONLY game that was the game as the mirror had last read it: of the last
-/// frame sent, which carried the houses by round of the plan of its tick, with nothing left to send or to read, on the
-/// plan's base, and finished (no signature left unchecked). What the house's trim of the game goes by.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GameAnswer {
-    /// The base it was folded on (the doc key of its checkpoint) and the id of the session that follows it.
-    pub base_key: String,
-    pub sid: String,
-    /// The houses by round it was folded under (the plan's of its tick): a trim goes by an answer under the houses
-    /// it would sign under.
-    pub spans: Vec<HouseSpan>,
-    /// Which taking up of the game by the mirror, and which frame of the worker's, it is the answer of.
-    pub born: u64,
-    pub frame: u64,
-    pub summary: FoldSummary,
-}
+pub use crate::fold_summary::{GameAnswer, GameAnswers};
 
 /// 🔒 Whether a table is a FAIR ONLY game (`p`/`q`): followed on the base the plan gives, and compared with nothing.
 fn is_game(k: &TableKey) -> bool {
@@ -696,13 +685,17 @@ impl RoomShadow {
     }
 
     /// 🔒 Keep, for each FAIR ONLY game the view follows, the answer in hand if it is the game as the mirror last read it
-    /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it: [`Feed::covers`]), the doc
-    /// has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the plan's, and the fold is
-    /// finished. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
-    /// its answer let go of.
+    /// ([`GameAnswer`]): it covers the table under `inputs` (the plan's houses by round for it, and the view's pins:
+    /// [`Feed::covers`]), the doc has changed nothing of it since ([`RoomMirror::current`]), the mirror's base is the
+    /// plan's, and the fold is finished. With the watch of the pins and its epoch as the view read them. Before the drain, which may bring what the answer does not cover. A game the view no longer follows has
+    /// its answer let go of, and no game has one while the pins are not the whole story ([`FoldView::pins_settled`]):
+    /// they move the epoch when they stop being so, which takes back an answer made before.
     fn keep_answers<L: Launch>(&mut self, view: &FoldView, inputs: &Inputs, sup: &Supervisor<L>) {
         let games: BTreeSet<TableKey> = view.games.iter().map(|g| (g.t.clone(), g.inc.clone())).collect();
-        self.answers.retain(|k, _| games.contains(k));
+        self.answers.retain(|k, _| games.contains(k) && view.pins_settled);
+        if !view.pins_settled {
+            return;
+        }
         for g in &view.games {
             let k = (g.t.clone(), g.inc.clone());
             if !self.feed.covers(&k.0, &k.1, &self.mirror, sup, inputs) || !self.mirror.current(&k.0, &k.1) {
@@ -714,7 +707,15 @@ impl RoomShadow {
             if !on_base {
                 continue;
             }
-            let answer = GameAnswer { base_key: g.base_key.clone(), sid: g.sid.clone(), spans: g.spans.clone(), born: st.born, frame: fold.frame, summary: fold.summary.clone() };
+            // (The records of the session as the frame had them: what the mirror holds, while nothing is left to send. Worked
+            // out once a frame.)
+            let digest = match self.answers.get(&k) {
+                Some(a) if a.born == st.born && a.frame == fold.frame => a.digest.clone(),
+                _ => self.mirror.records_digest(&k.0, &k.1).unwrap_or_default(),
+            };
+            // (The fold covers the view's pins: made with them, which the watch says where it stood on when they were read.)
+            let pins = view.watch.clone().map(|w| (w, view.pins_epoch));
+            let answer = GameAnswer { base_key: g.base_key.clone(), sid: g.sid.clone(), spans: g.spans.clone(), digest, born: st.born, frame: fold.frame, summary: fold.summary.clone(), pins };
             if self.answers.get(&k) != Some(&answer) {
                 self.answers.insert(k, answer);
             }
@@ -1050,6 +1051,9 @@ pub struct FoldShadow<L: Launch> {
     /// 🔒 The same of the FAIR ONLY games.
     games_followed: u64,
     games_over: u64,
+    /// 🔒 Where the house reads the answers for its games ([`FoldShadow::share_answers`]): put there at the end of each
+    /// pass.
+    shared: Option<GameAnswers>,
 }
 
 impl<L: Launch> FoldShadow<L> {
@@ -1070,6 +1074,29 @@ impl<L: Launch> FoldShadow<L> {
             over: 0,
             games_followed: 0,
             games_over: 0,
+            shared: None,
+        }
+    }
+
+    /// 🔒 Put the answers for the FAIR ONLY games in `to` at the end of each pass, where the house's tick takes them
+    /// (`House::trim_duty`) without waiting on a pass of the shadow.
+    pub fn share_answers(&mut self, to: GameAnswers) {
+        self.shared = Some(to);
+        self.publish();
+    }
+
+    /// 🔒 The answers kept now, and no other, where the house reads them. (Under the map's own lock only.)
+    fn publish(&self) {
+        let Some(shared) = &self.shared else { return };
+        let mut map = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|(room, t, inc), _| self.game_answer(room, t, inc).is_some());
+        for (room, rs) in &self.rooms {
+            for ((t, inc), a) in &rs.answers {
+                let k = (room.clone(), t.clone(), inc.clone());
+                if map.get(&k) != Some(a) {
+                    map.insert(k, a.clone());
+                }
+            }
         }
     }
 
@@ -1129,7 +1156,7 @@ impl<L: Launch> FoldShadow<L> {
         // (And the key the watch has pinned for that holder is the key the pass pinned: the houses are the ones that
         // key delegated.)
         let held = deed.as_deref() == Some(plan.owner.as_str()) && pins.iter().any(|(pid, key)| *pid == plan.owner && *key == plan.owner_key);
-        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch), gapped: plan.gapped, games: plan.games }
+        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_settled, pins_epoch, watch: Some(watch), gapped: plan.gapped, games: plan.games }
     }
 
     /// One tick, with every room the node serves: its doc, and what to follow there (None:
@@ -1154,6 +1181,7 @@ impl<L: Launch> FoldShadow<L> {
             self.remembered.clear();
             self.followed = 0;
             self.games_followed = 0;
+            self.publish();
             return;
         }
         let events = self.sup.poll(clock());
@@ -1271,6 +1299,7 @@ impl<L: Launch> FoldShadow<L> {
         // (A room the node does not serve any more is not coming back with a plan of its own: what is remembered of it
         // goes, as its watch of the players does.)
         self.remembered.retain(|room, _| listed.contains(room));
+        self.publish();
     }
 
     pub fn tally(&self) -> Tally {
@@ -1301,6 +1330,8 @@ impl<L: Launch> FoldShadow<L> {
         HouseFoldReport {
             rules: ["r", "d"].iter().filter_map(|l| rules_id(l).map(|r| (l.to_string(), r.to_string()))).collect(),
             letters: "rd".to_string(),
+            // (And `pq` with the rules versions, while the house serves FAIR ONLY games: main.rs puts them in, fair_only_switch.rs `advertise`.)
+            rv: Vec::new(),
             attest: false,
             shadow_agreed: self.tally.agree,
             shadow_mismatches: self.tally.mismatch,
@@ -1318,6 +1349,12 @@ impl<L: Launch> FoldShadow<L> {
             games: self.games_followed,
             games_over: self.games_over,
             game_answers: self.rooms.values().map(|rs| rs.answers.len() as u64).sum(),
+            // (The house's, which the node's pass puts in: main.rs `fold_shadow_pass`.)
+            trims: 0,
+            sweeps: 0,
+            ends: 0,
+            cross_check_mismatches: 0,
+            row_put_backs: 0,
             off: self.sup.off().map(str::to_string),
             recent_mismatches: self.log.mismatches.iter().cloned().collect(),
             recent_skips: self.log.skips.iter().cloned().collect(),
