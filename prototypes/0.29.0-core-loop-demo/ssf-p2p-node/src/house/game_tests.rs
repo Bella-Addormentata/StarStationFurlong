@@ -1278,15 +1278,92 @@ fn a_house_the_games_holder_delegated_in_the_room_is_a_house_of_the_game_too() {
 }
 
 #[test]
-fn stopping_it_steps_down_its_commitment_at_a_game() {
+fn stopping_it_keeps_its_join_at_a_game_and_plays_on_once_back() {
+    // 🔒 At its stop the house lifts no commitment at a FAIR ONLY game it serves: the game waits for it, as after a
+    // crash, and plays on once the node is back (one lifted could never be made again: its seed is open).
     let mut game = Game::new("stop");
     game.tick(0);
     assert_eq!(game.records("o:1:").len(), 1);
+    game.house.begin_step_down();
+    game.ticks();
+    assert!(game.records("h:").is_empty(), "no step-down");
+    assert_eq!(game.records("o:").len(), 1, "and no other join");
+    game.restart(0);
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.seeds(1);
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+    assert_eq!(str_of(&reveals[0].1, "c"), Some(game.commit(2).as_str()), "and it carries the game on");
+}
+
+#[test]
+fn stopping_it_keeps_the_commitment_its_reveal_carried_and_reveals_on_it_once_back() {
+    let mut game = Game::new("stop-carried");
+    let (c, _, _) = game.closed_on_the_join();
+    game.seeds(1);
+    game.ticks();
+    assert_eq!(str_of(&game.records("h:1:")[0].1, "c"), Some(game.commit(2).as_str()));
+    game.house.begin_step_down();
+    game.ticks();
+    assert!(game.records("h:2:").is_empty(), "round 2's commitment is not lifted");
+    game.restart(0);
+    let (c2, _, _) = game.closed(2, &c, &game.commit(2));
+    game.seeds(2);
+    game.ticks();
+    let reveals = game.records("h:2:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c2]);
+}
+
+#[test]
+fn stopping_with_a_close_whose_seeds_are_in_it_reveals_it_carrying_nothing_and_joins_the_next_round_once_back() {
+    let mut game = Game::new("stop-reveal");
+    let (c, _, _) = game.closed_on_the_join();
+    game.seeds(1);
+    game.house.begin_step_down();
+    game.ticks();
+    let reveals = game.records("h:1:");
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(strs(&reveals[0].1, "x"), vec![c]);
+    assert!(reveals[0].1.get("c").is_none(), "nothing carried on at its stop");
+    assert!(game.records("o:2:").is_empty());
+    game.restart(0);
+    game.ticks();
+    assert_eq!(game.records("o:2:").len(), 1, "back: it joins round 2");
+}
+
+#[test]
+fn stopping_with_an_end_order_standing_it_steps_down_still() {
+    let mut game = Game::new("stop-fin");
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    game.fin(&who("owner"));
     game.house.begin_step_down();
     game.tick(200);
     let downs = game.records("h:1:");
     assert_eq!(downs.len(), 1);
     assert!(strs(&downs[0].1, "x").is_empty());
+}
+
+#[test]
+fn a_second_house_takes_over_from_a_stopped_one_once_the_round_on_its_commitment_is_void() {
+    // 🔒 The stopped house's join stands, so the second house joins no round beside it; the pages close on it once they
+    // hear the second house, and that close's abandon (a void) opens the round after (#442's takeover, a round lost).
+    let mut game = Game::new("stopped-takeover");
+    let owner = who("owner");
+    let mut other = game.second_house(9, &owner);
+    game.tick(0);
+    assert_eq!(game.records("o:1:").len(), 1);
+    game.house.begin_step_down();
+    game.ticks();
+    game.ticks_of(&mut other);
+    assert!(game.of("o:1:", other.public()).is_empty(), "round 1 is the stopped house's join's");
+    let (c, _, _) = game.closed(1, &game.sid(), &game.commit(1));
+    game.abandon(&who("alice"), 1, &c);
+    game.ticks_of(&mut other);
+    assert_eq!(game.of("o:2:", other.public()).len(), 1, "voided: the second house joins round 2");
 }
 
 #[test]
@@ -2825,8 +2902,10 @@ fn a_house_back_after_its_step_down_joins_no_round_that_waits_on_another() {
     let mut other = game.second_house(9, &owner);
     game.tick(0);
     assert_eq!(game.records("o:1:").len(), 1);
-    // It stops: its commitment for round 1 is opened, and the second house joins round 1 in its place.
-    game.house.begin_step_down();
+    // Told to stop serving the games, its last word steps down: its commitment for round 1 is opened, and the second
+    // house joins round 1 in its place. (Its node's stop keeps the commitment: see
+    // a_second_house_takes_over_from_a_stopped_one_once_the_round_on_its_commitment_is_void.)
+    game.house.serve_fair_only(false);
     game.tick(200);
     let downs = game.records("h:1:");
     assert!(downs.len() == 1 && strs(&downs[0].1, "x").is_empty());
@@ -2995,13 +3074,13 @@ fn a_pass_behind_the_changes_counts_a_game_whose_records_were_gone_as_when_last_
 fn a_house_counts_the_records_of_a_house_the_holder_delegated_in_the_room_alone() {
     // 🔒 Another house of the game by the holder's delegation under its key in the room (no checkpoint carries it): its
     // join and its reveal are a house's (the walk weighs that delegation where a record of that house asks it). This
-    // one stopped, and back: round 1 is the other's, and once the other reveals it with no commitment, round 2 is open
-    // and this one joins it.
+    // one told to stop serving the games (its last word steps down), and back: round 1 is the other's, and once the
+    // other reveals it with no commitment, round 2 is open and this one joins it.
     let mut game = Game::new("other-in-room");
     let owner = who("owner");
     let mut other = game.second_house(9, &owner);
     game.tick(0);
-    game.house.begin_step_down();
+    game.house.serve_fair_only(false);
     game.tick(200);
     game.ticks_of(&mut other);
     let joins = game.of("o:1:", other.public());
@@ -4546,11 +4625,16 @@ fn the_cross_check_holds_the_commitment_to_what_its_reveal_carried_and_none_afte
     game.answer(f);
     game.tick(HOUSE_TRIM_AFTER_MS);
     assert_eq!(game.house.game_counts().cross_check_mismatches, 1);
-    // Stepped down since: the commitment is lifted, and a trim that names it is refused.
-    game.house.begin_step_down();
+    // Stepped down since (its last word, told to stop serving the games, and then to serve them again): the commitment
+    // is lifted, and a trim that names it is refused.
+    game.house.serve_fair_only(false);
     game.no_answer();
     game.ticks();
     assert!(game.house.last_of(&game.ctx).unwrap().r > 1, "stepped down");
+    game.house.serve_fair_only(true);
+    // (A pass plans the game again.)
+    game.no_answer();
+    game.tick(200);
     let f = game.pressed_answer(&c, &ck, &rk, &hash);
     game.answer(f);
     game.tick(200);

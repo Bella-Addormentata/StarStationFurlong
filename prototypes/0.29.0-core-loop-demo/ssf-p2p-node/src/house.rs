@@ -55,6 +55,12 @@
 //!    closed on that commitment is revealed instead, without a next one
 //!    (when stopping, only if every seed is in: a void hands every stake
 //!    back, a reveal short of seeds would cost the late ones theirs).
+//!    🔒 Not at a FAIR ONLY game it serves, though: there no table carries
+//!    on Friendly, and a commitment the stop lifted could not be made again
+//!    (its seed is open), so the game would wait on it for good. Its stop
+//!    leaves the commitment as a crash would: the game waits for the house,
+//!    and plays on when the node is back (or another house of the game takes
+//!    over once the pages hear it, at the cost of a void round).
 //!
 //! Signatures cost: a tick checks at most [`VERIFY_PER_TICK`] it hasn't
 //! checked before (the pages' 40 ms slices, casinoDoc computedCheck), and a
@@ -895,7 +901,8 @@ struct RoomMem {
     game_plans: BTreeMap<GameKey, GamePlan>,
     /// 🔒 The house was told to stop serving the FAIR ONLY games ([`House::serve_fair_only`]) while it followed the
     /// room's: its last word there is still to come. The next tick reads the games once more as it would serving them,
-    /// and steps down at each as the node's stop does ([`House::begin_step_down`]): it reveals a close whose seeds are
+    /// and steps down at each as at an end order (not as at the node's stop, [`House::begin_step_down`], which keeps the
+    /// commitment at a game it serves): it reveals a close whose seeds are
     /// all in with no next commitment, lifts the commitment nobody closed on, and joins nothing; it trims, sweeps and
     /// ends nothing, puts nothing back, and adds no beat for them. Told to serve them again before then, it serves on
     /// with no settling: it read them all along. Let go once a tick reads the room through (not short), notes on disk
@@ -1381,7 +1388,10 @@ impl House {
     }
 
     /// Stop joining, beating and carrying commitments: from the next tick
-    /// on, each table's outstanding commitment is stepped down.
+    /// on, each table's outstanding commitment is stepped down. 🔒 (Not at a
+    /// FAIR ONLY game it serves: there it reveals a close whose seeds are all
+    /// in, with no next commitment, and keeps the one nobody closed on, so the
+    /// game plays on when the node is back. See the module's 6.)
     pub fn begin_step_down(&mut self) {
         self.stepping_down = true;
     }
@@ -3435,7 +3445,8 @@ impl House {
     /// One table's join, reveal and step-down.
     /// 🔒 At a FAIR ONLY game (`game`): only at the rounds this house decides, `friendly` meaning an end order stands
     /// (it reveals with no next commitment, steps down and joins nothing). Its last word at a game it was told to stop
-    /// serving ([`RoomMem::games_last_word`]) is a step-down, as at the node's stop.
+    /// serving ([`RoomMem::games_last_word`]) is a step-down, as at an end order. At the node's stop it reveals a close
+    /// whose seeds are all in, with no next commitment, joins nothing, and keeps its outstanding commitment there.
     fn table_duties(&mut self, room: &str, read: &TableRead, friendly: bool, now: u64, writes: &mut Vec<Write>, game: Option<&GameView>) {
         let ctx = &read.ctx;
         let fo = game.is_some();
@@ -3576,6 +3587,14 @@ impl House {
             // the last revealed that has one), unless a close names it (then
             // its reveal, above, carries none on).
             if revealed_now.is_some() {
+                return;
+            }
+            // 🔒 Not at the node's stop at a FAIR ONLY game it serves with no end order: no table carries on Friendly
+            // there, and a commitment lifted now could never be made again (its seed is open, and the house joins no
+            // round it stepped down at), so the game would wait for an END FAIR ONLY. Kept, as a crash keeps it, the game
+            // waits for the house and plays on when the node is back; another house of the game takes over once the pages
+            // hear it (the round on this commitment voids). Its last word, once told to stop serving, still steps down.
+            if fo && !friendly && self.serve_games {
                 return;
             }
             // (🔒 At a game, from past its base, whose rounds a checkpoint may run far ahead of this house's.)

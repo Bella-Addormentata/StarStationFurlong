@@ -131,7 +131,7 @@ export const fairOnlyStoppedNote = (unable: FairOnlyUnable): string =>
 export const fairOnlyCannotNote = (unable: FairOnlyUnable): string => `FAIR ONLY tables are off. ${fairOnlyUnableWords(unable)}`;
 
 /** What a turn to on does, before CONFIRM. */
-export const FAIR_ONLY_ON_WARNING = `Turn FAIR ONLY tables on? Then ${WHAT_IT_DOES}, and your tables offer SET FAIR ONLY. This is the first test of FAIR ONLY tables. If your node stops while a game is on, its house steps down there and serves that game no more: end it from the table's ⚙ card. Turned off here, this page ends the games it holds itself. Tap CONFIRM.`;
+export const FAIR_ONLY_ON_WARNING = `Turn FAIR ONLY tables on? Then ${WHAT_IT_DOES}, and your tables offer SET FAIR ONLY. This is the first test of FAIR ONLY tables. If your node stops while a game is on, the game waits for it and plays on when your node is back. Turned off here, this page ends the games it holds itself. Tap CONFIRM.`;
 
 /** What a turn to off does, before CONFIRM. */
 export const FAIR_ONLY_OFF_WARNING = "Turn FAIR ONLY tables off? Your node's house stops serving them: at each FAIR ONLY game it reveals a round whose seeds are in and starts no new one, and this page ends each game it holds once no round is in flight (a bet riding a craps point goes back to its player). Your tables stop offering SET FAIR ONLY. Tap CONFIRM.";

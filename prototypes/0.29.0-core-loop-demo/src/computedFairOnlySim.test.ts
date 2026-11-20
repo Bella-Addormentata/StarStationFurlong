@@ -122,6 +122,29 @@ describe('FAIR ONLY roulette, end to end: the owner opens the game, the node is 
     expect(sim.node!.wrote.reveals, sim.label).toBeGreaterThan(revealsAtReturn);
   }, TIMEOUT);
 
+  it('the node shuts down cleanly for 40 s twice (its house stepping down as it stops): the house keeps its commitment at the game, so the game waits, and plays on once the node is back', async () => {
+    const sim = await Sim.open({ name: 'fair-only-clean-stop', seed: seed(1207), pages: named('ABCD'), houseNode: true, fairOnly: true });
+    for (const at of [40_000, 100_000]) {
+      // (The app asks the node to step down, then stops it: one tick in step-down mode, as house.rs step_down.)
+      sim.at(at, () => { sim.node!.steppingDown = true; });
+      sim.at(at + 1_000, () => { sim.nodeUp = false; });
+      sim.at(at + 40_000, () => {
+        sim.node!.restart();
+        sim.nodeUp = true;
+      });
+    }
+    let revealsAtReturn = -1;
+    sim.at(140_500, () => { revealsAtReturn = sim.node!.wrote.reveals; });
+    await sim.run(RUN_MS);
+    const s = await rouletteFinish(sim, { houseAway: true });
+    fairOnlyFinish(sim, s);
+    expect(sim.node!.wrote.stepDowns, sim.label).toBe(0);
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    // The game played on after its node's last return (a lifted commitment would have left it waiting for good).
+    expect(revealsAtReturn, sim.label).toBeGreaterThanOrEqual(0);
+    expect(sim.node!.wrote.reveals, sim.label).toBeGreaterThan(revealsAtReturn);
+  }, TIMEOUT);
+
   it("the owner's page reloads, and later sleeps for half a minute: the game is still the table's, and the house serves it again", async () => {
     const sim = await Sim.open({ name: 'fair-only-owner-away', seed: seed(1206), pages: named('ABCD'), houseNode: true, fairOnly: true });
     sim.at(60_000, () => sim.reload(sim.house));

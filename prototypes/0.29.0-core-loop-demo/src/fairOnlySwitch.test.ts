@@ -57,7 +57,8 @@ describe('fairOnlyRow, off', () => {
     const armed = { ...IDLE, armed: fairOnlyArm(true, BASE) };
     expect(fairOnlyRow(with_(OFF), armed)).toEqual({ value: 'OFF', colour: LANE_UNKNOWN_COLOUR, note: FAIR_ONLY_OFF_NOTE, warning: FAIR_ONLY_ON_WARNING, error: null, button: CONFIRM_ON });
     expect(FAIR_ONLY_ON_WARNING).toMatch(/^Turn FAIR ONLY tables on\? /);
-    expect(FAIR_ONLY_ON_WARNING).toContain("its house steps down there and serves that game no more: end it from the table's ⚙ card");
+    expect(FAIR_ONLY_ON_WARNING).toContain('If your node stops while a game is on, the game waits for it and plays on when your node is back.');
+    expect(FAIR_ONLY_ON_WARNING).not.toContain('serves that game no more');
     expect(FAIR_ONLY_ON_WARNING).toContain('Turned off here, this page ends the games it holds itself.');
     expect(FAIR_ONLY_ON_WARNING).toMatch(/Tap CONFIRM\.$/);
     // An off armed (from before the node turned off) shows no CONFIRM for an on.

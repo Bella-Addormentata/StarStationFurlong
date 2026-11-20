@@ -36,9 +36,11 @@
 //! so no page offers a new game.
 //!
 //! Turned off, the house says its last word at the games from its next tick
-//! (house.rs `games_last_word`), as at the node's stop: it reveals a close
+//! (house.rs `games_last_word`), as at an end order: it reveals a close
 //! whose seeds are in with no next commitment, lifts the commitment nobody
-//! closed on, and then serves them no more. So no page closes a round on a
+//! closed on, and then serves them no more. (Not as at the node's stop, which
+//! keeps that commitment, so a game waits for the node and plays on when it
+//! is back.) So no page closes a round on a
 //! commitment nobody will reveal, though the room's beat goes on for a house
 //! table beside. The page that holds a game, seeing its own node's switch off
 //! in the fingerprint, writes the game's end order, and the end once the
