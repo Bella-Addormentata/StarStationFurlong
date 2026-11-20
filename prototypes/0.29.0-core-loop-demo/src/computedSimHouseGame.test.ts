@@ -1912,14 +1912,14 @@ describe("the simulations' houses at a FAIR ONLY game with two houses of its hol
     expect(room.recs('o:3:')).toEqual([]);
   });
 
-  it('both joined the first round, and the house whose join the close does not name steps down from it and starts again: the round still waits on the other, and it joins nothing', () => {
+  it('both joined the first round, and the house whose join the close does not name stops (keeping its join: a FAIR ONLY game plays on when it is back) and starts again: the round still waits on the other, and it joins nothing', () => {
     const room = new TwoRoom().start();
     room.put(kit.houseJoin(H2, 1));
     room.on = false;
     room.closed(1, SID);
     room.house2.steppingDown = true;
     room.tick(TICK);
-    expect(by2(room, 'h:1:').map((v) => v.x)).toEqual([[]]);
+    expect(by2(room, 'h:1:')).toEqual([]);
     room.house2.restart();
     room.run(SETTLE_MS + 2_000);
     expect(room.fold()).toMatchObject({ open: 1 });

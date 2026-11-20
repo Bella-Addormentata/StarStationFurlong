@@ -769,7 +769,7 @@ export class SimHouse {
       }
       const read = this.readTable(comp, ctx, { u: B.u, h: B.h, sid }, (k, r) => res.houseAt(k, r) === true);
       if (!read) continue;
-      this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true, current);
+      this.tableDuties(mem, read, res.fin !== null, now, writes, out, (r) => res.houseAt(this.pub, r) === true, current, true);
       // (A house of a key the game has left writes no checkpoint, and is heard at the game no more.)
       if (!current) continue;
       if (now - (table.firstRead ?? now) >= SETTLE_MS) settled += 1;
@@ -1062,8 +1062,9 @@ export class SimHouse {
     return mem;
   }
 
-  /** One table's reveal, step-down and join (house.rs table_duties). */
-  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true, joins = true): void {
+  /** One table's reveal, step-down and join (house.rs table_duties). At a
+   *  FAIR ONLY `game`, its node's stop keeps the outstanding commitment. */
+  private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut, mine: (r: number) => boolean = () => true, joins = true, game = false): void {
     const { ctx } = read;
     const own = read.reveals.filter((h) => h.k === this.pub);
     const doneKey = `${ctx.room}|${ctx.t}|${ctx.inc}`;
@@ -1168,6 +1169,11 @@ export class SimHouse {
     if (friendly || this.steppingDown) {
       // Step down: the outstanding commitment, unless a close names it.
       if (revealedNow !== null) return;
+      // 🔒 Not at its node's stop at a FAIR ONLY game with no end order (house.rs table_duties): no table carries on
+      // Friendly there, and a lifted commitment could never be made again, so the game would wait for an END FAIR
+      // ONLY. Kept, as a crash keeps it, the game plays on when the node is back, or another house takes over once the
+      // pages hear it (the round on this commitment voids).
+      if (game && !friendly) return;
       let r: number | null = null;
       for (let at = done + 1; at <= Math.max(nextRound(), done + 1); at++) {
         if (carried(at) || joined(at)) {

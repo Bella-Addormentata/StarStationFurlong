@@ -679,6 +679,20 @@ fn a_join_nobody_closed_on_is_stepped_down_too() {
 }
 
 #[test]
+fn a_join_nobody_closed_on_is_stepped_down_on_stop_while_the_house_serves_fair_only_games_too() {
+    // 🔒 (Only at a FAIR ONLY game does its stop keep the commitment: a house table carries on Friendly.)
+    let mut room = Room::new("stopjoin-fo", true);
+    room.house.serve_fair_only(true);
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1);
+    room.house.begin_step_down();
+    room.tick(200);
+    let d = &room.records("h:1:")[0].1;
+    assert!(strs(d, "x").is_empty());
+    assert_eq!(hb::house_commit(&ctx(), 1, str_of(d, "s").unwrap()), room.commit(1));
+}
+
+#[test]
 fn puts_back_the_delegation_and_the_newest_setting() {
     let mut room = Room::new("putback", true);
     room.set_fair(1, 3);

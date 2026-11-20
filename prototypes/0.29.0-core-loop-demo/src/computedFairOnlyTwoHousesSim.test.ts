@@ -159,7 +159,7 @@ describe('FAIR ONLY roulette: two houses of one holder', () => {
     expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(sim.house.p.table.ABANDON_MS + 2 * sim.house.p.table.GRACE_MAX_MS);
   }, TIMEOUT);
 
-  it('the house that plays steps down as its node shuts down: the other house joins the next round (a round is lost only where a close named the commitment as it was stepped down)', async () => {
+  it('the house that plays steps down as its node shuts down, keeping its commitment at the game: the pages close on it once they hear the other house, the bettors void that round, and the other house plays on', async () => {
     const sim = await Sim.open({ name: 'fair-only-two-houses-step-down', seed: seed(1509), pages: room(), houseNode: true, fairOnly: true, bot: HEAVY_BOT });
     let was: SimHouse | null = null;
     sim.at(60_000, () => { was = playing(sim).on; was.steppingDown = true; });
